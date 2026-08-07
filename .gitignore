@@ -1,0 +1,11 @@
+target/
+*.rs.bk
+.codebro/
+.env
+
+# Generated benchmark output
+**/target/tarpaulin/
+**/criterion-report/
+
+# OS files
+.DS_Store
