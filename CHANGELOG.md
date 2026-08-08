@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- **P10.5.1 Fact Store Foundation**
+  - Canonical immutable repository for Engineering Facts built on the P10.5.0 FactsModel
+  - Owns: FactStore, FactCollection, FactIndex, FactLookup, FactQuery, FactSnapshot, FactStatistics, FactDiagnostics, FactValidation
+  - Deterministic, read-only primary indexes for every entity id plus reverse workspace/package/module/symbol scope indexes (pure field projections, no graph traversal)
+  - Byte-identical snapshots (canonical JSON + FNV-1a 64 digest, no timestamps/randomness)
+  - Store validation: duplicate facts, broken indexes, missing ids, orphan records, schema consistency
+  - O(log n) allocation-free lookups and enumeration; lifecycle builder; Send + Sync, 8-thread concurrency test
+  - 39 new tests; full suite 2111 passed / 0 failed
+- **P10.5.0 Engineering Facts Model**
+  - Immutable, language-neutral engineering fact model consumed by the Engineering Runtime
+  - Facts are the only public contract between language intelligence providers and the runtime (no source, AST or parser dependency)
+  - Entities: Symbol, Module, Package, Workspace, Dependency, Relationship, Reference, Test, Build Target, Diagnostic, Architecture Rule
+  - Opaque IDs (`FactId`) with no UUID generation, timestamps or randomness
+  - Deterministic validation: duplicate IDs, invalid references, self-references, orphan symbols, broken dependency links, unresolved visibility
+  - `FactsBuilder → FactsModel` freeze pattern; id-sorted storage with O(log n) allocation-free lookups
+  - Send + Sync, serde (JSON/TOML) round-trips, full determinism
+  - 27 new tests; full suite 2063 passed / 0 failed
+
 ## [1.0.0] - 2026-08-06
 
 ### Added
