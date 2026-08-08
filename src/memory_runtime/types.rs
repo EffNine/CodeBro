@@ -102,8 +102,7 @@ impl MemoryEntry {
 
     pub fn matches_key(&self, query: &str) -> bool {
         let query = query.to_lowercase();
-        self.key.to_lowercase().contains(&query)
-            || self.value.to_lowercase().contains(&query)
+        self.key.to_lowercase().contains(&query) || self.value.to_lowercase().contains(&query)
     }
 }
 
@@ -223,11 +222,7 @@ impl MemoryResolution {
         let resolution_order = if query.tier.is_some() {
             vec![query.tier.unwrap()]
         } else {
-            vec![
-                MemoryTier::Session,
-                MemoryTier::Project,
-                MemoryTier::Global,
-            ]
+            vec![MemoryTier::Session, MemoryTier::Project, MemoryTier::Global]
         };
 
         let misses = resolution_order

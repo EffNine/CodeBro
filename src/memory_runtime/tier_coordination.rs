@@ -35,9 +35,10 @@ impl TierCoordinator {
         let policy = self.policy.read().unwrap();
         if !policy.is_access_allowed(entry.tier, &entry.key, entry.metadata.confidence) {
             self.diagnostics.write().unwrap().record_policy_violation();
-            return Err(super::types::MemoryRuntimeError::PolicyViolation(
-                format!("Access denied for key '{}' in tier {}", entry.key, entry.tier),
-            ));
+            return Err(super::types::MemoryRuntimeError::PolicyViolation(format!(
+                "Access denied for key '{}' in tier {}",
+                entry.key, entry.tier
+            )));
         }
 
         // Check max entries per tier
@@ -56,7 +57,11 @@ impl TierCoordinator {
     }
 
     /// Update a memory entry.
-    pub fn update(&self, id: &str, value: impl Into<String>) -> super::types::MemoryRuntimeResult<()> {
+    pub fn update(
+        &self,
+        id: &str,
+        value: impl Into<String>,
+    ) -> super::types::MemoryRuntimeResult<()> {
         self.lifecycle.update(id, value)
     }
 
@@ -346,7 +351,9 @@ mod tests {
             .create(test_entry("s1", MemoryTier::Session, "key", "value"))
             .unwrap();
 
-        let snapshot_id = coordinator.snapshot_tier("snap1", MemoryTier::Session).unwrap();
+        let snapshot_id = coordinator
+            .snapshot_tier("snap1", MemoryTier::Session)
+            .unwrap();
         assert_eq!(snapshot_id, "snap1");
 
         let snapshot = coordinator.restore_from_snapshot("snap1").unwrap();
@@ -356,8 +363,7 @@ mod tests {
     #[test]
     fn test_access_denied() {
         let policy = MemoryPolicy::new().with_access_rule(
-            crate::memory_runtime::AccessRule::new(MemoryTier::Session)
-                .deny_key("secret"),
+            crate::memory_runtime::AccessRule::new(MemoryTier::Session).deny_key("secret"),
         );
         let coordinator = TierCoordinator::new(policy);
         let entry = test_entry("e1", MemoryTier::Session, "secret", "value");

@@ -277,9 +277,7 @@ impl MemoryPolicy {
                     0.2
                 }
             }
-            PriorityPolicy::Frequency => {
-                (entry.access_count as f64).min(10.0) / 10.0
-            }
+            PriorityPolicy::Frequency => (entry.access_count as f64).min(10.0) / 10.0,
         }
     }
 
@@ -303,8 +301,11 @@ mod tests {
     use crate::memory_runtime::types::{MemoryEntry, MemoryMetadata, MemoryTier};
 
     fn test_entry(id: &str, tier: MemoryTier, key: &str, value: &str) -> MemoryEntry {
-        MemoryEntry::new(id, tier, key, value)
-            .with_metadata(MemoryMetadata::new().with_importance(0.8).with_confidence(0.9))
+        MemoryEntry::new(id, tier, key, value).with_metadata(
+            MemoryMetadata::new()
+                .with_importance(0.8)
+                .with_confidence(0.9),
+        )
     }
 
     #[test]
@@ -316,9 +317,8 @@ mod tests {
 
     #[test]
     fn test_retention_policy_duration() {
-        let policy = MemoryPolicy::new().with_retention(RetentionPolicy::Duration(
-            Duration::from_secs(1),
-        ));
+        let policy =
+            MemoryPolicy::new().with_retention(RetentionPolicy::Duration(Duration::from_secs(1)));
         let entry = test_entry("e1", MemoryTier::Session, "key", "value");
         // Entry is fresh, shouldn't be evicted
         assert!(!policy.should_evict(&entry));
@@ -326,9 +326,8 @@ mod tests {
 
     #[test]
     fn test_retention_policy_importance_threshold() {
-        let policy = MemoryPolicy::new().with_retention(RetentionPolicy::ImportanceThreshold {
-            threshold: 0.5,
-        });
+        let policy = MemoryPolicy::new()
+            .with_retention(RetentionPolicy::ImportanceThreshold { threshold: 0.5 });
         let entry = test_entry("e1", MemoryTier::Session, "key", "value");
         assert!(!policy.should_evict(&entry));
 
@@ -346,9 +345,8 @@ mod tests {
 
     #[test]
     fn test_expiration_policy_idle_timeout() {
-        let policy = MemoryPolicy::new().with_expiration(ExpirationPolicy::IdleTimeout(
-            Duration::from_secs(1),
-        ));
+        let policy = MemoryPolicy::new()
+            .with_expiration(ExpirationPolicy::IdleTimeout(Duration::from_secs(1)));
         let entry = test_entry("e1", MemoryTier::Session, "key", "value");
         // Entry is fresh
         assert!(!policy.is_expired(&entry));
@@ -397,8 +395,7 @@ mod tests {
 
     #[test]
     fn test_access_rule_confidence() {
-        let rule = AccessRule::new(MemoryTier::Session)
-            .with_min_confidence(0.5);
+        let rule = AccessRule::new(MemoryTier::Session).with_min_confidence(0.5);
         assert!(!rule.matches("key", 0.3));
         assert!(rule.matches("key", 0.6));
     }

@@ -31,9 +31,10 @@ impl MemoryLifecycle {
         let mut tier_index = self.tier_index.write().unwrap();
 
         if entries.contains_key(&entry.id) {
-            return Err(super::types::MemoryRuntimeError::Conflict(
-                format!("Entry {} already exists", entry.id),
-            ));
+            return Err(super::types::MemoryRuntimeError::Conflict(format!(
+                "Entry {} already exists",
+                entry.id
+            )));
         }
 
         let id = entry.id.clone();
@@ -67,14 +68,20 @@ impl MemoryLifecycle {
     }
 
     /// Update a memory entry.
-    pub fn update(&self, id: &str, value: impl Into<String>) -> super::types::MemoryRuntimeResult<()> {
+    pub fn update(
+        &self,
+        id: &str,
+        value: impl Into<String>,
+    ) -> super::types::MemoryRuntimeResult<()> {
         let mut entries = self.entries.write().unwrap();
         if let Some(entry) = entries.get_mut(id) {
             entry.value = value.into();
             entry.record_access();
             Ok(())
         } else {
-            Err(super::types::MemoryRuntimeError::EntryNotFound(id.to_string()))
+            Err(super::types::MemoryRuntimeError::EntryNotFound(
+                id.to_string(),
+            ))
         }
     }
 
@@ -89,7 +96,9 @@ impl MemoryLifecycle {
             }
             Ok(())
         } else {
-            Err(super::types::MemoryRuntimeError::EntryNotFound(id.to_string()))
+            Err(super::types::MemoryRuntimeError::EntryNotFound(
+                id.to_string(),
+            ))
         }
     }
 
@@ -100,7 +109,11 @@ impl MemoryLifecycle {
 
         tier_index
             .get(&tier)
-            .map(|ids| ids.iter().filter_map(|id| entries.get(id).cloned()).collect())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| entries.get(id).cloned())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

@@ -94,11 +94,7 @@ impl MemoryRuntime {
     }
 
     /// Create a snapshot.
-    pub fn snapshot(
-        &self,
-        id: impl Into<String>,
-        tier: MemoryTier,
-    ) -> MemoryRuntimeResult<String> {
+    pub fn snapshot(&self, id: impl Into<String>, tier: MemoryTier) -> MemoryRuntimeResult<String> {
         self.coordinator.snapshot_tier(id, tier)
     }
 
@@ -113,11 +109,7 @@ impl MemoryRuntime {
     }
 
     /// Diff snapshots.
-    pub fn diff_snapshots(
-        &self,
-        snap_a: &str,
-        snap_b: &str,
-    ) -> MemoryRuntimeResult<SnapshotDiff> {
+    pub fn diff_snapshots(&self, snap_a: &str, snap_b: &str) -> MemoryRuntimeResult<SnapshotDiff> {
         self.coordinator.diff_snapshots(snap_a, snap_b)
     }
 
@@ -200,7 +192,10 @@ mod tests {
             eprintln!("  - {} ({})", h.id, h.tier);
         }
         // First match wins (deterministic)
-        assert!(resolution.hits.len() >= 1, "Should find at least one match for 'language'");
+        assert!(
+            resolution.hits.len() >= 1,
+            "Should find at least one match for 'language'"
+        );
     }
 
     #[test]

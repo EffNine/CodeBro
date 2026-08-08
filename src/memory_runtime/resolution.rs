@@ -29,11 +29,7 @@ impl MemoryResolver {
         let resolution_order = if let Some(tier) = query.tier {
             vec![tier]
         } else {
-            vec![
-                MemoryTier::Session,
-                MemoryTier::Project,
-                MemoryTier::Global,
-            ]
+            vec![MemoryTier::Session, MemoryTier::Project, MemoryTier::Global]
         };
 
         let mut hits = Vec::new();
@@ -107,11 +103,7 @@ impl MemoryResolver {
         let resolution_order = if let Some(tier) = query.tier {
             vec![tier]
         } else {
-            vec![
-                MemoryTier::Session,
-                MemoryTier::Project,
-                MemoryTier::Global,
-            ]
+            vec![MemoryTier::Session, MemoryTier::Project, MemoryTier::Global]
         };
 
         // Collect all matching entries
@@ -141,9 +133,10 @@ impl MemoryResolver {
 
         // Apply conflict resolution
         let hits = match policy {
-            super::policy::ConflictPolicy::FirstMatch => {
-                all_hits.into_iter().take(query.max_results).collect::<Vec<_>>()
-            }
+            super::policy::ConflictPolicy::FirstMatch => all_hits
+                .into_iter()
+                .take(query.max_results)
+                .collect::<Vec<_>>(),
             super::policy::ConflictPolicy::HighestImportance => {
                 all_hits.sort_by(|a, b| {
                     b.metadata
@@ -151,7 +144,10 @@ impl MemoryResolver {
                         .partial_cmp(&a.metadata.importance)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                all_hits.into_iter().take(query.max_results).collect::<Vec<_>>()
+                all_hits
+                    .into_iter()
+                    .take(query.max_results)
+                    .collect::<Vec<_>>()
             }
             super::policy::ConflictPolicy::HighestConfidence => {
                 all_hits.sort_by(|a, b| {
@@ -188,11 +184,7 @@ impl MemoryResolver {
         let resolution_order = if query.tier.is_some() {
             vec![query.tier.unwrap()]
         } else {
-            vec![
-                MemoryTier::Session,
-                MemoryTier::Project,
-                MemoryTier::Global,
-            ]
+            vec![MemoryTier::Session, MemoryTier::Project, MemoryTier::Global]
         };
 
         let misses = resolution_order
@@ -212,11 +204,7 @@ impl MemoryResolver {
 
     /// Get resolution order.
     pub fn resolution_order() -> Vec<MemoryTier> {
-        vec![
-            MemoryTier::Session,
-            MemoryTier::Project,
-            MemoryTier::Global,
-        ]
+        vec![MemoryTier::Session, MemoryTier::Project, MemoryTier::Global]
     }
 }
 
@@ -380,7 +368,12 @@ mod tests {
 
         for i in 0..5 {
             lifecycle
-                .create(test_entry(&format!("e{}", i), MemoryTier::Session, "prefix", &format!("value_{}", i)))
+                .create(test_entry(
+                    &format!("e{}", i),
+                    MemoryTier::Session,
+                    "prefix",
+                    &format!("value_{}", i),
+                ))
                 .unwrap();
         }
 
@@ -395,10 +388,9 @@ mod tests {
     #[test]
     fn test_deterministic_resolution_order() {
         let order = MemoryResolver::resolution_order();
-        assert_eq!(order, vec![
-            MemoryTier::Session,
-            MemoryTier::Project,
-            MemoryTier::Global,
-        ]);
+        assert_eq!(
+            order,
+            vec![MemoryTier::Session, MemoryTier::Project, MemoryTier::Global,]
+        );
     }
 }

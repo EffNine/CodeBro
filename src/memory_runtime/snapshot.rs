@@ -15,7 +15,11 @@ pub struct MemorySnapshot {
 }
 
 impl MemorySnapshot {
-    pub fn new(id: impl Into<String>, tier: MemoryTier, entries: HashMap<String, MemoryEntry>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        tier: MemoryTier,
+        entries: HashMap<String, MemoryEntry>,
+    ) -> Self {
         MemorySnapshot {
             id: id.into(),
             created_at: chrono::Utc::now().timestamp() as u64,
@@ -119,10 +123,7 @@ impl SnapshotDiff {
 }
 
 /// Compute diff between two snapshots.
-pub fn compute_diff(
-    snapshot_a: &MemorySnapshot,
-    snapshot_b: &MemorySnapshot,
-) -> SnapshotDiff {
+pub fn compute_diff(snapshot_a: &MemorySnapshot, snapshot_b: &MemorySnapshot) -> SnapshotDiff {
     let mut added = Vec::new();
     let mut removed = Vec::new();
     let mut modified = Vec::new();
@@ -145,13 +146,7 @@ pub fn compute_diff(
         }
     }
 
-    SnapshotDiff::new(
-        &snapshot_a.id,
-        &snapshot_b.id,
-        added,
-        removed,
-        modified,
-    )
+    SnapshotDiff::new(&snapshot_a.id, &snapshot_b.id, added, removed, modified)
 }
 
 /// Snapshot manager for creating, storing, and merging snapshots.
@@ -213,9 +208,10 @@ impl SnapshotManager {
         if snapshots.remove(id).is_some() {
             Ok(())
         } else {
-            Err(super::types::MemoryRuntimeError::SnapshotError(
-                format!("Snapshot {} not found", id),
-            ))
+            Err(super::types::MemoryRuntimeError::SnapshotError(format!(
+                "Snapshot {} not found",
+                id
+            )))
         }
     }
 
@@ -230,12 +226,18 @@ impl SnapshotManager {
         let (source_entries, target_entries, target_tier) = {
             let snapshots = self.snapshots.read().unwrap();
 
-            let source = snapshots
-                .get(source_id)
-                .ok_or_else(|| super::types::MemoryRuntimeError::SnapshotError(format!("Source snapshot {} not found", source_id)))?;
-            let target = snapshots
-                .get(target_id)
-                .ok_or_else(|| super::types::MemoryRuntimeError::SnapshotError(format!("Target snapshot {} not found", target_id)))?;
+            let source = snapshots.get(source_id).ok_or_else(|| {
+                super::types::MemoryRuntimeError::SnapshotError(format!(
+                    "Source snapshot {} not found",
+                    source_id
+                ))
+            })?;
+            let target = snapshots.get(target_id).ok_or_else(|| {
+                super::types::MemoryRuntimeError::SnapshotError(format!(
+                    "Target snapshot {} not found",
+                    target_id
+                ))
+            })?;
 
             (source.entries.clone(), target.entries.clone(), target.tier)
         };
@@ -279,12 +281,18 @@ impl SnapshotManager {
     ) -> super::types::MemoryRuntimeResult<SnapshotDiff> {
         let snapshots = self.snapshots.read().unwrap();
 
-        let snapshot_a = snapshots
-            .get(snapshot_a_id)
-            .ok_or_else(|| super::types::MemoryRuntimeError::SnapshotError(format!("Snapshot {} not found", snapshot_a_id)))?;
-        let snapshot_b = snapshots
-            .get(snapshot_b_id)
-            .ok_or_else(|| super::types::MemoryRuntimeError::SnapshotError(format!("Snapshot {} not found", snapshot_b_id)))?;
+        let snapshot_a = snapshots.get(snapshot_a_id).ok_or_else(|| {
+            super::types::MemoryRuntimeError::SnapshotError(format!(
+                "Snapshot {} not found",
+                snapshot_a_id
+            ))
+        })?;
+        let snapshot_b = snapshots.get(snapshot_b_id).ok_or_else(|| {
+            super::types::MemoryRuntimeError::SnapshotError(format!(
+                "Snapshot {} not found",
+                snapshot_b_id
+            ))
+        })?;
 
         Ok(compute_diff(snapshot_a, snapshot_b))
     }
@@ -292,10 +300,16 @@ impl SnapshotManager {
     /// Restore memory state from a snapshot.
     ///
     /// Returns the entries from the snapshot (does not modify lifecycle).
-    pub fn restore(&self, snapshot_id: &str) -> super::types::MemoryRuntimeResult<Vec<MemoryEntry>> {
-        let snapshot = self
-            .get(snapshot_id)
-            .ok_or_else(|| super::types::MemoryRuntimeError::SnapshotError(format!("Snapshot {} not found", snapshot_id)))?;
+    pub fn restore(
+        &self,
+        snapshot_id: &str,
+    ) -> super::types::MemoryRuntimeResult<Vec<MemoryEntry>> {
+        let snapshot = self.get(snapshot_id).ok_or_else(|| {
+            super::types::MemoryRuntimeError::SnapshotError(format!(
+                "Snapshot {} not found",
+                snapshot_id
+            ))
+        })?;
 
         Ok(snapshot.entries.values().cloned().collect())
     }
@@ -332,19 +346,29 @@ mod tests {
     use crate::memory_runtime::types::MemoryMetadata;
 
     fn test_entry(id: &str, tier: MemoryTier, key: &str, value: &str) -> MemoryEntry {
-        MemoryEntry::new(id, tier, key, value)
-            .with_metadata(MemoryMetadata::new())
+        MemoryEntry::new(id, tier, key, value).with_metadata(MemoryMetadata::new())
     }
 
     #[test]
     fn test_snapshot_create_and_get() {
         let manager = SnapshotManager::new(100);
         let mut entries = HashMap::new();
-        entries.insert("e1".to_string(), test_entry("e1", MemoryTier::Session, "key", "value1"));
-        entries.insert("e2".to_string(), test_entry("e2", MemoryTier::Session, "key", "value2"));
+        entries.insert(
+            "e1".to_string(),
+            test_entry("e1", MemoryTier::Session, "key", "value1"),
+        );
+        entries.insert(
+            "e2".to_string(),
+            test_entry("e2", MemoryTier::Session, "key", "value2"),
+        );
 
         let id = manager
-            .create("snap1".to_string().to_string(), MemoryTier::Session, entries.clone(), SnapshotMetadata::new())
+            .create(
+                "snap1".to_string().to_string(),
+                MemoryTier::Session,
+                entries.clone(),
+                SnapshotMetadata::new(),
+            )
             .unwrap();
         assert_eq!(id, "snap1");
 
@@ -358,10 +382,20 @@ mod tests {
     fn test_snapshot_list() {
         let manager = SnapshotManager::new(100);
         manager
-            .create("snap1".to_string().to_string(), MemoryTier::Session, HashMap::new(), SnapshotMetadata::new())
+            .create(
+                "snap1".to_string().to_string(),
+                MemoryTier::Session,
+                HashMap::new(),
+                SnapshotMetadata::new(),
+            )
             .unwrap();
         manager
-            .create("snap2".to_string().to_string(), MemoryTier::Project, HashMap::new(), SnapshotMetadata::new())
+            .create(
+                "snap2".to_string().to_string(),
+                MemoryTier::Project,
+                HashMap::new(),
+                SnapshotMetadata::new(),
+            )
             .unwrap();
 
         let snapshots = manager.list();
@@ -372,7 +406,12 @@ mod tests {
     fn test_snapshot_delete() {
         let manager = SnapshotManager::new(100);
         manager
-            .create("snap1".to_string(), MemoryTier::Session, HashMap::new(), SnapshotMetadata::new())
+            .create(
+                "snap1".to_string(),
+                MemoryTier::Session,
+                HashMap::new(),
+                SnapshotMetadata::new(),
+            )
             .unwrap();
 
         manager.delete("snap1").unwrap();
@@ -391,18 +430,40 @@ mod tests {
         let manager = SnapshotManager::new(100);
 
         let mut entries1 = HashMap::new();
-        entries1.insert("e1".to_string(), test_entry("e1", MemoryTier::Session, "key", "value1"));
-        entries1.insert("e2".to_string(), test_entry("e2", MemoryTier::Session, "key", "value2"));
+        entries1.insert(
+            "e1".to_string(),
+            test_entry("e1", MemoryTier::Session, "key", "value1"),
+        );
+        entries1.insert(
+            "e2".to_string(),
+            test_entry("e2", MemoryTier::Session, "key", "value2"),
+        );
 
         let mut entries2 = HashMap::new();
-        entries2.insert("e2".to_string(), test_entry("e2", MemoryTier::Session, "key", "value2_modified"));
-        entries2.insert("e3".to_string(), test_entry("e3", MemoryTier::Session, "key", "value3"));
+        entries2.insert(
+            "e2".to_string(),
+            test_entry("e2", MemoryTier::Session, "key", "value2_modified"),
+        );
+        entries2.insert(
+            "e3".to_string(),
+            test_entry("e3", MemoryTier::Session, "key", "value3"),
+        );
 
         manager
-            .create("snap1".to_string(), MemoryTier::Session, entries1, SnapshotMetadata::new())
+            .create(
+                "snap1".to_string(),
+                MemoryTier::Session,
+                entries1,
+                SnapshotMetadata::new(),
+            )
             .unwrap();
         manager
-            .create("snap2".to_string(), MemoryTier::Session, entries2, SnapshotMetadata::new())
+            .create(
+                "snap2".to_string(),
+                MemoryTier::Session,
+                entries2,
+                SnapshotMetadata::new(),
+            )
             .unwrap();
 
         let merged = manager.merge("snap1", "snap2", "snap_merged").unwrap();
@@ -417,18 +478,40 @@ mod tests {
         let manager = SnapshotManager::new(100);
 
         let mut entries1 = HashMap::new();
-        entries1.insert("e1".to_string(), test_entry("e1", MemoryTier::Session, "key", "value1"));
-        entries1.insert("e2".to_string(), test_entry("e2", MemoryTier::Session, "key", "value2"));
+        entries1.insert(
+            "e1".to_string(),
+            test_entry("e1", MemoryTier::Session, "key", "value1"),
+        );
+        entries1.insert(
+            "e2".to_string(),
+            test_entry("e2", MemoryTier::Session, "key", "value2"),
+        );
 
         let mut entries2 = HashMap::new();
-        entries2.insert("e1".to_string(), test_entry("e1", MemoryTier::Session, "key", "value1_modified"));
-        entries2.insert("e3".to_string(), test_entry("e3", MemoryTier::Session, "key", "value3"));
+        entries2.insert(
+            "e1".to_string(),
+            test_entry("e1", MemoryTier::Session, "key", "value1_modified"),
+        );
+        entries2.insert(
+            "e3".to_string(),
+            test_entry("e3", MemoryTier::Session, "key", "value3"),
+        );
 
         manager
-            .create("snap1".to_string(), MemoryTier::Session, entries1, SnapshotMetadata::new())
+            .create(
+                "snap1".to_string(),
+                MemoryTier::Session,
+                entries1,
+                SnapshotMetadata::new(),
+            )
             .unwrap();
         manager
-            .create("snap2".to_string(), MemoryTier::Session, entries2, SnapshotMetadata::new())
+            .create(
+                "snap2".to_string(),
+                MemoryTier::Session,
+                entries2,
+                SnapshotMetadata::new(),
+            )
             .unwrap();
 
         let diff = manager.diff("snap1", "snap2").unwrap();
@@ -443,10 +526,20 @@ mod tests {
 
         let entries = HashMap::new();
         manager
-            .create("snap1".to_string(), MemoryTier::Session, entries.clone(), SnapshotMetadata::new())
+            .create(
+                "snap1".to_string(),
+                MemoryTier::Session,
+                entries.clone(),
+                SnapshotMetadata::new(),
+            )
             .unwrap();
         manager
-            .create("snap2".to_string(), MemoryTier::Session, entries, SnapshotMetadata::new())
+            .create(
+                "snap2".to_string(),
+                MemoryTier::Session,
+                entries,
+                SnapshotMetadata::new(),
+            )
             .unwrap();
 
         let diff = manager.diff("snap1", "snap2").unwrap();
@@ -458,10 +551,18 @@ mod tests {
         let manager = SnapshotManager::new(100);
 
         let mut entries = HashMap::new();
-        entries.insert("e1".to_string(), test_entry("e1", MemoryTier::Session, "key", "value1"));
+        entries.insert(
+            "e1".to_string(),
+            test_entry("e1", MemoryTier::Session, "key", "value1"),
+        );
 
         manager
-            .create("snap1".to_string(), MemoryTier::Session, entries, SnapshotMetadata::new())
+            .create(
+                "snap1".to_string(),
+                MemoryTier::Session,
+                entries,
+                SnapshotMetadata::new(),
+            )
             .unwrap();
 
         let restored = manager.restore("snap1").unwrap();
@@ -479,12 +580,24 @@ mod tests {
     #[test]
     fn test_compute_diff() {
         let mut entries_a = HashMap::new();
-        entries_a.insert("e1".to_string(), test_entry("e1", MemoryTier::Session, "key", "value1"));
-        entries_a.insert("e2".to_string(), test_entry("e2", MemoryTier::Session, "key", "value2"));
+        entries_a.insert(
+            "e1".to_string(),
+            test_entry("e1", MemoryTier::Session, "key", "value1"),
+        );
+        entries_a.insert(
+            "e2".to_string(),
+            test_entry("e2", MemoryTier::Session, "key", "value2"),
+        );
 
         let mut entries_b = HashMap::new();
-        entries_b.insert("e1".to_string(), test_entry("e1", MemoryTier::Session, "key", "value1_modified"));
-        entries_b.insert("e3".to_string(), test_entry("e3", MemoryTier::Session, "key", "value3"));
+        entries_b.insert(
+            "e1".to_string(),
+            test_entry("e1", MemoryTier::Session, "key", "value1_modified"),
+        );
+        entries_b.insert(
+            "e3".to_string(),
+            test_entry("e3", MemoryTier::Session, "key", "value3"),
+        );
 
         let snap_a = MemorySnapshot::new("a", MemoryTier::Session, entries_a);
         let snap_b = MemorySnapshot::new("b", MemoryTier::Session, entries_b);
