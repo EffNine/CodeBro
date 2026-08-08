@@ -1,0 +1,98 @@
+# Optimization Profile — DeepSeek
+
+# Research-phase profile. Facts from official docs only. No benchmark run.
+# Status rules: Documentation | Hypothesis | Benchmark Required.
+# Adoption of any Optimization entry into a provider plugin is deferred to
+# certification (Optimize gate).
+
+provider: DeepSeek
+provider_id: "deepseek"
+status: research-complete
+certification: Draft
+
+optimizations:
+  - dimension: CONTEXT_CACHE
+    value: "Expect automatic disk prefix caching; identical prefixes (from token 0) hit cache; 64-token storage unit; cache hit billed drastically below miss."
+    confidence: HIGH
+    source: "https://api-docs.deepseek.com/guides/kv_cache ; https://api-docs.deepseek.com/news/news0802"
+    status: Documentation
+    example: "Reuse a stable system prompt + repo prefix across turns to maximize prompt_cache_hit_tokens."
+
+  - dimension: CONTEXT_CACHE_BILLING
+    value: "For deepseek-v4-flash: cache hit $0.0028/1M input vs cache miss $0.14/1M (~50x). For v4-pro: $0.003625 vs $0.435 (~120x)."
+    confidence: HIGH
+    source: "https://api-docs.deepseek.com/quick_start/pricing"
+    status: Documentation
+    example: "Long stable prefixes give order-of-magnitude input savings on both models."
+
+  - dimension: THINKING_MODE_TOKEN_COST
+    value: "Thinking mode costs CoT tokens in reasoning_content; thinking disabled on chat-class work avoids reasoning overhead (max output 384K, CoT can be long)."
+    confidence: MEDIUM
+    source: "https://api-docs.deepseek.com/guides/thinking_mode ; https://api-docs.deepseek.com/quick_start/pricing"
+    status: Hypothesis
+    example: "For deterministic transforms, toggle thinking disabled w/ reasoning_effort low to trim output cost."
+
+  - dimension: REASONING_EFFORT
+    value: "deepseek-v4-flash exposes low/high/max; v4-pro currently only high/max (low→high, xhigh→max) until early Aug 2026."
+    confidence: HIGH
+    source: "https://api-docs.deepseek.com/guides/thinking_mode ; https://api-docs.deepseek.com/api/create-chat-completion"
+    status: Documentation
+    example: "Pick max only where needed; default effort is high."
+
+  - dimension: JSON_OUTPUT
+    value: "JSON mode requires the word 'json' + a schema example in the prompt; may occasionally return empty content (long-log mitigations)."
+    confidence: HIGH
+    source: "https://api-docs.deepseek.com/guides/json_mode"
+    status: Documentation
+    example: "Always include an example JSON block in system message when using response_format json_object."
+
+  - dimension: TOOL_STRICT_SCHEMA
+    value: "strict tool mode on /beta enforces JSON-Schema; supports object/string/number/integer/boolean/array/enum/anyOf + $ref/$def; unsupported types error out."
+    confidence: HIGH
+    source: "https://api-docs.deepseek.com/guides/tool_calls"
+    status: Documentation
+    example: "Set strict:true and additionalProperties:false on every function for deterministic tool args."
+
+  - dimension: TOOL_CALL_REASONING_CONTEXT
+    value: "In thinking mode with tools, reasoning_content must be fully returned each turn else HTTP 400."
+    confidence: HIGH
+    source: "https://api-docs.deepseek.com/guides/thinking_mode ; https://api-docs.deepseek.com/guides/tool_calls"
+    status: Documentation
+    example: "Preserve assistant.reasoning_content when building reasoning+tool message history."
+
+  - dimension: RESPONSES_API
+    value: "Responses API currently flash-only; pro support expected early Aug 2026. Stateless; over-context → 400."
+    confidence: MEDIUM
+    source: "https://api-docs.deepseek.com/quick_start/pricing ; https://api-docs.deepseek.com/guides/responses_api"
+    status: Benchmark Required
+    example: "Evaluate Responses API only after pro support lands; it otherwise adds no capability here."
+
+  - dimension: FIM
+    value: "FIM on /beta, non-thinking only, 4K output cap; suitable for code completion infill."
+    confidence: MEDIUM
+    source: "https://api-docs.deepseek.com/guides/fim_completion"
+    status: Benchmark Required
+    example: "Measure infill fidelity by Benchmark spec T-04 before adoption for a code-completion feature."
+
+  - dimension: RATE_LIMIT
+    value: "Concurrency: v4-pro 500 / v4-flash 2500 per account; 429 on excess; 10-min pre-inference keep-alive drop."
+    confidence: HIGH
+    source: "https://api-docs.deepseek.com/quick_start/rate_limit"
+    status: Documentation
+    example: "Budget concurrent sessions under model concurrency to avoid 429 storms."
+
+  - dimension: EMBEDDINGS_ABSENT
+    value: "No official embeddings endpoint; do not plan an embeddings capability for deepseek until vendor offers it."
+    confidence: MEDIUM
+    source: "https://api-docs.deepseek.com (no embeddings product listed)"
+    status: Hypothesis
+    example: "Prefer a different provider for embeddings duties in CodeBro."
+
+  - dimension: TEMPERATURE_EFFECT_NULL
+    value: "In thinking mode, temperature/top_p/presence/frequency penalties are accepted but inert (no effect)."
+    confidence: HIGH
+    source: "https://api-docs.deepseek.com/guides/thinking_mode"
+    status: Documentation
+    example: "Do not rely on temperature to vary thinking-mode output."
+
+# Confidence summary: HIGH (documentation-backed) x8, MEDIUM (Hypothesis/Required) x4
