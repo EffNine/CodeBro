@@ -5,14 +5,14 @@
 //! Registered -> Activated -> Deactivated -> (registered state)
 //! Any -> Error -> (requires manual recovery)
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use serde::{Deserialize, Serialize};
 
 use crate::observability::{CorrelationId, Event, EventBus, EventType};
 use crate::service_registry::registry::{RegistryError, ServiceRegistry};
-use crate::service_registry::types::*;
 use crate::service_registry::service::Service;
+use crate::service_registry::types::*;
 
 /// Lifecycle state machine for a service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,7 +122,8 @@ impl ServiceLifecycle {
         })?;
 
         let to = LifecycleState::Activated;
-        let transition = LifecycleTransition::new(service_id.clone(), from.clone(), to.clone(), reason);
+        let transition =
+            LifecycleTransition::new(service_id.clone(), from.clone(), to.clone(), reason);
         self.log_transition(transition.clone());
         self.emit_event(&transition);
 
@@ -162,7 +163,8 @@ impl ServiceLifecycle {
         })?;
 
         let to = LifecycleState::Deactivated;
-        let transition = LifecycleTransition::new(service_id.clone(), from.clone(), to.clone(), reason);
+        let transition =
+            LifecycleTransition::new(service_id.clone(), from.clone(), to.clone(), reason);
         self.log_transition(transition.clone());
         self.emit_event(&transition);
 
@@ -188,7 +190,8 @@ impl ServiceLifecycle {
         }
 
         let to = LifecycleState::Error(error_msg.to_string());
-        let transition = LifecycleTransition::new(service_id.clone(), from.clone(), to.clone(), error_msg);
+        let transition =
+            LifecycleTransition::new(service_id.clone(), from.clone(), to.clone(), error_msg);
         self.log_transition(transition.clone());
         self.emit_event(&transition);
 
@@ -209,15 +212,13 @@ impl ServiceLifecycle {
         match &from {
             LifecycleState::Error(_) => {}
             _ => {
-                return Err(LifecycleError::ExpectedErrorState(
-                    service_id.clone(),
-                    from,
-                ));
+                return Err(LifecycleError::ExpectedErrorState(service_id.clone(), from));
             }
         }
 
         let to = LifecycleState::Registered;
-        let transition = LifecycleTransition::new(service_id.clone(), from.clone(), to.clone(), reason);
+        let transition =
+            LifecycleTransition::new(service_id.clone(), from.clone(), to.clone(), reason);
         self.log_transition(transition.clone());
         self.emit_event(&transition);
 
@@ -330,10 +331,7 @@ impl fmt::Display for LifecycleError {
                 write!(f, "Service shutting down: {id}")
             }
             LifecycleError::ExpectedErrorState(id, state) => {
-                write!(
-                    f,
-                    "Expected error state for {id}, got: {state}"
-                )
+                write!(f, "Expected error state for {id}, got: {state}")
             }
             LifecycleError::Registry(e) => write!(f, "Registry error: {e}"),
         }
@@ -363,7 +361,9 @@ mod tests {
         let mut lc = ServiceLifecycle::new(reg.clone());
         reg.register(make_svc("s1", "test", "1.0.0", "p")).unwrap();
 
-        let transition = lc.activate(&ServiceId::new("s1").unwrap(), "startup").unwrap();
+        let transition = lc
+            .activate(&ServiceId::new("s1").unwrap(), "startup")
+            .unwrap();
         assert_eq!(transition.from, LifecycleState::Registered);
         assert_eq!(transition.to, LifecycleState::Activated);
     }
@@ -373,9 +373,12 @@ mod tests {
         let mut reg = ServiceRegistry::new();
         let mut lc = ServiceLifecycle::new(reg.clone());
         reg.register(make_svc("s1", "test", "1.0.0", "p")).unwrap();
-        lc.activate(&ServiceId::new("s1").unwrap(), "startup").unwrap();
+        lc.activate(&ServiceId::new("s1").unwrap(), "startup")
+            .unwrap();
 
-        let transition = lc.deactivate(&ServiceId::new("s1").unwrap(), "shutdown").unwrap();
+        let transition = lc
+            .deactivate(&ServiceId::new("s1").unwrap(), "shutdown")
+            .unwrap();
         assert_eq!(transition.from, LifecycleState::Activated);
         assert_eq!(transition.to, LifecycleState::Deactivated);
     }
@@ -385,10 +388,14 @@ mod tests {
         let mut reg = ServiceRegistry::new();
         let mut lc = ServiceLifecycle::new(reg.clone());
         reg.register(make_svc("s1", "test", "1.0.0", "p")).unwrap();
-        lc.activate(&ServiceId::new("s1").unwrap(), "startup").unwrap();
-        lc.deactivate(&ServiceId::new("s1").unwrap(), "shutdown").unwrap();
+        lc.activate(&ServiceId::new("s1").unwrap(), "startup")
+            .unwrap();
+        lc.deactivate(&ServiceId::new("s1").unwrap(), "shutdown")
+            .unwrap();
 
-        let transition = lc.activate(&ServiceId::new("s1").unwrap(), "restart").unwrap();
+        let transition = lc
+            .activate(&ServiceId::new("s1").unwrap(), "restart")
+            .unwrap();
         assert_eq!(transition.from, LifecycleState::Deactivated);
         assert_eq!(transition.to, LifecycleState::Activated);
     }
@@ -398,11 +405,10 @@ mod tests {
         let mut reg = ServiceRegistry::new();
         let mut lc = ServiceLifecycle::new(reg.clone());
         reg.register(make_svc("s1", "test", "1.0.0", "p")).unwrap();
-        lc.activate(&ServiceId::new("s1").unwrap(), "startup").unwrap();
-
-        let transition = lc
-            .error(&ServiceId::new("s1").unwrap(), "crash")
+        lc.activate(&ServiceId::new("s1").unwrap(), "startup")
             .unwrap();
+
+        let transition = lc.error(&ServiceId::new("s1").unwrap(), "crash").unwrap();
         assert_eq!(transition.to, LifecycleState::Error("crash".to_string()));
 
         let state = lc.current_state(&ServiceId::new("s1").unwrap()).unwrap();
@@ -425,7 +431,8 @@ mod tests {
         let mut reg = ServiceRegistry::new();
         let mut lc = ServiceLifecycle::new(reg.clone());
         reg.register(make_svc("s1", "test", "1.0.0", "p")).unwrap();
-        lc.activate(&ServiceId::new("s1").unwrap(), "startup").unwrap();
+        lc.activate(&ServiceId::new("s1").unwrap(), "startup")
+            .unwrap();
 
         let result = lc.activate(&ServiceId::new("s1").unwrap(), "double");
         assert!(result.is_err());
@@ -447,8 +454,10 @@ mod tests {
         let mut reg = ServiceRegistry::new();
         let mut lc = ServiceLifecycle::new(reg.clone());
         reg.register(make_svc("s1", "test", "1.0.0", "p")).unwrap();
-        lc.activate(&ServiceId::new("s1").unwrap(), "startup").unwrap();
-        lc.deactivate(&ServiceId::new("s1").unwrap(), "shutdown").unwrap();
+        lc.activate(&ServiceId::new("s1").unwrap(), "startup")
+            .unwrap();
+        lc.deactivate(&ServiceId::new("s1").unwrap(), "shutdown")
+            .unwrap();
 
         let log = lc.recent_transitions(&ServiceId::new("s1").unwrap(), 10);
         assert_eq!(log.len(), 2);
@@ -471,12 +480,13 @@ mod tests {
         let lc = ServiceLifecycle::new(reg.clone());
         let mut lc = lc.with_event_bus(event_bus.clone());
         reg.register(make_svc("s1", "test", "1.0.0", "p")).unwrap();
-        lc.activate(&ServiceId::new("s1").unwrap(), "startup").unwrap();
+        lc.activate(&ServiceId::new("s1").unwrap(), "startup")
+            .unwrap();
 
         let events = event_bus.buffer();
-        assert!(events.iter().any(|e| {
-            matches!(&e.event_type, EventType::Custom(s) if s == "ServiceActivated")
-        }));
+        assert!(events
+            .iter()
+            .any(|e| { matches!(&e.event_type, EventType::Custom(s) if s == "ServiceActivated") }));
     }
 
     #[test]

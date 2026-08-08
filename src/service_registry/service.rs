@@ -1,9 +1,9 @@
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Service definition and builder.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use serde::{Deserialize, Serialize};
 
 use super::types::*;
 
@@ -43,17 +43,13 @@ impl Service {
     pub fn has_permission_for(&self, requester: &str, required: &AccessLevel) -> bool {
         for perm in &self.permissions {
             if perm.grantee == requester || perm.grantee == "*" {
-                if perm.access_level == *required
-                    || perm.access_level == AccessLevel::Admin
-                {
+                if perm.access_level == *required || perm.access_level == AccessLevel::Admin {
                     return true;
                 }
             }
         }
         // Public services allow read access by default
-        if matches!(self.visibility, Visibility::Public)
-            && *required == AccessLevel::Read
-        {
+        if matches!(self.visibility, Visibility::Public) && *required == AccessLevel::Read {
             return true;
         }
         false
@@ -62,17 +58,15 @@ impl Service {
     pub fn check_dependencies_satisfied(&self, registered: &[Service]) -> Vec<ServiceId> {
         let mut missing = Vec::new();
         for dep in &self.dependencies {
-            let found = registered
-                .iter()
-                .any(|s| {
-                    s.id == dep.service_id
-                        && s.version >= dep.min_version
-                        && s.has_capability(&dep.capability_required)
-                        && matches!(
-                            s.status,
-                            ServiceStatus::Activated | ServiceStatus::Registered
-                        )
-                });
+            let found = registered.iter().any(|s| {
+                s.id == dep.service_id
+                    && s.version >= dep.min_version
+                    && s.has_capability(&dep.capability_required)
+                    && matches!(
+                        s.status,
+                        ServiceStatus::Activated | ServiceStatus::Registered
+                    )
+            });
             if !found {
                 missing.push(dep.service_id.clone());
             }
@@ -331,8 +325,7 @@ mod tests {
     #[test]
     fn test_permission_granted() {
         let perm = ServicePermission::new("plugin-b", AccessLevel::Write, "write access");
-        let svc = make_service("s1", "test", "1.0.0", "p")
-            .clone();
+        let svc = make_service("s1", "test", "1.0.0", "p").clone();
         // Service is immutable after build; test via a new builder
         let svc = Service::builder()
             .with_id(ServiceId::new("s1").unwrap())
@@ -398,7 +391,9 @@ mod tests {
 
     #[test]
     fn test_service_metadata() {
-        let meta = ServiceMetadata::new().with("env", "production").with("region", "us-east-1");
+        let meta = ServiceMetadata::new()
+            .with("env", "production")
+            .with("region", "us-east-1");
         let svc = Service::builder()
             .with_id(ServiceId::new("s1").unwrap())
             .with_name(ServiceName::new("test").unwrap())

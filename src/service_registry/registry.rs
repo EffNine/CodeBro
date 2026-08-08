@@ -2,12 +2,12 @@
 //! Core Service Registry — register, unregister, activate, deactivate, enumerate.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use crate::observability::{CorrelationId, Event, EventBus, EventType};
-use crate::service_registry::types::*;
 use crate::service_registry::service::Service;
+use crate::service_registry::types::*;
 
 pub(crate) struct RegistryInner {
     pub services: HashMap<ServiceId, Service>,
@@ -117,7 +117,9 @@ impl ServiceRegistry {
             .ok_or(RegistryError::NotFound(service_id.clone()))?;
 
         match &service.status {
-            ServiceStatus::Activated => return Err(RegistryError::AlreadyActivated(service_id.clone())),
+            ServiceStatus::Activated => {
+                return Err(RegistryError::AlreadyActivated(service_id.clone()))
+            }
             ServiceStatus::Error(_) => return Err(RegistryError::ServiceError(service_id.clone())),
             _ => {}
         }
@@ -344,8 +346,10 @@ mod tests {
     #[test]
     fn test_enumerate_all() {
         let mut reg = ServiceRegistry::new();
-        reg.register(test_service("s1", "svc-a", "1.0.0", "p")).unwrap();
-        reg.register(test_service("s2", "svc-b", "1.0.0", "p")).unwrap();
+        reg.register(test_service("s1", "svc-a", "1.0.0", "p"))
+            .unwrap();
+        reg.register(test_service("s2", "svc-b", "1.0.0", "p"))
+            .unwrap();
         let all = reg.enumerate(None);
         assert_eq!(all.len(), 2);
     }
@@ -371,9 +375,12 @@ mod tests {
     #[test]
     fn test_enumerate_by_name() {
         let mut reg = ServiceRegistry::new();
-        reg.register(test_service("s1", "data", "1.0.0", "p1")).unwrap();
-        reg.register(test_service("s2", "data", "1.1.0", "p2")).unwrap();
-        reg.register(test_service("s3", "other", "1.0.0", "p1")).unwrap();
+        reg.register(test_service("s1", "data", "1.0.0", "p1"))
+            .unwrap();
+        reg.register(test_service("s2", "data", "1.1.0", "p2"))
+            .unwrap();
+        reg.register(test_service("s3", "other", "1.0.0", "p1"))
+            .unwrap();
 
         let datas = reg.enumerate_by_name("data");
         assert_eq!(datas.len(), 2);
@@ -405,8 +412,12 @@ mod tests {
         let events = event_bus.buffer();
         assert!(events.len() >= 2);
         let types: Vec<&EventType> = events.iter().map(|e| &e.event_type).collect();
-        assert!(types.iter().any(|t| matches!(t, EventType::Custom(s) if s == "ServiceRegistered")));
-        assert!(types.iter().any(|t| matches!(t, EventType::Custom(s) if s == "ServiceActivated")));
+        assert!(types
+            .iter()
+            .any(|t| matches!(t, EventType::Custom(s) if s == "ServiceRegistered")));
+        assert!(types
+            .iter()
+            .any(|t| matches!(t, EventType::Custom(s) if s == "ServiceActivated")));
     }
 
     #[test]
@@ -433,8 +444,10 @@ mod tests {
     #[test]
     fn test_unregister_removes_from_index() {
         let mut reg = ServiceRegistry::new();
-        reg.register(test_service("s1", "data", "1.0.0", "p")).unwrap();
-        reg.register(test_service("s2", "data", "1.1.0", "p")).unwrap();
+        reg.register(test_service("s1", "data", "1.0.0", "p"))
+            .unwrap();
+        reg.register(test_service("s2", "data", "1.1.0", "p"))
+            .unwrap();
         reg.unregister(&ServiceId::new("s1").unwrap()).unwrap();
         let datas = reg.enumerate_by_name("data");
         assert_eq!(datas.len(), 1);

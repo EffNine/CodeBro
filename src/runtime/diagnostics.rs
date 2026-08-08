@@ -109,10 +109,8 @@ impl PipelineDiagnostics {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        self.phase_durations.insert(
-            phase.to_string(),
-            PhaseDuration::new(phase, now),
-        );
+        self.phase_durations
+            .insert(phase.to_string(), PhaseDuration::new(phase, now));
     }
 
     /// Records the completion of a phase.
@@ -173,7 +171,8 @@ impl PipelineDiagnostics {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        self.total_duration_ms = (now - self.started_at.timestamp_nanos_opt().unwrap_or(0) as u64) / 1_000_000;
+        self.total_duration_ms =
+            (now - self.started_at.timestamp_nanos_opt().unwrap_or(0) as u64) / 1_000_000;
     }
 
     /// Marks the pipeline as failed and records completion time.
@@ -184,7 +183,8 @@ impl PipelineDiagnostics {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        self.total_duration_ms = (now - self.started_at.timestamp_nanos_opt().unwrap_or(0) as u64) / 1_000_000;
+        self.total_duration_ms =
+            (now - self.started_at.timestamp_nanos_opt().unwrap_or(0) as u64) / 1_000_000;
         self.record_error(error);
     }
 
@@ -200,7 +200,11 @@ impl PipelineDiagnostics {
         format!(
             "Pipeline[{}] {} in {}ms ({} tool calls, {} errors)",
             &self.task_id[..8.min(self.task_id.len())],
-            if self.succeeded { "succeeded" } else { "failed" },
+            if self.succeeded {
+                "succeeded"
+            } else {
+                "failed"
+            },
             self.total_duration_ms,
             self.tool_call_count,
             self.error_messages.len(),
@@ -308,11 +312,7 @@ impl RuntimeDiagnostics {
         if inner.completed.is_empty() {
             return 0.0;
         }
-        let succeeded = inner
-            .completed
-            .iter()
-            .filter(|d| d.succeeded)
-            .count() as f64;
+        let succeeded = inner.completed.iter().filter(|d| d.succeeded).count() as f64;
         succeeded / inner.completed.len() as f64
     }
 
@@ -331,22 +331,14 @@ impl RuntimeDiagnostics {
             return "No completed runs".to_string();
         }
         let total = inner.completed.len();
-        let succeeded = inner
-            .completed
-            .iter()
-            .filter(|d| d.succeeded)
-            .count();
+        let succeeded = inner.completed.iter().filter(|d| d.succeeded).count();
         let avg_duration = inner
             .completed
             .iter()
             .map(|d| d.total_duration_ms)
             .sum::<u64>()
             / total as u64;
-        let total_errors: usize = inner
-            .completed
-            .iter()
-            .map(|d| d.error_messages.len())
-            .sum();
+        let total_errors: usize = inner.completed.iter().map(|d| d.error_messages.len()).sum();
         format!(
             "Diagnostics[{} runs, {} succeeded, avg {}ms, {} errors]",
             total, succeeded, avg_duration, total_errors
@@ -362,8 +354,8 @@ impl Default for RuntimeDiagnostics {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::events::RuntimeEvent;
+    use super::*;
 
     #[test]
     fn test_pipeline_diagnostics_creation() {

@@ -46,9 +46,7 @@ pub enum RuntimeEvent {
     },
 
     /// A stream chunk was received from the provider.
-    StreamChunk {
-        chunk: String,
-    },
+    StreamChunk { chunk: String },
 
     /// Synthesis completed with a final response.
     SynthesizeComplete {
@@ -108,7 +106,11 @@ impl RuntimeEvent {
                 task_id,
                 user_request_summary,
                 ..
-            } => format!("Pipeline started: {} — {}", &task_id[..task_id.len().min(8)], user_request_summary),
+            } => format!(
+                "Pipeline started: {} — {}",
+                &task_id[..task_id.len().min(8)],
+                user_request_summary
+            ),
             RuntimeEvent::StateChange { from, to } => {
                 format!("{:?} → {:?}", from, to)
             }
@@ -139,11 +141,9 @@ impl RuntimeEvent {
                 };
                 format!(
                     "Synthesize complete ({}ms, {} tool calls) — {}",
-                    duration_ms,
-                    tool_calls_found,
-                    preview
+                    duration_ms, tool_calls_found, preview
                 )
-            },
+            }
             RuntimeEvent::ToolExecuted {
                 tool_name,
                 success,
@@ -170,7 +170,9 @@ impl RuntimeEvent {
                 "Pipeline completed in {}ms ({} tool calls)",
                 duration_ms, tool_calls_total
             ),
-            RuntimeEvent::PipelineFailed { error, duration_ms, .. } => {
+            RuntimeEvent::PipelineFailed {
+                error, duration_ms, ..
+            } => {
                 format!("Pipeline failed after {}ms: {}", duration_ms, error)
             }
             RuntimeEvent::LifecycleEvent { from, to } => {
@@ -191,8 +193,7 @@ impl RuntimeEvent {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            RuntimeEvent::PipelineCompleted { .. }
-                | RuntimeEvent::PipelineFailed { .. }
+            RuntimeEvent::PipelineCompleted { .. } | RuntimeEvent::PipelineFailed { .. }
         )
     }
 
@@ -210,9 +211,9 @@ impl RuntimeEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::state::RuntimeState;
     use super::super::lifecycle::RuntimeLifecycleState;
+    use super::super::state::RuntimeState;
+    use super::*;
 
     #[test]
     fn test_pipeline_started_summary() {

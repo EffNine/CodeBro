@@ -7,10 +7,10 @@
 //! - Permission violations
 //! - Lifecycle events
 
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use serde::{Deserialize, Serialize};
 
 use super::types::*;
 
@@ -180,7 +180,14 @@ impl ServiceDiagnostics {
             timestamp: chrono::Local::now().to_rfc3339(),
             stats: inner.stats.clone(),
             recent_failures: inner.failed_lookups.iter().cloned().collect(),
-            recent_events: inner.lifecycle_events.iter().rev().take(20).cloned().rev().collect(),
+            recent_events: inner
+                .lifecycle_events
+                .iter()
+                .rev()
+                .take(20)
+                .cloned()
+                .rev()
+                .collect(),
         }
     }
 
@@ -213,7 +220,8 @@ impl DiagnosticSnapshot {
     pub fn summary(&self) -> String {
         format!(
             "DiagnosticSnapshot@{}\n{}",
-            self.timestamp, self.stats.summary()
+            self.timestamp,
+            self.stats.summary()
         )
     }
 }

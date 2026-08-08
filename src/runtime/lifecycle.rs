@@ -137,9 +137,7 @@ impl RuntimeLifecycle {
                         // Account for pause duration
                         if let Some(start) = self.pause_started_at {
                             let pause_ms = start.elapsed().as_millis() as u64;
-                            self.total_running_ms = self
-                                .total_running_ms
-                                .saturating_add(pause_ms);
+                            self.total_running_ms = self.total_running_ms.saturating_add(pause_ms);
                         }
                         self.pause_started_at = None;
                     }
@@ -157,9 +155,7 @@ impl RuntimeLifecycle {
                     self.stopped_at = Some(Utc::now());
                     if let Some(pause_start) = self.pause_started_at {
                         let pause_ms = pause_start.elapsed().as_millis() as u64;
-                        self.total_running_ms = self
-                            .total_running_ms
-                            .saturating_add(pause_ms);
+                        self.total_running_ms = self.total_running_ms.saturating_add(pause_ms);
                         self.pause_started_at = None;
                     }
                 }
@@ -177,27 +173,32 @@ impl RuntimeLifecycle {
 
     /// Transitions to `Running`. Convenience wrapper.
     pub fn start(&mut self) -> Result<(), RuntimeError> {
-        self.try_transition(RuntimeLifecycleState::Running).map(|_| ())
+        self.try_transition(RuntimeLifecycleState::Running)
+            .map(|_| ())
     }
 
     /// Transitions to `Paused`. Convenience wrapper.
     pub fn pause(&mut self) -> Result<(), RuntimeError> {
-        self.try_transition(RuntimeLifecycleState::Paused).map(|_| ())
+        self.try_transition(RuntimeLifecycleState::Paused)
+            .map(|_| ())
     }
 
     /// Transitions to `Running` from `Paused`. Convenience wrapper.
     pub fn resume(&mut self) -> Result<(), RuntimeError> {
-        self.try_transition(RuntimeLifecycleState::Running).map(|_| ())
+        self.try_transition(RuntimeLifecycleState::Running)
+            .map(|_| ())
     }
 
     /// Transitions to `Stopping`. Convenience wrapper.
     pub fn stop(&mut self) -> Result<(), RuntimeError> {
-        self.try_transition(RuntimeLifecycleState::Stopping).map(|_| ())
+        self.try_transition(RuntimeLifecycleState::Stopping)
+            .map(|_| ())
     }
 
     /// Transitions to `Stopped`. Convenience wrapper.
     pub fn shutdown(&mut self) -> Result<(), RuntimeError> {
-        self.try_transition(RuntimeLifecycleState::Stopped).map(|_| ())
+        self.try_transition(RuntimeLifecycleState::Stopped)
+            .map(|_| ())
     }
 
     /// Returns the time at which the runtime entered `Running` for the

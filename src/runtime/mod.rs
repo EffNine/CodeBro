@@ -44,7 +44,7 @@ pub use events::RuntimeEvent;
 pub use lifecycle::{RuntimeLifecycle, RuntimeLifecycleState};
 pub use state::RuntimeState;
 pub use traits::{
-    HealthStatus, MockRuntimeEventEmitter, MockRuntimeProvider,
-    MockRuntimeToolRegistry, RuntimeContextFactory, RuntimeEventEmitter,
-    RuntimeObservable, RuntimeProvider, RuntimeToolRegistry,
+    HealthStatus, MockRuntimeEventEmitter, MockRuntimeProvider, MockRuntimeToolRegistry,
+    RuntimeContextFactory, RuntimeEventEmitter, RuntimeObservable, RuntimeProvider,
+    RuntimeToolRegistry,
 };

@@ -2,8 +2,8 @@
 //! Service Discovery — metadata queries, filtering, and search.
 
 use crate::service_registry::registry::ServiceRegistry;
-use crate::service_registry::types::*;
 use crate::service_registry::service::Service;
+use crate::service_registry::types::*;
 
 /// Discovery query results.
 #[derive(Debug, Clone)]
@@ -52,10 +52,7 @@ impl ServiceDiscovery {
     /// Search services by provider.
     pub fn search_by_provider(&self, provider: &str) -> DiscoveryResult {
         let all = self.registry.enumerate(None);
-        let filtered: Vec<Service> = all
-            .into_iter()
-            .filter(|s| s.provider == provider)
-            .collect();
+        let filtered: Vec<Service> = all.into_iter().filter(|s| s.provider == provider).collect();
         let count = filtered.len();
         DiscoveryResult {
             services: filtered,
@@ -82,10 +79,7 @@ impl ServiceDiscovery {
     /// Search with advanced filters.
     pub fn search(&self, filter: &DiscoveryFilter) -> DiscoveryResult {
         let all = self.registry.enumerate(None);
-        let filtered: Vec<Service> = all
-            .into_iter()
-            .filter(|s| filter.matches(s))
-            .collect();
+        let filtered: Vec<Service> = all.into_iter().filter(|s| filter.matches(s)).collect();
         let count = filtered.len();
         DiscoveryResult {
             services: filtered,
@@ -96,9 +90,7 @@ impl ServiceDiscovery {
 
     /// Get service metadata by ID.
     pub fn get_metadata(&self, service_id: &ServiceId) -> Option<ServiceMetadata> {
-        self.registry
-            .get(service_id)
-            .map(|s| s.metadata.clone())
+        self.registry.get(service_id).map(|s| s.metadata.clone())
     }
 
     /// Get service manifest (full details) by ID.
@@ -117,8 +109,7 @@ impl ServiceDiscovery {
 
     /// Get activated services only.
     pub fn activated_services(&self) -> Vec<Service> {
-        self.registry
-            .enumerate(Some(&ServiceStatus::Activated))
+        self.registry.enumerate(Some(&ServiceStatus::Activated))
     }
 
     /// Get service count by name.
@@ -198,10 +189,14 @@ mod tests {
 
     fn make_registry_with_services() -> (ServiceRegistry, ServiceDiscovery) {
         let mut reg = ServiceRegistry::new();
-        reg.register(make_svc("s1", "data-service", "1.0.0", "plugin-a")).unwrap();
-        reg.register(make_svc("s2", "data-service", "2.0.0", "plugin-b")).unwrap();
-        reg.register(make_svc("s3", "log-service", "1.0.0", "plugin-a")).unwrap();
-        reg.register(make_svc("s4", "auth-service", "1.0.0", "plugin-c")).unwrap();
+        reg.register(make_svc("s1", "data-service", "1.0.0", "plugin-a"))
+            .unwrap();
+        reg.register(make_svc("s2", "data-service", "2.0.0", "plugin-b"))
+            .unwrap();
+        reg.register(make_svc("s3", "log-service", "1.0.0", "plugin-a"))
+            .unwrap();
+        reg.register(make_svc("s4", "auth-service", "1.0.0", "plugin-c"))
+            .unwrap();
         (reg.clone(), ServiceDiscovery::new(reg))
     }
 
@@ -287,7 +282,9 @@ mod tests {
     #[test]
     fn test_find_by_metadata() {
         let mut reg = ServiceRegistry::new();
-        let meta = ServiceMetadata::new().with("env", "prod").with("region", "us");
+        let meta = ServiceMetadata::new()
+            .with("env", "prod")
+            .with("region", "us");
         let svc1 = Service::builder()
             .with_id(ServiceId::new("s1").unwrap())
             .with_name(ServiceName::new("svc").unwrap())
@@ -297,7 +294,9 @@ mod tests {
             .with_metadata(meta.clone())
             .build()
             .unwrap();
-        let meta2 = ServiceMetadata::new().with("env", "dev").with("region", "us");
+        let meta2 = ServiceMetadata::new()
+            .with("env", "dev")
+            .with("region", "us");
         let svc2 = Service::builder()
             .with_id(ServiceId::new("s2").unwrap())
             .with_name(ServiceName::new("svc").unwrap())
@@ -318,11 +317,10 @@ mod tests {
     #[test]
     fn test_discovery_filter_version_range() {
         let (reg, disc) = make_registry_with_services();
-        let filter = DiscoveryFilter::new()
-            .with_version_range(
-                ServiceVersion::new("1.5.0").unwrap(),
-                ServiceVersion::new("2.5.0").unwrap(),
-            );
+        let filter = DiscoveryFilter::new().with_version_range(
+            ServiceVersion::new("1.5.0").unwrap(),
+            ServiceVersion::new("2.5.0").unwrap(),
+        );
         let result = disc.search(&filter);
         assert_eq!(result.total_count, 1);
         assert_eq!(result.services[0].id.as_str(), "s2");
@@ -347,7 +345,8 @@ mod tests {
             .with_provider("p")
             .with_capabilities(vec![Capability::Read])
             .with_visibility(Visibility::Public)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let priv_svc = Service::builder()
             .with_id(ServiceId::new("s2").unwrap())
             .with_name(ServiceName::new("priv").unwrap())
@@ -355,7 +354,8 @@ mod tests {
             .with_provider("p")
             .with_capabilities(vec![Capability::Read])
             .with_visibility(Visibility::Private)
-            .build().unwrap();
+            .build()
+            .unwrap();
         reg.register(pub_svc).unwrap();
         reg.register(priv_svc).unwrap();
 

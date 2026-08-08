@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::service_registry::registry::ServiceRegistry;
-use crate::service_registry::types::*;
 use crate::service_registry::service::{Service, ServicePermission};
+use crate::service_registry::types::*;
 
 /// Permission checker for service access control.
 #[derive(Clone)]
@@ -108,11 +108,7 @@ impl ServicePermissions {
     }
 
     /// Get the effective access level for a requester on a service.
-    pub fn effective_access(
-        &self,
-        service_id: &ServiceId,
-        requester: &str,
-    ) -> AccessLevel {
+    pub fn effective_access(&self, service_id: &ServiceId, requester: &str) -> AccessLevel {
         match self.check_access(service_id, requester, AccessLevel::Read) {
             AccessResult::Granted(level) => level,
             AccessResult::Denied { .. } => AccessLevel::None,
@@ -133,10 +129,12 @@ impl ServicePermissions {
         &self,
         service_id: &ServiceId,
     ) -> Result<(), PermissionValidationError> {
-        let svc = self
-            .registry
-            .get(service_id)
-            .ok_or(PermissionValidationError::ServiceNotFound(service_id.clone()))?;
+        let svc =
+            self.registry
+                .get(service_id)
+                .ok_or(PermissionValidationError::ServiceNotFound(
+                    service_id.clone(),
+                ))?;
 
         // Check for conflicting permissions (same grantee with conflicting levels)
         let mut grantee_levels: std::collections::HashMap<String, AccessLevel> =
@@ -297,7 +295,8 @@ mod tests {
     fn test_public_read_allowed() {
         let mut reg = ServiceRegistry::new();
         let perm = ServicePermissions::new(reg.clone());
-        reg.register(make_svc("s1", "test", "1.0.0", "plugin-a")).unwrap();
+        reg.register(make_svc("s1", "test", "1.0.0", "plugin-a"))
+            .unwrap();
         assert!(perm.can_read(&ServiceId::new("s1").unwrap(), "anyone"));
     }
 
@@ -305,7 +304,8 @@ mod tests {
     fn test_public_write_denied() {
         let mut reg = ServiceRegistry::new();
         let perm = ServicePermissions::new(reg.clone());
-        reg.register(make_svc("s1", "test", "1.0.0", "plugin-a")).unwrap();
+        reg.register(make_svc("s1", "test", "1.0.0", "plugin-a"))
+            .unwrap();
         assert!(!perm.can_write(&ServiceId::new("s1").unwrap(), "anyone"));
     }
 
@@ -313,8 +313,13 @@ mod tests {
     fn test_owner_has_admin() {
         let mut reg = ServiceRegistry::new();
         let perm = ServicePermissions::new(reg.clone());
-        reg.register(make_svc("s1", "test", "1.0.0", "plugin-a")).unwrap();
-        let result = perm.check_access(&ServiceId::new("s1").unwrap(), "plugin-a", AccessLevel::Write);
+        reg.register(make_svc("s1", "test", "1.0.0", "plugin-a"))
+            .unwrap();
+        let result = perm.check_access(
+            &ServiceId::new("s1").unwrap(),
+            "plugin-a",
+            AccessLevel::Write,
+        );
         match result {
             AccessResult::Granted(level) => assert_eq!(level, AccessLevel::Admin),
             _ => panic!("Expected Granted"),
@@ -383,7 +388,8 @@ mod tests {
     fn test_validate_permissions_clean() {
         let mut reg = ServiceRegistry::new();
         let perm = ServicePermissions::new(reg.clone());
-        reg.register(make_svc("s1", "test", "1.0.0", "plugin-a")).unwrap();
+        reg.register(make_svc("s1", "test", "1.0.0", "plugin-a"))
+            .unwrap();
         let result = perm.validate_permissions(&ServiceId::new("s1").unwrap());
         assert!(result.is_ok());
     }
@@ -438,7 +444,8 @@ mod tests {
     fn test_effective_access() {
         let mut reg = ServiceRegistry::new();
         let perm = ServicePermissions::new(reg.clone());
-        reg.register(make_svc("s1", "test", "1.0.0", "plugin-a")).unwrap();
+        reg.register(make_svc("s1", "test", "1.0.0", "plugin-a"))
+            .unwrap();
         let access = perm.effective_access(&ServiceId::new("s1").unwrap(), "anyone");
         assert_eq!(access, AccessLevel::Read);
     }
@@ -469,7 +476,8 @@ mod tests {
     fn test_is_owner() {
         let mut reg = ServiceRegistry::new();
         let perm = ServicePermissions::new(reg.clone());
-        reg.register(make_svc("s1", "test", "1.0.0", "plugin-a")).unwrap();
+        reg.register(make_svc("s1", "test", "1.0.0", "plugin-a"))
+            .unwrap();
         assert!(perm.is_owner(&ServiceId::new("s1").unwrap(), "plugin-a"));
         assert!(!perm.is_owner(&ServiceId::new("s1").unwrap(), "plugin-b"));
     }

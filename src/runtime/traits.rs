@@ -40,11 +40,8 @@ pub trait RuntimeProvider: Send + Sync {
         correlation_id: &str,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = Result<
-                        Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
-                    >,
-                > + Send
+            dyn Future<Output = Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>>>
+                + Send
                 + '_,
         >,
     >;
@@ -59,12 +56,7 @@ pub trait RuntimeToolRegistry: Send + Sync {
     fn tool_names(&self) -> Vec<String>;
 
     /// Executes a tool by name with the given arguments.
-    fn execute_tool(
-        &mut self,
-        name: &str,
-        args: &str,
-        correlation_id: &str,
-    ) -> Result<String>;
+    fn execute_tool(&mut self, name: &str, args: &str, correlation_id: &str) -> Result<String>;
 
     /// Returns a description of the tool (for LLM context).
     fn tool_description(&self, name: &str) -> Option<String>;
@@ -187,11 +179,8 @@ impl RuntimeProvider for MockRuntimeProvider {
         _correlation_id: &str,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = Result<
-                        Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
-                    >,
-                > + Send
+            dyn Future<Output = Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>>>
+                + Send
                 + '_,
         >,
     > {
@@ -201,15 +190,14 @@ impl RuntimeProvider for MockRuntimeProvider {
             if fail {
                 return Err(anyhow::anyhow!("mock provider error"));
             }
-            let (tx, rx): (tokio::sync::mpsc::UnboundedSender<Result<String>>, tokio::sync::mpsc::UnboundedReceiver<Result<String>>) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, rx): (
+                tokio::sync::mpsc::UnboundedSender<Result<String>>,
+                tokio::sync::mpsc::UnboundedReceiver<Result<String>>,
+            ) = tokio::sync::mpsc::unbounded_channel();
             for chunk in &chunks {
                 let _ = tx.send(Ok(chunk.clone()));
             }
-            let stream = futures::stream::iter(
-                chunks
-                    .into_iter()
-                    .map(|c| Ok(c) as Result<String>),
-            );
+            let stream = futures::stream::iter(chunks.into_iter().map(|c| Ok(c) as Result<String>));
             Ok(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<String>> + Send>>)
         })
     }
@@ -253,12 +241,7 @@ impl RuntimeToolRegistry for MockRuntimeToolRegistry {
         self.tools.iter().map(|(n, _, _)| n.clone()).collect()
     }
 
-    fn execute_tool(
-        &mut self,
-        name: &str,
-        _args: &str,
-        _correlation_id: &str,
-    ) -> Result<String> {
+    fn execute_tool(&mut self, name: &str, _args: &str, _correlation_id: &str) -> Result<String> {
         if self.fail_next {
             return Err(anyhow::anyhow!("mock tool error"));
         }
@@ -331,8 +314,8 @@ mod tests {
 
     #[test]
     fn test_mock_registry() {
-        let registry = MockRuntimeToolRegistry::new()
-            .with_tool("read_file", "Read a file", "file contents");
+        let registry =
+            MockRuntimeToolRegistry::new().with_tool("read_file", "Read a file", "file contents");
 
         assert!(registry.has_tool("read_file"));
         assert!(!registry.has_tool("write_file"));
@@ -345,11 +328,9 @@ mod tests {
 
     #[test]
     fn test_mock_registry_execute() {
-        let mut registry = MockRuntimeToolRegistry::new()
-            .with_tool("read_file", "Read a file", "file contents");
-        let result = registry
-            .execute_tool("read_file", "path", "corr")
-            .unwrap();
+        let mut registry =
+            MockRuntimeToolRegistry::new().with_tool("read_file", "Read a file", "file contents");
+        let result = registry.execute_tool("read_file", "path", "corr").unwrap();
         assert_eq!(result, "file contents");
     }
 

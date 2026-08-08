@@ -13,8 +13,8 @@ use std::fmt;
 
 use crate::observability::{CorrelationId, Event, EventBus, EventType};
 use crate::service_registry::registry::ServiceRegistry;
-use crate::service_registry::types::*;
 use crate::service_registry::service::Service;
+use crate::service_registry::types::*;
 
 /// Resolver for finding the best matching service.
 #[derive(Clone)]
@@ -99,11 +99,7 @@ impl ServiceResolver {
     }
 
     /// Resolve by exact service ID.
-    pub fn resolve_by_id(
-        &self,
-        service_id: &ServiceId,
-        requester: &str,
-    ) -> ResolutionResult {
+    pub fn resolve_by_id(&self, service_id: &ServiceId, requester: &str) -> ResolutionResult {
         match self.registry.get(service_id) {
             Some(svc) => {
                 if !svc.has_permission_for(requester, &AccessLevel::Read) {
@@ -164,9 +160,7 @@ impl ServiceResolver {
         if filtered.is_empty() {
             let available: Vec<ServiceVersion> = candidates
                 .iter()
-                .filter_map(|c| {
-                    self.registry.get(&c.service_id).map(|s| s.version)
-                })
+                .filter_map(|c| self.registry.get(&c.service_id).map(|s| s.version))
                 .collect();
             return ResolutionResult::VersionConflict {
                 available_versions: available,
@@ -303,7 +297,13 @@ impl std::error::Error for DependencyCheckError {}
 mod tests {
     use super::*;
 
-    fn make_svc(id: &str, name: &str, version: &str, provider: &str, caps: Vec<Capability>) -> Service {
+    fn make_svc(
+        id: &str,
+        name: &str,
+        version: &str,
+        provider: &str,
+        caps: Vec<Capability>,
+    ) -> Service {
         Service::builder()
             .with_id(ServiceId::new(id).unwrap())
             .with_name(ServiceName::new(name).unwrap())
@@ -323,7 +323,14 @@ mod tests {
     #[test]
     fn test_resolve_found() {
         let (mut reg, resolver) = make_registry();
-        reg.register(make_svc("s1", "data", "1.0.0", "p1", vec![Capability::Read])).unwrap();
+        reg.register(make_svc(
+            "s1",
+            "data",
+            "1.0.0",
+            "p1",
+            vec![Capability::Read],
+        ))
+        .unwrap();
         let result = resolver.resolve("data", "plugin-a", None);
         match result {
             ResolutionResult::Found { service_id, .. } => {
@@ -353,7 +360,8 @@ mod tests {
             .with_provider("p1")
             .with_capabilities(vec![Capability::Read])
             .with_priority(ServicePriority::Low)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let high = Service::builder()
             .with_id(ServiceId::new("s-high").unwrap())
             .with_name(ServiceName::new("data").unwrap())
@@ -361,7 +369,8 @@ mod tests {
             .with_provider("p2")
             .with_capabilities(vec![Capability::Read])
             .with_priority(ServicePriority::High)
-            .build().unwrap();
+            .build()
+            .unwrap();
         reg.register(low).unwrap();
         reg.register(high).unwrap();
 
@@ -383,14 +392,16 @@ mod tests {
             .with_version(ServiceVersion::new("1.0.0").unwrap())
             .with_provider("p1")
             .with_capabilities(vec![Capability::Read])
-            .build().unwrap();
+            .build()
+            .unwrap();
         let v2 = Service::builder()
             .with_id(ServiceId::new("s2").unwrap())
             .with_name(ServiceName::new("data").unwrap())
             .with_version(ServiceVersion::new("2.0.0").unwrap())
             .with_provider("p2")
             .with_capabilities(vec![Capability::Read])
-            .build().unwrap();
+            .build()
+            .unwrap();
         reg.register(v1).unwrap();
         reg.register(v2).unwrap();
 
@@ -412,14 +423,16 @@ mod tests {
             .with_version(ServiceVersion::new("1.0.0").unwrap())
             .with_provider("p1")
             .with_capabilities(vec![Capability::Read])
-            .build().unwrap();
+            .build()
+            .unwrap();
         let s2 = Service::builder()
             .with_id(ServiceId::new("s2").unwrap())
             .with_name(ServiceName::new("data").unwrap())
             .with_version(ServiceVersion::new("1.0.0").unwrap())
             .with_provider("p2")
             .with_capabilities(vec![Capability::Read])
-            .build().unwrap();
+            .build()
+            .unwrap();
         reg.register(s1).unwrap();
         reg.register(s2).unwrap();
 
@@ -441,14 +454,16 @@ mod tests {
             .with_version(ServiceVersion::new("1.0.0").unwrap())
             .with_provider("p1")
             .with_capabilities(vec![Capability::Read])
-            .build().unwrap();
+            .build()
+            .unwrap();
         let read_write = Service::builder()
             .with_id(ServiceId::new("s2").unwrap())
             .with_name(ServiceName::new("data").unwrap())
             .with_version(ServiceVersion::new("1.0.0").unwrap())
             .with_provider("p2")
             .with_capabilities(vec![Capability::Read, Capability::Write])
-            .build().unwrap();
+            .build()
+            .unwrap();
         reg.register(read_only).unwrap();
         reg.register(read_write).unwrap();
 
@@ -474,7 +489,8 @@ mod tests {
             .with_capabilities(vec![Capability::Read])
             .with_permissions(vec![perm])
             .with_visibility(Visibility::Private)
-            .build().unwrap();
+            .build()
+            .unwrap();
         reg.register(svc).unwrap();
 
         let result = resolver.resolve("secret", "unauthorized", None);
@@ -495,14 +511,16 @@ mod tests {
             .with_version(ServiceVersion::new("1.0.0").unwrap())
             .with_provider("p1")
             .with_capabilities(vec![Capability::Read])
-            .build().unwrap();
+            .build()
+            .unwrap();
         let v2 = Service::builder()
             .with_id(ServiceId::new("s2").unwrap())
             .with_name(ServiceName::new("data").unwrap())
             .with_version(ServiceVersion::new("2.0.0").unwrap())
             .with_provider("p1")
             .with_capabilities(vec![Capability::Read])
-            .build().unwrap();
+            .build()
+            .unwrap();
         reg.register(v1).unwrap();
         reg.register(v2).unwrap();
 
@@ -530,7 +548,8 @@ mod tests {
             .with_version(ServiceVersion::new("1.0.0").unwrap())
             .with_provider("p1")
             .with_capabilities(vec![Capability::Read])
-            .build().unwrap();
+            .build()
+            .unwrap();
         reg.register(v1).unwrap();
 
         let result = resolver.resolve_with_version(
@@ -541,7 +560,9 @@ mod tests {
             None,
         );
         match result {
-            ResolutionResult::VersionConflict { available_versions, .. } => {
+            ResolutionResult::VersionConflict {
+                available_versions, ..
+            } => {
                 assert_eq!(available_versions.len(), 1);
                 assert_eq!(available_versions[0].to_string(), "1.0.0");
             }
@@ -558,7 +579,8 @@ mod tests {
             .with_version(ServiceVersion::new("1.0.0").unwrap())
             .with_provider("p1")
             .with_capabilities(vec![Capability::Read])
-            .build().unwrap();
+            .build()
+            .unwrap();
         let main = Service::builder()
             .with_id(ServiceId::new("main").unwrap())
             .with_name(ServiceName::new("main-svc").unwrap())
@@ -570,7 +592,8 @@ mod tests {
                 ServiceVersion::new("1.0.0").unwrap(),
                 Capability::Read,
             )])
-            .build().unwrap();
+            .build()
+            .unwrap();
         reg.register(dep).unwrap();
         reg.register(main).unwrap();
 
@@ -592,7 +615,8 @@ mod tests {
                 ServiceVersion::new("1.0.0").unwrap(),
                 Capability::Read,
             )])
-            .build().unwrap();
+            .build()
+            .unwrap();
         reg.register(main).unwrap();
 
         let result = resolver.validate_dependencies(&ServiceId::new("main").unwrap());
@@ -617,9 +641,30 @@ mod tests {
     #[test]
     fn test_resolve_all_versions() {
         let (mut reg, resolver) = make_registry();
-        reg.register(make_svc("s1", "data", "1.0.0", "p1", vec![Capability::Read])).unwrap();
-        reg.register(make_svc("s2", "data", "2.0.0", "p2", vec![Capability::Read])).unwrap();
-        reg.register(make_svc("s3", "data", "1.5.0", "p3", vec![Capability::Read])).unwrap();
+        reg.register(make_svc(
+            "s1",
+            "data",
+            "1.0.0",
+            "p1",
+            vec![Capability::Read],
+        ))
+        .unwrap();
+        reg.register(make_svc(
+            "s2",
+            "data",
+            "2.0.0",
+            "p2",
+            vec![Capability::Read],
+        ))
+        .unwrap();
+        reg.register(make_svc(
+            "s3",
+            "data",
+            "1.5.0",
+            "p3",
+            vec![Capability::Read],
+        ))
+        .unwrap();
 
         let all = resolver.resolve_all("data");
         assert_eq!(all.len(), 3);
@@ -643,7 +688,14 @@ mod tests {
         let r1 = resolver.resolve("data", "plugin-a", None);
         let r2 = resolver.resolve("data", "plugin-a", None);
         match (&r1, &r2) {
-            (ResolutionResult::Found { service_id: id1, .. }, ResolutionResult::Found { service_id: id2, .. }) => {
+            (
+                ResolutionResult::Found {
+                    service_id: id1, ..
+                },
+                ResolutionResult::Found {
+                    service_id: id2, ..
+                },
+            ) => {
                 assert_eq!(id1, id2);
             }
             _ => panic!("Expected deterministic resolution"),

@@ -54,7 +54,9 @@ impl fmt::Display for ServiceIdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ServiceIdError::Empty => write!(f, "ServiceId cannot be empty"),
-            ServiceIdError::InvalidChar(c) => write!(f, "ServiceId contains invalid character: {c}"),
+            ServiceIdError::InvalidChar(c) => {
+                write!(f, "ServiceId contains invalid character: {c}")
+            }
         }
     }
 }
@@ -494,11 +496,7 @@ impl DiscoveryFilter {
         self
     }
 
-    pub fn with_version_range(
-        mut self,
-        min: ServiceVersion,
-        max: ServiceVersion,
-    ) -> Self {
+    pub fn with_version_range(mut self, min: ServiceVersion, max: ServiceVersion) -> Self {
         self.min_version = Some(min);
         self.max_version = Some(max);
         self
@@ -526,13 +524,8 @@ impl DiscoveryFilter {
             }
         }
         if !self.capabilities.is_empty() {
-            let service_caps: Vec<&Capability> =
-                service.capabilities.iter().collect();
-            if !self
-                .capabilities
-                .iter()
-                .all(|c| service_caps.contains(&c))
-            {
+            let service_caps: Vec<&Capability> = service.capabilities.iter().collect();
+            if !self.capabilities.iter().all(|c| service_caps.contains(&c)) {
                 return false;
             }
         }
