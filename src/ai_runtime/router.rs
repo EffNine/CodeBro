@@ -2,14 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::capabilities::{Capability, CapabilitySet, CapabilityNegotiation, SupportedCapabilities};
+use super::capabilities::{
+    Capability, CapabilityNegotiation, CapabilitySet, SupportedCapabilities,
+};
+use super::diagnostics::{DiagnosticEvent, DiagnosticLevel, RuntimeDiagnostics};
 use super::request::ModelRequest;
 use super::response::ModelResponse;
 use super::stream::StreamPipeline;
 use super::types::{
     AIRRuntimeError, AIRRuntimeResult, CostEstimate, HealthStatus, ModelId, Priority, ProviderType,
 };
-use super::diagnostics::{DiagnosticEvent, DiagnosticLevel, RuntimeDiagnostics};
 
 /// A candidate model that the router can select.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,8 +87,8 @@ impl ModelCandidate {
         score += self.priority.score() as f64 * 10.0;
 
         // Cost efficiency (0-20): lower cost is better
-        let total_cost = self.cost_estimate.input_cost_per_million
-            + self.cost_estimate.output_cost_per_million;
+        let total_cost =
+            self.cost_estimate.input_cost_per_million + self.cost_estimate.output_cost_per_million;
         score += (1.0 / (1.0 + total_cost / 10.0)) * 20.0;
 
         // Latency (0-20): lower latency is better
@@ -97,9 +99,7 @@ impl ModelCandidate {
 
         // Capability coverage bonus (0-10)
         let required = super::capabilities::CapabilitySet::required_for_request(request);
-        let coverage = required.iter()
-            .filter(|c| self.capabilities.has(c))
-            .count() as f64;
+        let coverage = required.iter().filter(|c| self.capabilities.has(c)).count() as f64;
         if !required.is_empty() {
             score += (coverage / required.len() as f64) * 10.0;
         }
@@ -214,11 +214,10 @@ impl RuntimeRouter {
     }
 
     /// Get candidates that match the given capabilities.
-    pub fn candidates_with_capabilities(
-        &self,
-        required: &[Capability],
-    ) -> Vec<ModelCandidate> {
-        self.candidates.read().unwrap()
+    pub fn candidates_with_capabilities(&self, required: &[Capability]) -> Vec<ModelCandidate> {
+        self.candidates
+            .read()
+            .unwrap()
             .iter()
             .filter(|c| c.capabilities.has_all(required))
             .cloned()
@@ -236,7 +235,8 @@ impl RuntimeRouter {
         }
 
         // Score all candidates
-        let mut scored: Vec<(ModelCandidate, f64)> = candidates.iter()
+        let mut scored: Vec<(ModelCandidate, f64)> = candidates
+            .iter()
             .map(|c| (c.clone(), c.score_for_request(request)))
             .filter(|(_, score)| *score >= 0.0)
             .collect();
@@ -251,7 +251,8 @@ impl RuntimeRouter {
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let (best_candidate, best_score) = scored.first().unwrap();
-        let alternatives: Vec<ModelId> = scored.iter()
+        let alternatives: Vec<ModelId> = scored
+            .iter()
             .skip(1)
             .map(|(c, _)| c.model_id.clone())
             .collect();
@@ -272,14 +273,17 @@ impl RuntimeRouter {
         // Record in history
         {
             let mut history = self.request_history.write().unwrap();
-            history.push((request.clone(), RoutingDecision::new(
-                best_candidate.model_id.clone(),
-                best_candidate.clone(),
-                *best_score,
-                format!("Selected based on score {:.2}", best_score),
-                alternatives.clone(),
-                negotiation.clone(),
-            )));
+            history.push((
+                request.clone(),
+                RoutingDecision::new(
+                    best_candidate.model_id.clone(),
+                    best_candidate.clone(),
+                    *best_score,
+                    format!("Selected based on score {:.2}", best_score),
+                    alternatives.clone(),
+                    negotiation.clone(),
+                ),
+            ));
             // Keep history bounded
             if history.len() > 1000 {
                 let keep = history.len() - 1000;
@@ -320,10 +324,14 @@ impl RuntimeRouter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::ProviderType;
+    use super::*;
 
-    fn test_candidate(model_id: &str, provider: ProviderType, capabilities: Vec<Capability>) -> ModelCandidate {
+    fn test_candidate(
+        model_id: &str,
+        provider: ProviderType,
+        capabilities: Vec<Capability>,
+    ) -> ModelCandidate {
         ModelCandidate::new(
             ModelId::new(model_id, provider),
             CapabilitySet::new(capabilities),
@@ -390,7 +398,11 @@ mod tests {
     #[test]
     fn test_router_registers_candidate() {
         let router = RuntimeRouter::new(RoutingConfig::default());
-        let candidate = test_candidate("gpt-4o", ProviderType::OpenAI, vec![Capability::Streaming, Capability::ToolCalling]);
+        let candidate = test_candidate(
+            "gpt-4o",
+            ProviderType::OpenAI,
+            vec![Capability::Streaming, Capability::ToolCalling],
+        );
         router.register_candidate(candidate);
         assert_eq!(router.candidates().len(), 1);
     }
@@ -399,7 +411,11 @@ mod tests {
     fn test_router_replaces_same_model() {
         let router = RuntimeRouter::new(RoutingConfig::default());
         let c1 = test_candidate("gpt-4o", ProviderType::OpenAI, vec![Capability::Streaming]);
-        let c2 = test_candidate("gpt-4o", ProviderType::OpenAI, vec![Capability::Streaming, Capability::ToolCalling]);
+        let c2 = test_candidate(
+            "gpt-4o",
+            ProviderType::OpenAI,
+            vec![Capability::Streaming, Capability::ToolCalling],
+        );
         router.register_candidate(c1);
         router.register_candidate(c2);
         assert_eq!(router.candidates().len(), 1);
@@ -431,7 +447,7 @@ mod tests {
         let result = router.route(&request);
         assert!(result.is_err());
         match result.unwrap_err() {
-            AIRRuntimeError::NoSuitableProvider(_) => {},
+            AIRRuntimeError::NoSuitableProvider(_) => {}
             _ => panic!("Expected NoSuitableProvider"),
         }
     }
@@ -439,10 +455,18 @@ mod tests {
     #[test]
     fn test_router_selects_best_candidate() {
         let router = RuntimeRouter::new(RoutingConfig::default());
-        let low_priority = test_candidate("gpt-4o-mini", ProviderType::OpenAI, vec![Capability::Streaming])
-            .with_priority(Priority::Low);
-        let high_priority = test_candidate("gpt-4o", ProviderType::OpenAI, vec![Capability::Streaming, Capability::ToolCalling])
-            .with_priority(Priority::High);
+        let low_priority = test_candidate(
+            "gpt-4o-mini",
+            ProviderType::OpenAI,
+            vec![Capability::Streaming],
+        )
+        .with_priority(Priority::Low);
+        let high_priority = test_candidate(
+            "gpt-4o",
+            ProviderType::OpenAI,
+            vec![Capability::Streaming, Capability::ToolCalling],
+        )
+        .with_priority(Priority::High);
         router.register_candidate(low_priority);
         router.register_candidate(high_priority);
 
@@ -455,8 +479,12 @@ mod tests {
     fn test_router_filters_unhealthy() {
         let router = RuntimeRouter::new(RoutingConfig::default());
         let healthy = test_candidate("gpt-4o", ProviderType::OpenAI, vec![Capability::Streaming]);
-        let unhealthy = test_candidate("claude-3", ProviderType::Anthropic, vec![Capability::Streaming])
-            .with_health(HealthStatus::Unhealthy);
+        let unhealthy = test_candidate(
+            "claude-3",
+            ProviderType::Anthropic,
+            vec![Capability::Streaming],
+        )
+        .with_health(HealthStatus::Unhealthy);
         router.register_candidate(healthy);
         router.register_candidate(unhealthy);
 
@@ -468,17 +496,21 @@ mod tests {
     #[test]
     fn test_router_capability_filtering() {
         let router = RuntimeRouter::new(RoutingConfig::default());
-        let streaming_only = test_candidate("gpt-4o", ProviderType::OpenAI, vec![Capability::Streaming]);
-        let full_capability = test_candidate("claude-3", ProviderType::Anthropic, vec![
-            Capability::Streaming,
-            Capability::ToolCalling,
-            Capability::StructuredOutput,
-        ]);
+        let streaming_only =
+            test_candidate("gpt-4o", ProviderType::OpenAI, vec![Capability::Streaming]);
+        let full_capability = test_candidate(
+            "claude-3",
+            ProviderType::Anthropic,
+            vec![
+                Capability::Streaming,
+                Capability::ToolCalling,
+                Capability::StructuredOutput,
+            ],
+        );
         router.register_candidate(streaming_only);
         router.register_candidate(full_capability);
 
-        let request = ModelRequest::new("claude-3", vec![])
-            .with_tools(vec![]);
+        let request = ModelRequest::new("claude-3", vec![]).with_tools(vec![]);
         let decision = router.route(&request).unwrap();
         assert!(decision.selected_model.id == "gpt-4o" || decision.selected_model.id == "claude-3");
     }

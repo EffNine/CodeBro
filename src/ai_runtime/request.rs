@@ -199,7 +199,10 @@ impl ModelRequest {
         self
     }
 
-    pub fn with_structured_output(mut self, schema: super::structured_output::StructuredOutputSchema) -> Self {
+    pub fn with_structured_output(
+        mut self,
+        schema: super::structured_output::StructuredOutputSchema,
+    ) -> Self {
         self.structured_output = Some(schema);
         self
     }
@@ -230,20 +233,24 @@ impl ModelRequest {
 
     /// Serialize this request to JSON (provider-agnostic format).
     pub fn to_json(&self) -> AIRRuntimeResult<serde_json::Value> {
-        serde_json::to_value(self)
-            .map_err(|e| AIRRuntimeError::SerializationError(e.to_string()))
+        serde_json::to_value(self).map_err(|e| AIRRuntimeError::SerializationError(e.to_string()))
     }
 
     /// Deserialize a request from JSON.
     pub fn from_json(json: &str) -> AIRRuntimeResult<Self> {
-        serde_json::from_str(json)
-            .map_err(|e| AIRRuntimeError::JsonParseError(e.to_string()))
+        serde_json::from_str(json).map_err(|e| AIRRuntimeError::JsonParseError(e.to_string()))
     }
 }
 
 impl fmt::Display for ModelRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ModelRequest(model={}, messages={}, tools={}, stream={})",
-            self.model_id, self.messages.len(), self.tools.len(), self.stream)
+        write!(
+            f,
+            "ModelRequest(model={}, messages={}, tools={}, stream={})",
+            self.model_id,
+            self.messages.len(),
+            self.tools.len(),
+            self.stream
+        )
     }
 }

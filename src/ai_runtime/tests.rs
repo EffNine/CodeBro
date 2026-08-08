@@ -1,19 +1,23 @@
-use super::capabilities::{Capability, CapabilitySet, CapabilityNegotiation, SupportedCapabilities};
-use super::diagnostics::{DiagnosticEvent, DiagnosticLevel, RuntimeDiagnostics, DiagnosticSummary};
-use super::request::{Message, MessageRole, ModelRequest, ToolCall, FunctionCall};
+use super::capabilities::{
+    Capability, CapabilityNegotiation, CapabilitySet, SupportedCapabilities,
+};
+use super::diagnostics::{DiagnosticEvent, DiagnosticLevel, DiagnosticSummary, RuntimeDiagnostics};
+use super::request::{FunctionCall, Message, MessageRole, ModelRequest, ToolCall};
 use super::response::{
     Choice, FunctionCallDelta, ModelResponse, ResponseDelta, ResponseMessage, ResponseUsage,
     ToolCallDelta,
 };
+use super::router::{ModelCandidate, RoutingConfig, RoutingDecision, RuntimeRouter};
 use super::stream::{StreamEvent, StreamPipeline, StreamSegment, StreamingOutput};
 use super::structured_output::{
     JsonSchema, StructuredOutputBuilder, StructuredOutputSchema, StructuredOutputValidator,
 };
-use super::tool_contract::{FunctionDefinition, ToolArgument, ToolDefinition, ToolResult, ToolSchema};
+use super::tool_contract::{
+    FunctionDefinition, ToolArgument, ToolDefinition, ToolResult, ToolSchema,
+};
 use super::types::{
     AIRRuntimeError, AIRRuntimeResult, CostEstimate, HealthStatus, ModelId, Priority, ProviderType,
 };
-use super::router::{ModelCandidate, RuntimeRouter, RoutingConfig, RoutingDecision};
 use super::AIRRuntime;
 use std::str::FromStr;
 
@@ -29,20 +33,44 @@ fn test_capability_display() {
     assert_eq!(format!("{}", Capability::Reasoning), "reasoning");
     assert_eq!(format!("{}", Capability::Embeddings), "embeddings");
     assert_eq!(format!("{}", Capability::Audio), "audio");
-    assert_eq!(format!("{}", Capability::ImageGeneration), "image_generation");
-    assert_eq!(format!("{}", Capability::StructuredOutput), "structured_output");
+    assert_eq!(
+        format!("{}", Capability::ImageGeneration),
+        "image_generation"
+    );
+    assert_eq!(
+        format!("{}", Capability::StructuredOutput),
+        "structured_output"
+    );
 }
 
 #[test]
 fn test_capability_from_str() {
-    assert_eq!(Capability::from_str("streaming").unwrap(), Capability::Streaming);
-    assert_eq!(Capability::from_str("tool_calling").unwrap(), Capability::ToolCalling);
+    assert_eq!(
+        Capability::from_str("streaming").unwrap(),
+        Capability::Streaming
+    );
+    assert_eq!(
+        Capability::from_str("tool_calling").unwrap(),
+        Capability::ToolCalling
+    );
     assert_eq!(Capability::from_str("vision").unwrap(), Capability::Vision);
-    assert_eq!(Capability::from_str("reasoning").unwrap(), Capability::Reasoning);
-    assert_eq!(Capability::from_str("embeddings").unwrap(), Capability::Embeddings);
+    assert_eq!(
+        Capability::from_str("reasoning").unwrap(),
+        Capability::Reasoning
+    );
+    assert_eq!(
+        Capability::from_str("embeddings").unwrap(),
+        Capability::Embeddings
+    );
     assert_eq!(Capability::from_str("audio").unwrap(), Capability::Audio);
-    assert_eq!(Capability::from_str("image_generation").unwrap(), Capability::ImageGeneration);
-    assert_eq!(Capability::from_str("structured_output").unwrap(), Capability::StructuredOutput);
+    assert_eq!(
+        Capability::from_str("image_generation").unwrap(),
+        Capability::ImageGeneration
+    );
+    assert_eq!(
+        Capability::from_str("structured_output").unwrap(),
+        Capability::StructuredOutput
+    );
 }
 
 #[test]
@@ -116,7 +144,11 @@ fn test_capability_negotiation_compatible() {
 fn test_capability_negotiation_incompatible() {
     let request = ModelRequest::new("gpt-4o", vec![])
         .with_stream(true)
-        .with_tools(vec![ToolDefinition::new("test", "test", serde_json::json!({}))]);
+        .with_tools(vec![ToolDefinition::new(
+            "test",
+            "test",
+            serde_json::json!({}),
+        )]);
     let provider_caps = CapabilitySet::new(vec![Capability::Streaming]); // missing ToolCalling
     let negotiation = CapabilityNegotiation::new(&request, &provider_caps);
     assert!(!negotiation.compatible);
@@ -154,9 +186,15 @@ fn test_message_creation() {
 
 #[test]
 fn test_message_role_from_str() {
-    assert_eq!(MessageRole::from_str("system").unwrap(), MessageRole::System);
+    assert_eq!(
+        MessageRole::from_str("system").unwrap(),
+        MessageRole::System
+    );
     assert_eq!(MessageRole::from_str("user").unwrap(), MessageRole::User);
-    assert_eq!(MessageRole::from_str("assistant").unwrap(), MessageRole::Assistant);
+    assert_eq!(
+        MessageRole::from_str("assistant").unwrap(),
+        MessageRole::Assistant
+    );
     assert_eq!(MessageRole::from_str("tool").unwrap(), MessageRole::Tool);
     assert!(MessageRole::from_str("invalid").is_err());
 }
@@ -193,8 +231,7 @@ fn test_model_request_builder() {
 
 #[test]
 fn test_model_request_required_capabilities() {
-    let request = ModelRequest::new("gpt-4o", vec![])
-        .with_stream(true);
+    let request = ModelRequest::new("gpt-4o", vec![]).with_stream(true);
     let caps = request.required_capabilities();
     assert!(caps.contains(&Capability::Streaming));
 }
@@ -231,7 +268,11 @@ fn test_model_response_basic() {
     let response = ModelResponse::new(
         "resp-123",
         "gpt-4o",
-        vec![Choice::new(0, ResponseMessage::new("assistant", Some("Hello!".to_string())), None)],
+        vec![Choice::new(
+            0,
+            ResponseMessage::new("assistant", Some("Hello!".to_string())),
+            None,
+        )],
         ResponseUsage::new(10, 5, 15),
         1700000000,
         "openai",
@@ -250,7 +291,11 @@ fn test_model_response_tool_calls() {
     let response = ModelResponse::new(
         "resp-123",
         "gpt-4o",
-        vec![Choice::new(0, ResponseMessage::new("assistant", None).with_tool_calls(vec![tool_call.clone()]), None)],
+        vec![Choice::new(
+            0,
+            ResponseMessage::new("assistant", None).with_tool_calls(vec![tool_call.clone()]),
+            None,
+        )],
         ResponseUsage::new(20, 10, 30),
         1700000000,
         "openai",
@@ -265,7 +310,11 @@ fn test_model_response_no_tool_calls() {
     let response = ModelResponse::new(
         "resp-123",
         "gpt-4o",
-        vec![Choice::new(0, ResponseMessage::new("assistant", Some("Hello".to_string())), None)],
+        vec![Choice::new(
+            0,
+            ResponseMessage::new("assistant", Some("Hello".to_string())),
+            None,
+        )],
         ResponseUsage::new(10, 5, 15),
         1700000000,
         "openai",
@@ -278,7 +327,11 @@ fn test_model_response_to_json() {
     let response = ModelResponse::new(
         "resp-123",
         "gpt-4o",
-        vec![Choice::new(0, ResponseMessage::new("assistant", Some("Hi".to_string())), None)],
+        vec![Choice::new(
+            0,
+            ResponseMessage::new("assistant", Some("Hi".to_string())),
+            None,
+        )],
         ResponseUsage::new(5, 3, 8),
         1700000000,
         "openai",
@@ -309,7 +362,11 @@ fn test_model_response_display() {
     let response = ModelResponse::new(
         "resp-1",
         "gpt-4o",
-        vec![Choice::new(0, ResponseMessage::new("assistant", Some("test".to_string())), None)],
+        vec![Choice::new(
+            0,
+            ResponseMessage::new("assistant", Some("test".to_string())),
+            None,
+        )],
         ResponseUsage::new(1, 1, 2),
         0,
         "openai",
@@ -358,8 +415,7 @@ fn test_stream_segment() {
 
 #[test]
 fn test_stream_segment_finish() {
-    let segment = StreamSegment::new(ResponseDelta::default(), 0)
-        .with_finish_reason("stop");
+    let segment = StreamSegment::new(ResponseDelta::default(), 0).with_finish_reason("stop");
     assert!(segment.is_finished());
     assert_eq!(segment.finish_reason, Some("stop".to_string()));
 }
@@ -367,7 +423,11 @@ fn test_stream_segment_finish() {
 #[test]
 fn test_stream_event_display() {
     let event = StreamEvent::Segment(StreamSegment::new(
-        ResponseDelta { content: Some("Hi".to_string()), ..Default::default() }, 0
+        ResponseDelta {
+            content: Some("Hi".to_string()),
+            ..Default::default()
+        },
+        0,
     ));
     let display = format!("{}", event);
     assert!(display.contains("Segment"));
@@ -377,9 +437,16 @@ fn test_stream_event_display() {
 fn test_stream_pipeline_basic() {
     let mut pipeline = StreamPipeline::new();
     pipeline.push(StreamEvent::Segment(StreamSegment::new(
-        ResponseDelta { content: Some("Hello".to_string()), ..Default::default() }, 0
+        ResponseDelta {
+            content: Some("Hello".to_string()),
+            ..Default::default()
+        },
+        0,
     )));
-    pipeline.push(StreamEvent::Complete { total_tokens: 1, total_duration_ms: 100 });
+    pipeline.push(StreamEvent::Complete {
+        total_tokens: 1,
+        total_duration_ms: 100,
+    });
 
     let output = pipeline.process().unwrap();
     assert_eq!(output.segments.len(), 1);
@@ -391,12 +458,23 @@ fn test_stream_pipeline_basic() {
 fn test_stream_pipeline_collect_content() {
     let mut pipeline = StreamPipeline::new();
     pipeline.push(StreamEvent::Segment(StreamSegment::new(
-        ResponseDelta { content: Some("Hello".to_string()), ..Default::default() }, 0
+        ResponseDelta {
+            content: Some("Hello".to_string()),
+            ..Default::default()
+        },
+        0,
     )));
     pipeline.push(StreamEvent::Segment(StreamSegment::new(
-        ResponseDelta { content: Some(" World".to_string()), ..Default::default() }, 1
+        ResponseDelta {
+            content: Some(" World".to_string()),
+            ..Default::default()
+        },
+        1,
     )));
-    pipeline.push(StreamEvent::Complete { total_tokens: 2, total_duration_ms: 200 });
+    pipeline.push(StreamEvent::Complete {
+        total_tokens: 2,
+        total_duration_ms: 200,
+    });
 
     let output = pipeline.process().unwrap();
     assert_eq!(output.collect_content(), "Hello World");
@@ -417,7 +495,11 @@ fn test_stream_pipeline_error() {
 fn test_stream_pipeline_cancelled() {
     let mut pipeline = StreamPipeline::new();
     pipeline.push(StreamEvent::Segment(StreamSegment::new(
-        ResponseDelta { content: Some("Partial".to_string()), ..Default::default() }, 0
+        ResponseDelta {
+            content: Some("Partial".to_string()),
+            ..Default::default()
+        },
+        0,
     )));
     pipeline.push(StreamEvent::Cancelled);
 
@@ -446,8 +528,14 @@ fn test_stream_pipeline_push_pop() {
 #[test]
 fn test_stream_pipeline_drain() {
     let mut pipeline = StreamPipeline::new();
-    pipeline.push(StreamEvent::Segment(StreamSegment::new(ResponseDelta::default(), 0)));
-    pipeline.push(StreamEvent::Segment(StreamSegment::new(ResponseDelta::default(), 1)));
+    pipeline.push(StreamEvent::Segment(StreamSegment::new(
+        ResponseDelta::default(),
+        0,
+    )));
+    pipeline.push(StreamEvent::Segment(StreamSegment::new(
+        ResponseDelta::default(),
+        1,
+    )));
     let events = pipeline.drain();
     assert_eq!(events.len(), 2);
     assert!(pipeline.is_empty());
@@ -463,7 +551,13 @@ fn test_streaming_output_new() {
 #[test]
 fn test_streaming_output_append() {
     let mut output = StreamingOutput::new();
-    output.append(StreamSegment::new(ResponseDelta { content: Some("x".to_string()), ..Default::default() }, 0));
+    output.append(StreamSegment::new(
+        ResponseDelta {
+            content: Some("x".to_string()),
+            ..Default::default()
+        },
+        0,
+    ));
     assert_eq!(output.segments.len(), 1);
     assert_eq!(output.total_tokens, 1);
 }
@@ -633,8 +727,12 @@ fn test_structured_output_builder() {
         .build();
 
     assert_eq!(schema.name, "Person");
-    assert!(schema.validate_json(&serde_json::json!({"name": "Alice", "age": 30})).is_empty());
-    assert!(!schema.validate_json(&serde_json::json!({"age": 30})).is_empty());
+    assert!(schema
+        .validate_json(&serde_json::json!({"name": "Alice", "age": 30}))
+        .is_empty());
+    assert!(!schema
+        .validate_json(&serde_json::json!({"age": 30}))
+        .is_empty());
 }
 
 #[test]
@@ -645,8 +743,12 @@ fn test_structured_output_validator() {
         .add_required("name")
         .build();
 
-    assert!(validator.validate_strict(&schema, &serde_json::json!({"name": "Alice"})).is_ok());
-    assert!(validator.validate_strict(&schema, &serde_json::json!({})).is_err());
+    assert!(validator
+        .validate_strict(&schema, &serde_json::json!({"name": "Alice"}))
+        .is_ok());
+    assert!(validator
+        .validate_strict(&schema, &serde_json::json!({}))
+        .is_err());
 }
 
 // =============================================================================
@@ -655,10 +757,14 @@ fn test_structured_output_validator() {
 
 #[test]
 fn test_tool_definition() {
-    let tool = ToolDefinition::new("read_file", "Read a file", serde_json::json!({
-        "type": "object",
-        "properties": {"path": {"type": "string"}}
-    }));
+    let tool = ToolDefinition::new(
+        "read_file",
+        "Read a file",
+        serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}}
+        }),
+    );
     assert_eq!(tool.r#type, "function");
     assert_eq!(tool.function.name, "read_file");
     assert_eq!(tool.function.description, "Read a file");
@@ -666,9 +772,14 @@ fn test_tool_definition() {
 
 #[test]
 fn test_tool_definition_with_strict() {
-    let tool = ToolDefinition::new("read_file", "Read a file", serde_json::json!({
-        "type": "object"
-    })).with_strict(true);
+    let tool = ToolDefinition::new(
+        "read_file",
+        "Read a file",
+        serde_json::json!({
+            "type": "object"
+        }),
+    )
+    .with_strict(true);
     let params = tool.function.parameters.as_object().unwrap();
     assert_eq!(params.get("strict").unwrap(), true);
 }
@@ -714,7 +825,10 @@ fn test_provider_type_display() {
     assert_eq!(format!("{}", ProviderType::OpenAI), "openai");
     assert_eq!(format!("{}", ProviderType::Anthropic), "anthropic");
     assert_eq!(format!("{}", ProviderType::Ollama), "ollama");
-    assert_eq!(format!("{}", ProviderType::Custom("my-provider".to_string())), "my-provider");
+    assert_eq!(
+        format!("{}", ProviderType::Custom("my-provider".to_string())),
+        "my-provider"
+    );
 }
 
 #[test]
@@ -722,7 +836,10 @@ fn test_provider_type_from_str() {
     assert_eq!(ProviderType::from_str("openai"), ProviderType::OpenAI);
     assert_eq!(ProviderType::from_str("anthropic"), ProviderType::Anthropic);
     assert_eq!(ProviderType::from_str("ollama"), ProviderType::Ollama);
-    assert_eq!(ProviderType::from_str("my-provider"), ProviderType::Custom("my-provider".to_string()));
+    assert_eq!(
+        ProviderType::from_str("my-provider"),
+        ProviderType::Custom("my-provider".to_string())
+    );
 }
 
 #[test]
@@ -868,11 +985,11 @@ fn test_router_routes_with_capability_match() {
         CapabilitySet::new(vec![Capability::Streaming, Capability::ToolCalling]),
         HealthStatus::Healthy,
         CostEstimate::default(),
-    ).with_priority(Priority::High);
+    )
+    .with_priority(Priority::High);
     router.register_candidate(candidate);
 
-    let request = ModelRequest::new("gpt-4o", vec![Message::user("Hello")])
-        .with_stream(true);
+    let request = ModelRequest::new("gpt-4o", vec![Message::user("Hello")]).with_stream(true);
     let decision = router.route(&request).unwrap();
     assert_eq!(decision.selected_model.id, "gpt-4o");
 }
@@ -890,7 +1007,8 @@ fn test_router_picks_lower_cost_among_equal() {
             cache_read_cost_per_million: None,
             cache_creation_cost_per_million: None,
         },
-    ).with_priority(Priority::Normal);
+    )
+    .with_priority(Priority::Normal);
     let expensive = ModelCandidate::new(
         ModelId::openai("gpt-4o"),
         CapabilitySet::new(vec![Capability::Streaming]),
@@ -901,7 +1019,8 @@ fn test_router_picks_lower_cost_among_equal() {
             cache_read_cost_per_million: None,
             cache_creation_cost_per_million: None,
         },
-    ).with_priority(Priority::Normal);
+    )
+    .with_priority(Priority::Normal);
     router.register_candidate(cheap);
     router.register_candidate(expensive);
 
@@ -941,13 +1060,15 @@ fn test_router_alternatives_in_decision() {
         CapabilitySet::new(vec![Capability::Streaming]),
         HealthStatus::Healthy,
         CostEstimate::default(),
-    ).with_priority(Priority::High);
+    )
+    .with_priority(Priority::High);
     let c2 = ModelCandidate::new(
         ModelId::openai("gpt-4o-mini"),
         CapabilitySet::new(vec![Capability::Streaming]),
         HealthStatus::Healthy,
         CostEstimate::default(),
-    ).with_priority(Priority::Low);
+    )
+    .with_priority(Priority::Low);
     router.register_candidate(c1);
     router.register_candidate(c2);
 
@@ -973,11 +1094,12 @@ fn test_model_request_with_structured_output() {
         .add_property("answer", JsonSchema::string("The answer"))
         .add_required("answer")
         .build();
-    let request = ModelRequest::new("gpt-4o", vec![])
-        .with_structured_output(schema);
+    let request = ModelRequest::new("gpt-4o", vec![]).with_structured_output(schema);
     assert!(request.structured_output.is_some());
     assert_eq!(request.required_capabilities().len(), 1);
-    assert!(request.required_capabilities().contains(&Capability::StructuredOutput));
+    assert!(request
+        .required_capabilities()
+        .contains(&Capability::StructuredOutput));
 }
 
 #[test]
@@ -986,10 +1108,11 @@ fn test_model_request_with_tools() {
         ToolDefinition::new("read_file", "Read a file", serde_json::json!({})),
         ToolDefinition::new("write_file", "Write a file", serde_json::json!({})),
     ];
-    let request = ModelRequest::new("gpt-4o", vec![])
-        .with_tools(tools.clone());
+    let request = ModelRequest::new("gpt-4o", vec![]).with_tools(tools.clone());
     assert_eq!(request.tools.len(), 2);
-    assert!(request.required_capabilities().contains(&Capability::ToolCalling));
+    assert!(request
+        .required_capabilities()
+        .contains(&Capability::ToolCalling));
 }
 
 #[test]
@@ -1011,10 +1134,14 @@ fn test_model_request_function_call_invalid_json() {
 
 #[test]
 fn test_tool_definition_roundtrip() {
-    let tool = ToolDefinition::new("read_file", "Read a file", serde_json::json!({
-        "type": "object",
-        "properties": {"path": {"type": "string"}}
-    }));
+    let tool = ToolDefinition::new(
+        "read_file",
+        "Read a file",
+        serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}}
+        }),
+    );
     let json = serde_json::to_string(&tool).unwrap();
     let parsed: ToolDefinition = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.function.name, "read_file");
@@ -1046,9 +1173,27 @@ fn test_streaming_output_default() {
 #[test]
 fn test_streaming_output_multiple_segments() {
     let mut output = StreamingOutput::new();
-    output.append(StreamSegment::new(ResponseDelta { content: Some("a".to_string()), ..Default::default() }, 0));
-    output.append(StreamSegment::new(ResponseDelta { content: Some("b".to_string()), ..Default::default() }, 1));
-    output.append(StreamSegment::new(ResponseDelta { content: Some("c".to_string()), ..Default::default() }, 2));
+    output.append(StreamSegment::new(
+        ResponseDelta {
+            content: Some("a".to_string()),
+            ..Default::default()
+        },
+        0,
+    ));
+    output.append(StreamSegment::new(
+        ResponseDelta {
+            content: Some("b".to_string()),
+            ..Default::default()
+        },
+        1,
+    ));
+    output.append(StreamSegment::new(
+        ResponseDelta {
+            content: Some("c".to_string()),
+            ..Default::default()
+        },
+        2,
+    ));
     assert_eq!(output.total_tokens, 3);
     assert_eq!(output.collect_content(), "abc");
 }
@@ -1069,7 +1214,11 @@ fn test_message_tool_result() {
 
 #[test]
 fn test_choice_creation() {
-    let choice = Choice::new(0, ResponseMessage::new("assistant", Some("Hi".to_string())), Some("stop".to_string()));
+    let choice = Choice::new(
+        0,
+        ResponseMessage::new("assistant", Some("Hi".to_string())),
+        Some("stop".to_string()),
+    );
     assert_eq!(choice.index, 0);
     assert_eq!(choice.finish_reason, Some("stop".to_string()));
 }
@@ -1090,7 +1239,10 @@ fn test_tool_call_delta() {
         }),
     };
     assert_eq!(delta.index, 0);
-    assert_eq!(delta.function.as_ref().unwrap().name, Some("read_file".to_string()));
+    assert_eq!(
+        delta.function.as_ref().unwrap().name,
+        Some("read_file".to_string())
+    );
 }
 
 // =============================================================================
@@ -1199,7 +1351,7 @@ fn test_router_no_candidates() {
     let result = router.route(&request);
     assert!(result.is_err());
     match result.unwrap_err() {
-        AIRRuntimeError::NoSuitableProvider(_) => {},
+        AIRRuntimeError::NoSuitableProvider(_) => {}
         e => panic!("Expected NoSuitableProvider, got: {:?}", e),
     }
 }
@@ -1212,13 +1364,15 @@ fn test_router_selects_best_candidate() {
         CapabilitySet::new(vec![Capability::Streaming]),
         HealthStatus::Healthy,
         CostEstimate::default(),
-    ).with_priority(Priority::Low);
+    )
+    .with_priority(Priority::Low);
     let high_priority = ModelCandidate::new(
         ModelId::openai("gpt-4o"),
         CapabilitySet::new(vec![Capability::Streaming, Capability::ToolCalling]),
         HealthStatus::Healthy,
         CostEstimate::default(),
-    ).with_priority(Priority::High);
+    )
+    .with_priority(Priority::High);
     router.register_candidate(low_priority);
     router.register_candidate(high_priority);
 
@@ -1419,8 +1573,13 @@ fn test_stream_segment_is_finished_false_by_default() {
 #[test]
 fn test_stream_event_is_methods() {
     let seg = StreamEvent::Segment(StreamSegment::new(ResponseDelta::default(), 0));
-    let comp = StreamEvent::Complete { total_tokens: 1, total_duration_ms: 100 };
-    let err = StreamEvent::Error { error: "test".to_string() };
+    let comp = StreamEvent::Complete {
+        total_tokens: 1,
+        total_duration_ms: 100,
+    };
+    let err = StreamEvent::Error {
+        error: "test".to_string(),
+    };
     let cancel = StreamEvent::Cancelled;
 
     assert!(seg.is_segment());
@@ -1453,7 +1612,16 @@ fn test_diagnostic_summary_all_zero() {
 
 #[test]
 fn test_capability_description() {
-    assert_eq!(Capability::Streaming.description(), "Streaming responses via Server-Sent Events");
-    assert_eq!(Capability::ToolCalling.description(), "Tool/function calling capabilities");
-    assert_eq!(Capability::Vision.description(), "Vision input — ability to process images");
+    assert_eq!(
+        Capability::Streaming.description(),
+        "Streaming responses via Server-Sent Events"
+    );
+    assert_eq!(
+        Capability::ToolCalling.description(),
+        "Tool/function calling capabilities"
+    );
+    assert_eq!(
+        Capability::Vision.description(),
+        "Vision input — ability to process images"
+    );
 }

@@ -61,7 +61,9 @@ impl FromStr for Capability {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "streaming" => Ok(Capability::Streaming),
-            "structured_output" | "structured-output" | "json_output" => Ok(Capability::StructuredOutput),
+            "structured_output" | "structured-output" | "json_output" => {
+                Ok(Capability::StructuredOutput)
+            }
             "tool_calling" | "tool-calling" | "function_calling" => Ok(Capability::ToolCalling),
             "vision" | "image_input" => Ok(Capability::Vision),
             "reasoning" | "chain_of_thought" => Ok(Capability::Reasoning),
@@ -112,11 +114,17 @@ impl CapabilitySet {
 
     pub fn intersection(&self, other: &CapabilitySet) -> CapabilitySet {
         CapabilitySet {
-            capabilities: self.capabilities.intersection(&other.capabilities).copied().collect(),
+            capabilities: self
+                .capabilities
+                .intersection(&other.capabilities)
+                .copied()
+                .collect(),
         }
     }
 
-    pub fn required_for_request(request: &crate::ai_runtime::request::ModelRequest) -> Vec<Capability> {
+    pub fn required_for_request(
+        request: &crate::ai_runtime::request::ModelRequest,
+    ) -> Vec<Capability> {
         let mut caps = Vec::new();
         if request.stream {
             caps.push(Capability::Streaming);
@@ -145,7 +153,10 @@ pub struct CapabilityNegotiation {
 }
 
 impl CapabilityNegotiation {
-    pub fn new(request: &crate::ai_runtime::request::ModelRequest, provider_caps: &CapabilitySet) -> Self {
+    pub fn new(
+        request: &crate::ai_runtime::request::ModelRequest,
+        provider_caps: &CapabilitySet,
+    ) -> Self {
         let required = CapabilitySet::required_for_request(request);
         let negotiated: Vec<Capability> = required
             .iter()
@@ -178,7 +189,11 @@ pub struct SupportedCapabilities {
 }
 
 impl SupportedCapabilities {
-    pub fn new(model_id: impl Into<String>, provider_type: impl Into<String>, caps: CapabilitySet) -> Self {
+    pub fn new(
+        model_id: impl Into<String>,
+        provider_type: impl Into<String>,
+        caps: CapabilitySet,
+    ) -> Self {
         SupportedCapabilities {
             model_id: model_id.into(),
             provider_type: provider_type.into(),

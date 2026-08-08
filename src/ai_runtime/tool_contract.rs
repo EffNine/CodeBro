@@ -9,7 +9,11 @@ pub struct ToolDefinition {
 }
 
 impl ToolDefinition {
-    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: serde_json::Value) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
         ToolDefinition {
             r#type: "function".to_string(),
             function: FunctionDefinition {
@@ -22,7 +26,8 @@ impl ToolDefinition {
 
     pub fn with_strict(mut self, strict: bool) -> Self {
         if strict {
-            self.function.parameters
+            self.function
+                .parameters
                 .as_object_mut()
                 .unwrap()
                 .insert("strict".to_string(), serde_json::Value::Bool(true));
@@ -108,12 +113,8 @@ impl ToolArgument {
 /// The result of executing a tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolResult {
-    Success {
-        content: String,
-    },
-    Error {
-        error: String,
-    },
+    Success { content: String },
+    Error { error: String },
 }
 
 impl fmt::Display for ToolResult {

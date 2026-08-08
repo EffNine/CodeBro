@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt;
 
-use super::types::{AIRRuntimeError, AIRRuntimeResult};
 use super::response::{ModelResponse, ResponseDelta};
+use super::types::{AIRRuntimeError, AIRRuntimeResult};
 
 /// A single segment of a streaming response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,9 +47,7 @@ pub enum StreamEvent {
         total_duration_ms: u64,
     },
     /// Stream encountered an error
-    Error {
-        error: String,
-    },
+    Error { error: String },
     /// Stream was cancelled
     Cancelled,
 }
@@ -85,8 +83,15 @@ impl fmt::Display for StreamEvent {
                     write!(f, "Segment({})", segment.index)
                 }
             }
-            StreamEvent::Complete { total_tokens, total_duration_ms } => {
-                write!(f, "Complete(tokens={}, duration={}ms)", total_tokens, total_duration_ms)
+            StreamEvent::Complete {
+                total_tokens,
+                total_duration_ms,
+            } => {
+                write!(
+                    f,
+                    "Complete(tokens={}, duration={}ms)",
+                    total_tokens, total_duration_ms
+                )
             }
             StreamEvent::Error { error } => {
                 write!(f, "Error({})", error)
@@ -128,7 +133,8 @@ impl StreamingOutput {
     }
 
     pub fn collect_content(&self) -> String {
-        self.segments.iter()
+        self.segments
+            .iter()
             .filter_map(|s| s.content_fragment())
             .collect()
     }
@@ -183,7 +189,10 @@ impl StreamPipeline {
                 StreamEvent::Segment(segment) => {
                     output.append(segment);
                 }
-                StreamEvent::Complete { total_tokens, total_duration_ms } => {
+                StreamEvent::Complete {
+                    total_tokens,
+                    total_duration_ms,
+                } => {
                     output.total_tokens = total_tokens;
                     output.duration_ms = total_duration_ms;
                     output.finished = true;

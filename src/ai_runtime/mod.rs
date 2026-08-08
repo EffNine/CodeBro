@@ -15,11 +15,9 @@ pub use capabilities::{Capability, CapabilityNegotiation, CapabilitySet, Support
 pub use diagnostics::{DiagnosticEvent, DiagnosticLevel, RuntimeDiagnostics};
 pub use request::{MessageRole, ModelRequest};
 pub use response::{Choice, ModelResponse, ResponseUsage};
-pub use router::{ModelCandidate, RuntimeRouter, RoutingConfig, RoutingDecision};
+pub use router::{ModelCandidate, RoutingConfig, RoutingDecision, RuntimeRouter};
 pub use stream::{StreamEvent, StreamPipeline, StreamSegment, StreamingOutput};
-pub use structured_output::{
-    JsonSchema, StructuredOutputSchema, StructuredOutputValidator,
-};
+pub use structured_output::{JsonSchema, StructuredOutputSchema, StructuredOutputValidator};
 pub use tool_contract::{ToolArgument, ToolDefinition, ToolResult as ToolResultData, ToolSchema};
 pub use types::{
     AIRRuntimeError, AIRRuntimeResult, CostEstimate, HealthStatus, ModelId, Priority, ProviderType,

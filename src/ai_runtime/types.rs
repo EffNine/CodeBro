@@ -140,7 +140,12 @@ pub struct CostEstimate {
 }
 
 impl CostEstimate {
-    pub fn estimate(&self, input_tokens: usize, output_tokens: usize, cache_read_tokens: Option<usize>) -> f64 {
+    pub fn estimate(
+        &self,
+        input_tokens: usize,
+        output_tokens: usize,
+        cache_read_tokens: Option<usize>,
+    ) -> f64 {
         let cache_tokens = cache_read_tokens.unwrap_or(0) as f64;
         let input_cost = (input_tokens as f64 / 1_000_000.0) * self.input_cost_per_million;
         let output_cost = (output_tokens as f64 / 1_000_000.0) * self.output_cost_per_million;
@@ -218,20 +223,33 @@ impl fmt::Display for AIRRuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AIRRuntimeError::NoSuitableProvider(msg) => write!(f, "No suitable provider: {}", msg),
-            AIRRuntimeError::CapabilityMismatch { requested, available } => {
-                write!(f, "Capability mismatch: requested {:?}, available {:?}", requested, available)
+            AIRRuntimeError::CapabilityMismatch {
+                requested,
+                available,
+            } => {
+                write!(
+                    f,
+                    "Capability mismatch: requested {:?}, available {:?}",
+                    requested, available
+                )
             }
             AIRRuntimeError::InvalidRequest(msg) => write!(f, "Invalid request: {}", msg),
             AIRRuntimeError::ResponseParseError(msg) => write!(f, "Response parse error: {}", msg),
-            AIRRuntimeError::StructuredOutputValidation(msg) => write!(f, "Structured output validation failed: {}", msg),
-            AIRRuntimeError::ToolContractViolation(msg) => write!(f, "Tool contract violation: {}", msg),
+            AIRRuntimeError::StructuredOutputValidation(msg) => {
+                write!(f, "Structured output validation failed: {}", msg)
+            }
+            AIRRuntimeError::ToolContractViolation(msg) => {
+                write!(f, "Tool contract violation: {}", msg)
+            }
             AIRRuntimeError::RoutingError(msg) => write!(f, "Routing error: {}", msg),
             AIRRuntimeError::DiagnosticError(msg) => write!(f, "Diagnostic error: {}", msg),
             AIRRuntimeError::StreamingError(msg) => write!(f, "Streaming error: {}", msg),
             AIRRuntimeError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
             AIRRuntimeError::JsonParseError(msg) => write!(f, "JSON parse error: {}", msg),
             AIRRuntimeError::CapabilityUnknown(cap) => write!(f, "Unknown capability: {}", cap),
-            AIRRuntimeError::InvalidMessageRole(role) => write!(f, "Invalid message role: {}", role),
+            AIRRuntimeError::InvalidMessageRole(role) => {
+                write!(f, "Invalid message role: {}", role)
+            }
             AIRRuntimeError::Generic(msg) => write!(f, "Runtime error: {}", msg),
         }
     }

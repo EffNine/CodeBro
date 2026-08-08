@@ -56,25 +56,76 @@ pub enum DiagnosticEvent {
 impl fmt::Display for DiagnosticEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DiagnosticEvent::ModelSelected { event_id, model_id, reason, .. } => {
-                write!(f, "[{}] Router selected model {}: {}", event_id, model_id, reason)
+            DiagnosticEvent::ModelSelected {
+                event_id,
+                model_id,
+                reason,
+                ..
+            } => {
+                write!(
+                    f,
+                    "[{}] Router selected model {}: {}",
+                    event_id, model_id, reason
+                )
             }
-            DiagnosticEvent::CapabilityNegotiationFailed { event_id, model_id, missing_capabilities, .. } => {
-                write!(f, "[{}] Capability negotiation failed for {}: missing {:?}", event_id, model_id, missing_capabilities)
+            DiagnosticEvent::CapabilityNegotiationFailed {
+                event_id,
+                model_id,
+                missing_capabilities,
+                ..
+            } => {
+                write!(
+                    f,
+                    "[{}] Capability negotiation failed for {}: missing {:?}",
+                    event_id, model_id, missing_capabilities
+                )
             }
-            DiagnosticEvent::StreamingPipelineStarted { event_id, model_id, .. } => {
-                write!(f, "[{}] Streaming pipeline started for {}", event_id, model_id)
+            DiagnosticEvent::StreamingPipelineStarted {
+                event_id, model_id, ..
+            } => {
+                write!(
+                    f,
+                    "[{}] Streaming pipeline started for {}",
+                    event_id, model_id
+                )
             }
-            DiagnosticEvent::StreamingPipelineStopped { event_id, model_id, tokens_emitted, .. } => {
-                write!(f, "[{}] Streaming pipeline stopped for {} (tokens: {})", event_id, model_id, tokens_emitted)
+            DiagnosticEvent::StreamingPipelineStopped {
+                event_id,
+                model_id,
+                tokens_emitted,
+                ..
+            } => {
+                write!(
+                    f,
+                    "[{}] Streaming pipeline stopped for {} (tokens: {})",
+                    event_id, model_id, tokens_emitted
+                )
             }
-            DiagnosticEvent::StructuredOutputValidationFailed { event_id, model_id, errors, .. } => {
-                write!(f, "[{}] Structured output validation failed for {}: {:?}", event_id, model_id, errors)
+            DiagnosticEvent::StructuredOutputValidationFailed {
+                event_id,
+                model_id,
+                errors,
+                ..
+            } => {
+                write!(
+                    f,
+                    "[{}] Structured output validation failed for {}: {:?}",
+                    event_id, model_id, errors
+                )
             }
-            DiagnosticEvent::ToolCallCreated { event_id, tool_name, .. } => {
+            DiagnosticEvent::ToolCallCreated {
+                event_id,
+                tool_name,
+                ..
+            } => {
                 write!(f, "[{}] Tool call created: {}", event_id, tool_name)
             }
-            DiagnosticEvent::DiagnosticLevel { event_id, level, message, .. } => {
+            DiagnosticEvent::DiagnosticLevel {
+                event_id,
+                level,
+                message,
+                ..
+            } => {
                 write!(f, "[{}] [{}] {}", event_id, level, message)
             }
         }
@@ -132,9 +183,45 @@ impl RuntimeDiagnostics {
     }
 
     pub fn summary(&self) -> DiagnosticSummary {
-        let info_count = self.events.iter().filter(|e| matches!(e, DiagnosticEvent::DiagnosticLevel { level: DiagnosticLevel::Info, .. })).count();
-        let warn_count = self.events.iter().filter(|e| matches!(e, DiagnosticEvent::DiagnosticLevel { level: DiagnosticLevel::Warning, .. })).count();
-        let error_count = self.events.iter().filter(|e| matches!(e, DiagnosticEvent::DiagnosticLevel { level: DiagnosticLevel::Error, .. })).count();
+        let info_count = self
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    DiagnosticEvent::DiagnosticLevel {
+                        level: DiagnosticLevel::Info,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let warn_count = self
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    DiagnosticEvent::DiagnosticLevel {
+                        level: DiagnosticLevel::Warning,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let error_count = self
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    DiagnosticEvent::DiagnosticLevel {
+                        level: DiagnosticLevel::Error,
+                        ..
+                    }
+                )
+            })
+            .count();
         DiagnosticSummary {
             total_events: self.events.len(),
             info: info_count,

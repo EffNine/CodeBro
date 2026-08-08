@@ -32,9 +32,7 @@ impl StructuredOutputSchema {
     }
 
     pub fn is_valid(&self) -> bool {
-        !self.name.is_empty()
-            && !self.description.is_empty()
-            && self.properties.is_object()
+        !self.name.is_empty() && !self.description.is_empty() && self.properties.is_object()
     }
 
     pub fn validate_json(&self, json: &serde_json::Value) -> Vec<String> {
@@ -108,71 +106,157 @@ pub enum JsonSchema {
 impl JsonSchema {
     pub fn to_value(&self) -> serde_json::Value {
         match self {
-            JsonSchema::StringSchema { description, pattern, enum_values } => {
+            JsonSchema::StringSchema {
+                description,
+                pattern,
+                enum_values,
+            } => {
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("string".to_string()));
-                map.insert("description".to_string(), serde_json::Value::String(description.clone()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("string".to_string()),
+                );
+                map.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(description.clone()),
+                );
                 if let Some(pat) = pattern {
-                    map.insert("pattern".to_string(), serde_json::Value::String(pat.clone()));
+                    map.insert(
+                        "pattern".to_string(),
+                        serde_json::Value::String(pat.clone()),
+                    );
                 }
                 if let Some(enums) = enum_values {
                     map.insert("enum".to_string(), serde_json::to_value(enums).unwrap());
                 }
                 serde_json::Value::Object(map)
             }
-            JsonSchema::NumberSchema { description, minimum, maximum } => {
+            JsonSchema::NumberSchema {
+                description,
+                minimum,
+                maximum,
+            } => {
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("number".to_string()));
-                map.insert("description".to_string(), serde_json::Value::String(description.clone()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("number".to_string()),
+                );
+                map.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(description.clone()),
+                );
                 if let Some(min) = minimum {
-                    map.insert("minimum".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(*min as f64).unwrap_or_else(|| serde_json::Number::from(0))));
+                    map.insert(
+                        "minimum".to_string(),
+                        serde_json::Value::Number(
+                            serde_json::Number::from_f64(*min as f64)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ),
+                    );
                 }
                 if let Some(max) = maximum {
-                    map.insert("maximum".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(*max as f64).unwrap_or_else(|| serde_json::Number::from(0))));
+                    map.insert(
+                        "maximum".to_string(),
+                        serde_json::Value::Number(
+                            serde_json::Number::from_f64(*max as f64)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ),
+                    );
                 }
                 serde_json::Value::Object(map)
             }
-            JsonSchema::IntegerSchema { description, minimum, maximum } => {
+            JsonSchema::IntegerSchema {
+                description,
+                minimum,
+                maximum,
+            } => {
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("integer".to_string()));
-                map.insert("description".to_string(), serde_json::Value::String(description.clone()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("integer".to_string()),
+                );
+                map.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(description.clone()),
+                );
                 if let Some(min) = minimum {
-                    map.insert("minimum".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(*min as f64).unwrap_or_else(|| serde_json::Number::from(0))));
+                    map.insert(
+                        "minimum".to_string(),
+                        serde_json::Value::Number(
+                            serde_json::Number::from_f64(*min as f64)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ),
+                    );
                 }
                 if let Some(max) = maximum {
-                    map.insert("maximum".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(*max as f64).unwrap_or_else(|| serde_json::Number::from(0))));
+                    map.insert(
+                        "maximum".to_string(),
+                        serde_json::Value::Number(
+                            serde_json::Number::from_f64(*max as f64)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ),
+                    );
                 }
                 serde_json::Value::Object(map)
             }
             JsonSchema::BooleanSchema { description } => {
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("boolean".to_string()));
-                map.insert("description".to_string(), serde_json::Value::String(description.clone()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("boolean".to_string()),
+                );
+                map.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(description.clone()),
+                );
                 serde_json::Value::Object(map)
             }
             JsonSchema::ArraySchema { description, items } => {
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("array".to_string()));
-                map.insert("description".to_string(), serde_json::Value::String(description.clone()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("array".to_string()),
+                );
+                map.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(description.clone()),
+                );
                 map.insert("items".to_string(), items.to_value());
                 serde_json::Value::Object(map)
             }
-            JsonSchema::ObjectSchema { description, properties, required } => {
+            JsonSchema::ObjectSchema {
+                description,
+                properties,
+                required,
+            } => {
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("object".to_string()));
-                map.insert("description".to_string(), serde_json::Value::String(description.clone()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("object".to_string()),
+                );
+                map.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(description.clone()),
+                );
 
-                let props: serde_json::Map<String, serde_json::Value> = properties.iter()
+                let props: serde_json::Map<String, serde_json::Value> = properties
+                    .iter()
                     .map(|(k, v)| (k.clone(), v.to_value()))
                     .collect();
                 map.insert("properties".to_string(), serde_json::Value::Object(props));
 
-                map.insert("required".to_string(), serde_json::to_value(required).unwrap());
+                map.insert(
+                    "required".to_string(),
+                    serde_json::to_value(required).unwrap(),
+                );
                 serde_json::Value::Object(map)
             }
             JsonSchema::AnySchema { description } => {
                 let mut map = serde_json::Map::new();
-                map.insert("description".to_string(), serde_json::Value::String(description.clone()));
+                map.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(description.clone()),
+                );
                 serde_json::Value::Object(map)
             }
         }
@@ -253,7 +337,8 @@ impl StructuredOutputBuilder {
     }
 
     pub fn build(self) -> StructuredOutputSchema {
-        let properties: serde_json::Map<String, serde_json::Value> = self.properties
+        let properties: serde_json::Map<String, serde_json::Value> = self
+            .properties
             .into_iter()
             .map(|(k, v)| (k, v.to_value()))
             .collect();
@@ -276,11 +361,19 @@ impl StructuredOutputValidator {
         StructuredOutputValidator
     }
 
-    pub fn validate(&self, schema: &StructuredOutputSchema, json: &serde_json::Value) -> Vec<String> {
+    pub fn validate(
+        &self,
+        schema: &StructuredOutputSchema,
+        json: &serde_json::Value,
+    ) -> Vec<String> {
         schema.validate_json(json)
     }
 
-    pub fn validate_strict(&self, schema: &StructuredOutputSchema, json: &serde_json::Value) -> Result<(), Vec<String>> {
+    pub fn validate_strict(
+        &self,
+        schema: &StructuredOutputSchema,
+        json: &serde_json::Value,
+    ) -> Result<(), Vec<String>> {
         let errors = self.validate(schema, json);
         if errors.is_empty() {
             Ok(())

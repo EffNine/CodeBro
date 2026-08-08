@@ -139,12 +139,17 @@ impl ModelResponse {
 
     /// Get the primary content from the first choice.
     pub fn content(&self) -> Option<&str> {
-        self.choices.first().and_then(|c| c.message.content.as_deref())
+        self.choices
+            .first()
+            .and_then(|c| c.message.content.as_deref())
     }
 
     /// Get all tool calls from the response.
     pub fn tool_calls(&self) -> &[super::request::ToolCall] {
-        self.choices.first().map(|c| c.message.tool_calls.as_slice()).unwrap_or(&[])
+        self.choices
+            .first()
+            .map(|c| c.message.tool_calls.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Check if this response contains any tool calls.
@@ -154,21 +159,25 @@ impl ModelResponse {
 
     /// Serialize this response to JSON.
     pub fn to_json(&self) -> AIRRuntimeResult<serde_json::Value> {
-        serde_json::to_value(self)
-            .map_err(|e| AIRRuntimeError::SerializationError(e.to_string()))
+        serde_json::to_value(self).map_err(|e| AIRRuntimeError::SerializationError(e.to_string()))
     }
 
     /// Deserialize a response from JSON.
     pub fn from_json(json: &str) -> AIRRuntimeResult<Self> {
-        serde_json::from_str(json)
-            .map_err(|e| AIRRuntimeError::JsonParseError(e.to_string()))
+        serde_json::from_str(json).map_err(|e| AIRRuntimeError::JsonParseError(e.to_string()))
     }
 }
 
 impl fmt::Display for ModelResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let content = self.content().unwrap_or("");
-        write!(f, "ModelResponse(id={}, model={}, tokens={}, content_len={})",
-            self.id, self.model_id, self.usage.total_tokens, content.len())
+        write!(
+            f,
+            "ModelResponse(id={}, model={}, tokens={}, content_len={})",
+            self.id,
+            self.model_id,
+            self.usage.total_tokens,
+            content.len()
+        )
     }
 }
