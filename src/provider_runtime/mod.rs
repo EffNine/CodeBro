@@ -16,6 +16,7 @@
 //! - Failover Policy
 //! - Cost Tracking
 //! - Provider Diagnostics
+//! - Circuit Breaker (P17.0)
 //!
 //! # What Provider Runtime does NOT own
 //!
@@ -28,24 +29,39 @@
 //! Cost → Priority → Registration Order. Provider name never influences
 //! routing.
 //!
+//! # Circuit Breaker (P17.0)
+//!
+//! Every provider owns an independent circuit breaker. When the failure
+//! threshold is reached the breaker opens and requests are rejected
+//! immediately. After the cooldown expires the breaker enters half-open
+//! and probes recovery.
+//!
 //! # Modules
 //!
 //! ```text
 //! provider_runtime
-//!   ├─ types        — ProviderId, RouteRequest, HealthState, cost, errors
-//!   ├─ capabilities  — Capability, CapabilitySet, CapabilityMatch
-//!   ├─ provider      — Provider contract + RegisteredProvider
-//!   ├─ registry      — Register / unregister / lookup (deterministic)
-//!   ├─ discovery     — Descriptive queries over providers
-//!   ├─ health        — Observational health management
-//!   ├─ router        — Deterministic selection (the 6-stage pipeline)
-//!   ├─ retry         — Immediate / exponential backoff, budget
-//!   ├─ failover      — Primary → Secondary → Fallback chains
-//!   ├─ cost          — Observational cost & latency tracking
-//!   └─ diagnostics   — Selection, mismatch, retry, failover, stats
+//!   ├─ types           — ProviderId, RouteRequest, HealthState, cost, errors
+//!   ├─ capabilities     — Capability, CapabilitySet, CapabilityMatch
+//!   ├─ provider         — Provider contract + RegisteredProvider
+//!   ├─ registry         — Register / unregister / lookup (deterministic)
+//!   ├─ discovery        — Descriptive queries over providers
+//!   ├─ health           — Observational health management
+//!   ├─ router           — Deterministic selection (the 6-stage pipeline)
+//!   ├─ retry            — Immediate / exponential backoff, budget
+//!   ├─ failover         — Primary → Secondary → Fallback chains
+//!   ├─ cost             — Observational cost & latency tracking
+//!   ├─ diagnostics      — Selection, mismatch, retry, failover, stats
+//!   ├─ circuit_breaker  — Closed → Open → HalfOpen state machine
+//!   ├─ circuit_breaker_registry — Per-provider breaker management
+//!   ├─ circuit_breaker_metrics  — Observability integration
+//!   └─ circuit_breaker_events   — CB-specific diagnostic events
 //! ```
 
 pub mod capabilities;
+pub mod circuit_breaker;
+pub mod circuit_breaker_events;
+pub mod circuit_breaker_metrics;
+pub mod circuit_breaker_registry;
 pub mod cost;
 pub mod diagnostics;
 pub mod discovery;
@@ -55,12 +71,19 @@ pub mod provider;
 pub mod registry;
 pub mod retry;
 pub mod router;
+pub mod routing;
 pub mod types;
 
 #[cfg(test)]
 mod tests;
 
 pub use capabilities::{Capability, CapabilityMatch, CapabilitySet};
+pub use circuit_breaker::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerMetrics, CircuitBreakerState,
+};
+pub use circuit_breaker_events::{CircuitBreakerEvent, ProviderRuntimeEvent};
+pub use circuit_breaker_metrics::{CircuitBreakerMetricsCollector, CircuitBreakerMetricsView};
+pub use circuit_breaker_registry::CircuitBreakerRegistry;
 pub use cost::{CostDashboard, CostTracker, ProviderCostStats, TokenUsage};
 pub use diagnostics::{DiagnosticsSummary, ProviderDiagnostics, ProviderEvent};
 pub use discovery::{DiscoveryQuery, DiscoveryResult, ProviderDiscovery};
@@ -70,6 +93,10 @@ pub use provider::{Provider, RegisteredProvider};
 pub use registry::ProviderRegistry;
 pub use retry::{BackoffStrategy, RetryController, RetryPolicy, RetrySchedule};
 pub use router::{ProviderRouter, Rejection, RejectionReason, RouterDecision, RoutingPolicy};
+pub use routing::{
+    IntelligentProviderRouter, ProviderProfile, ProviderRoutingConfig, ProviderRoutingDecision,
+    ProviderRoutingScore, RoutingPreferences, RoutingStrategy, RoutingStrategyConfig,
+};
 pub use types::{
     CostObservation, HealthState, Outcome, Priority, ProviderCost, ProviderId,
     ProviderRuntimeError, ProviderRuntimeResult, RouteRequest,
@@ -90,6 +117,7 @@ pub struct ProviderRuntime {
     cost: CostTracker,
     diagnostics: ProviderDiagnostics,
     retry_policy: RetryPolicy,
+    circuit_breakers: CircuitBreakerRegistry,
     correlation_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -109,6 +137,7 @@ impl ProviderRuntime {
             cost: CostTracker::new(),
             diagnostics: ProviderDiagnostics::new(),
             retry_policy: RetryPolicy::default(),
+            circuit_breakers: CircuitBreakerRegistry::new(),
             correlation_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -137,6 +166,10 @@ impl ProviderRuntime {
         &self.diagnostics
     }
 
+    pub fn circuit_breakers(&self) -> &CircuitBreakerRegistry {
+        &self.circuit_breakers
+    }
+
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
         self
@@ -151,19 +184,34 @@ impl ProviderRuntime {
     }
 
     pub fn register_value(&self, p: RegisteredProvider) -> ProviderRuntimeResult<()> {
-        self.registry.register_value(p)
+        self.registry.register_value(p.clone())?;
+        // Ensure a circuit breaker exists for this provider.
+        self.circuit_breakers.get_or_create(&p.id);
+        Ok(())
     }
 
     /// Deterministically select a provider for a request.
+    ///
+    /// If the selected provider's circuit breaker is open, returns
+    /// `CircuitBreakerOpen` instead of proceeding to the provider.
     pub fn select(&self, request: &RouteRequest) -> ProviderRuntimeResult<RouterDecision> {
         let corr = self.next_correlation();
         let decision = self.router.resolve(request)?;
         let selected = &decision.provider.id;
-        self.diagnostics.record_selected(
-            selected,
-            "deterministic pick",
-            &corr,
-        );
+
+        // Check circuit breaker before allowing the request through.
+        if let Some(cb) = self.circuit_breakers.get(selected) {
+            if !cb.can_execute() {
+                self.diagnostics.record_breaker_rejected(selected, &corr);
+                return Err(ProviderRuntimeError::CircuitBreakerOpen {
+                    provider: selected.clone(),
+                    state: cb.state(),
+                });
+            }
+        }
+
+        self.diagnostics
+            .record_selected(selected, "deterministic pick", &corr);
         for r in &decision.rejected {
             self.diagnostics
                 .record_rejected(&r.provider, &format!("{:?}", r.reason), &corr);
@@ -172,12 +220,58 @@ impl ProviderRuntime {
     }
 
     /// Report a successful provider call (observational).
+    ///
+    /// Updates health, cost, and circuit breaker state. If the breaker
+    /// transitions from half-open to closed, emits the appropriate
+    /// diagnostics.
     pub fn report_success(&self, provider: &ProviderId, tokens: TokenUsage, cost: ProviderCost) {
         let estimated = cost.estimate(tokens.input, tokens.output);
-        self.health.report_success(provider, std::time::Instant::now());
+        self.health
+            .report_success(provider, std::time::Instant::now());
         self.diagnostics.record_cost(provider, estimated);
+
+        if let Some(cb) = self.circuit_breakers.get(provider) {
+            let prev = cb.state();
+            cb.record_success();
+            let next = cb.state();
+            if prev == CircuitBreakerState::HalfOpen && next == CircuitBreakerState::Closed {
+                let corr = self.next_correlation();
+                self.diagnostics.record_breaker_closed(provider, &corr);
+                self.diagnostics
+                    .record_breaker_recovery_succeeded(provider, &corr);
+            }
+        }
+
         let _ = tokens;
         let _ = cost;
+    }
+
+    /// Report a failed provider call (observational).
+    ///
+    /// Updates health, cost, and circuit breaker state. If the breaker
+    /// transitions to open, emits the appropriate diagnostics.
+    pub fn report_failure(&self, provider: &ProviderId) {
+        self.health
+            .report_failure(provider, std::time::Instant::now());
+
+        if let Some(cb) = self.circuit_breakers.get(provider) {
+            let prev = cb.state();
+            cb.record_failure();
+            let next = cb.state();
+            match (prev, next) {
+                (CircuitBreakerState::Closed, CircuitBreakerState::Open) => {
+                    let corr = self.next_correlation();
+                    self.diagnostics
+                        .record_breaker_opened(provider, cb.failure_count(), &corr);
+                }
+                (CircuitBreakerState::HalfOpen, CircuitBreakerState::Open) => {
+                    let corr = self.next_correlation();
+                    self.diagnostics
+                        .record_breaker_recovery_failed(provider, &corr);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Compute a retry schedule for a provider after N consumed attempts.
@@ -196,9 +290,7 @@ impl ProviderRuntime {
 
     fn next_correlation(&self) -> String {
         use std::sync::atomic::Ordering;
-        let n = self
-            .correlation_counter
-            .fetch_add(1, Ordering::Relaxed);
+        let n = self.correlation_counter.fetch_add(1, Ordering::Relaxed);
         format!("req-{n}")
     }
 }

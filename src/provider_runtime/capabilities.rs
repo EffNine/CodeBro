@@ -174,7 +174,11 @@ impl CapabilitySet {
 
     pub fn intersection(&self, other: &CapabilitySet) -> CapabilitySet {
         CapabilitySet {
-            capabilities: self.capabilities.intersection(&other.capabilities).copied().collect(),
+            capabilities: self
+                .capabilities
+                .intersection(&other.capabilities)
+                .copied()
+                .collect(),
         }
     }
 
@@ -285,11 +289,14 @@ mod tests {
     #[test]
     fn test_capability_match_compatible() {
         let req = vec![Capability::Streaming, Capability::ToolCalling];
-        let m = CapabilityMatch::new(&req, &set(&[
-            Capability::Streaming,
-            Capability::ToolCalling,
-            Capability::Vision,
-        ]));
+        let m = CapabilityMatch::new(
+            &req,
+            &set(&[
+                Capability::Streaming,
+                Capability::ToolCalling,
+                Capability::Vision,
+            ]),
+        );
         assert!(m.compatible);
         assert!(m.missing.is_empty());
         assert_eq!(m.satisfied.len(), 2);
@@ -333,8 +340,14 @@ mod tests {
 
     #[test]
     fn test_capability_from_str_case_insensitive() {
-        assert_eq!("STREAMING".parse::<Capability>().unwrap(), Capability::Streaming);
-        assert_eq!("Tool-Calling".parse::<Capability>().unwrap(), Capability::ToolCalling);
+        assert_eq!(
+            "STREAMING".parse::<Capability>().unwrap(),
+            Capability::Streaming
+        );
+        assert_eq!(
+            "Tool-Calling".parse::<Capability>().unwrap(),
+            Capability::ToolCalling
+        );
     }
 
     #[test]

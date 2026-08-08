@@ -19,7 +19,9 @@ use super::capabilities::{Capability, CapabilityMatch, CapabilitySet};
 use super::health::HealthManager;
 use super::provider::RegisteredProvider;
 use super::registry::ProviderRegistry;
-use super::types::{HealthState, ProviderId, ProviderRuntimeError, ProviderRuntimeResult, RouteRequest};
+use super::types::{
+    HealthState, ProviderId, ProviderRuntimeError, ProviderRuntimeResult, RouteRequest,
+};
 
 /// Routing policy — runtime configuration, not provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,7 +151,9 @@ impl ProviderRouter {
             let state = self.health.health(&p.id);
             let selectable = match state {
                 HealthState::Healthy | HealthState::Recovering => true,
-                HealthState::Degraded => request.allow_degraded || self.policy.allow_degraded_fallback,
+                HealthState::Degraded => {
+                    request.allow_degraded || self.policy.allow_degraded_fallback
+                }
                 HealthState::Unavailable | HealthState::Cooldown => !self.policy.skip_unhealthy,
             };
             if !selectable {
@@ -233,8 +237,17 @@ impl ProviderRouter {
                         .partial_cmp(&b.provider.cost.routing_cost())
                         .unwrap_or(std::cmp::Ordering::Equal),
                 )
-                .then(b.provider.priority.score().cmp(&a.provider.priority.score()))
-                .then(a.provider.registration_seq.cmp(&b.provider.registration_seq))
+                .then(
+                    b.provider
+                        .priority
+                        .score()
+                        .cmp(&a.provider.priority.score()),
+                )
+                .then(
+                    a.provider
+                        .registration_seq
+                        .cmp(&b.provider.registration_seq),
+                )
         });
         out
     }
@@ -257,11 +270,16 @@ mod tests {
     use crate::provider_runtime::types::{Priority, ProviderCost};
 
     fn rec(id: &str, caps: &[Capability], cost: f64, priority: Priority) -> RegisteredProvider {
-        RegisteredProvider::new(id, CapabilitySet::new(caps.iter().copied()), ProviderCost {
-            input_per_million: cost,
-            output_per_million: cost,
-            cache_read_per_million: None,
-        }, priority)
+        RegisteredProvider::new(
+            id,
+            CapabilitySet::new(caps.iter().copied()),
+            ProviderCost {
+                input_per_million: cost,
+                output_per_million: cost,
+                cache_read_per_million: None,
+            },
+            priority,
+        )
     }
 
     fn healthy_router() -> ProviderRouter {
@@ -278,17 +296,32 @@ mod tests {
     #[test]
     fn test_resolve_selects_capability_match() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("novision", &[Capability::Streaming], 1.0, Priority::Normal)).unwrap();
-        reg.register_value(rec("vision", &[Capability::Streaming, Capability::Vision], 5.0, Priority::Normal)).unwrap();
+        reg.register_value(rec(
+            "novision",
+            &[Capability::Streaming],
+            1.0,
+            Priority::Normal,
+        ))
+        .unwrap();
+        reg.register_value(rec(
+            "vision",
+            &[Capability::Streaming, Capability::Vision],
+            5.0,
+            Priority::Normal,
+        ))
+        .unwrap();
         let r = ProviderRouter::new(reg, HealthManager::new());
-        let decision = r.resolve(&RouteRequest::new().with_capabilities(vec![Capability::Vision])).unwrap();
+        let decision = r
+            .resolve(&RouteRequest::new().with_capabilities(vec![Capability::Vision]))
+            .unwrap();
         assert_eq!(decision.provider.id.as_str(), "vision");
     }
 
     #[test]
     fn test_resolve_rejects_capability_mismatch() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("only", &[Capability::Streaming], 1.0, Priority::Normal)).unwrap();
+        reg.register_value(rec("only", &[Capability::Streaming], 1.0, Priority::Normal))
+            .unwrap();
         let r = ProviderRouter::new(reg, HealthManager::new());
         let err = r
             .resolve(&RouteRequest::new().with_capabilities(vec![Capability::Audio]))
@@ -299,8 +332,20 @@ mod tests {
     #[test]
     fn test_resolve_lower_cost_wins() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("cheap", &[Capability::Streaming], 1.0, Priority::Normal)).unwrap();
-        reg.register_value(rec("pricey", &[Capability::Streaming], 50.0, Priority::Normal)).unwrap();
+        reg.register_value(rec(
+            "cheap",
+            &[Capability::Streaming],
+            1.0,
+            Priority::Normal,
+        ))
+        .unwrap();
+        reg.register_value(rec(
+            "pricey",
+            &[Capability::Streaming],
+            50.0,
+            Priority::Normal,
+        ))
+        .unwrap();
         let r = ProviderRouter::new(reg, HealthManager::new());
         let d = r.resolve(&RouteRequest::new()).unwrap();
         assert_eq!(d.provider.id.as_str(), "cheap");
@@ -309,8 +354,20 @@ mod tests {
     #[test]
     fn test_resolve_higher_priority_wins_at_equal_cost() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("normal", &[Capability::Streaming], 10.0, Priority::Normal)).unwrap();
-        reg.register_value(rec("critical", &[Capability::Streaming], 10.0, Priority::Critical)).unwrap();
+        reg.register_value(rec(
+            "normal",
+            &[Capability::Streaming],
+            10.0,
+            Priority::Normal,
+        ))
+        .unwrap();
+        reg.register_value(rec(
+            "critical",
+            &[Capability::Streaming],
+            10.0,
+            Priority::Critical,
+        ))
+        .unwrap();
         let r = ProviderRouter::new(reg, HealthManager::new());
         let d = r.resolve(&RouteRequest::new()).unwrap();
         assert_eq!(d.provider.id.as_str(), "critical");
@@ -319,8 +376,20 @@ mod tests {
     #[test]
     fn test_resolve_registration_order_is_tiebreaker() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("later", &[Capability::Streaming], 5.0, Priority::Normal)).unwrap();
-        reg.register_value(rec("earlier", &[Capability::Streaming], 5.0, Priority::Normal)).unwrap();
+        reg.register_value(rec(
+            "later",
+            &[Capability::Streaming],
+            5.0,
+            Priority::Normal,
+        ))
+        .unwrap();
+        reg.register_value(rec(
+            "earlier",
+            &[Capability::Streaming],
+            5.0,
+            Priority::Normal,
+        ))
+        .unwrap();
         let r = ProviderRouter::new(reg, HealthManager::new());
         let d = r.resolve(&RouteRequest::new()).unwrap();
         // Earlier registration wins on the final tiebreak.
@@ -330,12 +399,22 @@ mod tests {
     #[test]
     fn test_resolve_skips_cooldown() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("down", &[Capability::Streaming], 1.0, Priority::Critical)).unwrap();
-        reg.register_value(rec("up", &[Capability::Streaming], 2.0, Priority::Normal)).unwrap();
+        reg.register_value(rec(
+            "down",
+            &[Capability::Streaming],
+            1.0,
+            Priority::Critical,
+        ))
+        .unwrap();
+        reg.register_value(rec("up", &[Capability::Streaming], 2.0, Priority::Normal))
+            .unwrap();
         let hm = HealthManager::new();
         let t = std::time::Instant::now();
         for i in 0..3 {
-            hm.report_failure(&ProviderId::new("down"), t + std::time::Duration::from_secs(i));
+            hm.report_failure(
+                &ProviderId::new("down"),
+                t + std::time::Duration::from_secs(i),
+            );
         }
         let r = ProviderRouter::new(reg, hm);
         let d = r.resolve(&RouteRequest::new()).unwrap();
@@ -345,8 +424,15 @@ mod tests {
     #[test]
     fn test_resolve_prefers_healthy_over_degraded() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("deg", &[Capability::Streaming], 0.1, Priority::Critical)).unwrap();
-        reg.register_value(rec("ok", &[Capability::Streaming], 5.0, Priority::Low)).unwrap();
+        reg.register_value(rec(
+            "deg",
+            &[Capability::Streaming],
+            0.1,
+            Priority::Critical,
+        ))
+        .unwrap();
+        reg.register_value(rec("ok", &[Capability::Streaming], 5.0, Priority::Low))
+            .unwrap();
         let hm = HealthManager::new();
         let cfg = crate::provider_runtime::health::HealthPolicyConfig {
             min_samples: 1,
@@ -357,46 +443,78 @@ mod tests {
         let hm = HealthManager::with_config(cfg);
         hm.report_failure(&ProviderId::new("deg"), std::time::Instant::now());
         let r = ProviderRouter::new(reg, hm);
-        let d = r.resolve(&RouteRequest::new().allow_degraded(true)).unwrap();
+        let d = r
+            .resolve(&RouteRequest::new().allow_degraded(true))
+            .unwrap();
         assert_eq!(d.provider.id.as_str(), "ok");
     }
 
     #[test]
     fn test_resolve_cost_ceiling() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("cheap", &[Capability::Streaming], 1.0, Priority::Normal)).unwrap();
-        reg.register_value(rec("rich", &[Capability::Streaming], 100.0, Priority::Critical)).unwrap();
+        reg.register_value(rec(
+            "cheap",
+            &[Capability::Streaming],
+            1.0,
+            Priority::Normal,
+        ))
+        .unwrap();
+        reg.register_value(rec(
+            "rich",
+            &[Capability::Streaming],
+            100.0,
+            Priority::Critical,
+        ))
+        .unwrap();
         let r = ProviderRouter::new(reg, HealthManager::new());
-        let d = r.resolve(&RouteRequest::new().with_cost_ceiling(10.0)).unwrap();
+        let d = r
+            .resolve(&RouteRequest::new().with_cost_ceiling(10.0))
+            .unwrap();
         assert_eq!(d.provider.id.as_str(), "cheap");
     }
 
     #[test]
     fn test_resolve_all_above_ceiling_fails() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("p1", &[Capability::Streaming], 20.0, Priority::Normal)).unwrap();
+        reg.register_value(rec("p1", &[Capability::Streaming], 20.0, Priority::Normal))
+            .unwrap();
         let r = ProviderRouter::new(reg, HealthManager::new());
-        let err = r.resolve(&RouteRequest::new().with_cost_ceiling(1.0)).unwrap_err();
+        let err = r
+            .resolve(&RouteRequest::new().with_cost_ceiling(1.0))
+            .unwrap_err();
         assert!(matches!(err, ProviderRuntimeError::NoSuitableProvider(_)));
     }
 
     #[test]
     fn test_resolve_excluded_provider() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("a", &[Capability::Streaming], 1.0, Priority::Critical)).unwrap();
-        reg.register_value(rec("b", &[Capability::Streaming], 2.0, Priority::Normal)).unwrap();
+        reg.register_value(rec("a", &[Capability::Streaming], 1.0, Priority::Critical))
+            .unwrap();
+        reg.register_value(rec("b", &[Capability::Streaming], 2.0, Priority::Normal))
+            .unwrap();
         let r = ProviderRouter::new(reg, HealthManager::new());
-        let d = r.resolve(&RouteRequest::new().excluding(vec![ProviderId::new("a")])).unwrap();
+        let d = r
+            .resolve(&RouteRequest::new().excluding(vec![ProviderId::new("a")]))
+            .unwrap();
         assert_eq!(d.provider.id.as_str(), "b");
     }
 
     #[test]
     fn test_resolve_records_rejections() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("noaud", &[Capability::Streaming], 1.0, Priority::Normal)).unwrap();
-        reg.register_value(rec("audio", &[Capability::Audio], 1.0, Priority::Normal)).unwrap();
+        reg.register_value(rec(
+            "noaud",
+            &[Capability::Streaming],
+            1.0,
+            Priority::Normal,
+        ))
+        .unwrap();
+        reg.register_value(rec("audio", &[Capability::Audio], 1.0, Priority::Normal))
+            .unwrap();
         let r = ProviderRouter::new(reg, HealthManager::new());
-        let d = r.resolve(&RouteRequest::new().with_capabilities(vec![Capability::Audio])).unwrap();
+        let d = r
+            .resolve(&RouteRequest::new().with_capabilities(vec![Capability::Audio]))
+            .unwrap();
         assert_eq!(d.provider.id.as_str(), "audio");
         assert!(d
             .rejected
@@ -409,7 +527,13 @@ mod tests {
         let reg = ProviderRegistry::new();
         for i in 0..20 {
             let cost = (i as f64) * 0.7 + 0.1;
-            reg.register_value(rec(&format!("p{i}"), &[Capability::Streaming], cost, Priority::Normal)).unwrap();
+            reg.register_value(rec(
+                &format!("p{i}"),
+                &[Capability::Streaming],
+                cost,
+                Priority::Normal,
+            ))
+            .unwrap();
         }
         let r = ProviderRouter::new(reg, HealthManager::new());
         let a = r.resolve(&RouteRequest::new()).unwrap();
@@ -421,10 +545,14 @@ mod tests {
     #[test]
     fn test_resolve_considered_counts_all() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("a", &[Capability::Streaming], 1.0, Priority::Normal)).unwrap();
-        reg.register_value(rec("b", &[Capability::Audio], 1.0, Priority::Normal)).unwrap();
+        reg.register_value(rec("a", &[Capability::Streaming], 1.0, Priority::Normal))
+            .unwrap();
+        reg.register_value(rec("b", &[Capability::Audio], 1.0, Priority::Normal))
+            .unwrap();
         let r = ProviderRouter::new(reg, HealthManager::new());
-        let d = r.resolve(&RouteRequest::new().with_capabilities(vec![Capability::Streaming])).unwrap();
+        let d = r
+            .resolve(&RouteRequest::new().with_capabilities(vec![Capability::Streaming]))
+            .unwrap();
         assert_eq!(d.considered, 2);
         assert_eq!(d.applied.len(), 6);
     }
@@ -434,8 +562,20 @@ mod tests {
         // Two providers identical in every routing key but with wildly
         // different ids; selection must be registration-order based.
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("zzz-alpha", &[Capability::Streaming], 3.0, Priority::Normal)).unwrap();
-        reg.register_value(rec("aaa-beta", &[Capability::Streaming], 3.0, Priority::Normal)).unwrap();
+        reg.register_value(rec(
+            "zzz-alpha",
+            &[Capability::Streaming],
+            3.0,
+            Priority::Normal,
+        ))
+        .unwrap();
+        reg.register_value(rec(
+            "aaa-beta",
+            &[Capability::Streaming],
+            3.0,
+            Priority::Normal,
+        ))
+        .unwrap();
         let r = ProviderRouter::new(reg, HealthManager::new());
         let d = r.resolve(&RouteRequest::new()).unwrap();
         assert_eq!(d.provider.id.as_str(), "zzz-alpha");
@@ -444,9 +584,12 @@ mod tests {
     #[test]
     fn test_chain_orders_deterministically() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("a", &[Capability::Streaming], 9.0, Priority::Normal)).unwrap();
-        reg.register_value(rec("b", &[Capability::Streaming], 1.0, Priority::Normal)).unwrap();
-        reg.register_value(rec("c", &[Capability::Streaming], 5.0, Priority::High)).unwrap();
+        reg.register_value(rec("a", &[Capability::Streaming], 9.0, Priority::Normal))
+            .unwrap();
+        reg.register_value(rec("b", &[Capability::Streaming], 1.0, Priority::Normal))
+            .unwrap();
+        reg.register_value(rec("c", &[Capability::Streaming], 5.0, Priority::High))
+            .unwrap();
         let r = ProviderRouter::new(reg, HealthManager::new());
         let chain = r.chain(&RouteRequest::new().with_capabilities(vec![Capability::Streaming]));
         let ids: Vec<String> = chain.iter().map(|d| d.provider.id.to_string()).collect();
@@ -456,12 +599,17 @@ mod tests {
     #[test]
     fn test_chain_filters_unhealthy() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("good", &[Capability::Streaming], 1.0, Priority::Normal)).unwrap();
-        reg.register_value(rec("bad", &[Capability::Streaming], 1.0, Priority::Normal)).unwrap();
+        reg.register_value(rec("good", &[Capability::Streaming], 1.0, Priority::Normal))
+            .unwrap();
+        reg.register_value(rec("bad", &[Capability::Streaming], 1.0, Priority::Normal))
+            .unwrap();
         let hm = HealthManager::new();
         let t = std::time::Instant::now();
         for i in 0..3 {
-            hm.report_failure(&ProviderId::new("bad"), t + std::time::Duration::from_secs(i));
+            hm.report_failure(
+                &ProviderId::new("bad"),
+                t + std::time::Duration::from_secs(i),
+            );
         }
         let r = ProviderRouter::new(reg, hm);
         let chain = r.chain(&RouteRequest::new().with_capabilities(vec![Capability::Streaming]));

@@ -91,7 +91,8 @@ impl RetryPolicy {
                 let base = self.initial_backoff.as_millis() as f64;
                 let mult = self.multiplier.max(1.0);
                 let exp = self.max_attempts.min(attempt) - 1;
-                let delay_ms = (base * mult.powi(exp as i32)).min(self.max_backoff.as_millis() as f64);
+                let delay_ms =
+                    (base * mult.powi(exp as i32)).min(self.max_backoff.as_millis() as f64);
                 Duration::from_millis(delay_ms as u64)
             }
         }
@@ -146,7 +147,10 @@ impl RetrySchedule {
                 retry_delays.push(policy.delay_for_attempt(attempt_idx));
             }
         }
-        RetrySchedule { policy, retry_delays }
+        RetrySchedule {
+            policy,
+            retry_delays,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -195,13 +199,16 @@ impl RetryController {
 
     /// Attempt a single retry planning step, returning an error when the
     /// budget is exhausted.
-    pub fn next_attempt(&mut self, elapsed: Duration, provider: &ProviderId) -> ProviderRuntimeResult<Duration> {
-        self.next_delay(elapsed).ok_or_else(|| {
-            ProviderRuntimeError::RetryExhausted {
+    pub fn next_attempt(
+        &mut self,
+        elapsed: Duration,
+        provider: &ProviderId,
+    ) -> ProviderRuntimeResult<Duration> {
+        self.next_delay(elapsed)
+            .ok_or_else(|| ProviderRuntimeError::RetryExhausted {
                 provider: provider.clone(),
                 attempts: self.attempts_used,
-            }
-        })
+            })
     }
 }
 
@@ -314,9 +321,15 @@ mod tests {
             .with_budget(Duration::from_secs(60));
         let mut c = RetryController::new(p);
         assert_eq!(c.attempts_used(), 0);
-        assert_eq!(c.next_delay(Duration::ZERO), Some(Duration::from_millis(100)));
+        assert_eq!(
+            c.next_delay(Duration::ZERO),
+            Some(Duration::from_millis(100))
+        );
         assert_eq!(c.attempts_used(), 1);
-        assert_eq!(c.next_delay(Duration::ZERO), Some(Duration::from_millis(200)));
+        assert_eq!(
+            c.next_delay(Duration::ZERO),
+            Some(Duration::from_millis(200))
+        );
         assert_eq!(c.attempts_used(), 2);
     }
 
@@ -328,7 +341,10 @@ mod tests {
         assert!(c.next_delay(Duration::ZERO).is_some());
         let err = c.next_attempt(Duration::ZERO, &provider);
         assert!(err.is_err());
-        assert!(matches!(err.unwrap_err(), ProviderRuntimeError::RetryExhausted { .. }));
+        assert!(matches!(
+            err.unwrap_err(),
+            ProviderRuntimeError::RetryExhausted { .. }
+        ));
     }
 
     #[test]

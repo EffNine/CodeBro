@@ -173,11 +173,16 @@ mod tests {
     use crate::provider_runtime::types::{Priority, ProviderCost};
 
     fn rec(id: &str, caps: &[Capability], priority: Priority, cost: f64) -> RegisteredProvider {
-        RegisteredProvider::new(id, CapabilitySet::new(caps.iter().copied()), ProviderCost {
-            input_per_million: cost,
-            output_per_million: cost,
-            cache_read_per_million: None,
-        }, priority)
+        RegisteredProvider::new(
+            id,
+            CapabilitySet::new(caps.iter().copied()),
+            ProviderCost {
+                input_per_million: cost,
+                output_per_million: cost,
+                cache_read_per_million: None,
+            },
+            priority,
+        )
     }
 
     #[test]
@@ -193,8 +198,10 @@ mod tests {
     #[test]
     fn test_discovery_returns_all_with_no_constraints() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("a", &[], Priority::Normal, 1.0)).unwrap();
-        reg.register_value(rec("b", &[], Priority::Normal, 1.0)).unwrap();
+        reg.register_value(rec("a", &[], Priority::Normal, 1.0))
+            .unwrap();
+        reg.register_value(rec("b", &[], Priority::Normal, 1.0))
+            .unwrap();
         let hm = HealthManager::new();
         let d = ProviderDiscovery::new(reg, hm);
         let r = d.query(&DiscoveryQuery::default());
@@ -205,8 +212,10 @@ mod tests {
     #[test]
     fn test_discovery_filters_by_capability() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("a", &[Capability::Streaming], Priority::Normal, 1.0)).unwrap();
-        reg.register_value(rec("b", &[Capability::Vision], Priority::Normal, 1.0)).unwrap();
+        reg.register_value(rec("a", &[Capability::Streaming], Priority::Normal, 1.0))
+            .unwrap();
+        reg.register_value(rec("b", &[Capability::Vision], Priority::Normal, 1.0))
+            .unwrap();
         let d = ProviderDiscovery::new(reg, HealthManager::new());
         let r = d.query(&DiscoveryQuery::new().requiring(vec![Capability::Streaming]));
         assert_eq!(r.providers.len(), 1);
@@ -216,9 +225,12 @@ mod tests {
     #[test]
     fn test_discovery_orders_by_priority_then_registration() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("low", &[], Priority::Low, 1.0)).unwrap();
-        reg.register_value(rec("high", &[], Priority::High, 1.0)).unwrap();
-        reg.register_value(rec("norm", &[], Priority::Normal, 1.0)).unwrap();
+        reg.register_value(rec("low", &[], Priority::Low, 1.0))
+            .unwrap();
+        reg.register_value(rec("high", &[], Priority::High, 1.0))
+            .unwrap();
+        reg.register_value(rec("norm", &[], Priority::Normal, 1.0))
+            .unwrap();
         let d = ProviderDiscovery::new(reg, HealthManager::new());
         let r = d.query(&DiscoveryQuery::default());
         let ids: Vec<String> = r.providers.iter().map(|p| p.id.to_string()).collect();
@@ -228,8 +240,10 @@ mod tests {
     #[test]
     fn test_discovery_stable_for_equal_priority() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("first", &[], Priority::Normal, 1.0)).unwrap();
-        reg.register_value(rec("second", &[], Priority::Normal, 1.0)).unwrap();
+        reg.register_value(rec("first", &[], Priority::Normal, 1.0))
+            .unwrap();
+        reg.register_value(rec("second", &[], Priority::Normal, 1.0))
+            .unwrap();
         let d = ProviderDiscovery::new(reg, HealthManager::new());
         let r1 = d.query(&DiscoveryQuery::default());
         let r2 = d.query(&DiscoveryQuery::default());
@@ -240,12 +254,17 @@ mod tests {
     #[test]
     fn test_discovery_healthy_only_skips_cooldown() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("good", &[], Priority::Normal, 1.0)).unwrap();
-        reg.register_value(rec("bad", &[], Priority::Normal, 1.0)).unwrap();
+        reg.register_value(rec("good", &[], Priority::Normal, 1.0))
+            .unwrap();
+        reg.register_value(rec("bad", &[], Priority::Normal, 1.0))
+            .unwrap();
         let hm = HealthManager::new();
         let t = std::time::Instant::now();
         for i in 0..3 {
-            hm.report_failure(&crate::provider_runtime::types::ProviderId::new("bad"), t + std::time::Duration::from_secs(i));
+            hm.report_failure(
+                &crate::provider_runtime::types::ProviderId::new("bad"),
+                t + std::time::Duration::from_secs(i),
+            );
         }
         let d = ProviderDiscovery::new(reg, hm);
         let r = d.query(&DiscoveryQuery::new().only_healthy(false));
@@ -257,7 +276,8 @@ mod tests {
     fn test_discovery_limit() {
         let reg = ProviderRegistry::new();
         for i in 0..5 {
-            reg.register_value(rec(&format!("p{i}"), &[], Priority::Normal, 1.0)).unwrap();
+            reg.register_value(rec(&format!("p{i}"), &[], Priority::Normal, 1.0))
+                .unwrap();
         }
         let d = ProviderDiscovery::new(reg, HealthManager::new());
         let r = d.query(&DiscoveryQuery::new().with_limit(2));
@@ -267,8 +287,10 @@ mod tests {
     #[test]
     fn test_discovery_min_priority() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("low", &[], Priority::Low, 1.0)).unwrap();
-        reg.register_value(rec("high", &[], Priority::High, 1.0)).unwrap();
+        reg.register_value(rec("low", &[], Priority::Low, 1.0))
+            .unwrap();
+        reg.register_value(rec("high", &[], Priority::High, 1.0))
+            .unwrap();
         let d = ProviderDiscovery::new(reg, HealthManager::new());
         let r = d.query(&DiscoveryQuery::new().min_priority(Some(Priority::High)));
         assert_eq!(r.providers.len(), 1);
@@ -278,7 +300,8 @@ mod tests {
     #[test]
     fn test_discovery_health_vector_aligns() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("a", &[], Priority::Normal, 1.0)).unwrap();
+        reg.register_value(rec("a", &[], Priority::Normal, 1.0))
+            .unwrap();
         let hm = HealthManager::new();
         hm.report_success(&ProviderId::new("a"), std::time::Instant::now());
         let d = ProviderDiscovery::new(reg, hm);
@@ -290,8 +313,10 @@ mod tests {
     #[test]
     fn test_with_capability_helper() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("a", &[Capability::ToolCalling], Priority::Normal, 1.0)).unwrap();
-        reg.register_value(rec("b", &[], Priority::Normal, 1.0)).unwrap();
+        reg.register_value(rec("a", &[Capability::ToolCalling], Priority::Normal, 1.0))
+            .unwrap();
+        reg.register_value(rec("b", &[], Priority::Normal, 1.0))
+            .unwrap();
         let d = ProviderDiscovery::new(reg, HealthManager::new());
         assert_eq!(d.with_capability(Capability::ToolCalling).len(), 1);
     }
@@ -299,8 +324,10 @@ mod tests {
     #[test]
     fn test_find_usable_respects_health() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("a", &[Capability::Streaming], Priority::Normal, 1.0)).unwrap();
-        reg.register_value(rec("b", &[Capability::Streaming], Priority::Normal, 1.0)).unwrap();
+        reg.register_value(rec("a", &[Capability::Streaming], Priority::Normal, 1.0))
+            .unwrap();
+        reg.register_value(rec("b", &[Capability::Streaming], Priority::Normal, 1.0))
+            .unwrap();
         let hm = HealthManager::new();
         let t = std::time::Instant::now();
         for i in 0..3 {
@@ -317,8 +344,15 @@ mod tests {
         let reg = ProviderRegistry::new();
         let mut caps = CapabilitySet::empty();
         caps.insert(Capability::JsonMode);
-        reg.register_value(rec("a", &[Capability::JsonMode], Priority::Normal, 1.0)).unwrap();
-        reg.register_value(rec("b", &[Capability::JsonMode, Capability::Audio], Priority::Normal, 1.0)).unwrap();
+        reg.register_value(rec("a", &[Capability::JsonMode], Priority::Normal, 1.0))
+            .unwrap();
+        reg.register_value(rec(
+            "b",
+            &[Capability::JsonMode, Capability::Audio],
+            Priority::Normal,
+            1.0,
+        ))
+        .unwrap();
         let d = ProviderDiscovery::new(reg, HealthManager::new());
         assert_eq!(d.count_with(&caps), 2);
     }

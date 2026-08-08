@@ -270,16 +270,18 @@ pub enum ProviderRuntimeError {
         attempts: usize,
     },
     /// The failover chain is empty or exhausted.
-    FailoverExhausted {
-        attempted: usize,
-        total: usize,
-    },
+    FailoverExhausted { attempted: usize, total: usize },
     /// A cost ceiling prevented selection.
     CostCeilingExceeded { provider: ProviderId },
     /// Runtime was in an invalid/illegal state.
     InvalidState(String),
     /// Capability string could not be parsed.
     UnknownCapability(String),
+    /// The circuit breaker for the selected provider is open.
+    CircuitBreakerOpen {
+        provider: ProviderId,
+        state: super::circuit_breaker::CircuitBreakerState,
+    },
     /// A generic runtime error.
     Generic(String),
 }
@@ -292,12 +294,18 @@ impl fmt::Display for ProviderRuntimeError {
             ProviderRuntimeError::NoSuitableProvider(msg) => {
                 write!(f, "No suitable provider: {msg}")
             }
-            ProviderRuntimeError::CapabilityMismatch { requested, available } => write!(
+            ProviderRuntimeError::CapabilityMismatch {
+                requested,
+                available,
+            } => write!(
                 f,
                 "Capability mismatch: requested {requested:?}, available {available:?}"
             ),
             ProviderRuntimeError::RetryExhausted { provider, attempts } => {
-                write!(f, "Retry exhausted for {provider} after {attempts} attempts")
+                write!(
+                    f,
+                    "Retry exhausted for {provider} after {attempts} attempts"
+                )
             }
             ProviderRuntimeError::FailoverExhausted { total, attempted } => {
                 write!(f, "Failover exhausted: {attempted} of {total} attempted")
@@ -308,6 +316,9 @@ impl fmt::Display for ProviderRuntimeError {
             ProviderRuntimeError::InvalidState(msg) => write!(f, "Invalid state: {msg}"),
             ProviderRuntimeError::UnknownCapability(cap) => {
                 write!(f, "Unknown capability: {cap}")
+            }
+            ProviderRuntimeError::CircuitBreakerOpen { provider, state } => {
+                write!(f, "Circuit breaker open for {provider}: {state}")
             }
             ProviderRuntimeError::Generic(msg) => write!(f, "Provider runtime error: {msg}"),
         }

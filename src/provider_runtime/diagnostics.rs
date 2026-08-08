@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use super::capabilities::Capability;
+use super::circuit_breaker::CircuitBreakerState;
 use super::types::{HealthState, ProviderId};
 
 /// Diagnostic events emitted by the Provider Runtime.
@@ -51,6 +52,31 @@ pub enum ProviderEvent {
         from: HealthState,
         to: HealthState,
     },
+    CircuitBreakerOpened {
+        provider: ProviderId,
+        failure_count: u32,
+        correlation_id: String,
+    },
+    CircuitBreakerClosed {
+        provider: ProviderId,
+        correlation_id: String,
+    },
+    CircuitBreakerHalfOpened {
+        provider: ProviderId,
+        correlation_id: String,
+    },
+    CircuitBreakerRequestRejected {
+        provider: ProviderId,
+        correlation_id: String,
+    },
+    CircuitBreakerRecoverySucceeded {
+        provider: ProviderId,
+        correlation_id: String,
+    },
+    CircuitBreakerRecoveryFailed {
+        provider: ProviderId,
+        correlation_id: String,
+    },
 }
 
 impl ProviderEvent {
@@ -60,7 +86,9 @@ impl ProviderEvent {
             ProviderEvent::ProviderSelected { provider, .. } => {
                 format!("selected {provider}")
             }
-            ProviderEvent::ProviderRejected { provider, reason, .. } => {
+            ProviderEvent::ProviderRejected {
+                provider, reason, ..
+            } => {
                 format!("rejected {provider}: {reason}")
             }
             ProviderEvent::ProviderUnavailable { provider, state } => {
@@ -69,17 +97,45 @@ impl ProviderEvent {
             ProviderEvent::RetryStarted { provider, attempt } => {
                 format!("retry {provider} attempt {attempt}")
             }
-            ProviderEvent::RetryCompleted { provider, attempts_used } => {
+            ProviderEvent::RetryCompleted {
+                provider,
+                attempts_used,
+            } => {
                 format!("retries done for {provider} ({attempts_used})")
             }
             ProviderEvent::FailoverTriggered { from, to, reason } => {
                 format!("failover {from} -> {to}: {reason}")
             }
-            ProviderEvent::CostRecorded { provider, estimated } => {
+            ProviderEvent::CostRecorded {
+                provider,
+                estimated,
+            } => {
                 format!("cost {provider} = {estimated:.6}")
             }
             ProviderEvent::ProviderRecovered { provider, from, to } => {
                 format!("recovered {provider} {from:?}->{to:?}")
+            }
+            ProviderEvent::CircuitBreakerOpened {
+                provider,
+                failure_count,
+                ..
+            } => {
+                format!("breaker opened for {provider} (failures={failure_count})")
+            }
+            ProviderEvent::CircuitBreakerClosed { provider, .. } => {
+                format!("breaker closed for {provider}")
+            }
+            ProviderEvent::CircuitBreakerHalfOpened { provider, .. } => {
+                format!("breaker half-open for {provider}")
+            }
+            ProviderEvent::CircuitBreakerRequestRejected { provider, .. } => {
+                format!("request rejected for {provider}")
+            }
+            ProviderEvent::CircuitBreakerRecoverySucceeded { provider, .. } => {
+                format!("recovery succeeded for {provider}")
+            }
+            ProviderEvent::CircuitBreakerRecoveryFailed { provider, .. } => {
+                format!("recovery failed for {provider}")
             }
         }
     }
@@ -153,6 +209,7 @@ struct DiagnosticsInner {
     retries: Vec<RetryRecord>,
     failovers: Vec<FailoverRecord>,
     stats: HashMap<ProviderId, ProviderStatistics>,
+    circuit_breaker_events: Vec<ProviderEvent>,
     max: usize,
 }
 
@@ -218,7 +275,12 @@ impl ProviderDiagnostics {
         });
     }
 
-    pub fn record_health_transition(&self, provider: &ProviderId, from: HealthState, to: HealthState) {
+    pub fn record_health_transition(
+        &self,
+        provider: &ProviderId,
+        from: HealthState,
+        to: HealthState,
+    ) {
         if from == to {
             return;
         }
@@ -267,13 +329,24 @@ impl ProviderDiagnostics {
             attempts_used,
         });
         let mut inner = self.inner.write().unwrap();
-        if let Some(rec) = inner.retries.iter_mut().rev().find(|r| r.provider == *provider) {
+        if let Some(rec) = inner
+            .retries
+            .iter_mut()
+            .rev()
+            .find(|r| r.provider == *provider)
+        {
             rec.attempts = attempts_used;
             rec.succeeded = true;
         }
     }
 
-    pub fn record_failover(&self, correlation_id: &str, from: &ProviderId, to: &ProviderId, reason: &str) {
+    pub fn record_failover(
+        &self,
+        correlation_id: &str,
+        from: &ProviderId,
+        to: &ProviderId,
+        reason: &str,
+    ) {
         self.emit(ProviderEvent::FailoverTriggered {
             from: from.clone(),
             to: to.clone(),
@@ -305,7 +378,12 @@ impl ProviderDiagnostics {
         stat.cost_records += 1;
     }
 
-    pub fn record_mismatch(&self, provider: &ProviderId, missing: Vec<Capability>, correlation_id: &str) {
+    pub fn record_mismatch(
+        &self,
+        provider: &ProviderId,
+        missing: Vec<Capability>,
+        correlation_id: &str,
+    ) {
         let mut inner = self.inner.write().unwrap();
         let max = inner.max;
         Self::push(
@@ -317,6 +395,90 @@ impl ProviderDiagnostics {
             },
             max,
         );
+    }
+
+    pub fn record_breaker_opened(
+        &self,
+        provider: &ProviderId,
+        failure_count: u32,
+        correlation_id: &str,
+    ) {
+        let event = ProviderEvent::CircuitBreakerOpened {
+            provider: provider.clone(),
+            failure_count,
+            correlation_id: correlation_id.to_string(),
+        };
+        self.emit(event.clone());
+        let max = self.inner.read().unwrap().max;
+        {
+            let mut inner = self.inner.write().unwrap();
+            Self::push(&mut inner.circuit_breaker_events, event, max);
+        }
+    }
+
+    pub fn record_breaker_closed(&self, provider: &ProviderId, correlation_id: &str) {
+        let event = ProviderEvent::CircuitBreakerClosed {
+            provider: provider.clone(),
+            correlation_id: correlation_id.to_string(),
+        };
+        self.emit(event.clone());
+        let max = self.inner.read().unwrap().max;
+        {
+            let mut inner = self.inner.write().unwrap();
+            Self::push(&mut inner.circuit_breaker_events, event, max);
+        }
+    }
+
+    pub fn record_breaker_half_opened(&self, provider: &ProviderId, correlation_id: &str) {
+        let event = ProviderEvent::CircuitBreakerHalfOpened {
+            provider: provider.clone(),
+            correlation_id: correlation_id.to_string(),
+        };
+        self.emit(event.clone());
+        let max = self.inner.read().unwrap().max;
+        {
+            let mut inner = self.inner.write().unwrap();
+            Self::push(&mut inner.circuit_breaker_events, event, max);
+        }
+    }
+
+    pub fn record_breaker_rejected(&self, provider: &ProviderId, correlation_id: &str) {
+        let event = ProviderEvent::CircuitBreakerRequestRejected {
+            provider: provider.clone(),
+            correlation_id: correlation_id.to_string(),
+        };
+        self.emit(event.clone());
+        let max = self.inner.read().unwrap().max;
+        {
+            let mut inner = self.inner.write().unwrap();
+            Self::push(&mut inner.circuit_breaker_events, event, max);
+        }
+    }
+
+    pub fn record_breaker_recovery_succeeded(&self, provider: &ProviderId, correlation_id: &str) {
+        let event = ProviderEvent::CircuitBreakerRecoverySucceeded {
+            provider: provider.clone(),
+            correlation_id: correlation_id.to_string(),
+        };
+        self.emit(event.clone());
+        let max = self.inner.read().unwrap().max;
+        {
+            let mut inner = self.inner.write().unwrap();
+            Self::push(&mut inner.circuit_breaker_events, event, max);
+        }
+    }
+
+    pub fn record_breaker_recovery_failed(&self, provider: &ProviderId, correlation_id: &str) {
+        let event = ProviderEvent::CircuitBreakerRecoveryFailed {
+            provider: provider.clone(),
+            correlation_id: correlation_id.to_string(),
+        };
+        self.emit(event.clone());
+        let max = self.inner.read().unwrap().max;
+        {
+            let mut inner = self.inner.write().unwrap();
+            Self::push(&mut inner.circuit_breaker_events, event, max);
+        }
     }
 
     fn emit(&self, event: ProviderEvent) {
@@ -369,6 +531,7 @@ impl ProviderDiagnostics {
             retries: inner.retries.len(),
             failovers: inner.failovers.len(),
             providers_tracked: inner.stats.len(),
+            circuit_breaker_events: inner.circuit_breaker_events.len(),
         }
     }
 }
@@ -383,6 +546,7 @@ pub struct DiagnosticsSummary {
     pub retries: usize,
     pub failovers: usize,
     pub providers_tracked: usize,
+    pub circuit_breaker_events: usize,
 }
 
 #[cfg(test)]
@@ -421,14 +585,22 @@ mod tests {
     #[test]
     fn test_health_transition_recorded() {
         let d = ProviderDiagnostics::new();
-        d.record_health_transition(&ProviderId::new("p"), HealthState::Healthy, HealthState::Degraded);
+        d.record_health_transition(
+            &ProviderId::new("p"),
+            HealthState::Healthy,
+            HealthState::Degraded,
+        );
         assert_eq!(d.health_transitions().len(), 1);
     }
 
     #[test]
     fn test_health_transition_noop_ignored() {
         let d = ProviderDiagnostics::new();
-        d.record_health_transition(&ProviderId::new("p"), HealthState::Healthy, HealthState::Healthy);
+        d.record_health_transition(
+            &ProviderId::new("p"),
+            HealthState::Healthy,
+            HealthState::Healthy,
+        );
         assert_eq!(d.health_transitions().len(), 0);
     }
 
@@ -453,7 +625,12 @@ mod tests {
     #[test]
     fn test_failover_recorded() {
         let d = ProviderDiagnostics::new();
-        d.record_failover("c5", &ProviderId::new("a"), &ProviderId::new("b"), "unhealthy");
+        d.record_failover(
+            "c5",
+            &ProviderId::new("a"),
+            &ProviderId::new("b"),
+            "unhealthy",
+        );
         assert_eq!(d.failovers().len(), 1);
         assert_eq!(d.statistics(&ProviderId::new("a")).failovers_from, 1);
         assert!(d

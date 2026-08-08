@@ -84,10 +84,7 @@ impl CostDashboard {
     }
 
     pub fn total_estimated_cost(&self) -> f64 {
-        self.providers
-            .values()
-            .map(|p| p.estimated_cost)
-            .sum()
+        self.providers.values().map(|p| p.estimated_cost).sum()
     }
 
     pub fn overall_success_rate(&self) -> f64 {
@@ -230,7 +227,14 @@ pub struct CostSummary {
 mod tests {
     use super::*;
 
-    fn obs(provider: &str, input: usize, output: usize, cost: f64, ok: bool, latency: u64) -> CostObservation {
+    fn obs(
+        provider: &str,
+        input: usize,
+        output: usize,
+        cost: f64,
+        ok: bool,
+        latency: u64,
+    ) -> CostObservation {
         CostObservation {
             provider: ProviderId::new(provider),
             input_tokens: input,

@@ -91,7 +91,11 @@ impl ProviderRegistry {
     /// Get a provider by id.
     pub fn get(&self, id: &ProviderId) -> Option<RegisteredProvider> {
         let inner = self.inner.read().unwrap();
-        inner.by_id.get(id).and_then(|i| inner.ordered.get(*i)).cloned()
+        inner
+            .by_id
+            .get(id)
+            .and_then(|i| inner.ordered.get(*i))
+            .cloned()
     }
 
     /// True if a provider with the id is registered.
@@ -149,7 +153,8 @@ impl Clone for ProviderRegistry {
 mod tests {
     use super::*;
     use crate::provider_runtime::{
-        capabilities::Capability, types::{Priority, ProviderCost},
+        capabilities::Capability,
+        types::{Priority, ProviderCost},
     };
 
     fn caps(xs: &[Capability]) -> crate::provider_runtime::CapabilitySet {
@@ -180,7 +185,8 @@ mod tests {
     #[test]
     fn test_registry_register_and_get() {
         let r = ProviderRegistry::new();
-        r.register_value(rec("alpha", &[Capability::Streaming], 1.0)).unwrap();
+        r.register_value(rec("alpha", &[Capability::Streaming], 1.0))
+            .unwrap();
         let p = r.get(&ProviderId::new("alpha")).unwrap();
         assert_eq!(p.id.as_str(), "alpha");
         assert!(p.supports_all(&[Capability::Streaming]));
@@ -289,7 +295,8 @@ mod tests {
     #[test]
     fn test_registry_serializable_value() {
         let r = ProviderRegistry::new();
-        r.register_value(rec("s", &[Capability::JsonMode], 3.0).with_seq(9)).unwrap();
+        r.register_value(rec("s", &[Capability::JsonMode], 3.0).with_seq(9))
+            .unwrap();
         // RegisteredProvider must be serializable for persistence.
         let rec = r.get(&ProviderId::new("s")).unwrap();
         let json = serde_json::to_string(&rec).unwrap();

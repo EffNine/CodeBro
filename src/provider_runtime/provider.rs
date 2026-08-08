@@ -132,20 +132,30 @@ impl RegisteredProvider {
 /// Convenience helpers for building descriptor-only providers in tests.
 impl RegisteredProvider {
     pub fn minimal(id: &str) -> Self {
-        RegisteredProvider::new(id, CapabilitySet::empty(), ProviderCost::default(), Priority::Normal)
+        RegisteredProvider::new(
+            id,
+            CapabilitySet::empty(),
+            ProviderCost::default(),
+            Priority::Normal,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::capabilities::Capability;
+    use super::*;
 
     #[test]
     fn test_registered_provider_fields() {
         let mut caps = CapabilitySet::empty();
         caps.insert(Capability::Streaming);
-        let p = RegisteredProvider::new("alpha", caps.clone(), ProviderCost::default(), Priority::High);
+        let p = RegisteredProvider::new(
+            "alpha",
+            caps.clone(),
+            ProviderCost::default(),
+            Priority::High,
+        );
         assert_eq!(p.id.as_str(), "alpha");
         assert_eq!(p.priority, Priority::High);
         assert!(p.supports_all(&[Capability::Streaming]));
@@ -176,7 +186,7 @@ mod tests {
             fn id(&self) -> &ProviderId {
                 &self.id
             }
-fn capabilities(&self) -> &CapabilitySet {
+            fn capabilities(&self) -> &CapabilitySet {
                 &self.caps
             }
             fn cost(&self) -> &ProviderCost {

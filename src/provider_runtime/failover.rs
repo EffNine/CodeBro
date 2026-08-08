@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use super::capabilities::Capability;
 use super::router::ProviderRouter;
-use super::types::{Outcome, ProviderId, ProviderRuntimeError, ProviderRuntimeResult, RouteRequest};
+use super::types::{
+    Outcome, ProviderId, ProviderRuntimeError, ProviderRuntimeResult, RouteRequest,
+};
 
 /// How the failover chain is derived for a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,21 +190,19 @@ impl Failover {
         request: &RouteRequest,
         required: &[Capability],
     ) -> bool {
-        self.plan(request)
-            .iter()
-            .all(|id| {
-                self.router
-                    .provider_capabilities(id)
-                    .map(|c| c.has_all(required))
-                    .unwrap_or(false)
-            })
+        self.plan(request).iter().all(|id| {
+            self.router
+                .provider_capabilities(id)
+                .map(|c| c.has_all(required))
+                .unwrap_or(false)
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::Outcome;
+    use super::*;
     use crate::provider_runtime::{
         capabilities::CapabilitySet,
         health::HealthManager,
@@ -213,19 +213,23 @@ mod tests {
     };
 
     fn rec(id: &str, caps: &[Capability], cost: f64) -> RegisteredProvider {
-        RegisteredProvider::new(id, CapabilitySet::new(caps.iter().copied()), ProviderCost {
-            input_per_million: cost,
-            output_per_million: cost,
-            cache_read_per_million: None,
-        }, Priority::Normal)
+        RegisteredProvider::new(
+            id,
+            CapabilitySet::new(caps.iter().copied()),
+            ProviderCost {
+                input_per_million: cost,
+                output_per_million: cost,
+                cache_read_per_million: None,
+            },
+            Priority::Normal,
+        )
     }
 
-    fn mk(
-        ids: &[(&str, f64)],
-    ) -> (ProviderRegistry, ProviderRouter) {
+    fn mk(ids: &[(&str, f64)]) -> (ProviderRegistry, ProviderRouter) {
         let reg = ProviderRegistry::new();
         for (id, cost) in ids {
-            reg.register_value(rec(id, &[Capability::Streaming], *cost)).unwrap();
+            reg.register_value(rec(id, &[Capability::Streaming], *cost))
+                .unwrap();
         }
         (reg.clone(), ProviderRouter::new(reg, HealthManager::new()))
     }
@@ -239,16 +243,23 @@ mod tests {
         let (_, router) = mk(&[("a", 3.0), ("b", 1.0), ("c", 2.0)]);
         let f = Failover::new(router, FailoverPolicy::default());
         let plan = f.plan(&RouteRequest::new().with_capabilities(vec![Capability::Streaming]));
-        assert_eq!(plan, vec![ProviderId::new("b"), ProviderId::new("c"), ProviderId::new("a")]);
+        assert_eq!(
+            plan,
+            vec![
+                ProviderId::new("b"),
+                ProviderId::new("c"),
+                ProviderId::new("a")
+            ]
+        );
     }
 
     #[test]
     fn test_plan_ordered_mode() {
         let (_, router) = mk(&[("a", 1.0), ("b", 1.0)]);
-        let f = Failover::new(router, FailoverPolicy::ordered(vec![
-            ProviderId::new("b"),
-            ProviderId::new("a"),
-        ]));
+        let f = Failover::new(
+            router,
+            FailoverPolicy::ordered(vec![ProviderId::new("b"), ProviderId::new("a")]),
+        );
         let plan = f.plan(&RouteRequest::new());
         assert_eq!(plan, vec![ProviderId::new("b"), ProviderId::new("a")]);
     }
@@ -256,12 +267,16 @@ mod tests {
     #[test]
     fn test_plan_ordered_truncates_to_max_attempts() {
         let (_, router) = mk(&[("a", 1.0), ("b", 1.0), ("c", 1.0), ("d", 1.0)]);
-        let f = Failover::new(router, FailoverPolicy::ordered(vec![
-            ProviderId::new("a"),
-            ProviderId::new("b"),
-            ProviderId::new("c"),
-            ProviderId::new("d"),
-        ]).with_max_attempts(2));
+        let f = Failover::new(
+            router,
+            FailoverPolicy::ordered(vec![
+                ProviderId::new("a"),
+                ProviderId::new("b"),
+                ProviderId::new("c"),
+                ProviderId::new("d"),
+            ])
+            .with_max_attempts(2),
+        );
         let plan = f.plan(&RouteRequest::new());
         assert_eq!(plan.len(), 2);
     }
@@ -334,7 +349,10 @@ mod tests {
         let router = ProviderRouter::new(reg, HealthManager::new());
         let f = Failover::new(router, FailoverPolicy::default());
         let err = f.execute(&RouteRequest::new(), success).unwrap_err();
-        assert!(matches!(err, ProviderRuntimeError::FailoverExhausted { .. }));
+        assert!(matches!(
+            err,
+            ProviderRuntimeError::FailoverExhausted { .. }
+        ));
     }
 
     #[test]
@@ -350,13 +368,12 @@ mod tests {
     #[test]
     fn test_plan_satisfies_capabilities() {
         let reg = ProviderRegistry::new();
-        reg.register_value(rec("a", &[Capability::Streaming, Capability::Vision], 1.0)).unwrap();
-        reg.register_value(rec("b", &[Capability::Streaming], 1.0)).unwrap();
+        reg.register_value(rec("a", &[Capability::Streaming, Capability::Vision], 1.0))
+            .unwrap();
+        reg.register_value(rec("b", &[Capability::Streaming], 1.0))
+            .unwrap();
         let router = ProviderRouter::new(reg, HealthManager::new());
         let f = Failover::new(router, FailoverPolicy::default());
-        assert!(!f.plan_satisfies_capabilities(
-            &RouteRequest::new(),
-            &[Capability::Vision],
-        ));
+        assert!(!f.plan_satisfies_capabilities(&RouteRequest::new(), &[Capability::Vision],));
     }
 }

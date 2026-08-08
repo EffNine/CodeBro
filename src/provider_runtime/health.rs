@@ -192,7 +192,9 @@ impl HealthManager {
 
         if rec.consecutive_failures >= cfg.cooldown_after {
             rec.state = HealthState::Cooldown;
-            inner.cooldown_until.insert(id.clone(), at + cfg.cooldown_duration);
+            inner
+                .cooldown_until
+                .insert(id.clone(), at + cfg.cooldown_duration);
             return;
         }
 
@@ -212,9 +214,10 @@ impl HealthManager {
     pub fn begin_recovery(&self, id: &ProviderId) -> ProviderRuntimeResult<()> {
         let mut inner = self.inner.write().unwrap();
         inner.cooldown_until.remove(id);
-        let rec = inner.records.get_mut(id).ok_or_else(|| {
-            ProviderRuntimeError::NotFound(id.clone())
-        })?;
+        let rec = inner
+            .records
+            .get_mut(id)
+            .ok_or_else(|| ProviderRuntimeError::NotFound(id.clone()))?;
         if matches!(rec.state, HealthState::Unavailable | HealthState::Cooldown) {
             rec.state = HealthState::Recovering;
         }
