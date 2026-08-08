@@ -1,8 +1,14 @@
 # Developer Experience Principles
 
+**Version:** 1.1.0
+**Status:** Active
+**Date:** 2026-08-08
+
+---
+
 ## Overview
 
-These principles govern every interaction, panel, command, and workflow in CodeBro's Developer Experience Platform (P5). They are the lens through which every design decision is made.
+These principles govern every interaction, panel, command, and workflow in CodeBro's Developer Experience Platform. They are the lens through which every design decision is made.
 
 ---
 
@@ -37,8 +43,8 @@ Simple tasks should be trivially easy; complex tasks should be discoverable, not
 - The command palette (`Ctrl+P`) is the primary navigation mechanism
 
 ### Implementation Checklist
-- [ ] All settings accessible via `/settings` command
-- [ ] All providers accessible via `/providers` command
+- [ ] All settings accessible via `//settings` command
+- [ ] All providers accessible via `//provider` command
 - [ ] Workspace info visible in title bar
 - [ ] Shortcuts shown in status bar
 
@@ -56,7 +62,7 @@ No destructive or irreversible action proceeds without explicit user consent.
 - Configuration changes are reviewed before persisting
 
 ### Implementation Checklist
-- [ ] Every `/settings` change shows a preview
+- [ ] Every `//settings` change shows a preview
 - [ ] Provider removal prompts for confirmation
 - [ ] Workspace integrations ask before enabling
 - [ ] Configuration resets require double confirmation
@@ -75,8 +81,8 @@ The terminal UI is the primary interface. No feature should require leaving the 
 - No `vim`/`nano` config editing required
 
 ### Implementation Checklist
-- [ ] `/settings` opens an interactive panel
-- [ ] `/providers` manages API keys in-terminal
+- [ ] `//settings` opens an interactive panel
+- [ ] `//provider` manages API keys in-terminal
 - [ ] `/discover` shows workspace findings
 - [ ] `/onboard` guides first-time setup
 

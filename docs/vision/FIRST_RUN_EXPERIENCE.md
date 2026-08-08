@@ -1,8 +1,14 @@
 # First-Run Experience
 
+**Version:** 1.1.0
+**Status:** Active
+**Date:** 2026-08-08
+
+---
+
 ## Goal
 
-A new user should go from `cargo install codebro` to a working AI chat session in under 30 seconds, with no manual configuration file editing.
+A new user should go from `cargo install codebro` to a working engineering task in under 30 seconds, with no manual configuration file editing.
 
 ---
 
@@ -16,28 +22,31 @@ Check for existing config
 ┌─ Has config? ─┐
 │               │
  Yes            No
- │               ↓
- │         Show Onboarding Wizard
- │               │
- │               ↓
- │         Step 1: Enter API Key
- │               │
- │               ↓
- │         Step 2: Select Provider (auto-detected)
- │               │
- │               ↓
- │         Step 3: Auto-detect Model
- │               │
- │               ↓
- │         Step 4: Discover Workspace
- │               │
- │               ↓
- │         Step 5: Enable Integrations (approval)
- │               │
- │               ↓
- │         Save Config → Enter Main TUI
- │
- ↓               ↓
+  │               ↓
+  │         Show Onboarding Wizard
+  │               │
+  │               ↓
+  │         Step 1: Detect Environment
+  │               │
+  │               ↓
+  │         Step 2: Enter API Key
+  │               │
+  │               ↓
+  │         Step 3: Select Provider (auto-detected)
+  │               │
+  │               ↓
+  │         Step 4: Auto-detect Model
+  │               │
+  │               ↓
+  │         Step 5: Discover Workspace
+  │               │
+  │               ↓
+  │         Step 6: Discover Integrations (approval)
+  │               │
+  │               ↓
+  │         Save Config → Enter Main TUI
+  │
+  ↓               ↓
 └────→ Enter Main TUI ←─────┘
         ↓
   Show Welcome Panel
@@ -55,7 +64,28 @@ On launch, CodeBro checks for `~/.codebro/config.toml`.
 - **Found**: Load existing config, skip to main TUI
 - **Not found**: Trigger onboarding wizard
 
-### Step 1: API Key Input
+---
+
+### Step 1: Environment Detection
+
+Before asking the user for any input, CodeBro automatically detects the developer's environment:
+
+| Tool | Detection Signal | Suggestion |
+|------|-----------------|------------|
+| **Ollama** | `ollama` process running on localhost:11434 | "Local model server detected. Use Ollama for offline inference?" |
+| **LM Studio** | `lmstudio` process running on localhost:1234 | "LM Studio detected. Use local models?" |
+| **GitHub CLI** | `gh` in PATH, authenticated | "GitHub CLI detected. Enable GitHub integration?" |
+| **Docker** | `docker` in PATH, daemon running | "Docker detected. Enable Docker build integration?" |
+| **Cargo** | `Cargo.toml` in workspace | "Rust project detected. Enable cargo test/build?" |
+| **Node** | `package.json` in workspace | "Node.js project detected. Enable npm/yarn integration?" |
+| **Python** | `pyproject.toml` or `requirements.txt` | "Python project detected. Enable pip/pytest integration?" |
+| **Playwright** | `playwright` in PATH, project config found | "Playwright detected. Enable E2E test integration?" |
+
+Detection is read-only. No integrations are enabled without explicit user approval. Each detected tool is presented as a suggestion, not an assumption.
+
+---
+
+### Step 2: API Key Input
 
 The user is prompted (in-terminal) for their API key.
 
@@ -64,14 +94,16 @@ The user is prompted (in-terminal) for their API key.
 - Accept keys from:
   - Direct input
   - `CODEBRO_API_KEY` environment variable (auto-fill)
-  - Clipboard via `/paste` command
+  - Clipboard via `//apikey` command
 
 Validation:
 - Non-empty check
 - Provider-specific format validation (if known)
 - Connection test against provider's `/models` endpoint
 
-### Step 2: Provider Selection
+---
+
+### Step 3: Provider Selection
 
 After API key validation, CodeBro presents available providers:
 
@@ -86,7 +118,9 @@ After API key validation, CodeBro presents available providers:
 If `CODEBRO_PROVIDER` env var is set, skip selection.
 If no env var, show interactive picker with arrow keys.
 
-### Step 3: Model Auto-Detection
+---
+
+### Step 4: Model Auto-Detection
 
 CodeBro calls `GET {base_url}/models` with the API key.
 
@@ -100,7 +134,9 @@ If fetch fails:
 - Fall back to provider-specific default (e.g., `gpt-4o` for OpenAI)
 - Log warning but continue
 
-### Step 4: Workspace Discovery
+---
+
+### Step 5: Workspace Discovery
 
 CodeBro scans the current directory for project signals:
 
@@ -118,12 +154,12 @@ Results are presented in a discovery panel:
 
 ```
 Workspace Discovered
-─────────────────────────
-Repository:    git ✓
-Language:      rust
-Build System:  cargo
-Package Mgr:   cargo
-Testing:       cargo test
+                    ─────────────────
+Repository:     git ✓
+Language:       rust
+Build System:   cargo
+Package Mgr:    cargo
+Testing:        cargo test
 
 Integrations Available:
   [ ] Git status tracking
@@ -133,7 +169,9 @@ Integrations Available:
 
 User approves each integration with `Space` to toggle, `Enter` to confirm.
 
-### Step 5: Integration Approval
+---
+
+### Step 6: Integration Approval
 
 For each detected integration:
 
@@ -142,16 +180,20 @@ For each detected integration:
 3. Ask for explicit approval
 4. Record decision in `~/.codebro/integrations.json`
 
+**Never silently enable integrations.** Every detected integration requires explicit user approval. If the user skips this step, all integrations remain disabled.
+
 Approval is persistent — next launch skips already-approved integrations.
 
-### Step 6: Save & Enter
+---
+
+### Step 7: Save & Enter
 
 All settings are written to `~/.codebro/config.toml`.
 Welcome panel shows summary:
 
 ```
 Welcome to CodeBro v0.7.0
-─────────────────────────
+                    ─────────────────
 Provider:   OpenAI
 Model:      gpt-4o
 Workspace:  /path/to/project (rust, cargo)
@@ -167,7 +209,7 @@ User is dropped into the main TUI.
 
 | Error | User Message | Recovery |
 |-------|-------------|----------|
-| API key invalid | "Invalid API key. Please check and retry." | Return to Step 1 |
+| API key invalid | "Invalid API key. Please check and retry." | Return to Step 2 |
 | Provider unreachable | "Cannot reach {provider}. Is it running?" | Offer to try another provider |
 | Model fetch failed | "Could not list models. Using default." | Continue with fallback |
 | No workspace detected | "No project detected. Running in generic mode." | Continue without integrations |
@@ -183,6 +225,8 @@ User is dropped into the main TUI.
 | `Esc` | Cancel and return to previous step |
 | `↑/↓` | Navigate options |
 | `Space` | Toggle integration |
+| `Tab` | Move to next field |
+| `Shift+Tab` | Move to previous field |
 | `Ctrl+C` | Abort onboarding |
 
 ---
@@ -194,4 +238,12 @@ After first run, CodeBro:
 1. Remembers all settings
 2. Skips onboarding on subsequent launches
 3. Shows a brief startup banner with current config
-4. Offers `/settings` to modify any value
+4. Offers `//settings` to modify any value
+
+---
+
+## Guiding Principle
+
+**Detect, never assume. Suggest, never enable.**
+
+Every integration, every tool, every capability is detected from the environment and presented to the user as a suggestion. The user explicitly approves each one. Nothing is silently enabled. The onboarding wizard is a conversation, not a configuration script.

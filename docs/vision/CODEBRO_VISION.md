@@ -1,8 +1,14 @@
 # CodeBro Vision
 
+**Version:** 1.1.0
+**Status:** Active
+**Date:** 2026-08-08
+
+---
+
 ## Product Vision
 
-CodeBro is a developer-first AI coding partner that lives in the terminal. It is designed to be the most intuitive, transparent, and configurable AI-assisted development tool available.
+CodeBro is a terminal-native engineering intelligence runtime. It is designed to be the most trustworthy, transparent, and configurable engineering tool available for professional software developers.
 
 ### Core Philosophy
 
@@ -10,7 +16,7 @@ CodeBro exists to eliminate friction between the developer's intent and the mach
 
 ### What We Build
 
-A terminal-based AI coding agent that:
+A terminal-native engineering intelligence runtime that:
 
 1. **Requires zero configuration to start** — one API key unlocks full functionality
 2. **Makes every action visible and controllable** — no hidden automation
@@ -32,7 +38,7 @@ These belong to P6. P5 creates the foundation they will sit on.
 
 | Phase | Focus | Deliverable |
 |-------|-------|-------------|
-| P0–P2 | Core runtime, reliability, tooling | Stable single-agent chat with tools |
+| P0–P2 | Core runtime, reliability, tooling | Stable single-agent runtime with tools |
 | P3–P4 | Multi-agent coordination, intelligence | Task graph, memory, skills, code intelligence |
 | P4.5 | Architecture freeze | Frozen core architecture, validated |
 | **P5** | **Developer Experience Platform** | **Interactive settings, provider management, guided onboarding** |
