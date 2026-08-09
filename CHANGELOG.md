@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Sprint 23.0 Workspace Metadata Correction**
+  - `ProjectIdentityRuntime::create` and `create_minimal` now persist the runtime's `workspace_root` into both the canonical `project_identity.json` and the `workspace.json` projection.
+  - Caller-provided builder workspace roots are preserved only when they exactly match the runtime root; otherwise the runtime root wins.
+  - `save_all` documentation updated to reflect sequential (non-atomic) projection writes.
+  - 3 new tests; full suite 2387 passed / 0 failed
 - **P10.5.1 Fact Store Foundation**
   - Canonical immutable repository for Engineering Facts built on the P10.5.0 FactsModel
   - Owns: FactStore, FactCollection, FactIndex, FactLookup, FactQuery, FactSnapshot, FactStatistics, FactDiagnostics, FactValidation

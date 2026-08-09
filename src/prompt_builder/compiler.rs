@@ -166,8 +166,8 @@ impl PromptCompiler {
 
         let project_info = Some(super::sections::ProjectInfoLike {
             name: context.project.name.clone(),
-            language: context.project.language.clone(),
-            framework: context.project.framework.clone(),
+            language: context.project.primary_language().to_string(),
+            framework: context.project.frameworks.first().cloned(),
             build_system: context.project.build_system.clone(),
             package_manager: context.project.package_manager.clone(),
             testing_framework: context.project.testing_framework.clone(),
