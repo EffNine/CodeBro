@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn test_thread_safety() {
         use std::thread;
-        let mut reg = ServiceRegistry::new();
+        let reg = ServiceRegistry::new();
         let handles: Vec<_> = (0..10)
             .map(|i| {
                 let mut r = reg.clone();

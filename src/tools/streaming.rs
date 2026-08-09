@@ -137,6 +137,22 @@ pub fn channel_stream(
     StreamResult::new(stream, tool_name)
 }
 
+/// Create a raw stream backed by a tokio channel and a producer closure.
+///
+/// This is the streaming primitive used by PTY-backed tools: the producer runs
+/// on a dedicated OS thread (so the async runtime is never blocked) and drives
+/// the channel with [`mpsc::Sender::blocking_send`].
+pub fn channel_stream_factory(
+    tool_name: &str,
+    produce: impl FnOnce(mpsc::Sender<StreamChunk>) + Send + 'static,
+) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
+    let (tx, mut rx) = mpsc::channel::<StreamChunk>(32);
+    std::thread::spawn(move || {
+        produce(tx);
+    });
+    Box::pin(stream::poll_fn(move |cx| rx.poll_recv(cx)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

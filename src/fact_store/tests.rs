@@ -93,7 +93,7 @@ fn sample_model() -> FactsModel {
             .with_module(m1.clone()),
     );
 
-    let mut d1f = DependencyFact::new(
+    let d1f = DependencyFact::new(
         d1.clone(),
         FactId::Package(p1.clone()),
         FactId::Package(p2.clone()),

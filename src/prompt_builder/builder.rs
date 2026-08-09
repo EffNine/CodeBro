@@ -661,6 +661,5 @@ mod tests {
         ));
         assert!(result.diagnostics.total_length > 0);
         assert_eq!(result.diagnostics.template_used, "engineering");
-        assert!(result.diagnostics.compile_duration_ms >= 0);
     }
 }

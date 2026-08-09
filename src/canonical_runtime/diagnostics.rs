@@ -51,6 +51,8 @@ pub struct TaskDiagnostics {
     pub provider_execution_ms: u64,
     /// Total task wall time.
     pub total_ms: u64,
+    /// Explicit verification results (build / tests), when run.
+    pub verification: Option<super::VerificationSummary>,
 }
 
 impl TaskDiagnostics {

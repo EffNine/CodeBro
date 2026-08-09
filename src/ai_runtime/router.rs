@@ -226,7 +226,7 @@ impl RuntimeRouter {
 
     /// Route a request to the best model.
     pub fn route(&self, request: &ModelRequest) -> AIRRuntimeResult<RoutingDecision> {
-        let mut candidates = self.candidates.read().unwrap();
+        let candidates = self.candidates.read().unwrap();
 
         if candidates.is_empty() {
             return Err(AIRRuntimeError::NoSuitableProvider(

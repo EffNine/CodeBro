@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_resolve_not_found() {
-        let (mut reg, resolver) = make_registry();
+        let (reg, resolver) = make_registry();
         let result = resolver.resolve("nonexistent", "plugin-a", None);
         match result {
             ResolutionResult::NotFound { name } => assert_eq!(name, "nonexistent"),

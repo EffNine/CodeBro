@@ -412,7 +412,6 @@ mod tests {
         assert!(diag.succeeded);
         assert!(diag.completed_at.is_some());
         // Duration should be at least 0 (may be 0 in very fast tests)
-        assert!(diag.total_duration_ms >= 0);
     }
 
     #[test]

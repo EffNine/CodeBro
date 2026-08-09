@@ -2354,11 +2354,12 @@ fn test_input_history_dedup() {
 #[test]
 fn test_panel_toggle_state() {
     let mut dashboard = crate::tui::dashboard::Dashboard::new();
-    assert!(dashboard.show_agents);
-    dashboard.toggle_agents();
+    // Default view is task-focused: agent panels are overlays, not fixtures.
     assert!(!dashboard.show_agents);
     dashboard.toggle_agents();
     assert!(dashboard.show_agents);
+    dashboard.toggle_agents();
+    assert!(!dashboard.show_agents);
 
     assert!(!dashboard.show_metrics);
     dashboard.toggle_metrics();
@@ -9601,6 +9602,46 @@ mod p55_validation {
             .unwrap()
             .block_on(manager.complete(&dir.path().to_path_buf()));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_onboarding_stores_key_in_credentials_not_plaintext() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "").unwrap();
+
+        let mut manager = crate::onboarding::OnboardingManager::new(dir.path().to_path_buf());
+        manager.start();
+        manager.set_api_key("sk-onboard-secret-123456");
+        manager.select_provider(&crate::provider_manager::ProviderId::OpenAI);
+        manager.session.wizard_state.selected_model = Some("gpt-4o".to_string());
+        manager.session.workspace_discovery = Some(
+            crate::workspace_discovery::DiscoveryEngine::new(dir.path().to_path_buf()).discover(),
+        );
+        manager.session.capability_discovery = Some(
+            crate::capability_discovery::CapabilityScanner::new(dir.path().to_path_buf()).scan(),
+        );
+        while !matches!(
+            manager.session.step,
+            crate::onboarding::OnboardingStep::Confirm
+        ) {
+            manager.next();
+        }
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(manager.complete(&dir.path().to_path_buf()))
+            .unwrap();
+
+        // The secret must not appear in normal config or a legacy key file.
+        let config = fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(!config.contains("sk-onboard-secret-123456"));
+        assert!(
+            !dir.path().join(".api_key").exists(),
+            "legacy plaintext key file must be migrated away"
+        );
+        // It must live in the secure credential store.
+        let mut store = crate::credentials::CredentialStore::new(dir.path().to_path_buf());
+        store.load().unwrap();
+        assert_eq!(store.get("openai"), Some("sk-onboard-secret-123456"));
     }
 
     #[test]

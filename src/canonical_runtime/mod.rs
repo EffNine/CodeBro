@@ -51,6 +51,7 @@ use crate::assembly::{
     AssemblyConfig, ContextAssembler, ContextAssemblyRequest, ContextAssemblyResult,
     ContextFragment as AssemblyFragment, ContextPriority, ContextSource, IntentType,
 };
+use crate::cancellation::CancellationToken;
 use crate::config::Config;
 use crate::dispatcher::ToolRegistry;
 use crate::engineering_context::constraints::{ConstraintCategory, EngineeringConstraint};
@@ -79,6 +80,7 @@ use crate::providers::OpenAiProvider;
 use crate::scanner::ProjectInfo;
 use crate::tools::{detect_workspace_root, is_toolable, run_tool_pipeline};
 use crate::workspace_runtime::{LocalFileSystem, WorkspaceRuntime};
+use futures::StreamExt;
 
 /// The number of ReAct reasoning iterations before giving up.
 const MAX_REACT_ITERATIONS: usize = 5;
@@ -93,6 +95,58 @@ pub struct TaskRequest<'a> {
     pub emit: &'a (dyn Fn(AgentEvent) + Send + Sync),
     /// Streaming response chunks sink (TUI renderer).
     pub on_chunk: &'a (dyn Fn(&str) + Send + Sync),
+}
+
+/// Optional task-run controls. Kept separate from [`TaskRequest`] so existing
+/// callers keep compiling; the TUI passes cancellation and live-PTY routing.
+#[derive(Default, Clone)]
+pub struct TaskOptions {
+    /// Cooperative cancellation (Ctrl+C). When set, execution stops promptly
+    /// and PTY-backed processes receive SIGINT.
+    pub cancel: Option<CancellationToken>,
+    /// Live PTY output sink: `(console_id, content)`. When set, streaming tool
+    /// output and verification output are forwarded here in addition to the
+    /// event stream.
+    pub on_pty: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+}
+
+/// The outcome of a directly-invoked streaming tool run (shell commands,
+/// build/test/playwright). Carries the authoritative exit code.
+#[derive(Debug, Clone)]
+pub struct CommandOutcome {
+    pub success: bool,
+    pub exit_code: i32,
+    pub output: String,
+    pub cancelled: bool,
+}
+
+impl CommandOutcome {
+    fn from_err(e: String) -> Self {
+        CommandOutcome {
+            success: false,
+            exit_code: -1,
+            output: e,
+            cancelled: false,
+        }
+    }
+}
+
+/// Result of the explicit verification phase (build / tests).
+#[derive(Debug, Clone, Default)]
+pub struct VerificationSummary {
+    pub steps: Vec<VerificationStep>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerificationStep {
+    /// Human label, e.g. "build" or "tests".
+    pub label: String,
+    /// The command that was run.
+    pub command: String,
+    pub success: bool,
+    pub exit_code: i32,
+    /// Tail of the command output, for diagnostics.
+    pub output_tail: String,
 }
 
 /// The outcome of one task execution.
@@ -218,6 +272,8 @@ impl CanonicalRuntime {
             ProviderRuntime::from_parts(registry.clone(), health.clone(), cost.clone());
         let router = IntelligentProviderRouter::new(registry.clone(), health.clone(), cost.clone());
 
+        let tool_registry = build_tool_registry(&workspace_root);
+
         Ok(CanonicalRuntime {
             config,
             workspace_root,
@@ -230,7 +286,7 @@ impl CanonicalRuntime {
             router,
             registry,
             io_providers: HashMap::new(),
-            tool_registry: build_tool_registry(),
+            tool_registry,
         })
     }
 
@@ -284,8 +340,35 @@ impl CanonicalRuntime {
 
     /// Execute one engineering task through the canonical pipeline.
     pub async fn run_task(&mut self, req: &TaskRequest<'_>) -> TaskResult {
+        self.run_task_with_options(req, TaskOptions::default())
+            .await
+    }
+
+    /// Execute one engineering task through the canonical pipeline with
+    /// optional cancellation and live-PTY routing.
+    pub async fn run_task_with_options(
+        &mut self,
+        req: &TaskRequest<'_>,
+        opts: TaskOptions,
+    ) -> TaskResult {
         let started = Instant::now();
         let mut diag = TaskDiagnostics::new(req.task);
+
+        if opts
+            .cancel
+            .as_ref()
+            .map(|c| c.is_cancelled())
+            .unwrap_or(false)
+        {
+            return self.fail(
+                req,
+                None,
+                req.task,
+                "Task cancelled".to_string(),
+                diag,
+                started,
+            );
+        }
 
         // Task lifecycle: begin.
         let mut graph = TaskGraph::new(req.task);
@@ -328,7 +411,7 @@ impl CanonicalRuntime {
         let t = Instant::now();
         let (assembly, report) = match self.observe(req).await {
             Ok(assembled) => assembled,
-            Err(e) => return self.fail(req, &mut graph, &root_id, e, diag, started),
+            Err(e) => return self.fail(req, Some(&mut graph), &root_id, e, diag, started),
         };
         diag.assembly_ms = t.elapsed().as_millis() as u64;
         diag.intent = format!("{:?}", assembly.intent.intent).to_lowercase();
@@ -336,7 +419,7 @@ impl CanonicalRuntime {
         // EngineeringContext handoff contract.
         let context = match self.build_context(req, &identity, memory_ctx, assembly, report) {
             Ok(ctx) => ctx,
-            Err(e) => return self.fail(req, &mut graph, &root_id, e, diag, started),
+            Err(e) => return self.fail(req, Some(&mut graph), &root_id, e, diag, started),
         };
         diag.context_fragments = context.fragment_count();
 
@@ -348,7 +431,7 @@ impl CanonicalRuntime {
         diag.prompt_tokens = compiled.estimated_tokens();
 
         // Execute: routing → breaker → health → retry → provider.
-        let (exec_result, route_trace) = self.run_execution_loop(req, context).await;
+        let (exec_result, route_trace) = self.run_execution_loop(req, context.clone(), &opts).await;
         diag.provider = route_trace.provider;
         diag.routing_reason = route_trace.reason;
         diag.strategy = route_trace.strategy;
@@ -356,10 +439,30 @@ impl CanonicalRuntime {
         diag.breaker_allowed = route_trace.breaker_allowed;
         diag.routing_ms = route_trace.routing_ms;
         diag.provider_execution_ms = route_trace.exec_ms;
-        diag.total_ms = started.elapsed().as_millis() as u64;
 
         match exec_result {
-            Ok(response) => {
+            Ok(mut response) => {
+                // Explicit verification phase (Understand → Recommend → Execute
+                // → Verify → Stop). Only tasks that intend to modify or debug
+                // the project are verified; a successful verification stops the
+                // task. No further work is generated after success.
+                let should_verify = context
+                    .task
+                    .as_ref()
+                    .map(|t| t.intent_type == "execution" || t.intent_type == "debugging")
+                    .unwrap_or(false);
+                if should_verify {
+                    if let Some((summary, verify_response)) =
+                        self.verify_task(req, &opts, &mut diag, started).await
+                    {
+                        diag.verification = Some(summary);
+                        if !verify_response.trim().is_empty() {
+                            response.push_str("\n\n");
+                            response.push_str(&verify_response);
+                        }
+                    }
+                }
+
                 graph.update_status(&root_id, TaskStatus::Completed);
                 graph.set_result(&root_id, &response);
                 (req.emit)(AgentEvent::TaskGraphUpdated {
@@ -380,7 +483,7 @@ impl CanonicalRuntime {
                     diagnostics: diag,
                 }
             }
-            Err(e) => self.fail(req, &mut graph, &root_id, e, diag, started),
+            Err(e) => self.fail(req, Some(&mut graph), &root_id, e, diag, started),
         }
     }
 
@@ -432,7 +535,8 @@ impl CanonicalRuntime {
             });
             match run_tool_pipeline(req.task, &self.workspace_root) {
                 Ok(pipeline) => {
-                    for run in &pipeline.tool_runs {
+                    let total = pipeline.tool_runs.len().max(1);
+                    for (i, run) in pipeline.tool_runs.iter().enumerate() {
                         (req.emit)(AgentEvent::ToolStarted {
                             tool: run.name.clone(),
                             args: run.args.clone(),
@@ -442,9 +546,10 @@ impl CanonicalRuntime {
                             result: run.output.clone(),
                             success: run.success,
                         });
+                        // Progress reflects the real share of completed runs.
                         (req.emit)(AgentEvent::AgentProgress {
                             agent: "main".to_string(),
-                            progress: 0.5,
+                            progress: (i + 1) as f32 / total as f32,
                             action: format!("Executed {}", run.name),
                         });
                     }
@@ -647,12 +752,22 @@ impl CanonicalRuntime {
         &mut self,
         req: &TaskRequest<'_>,
         initial_context: EngineeringContext,
+        opts: &TaskOptions,
     ) -> (std::result::Result<String, String>, RouteTrace) {
         let started = Instant::now();
         let mut trace = RouteTrace::default();
         let mut context = initial_context;
 
         for _ in 0..MAX_REACT_ITERATIONS {
+            if opts
+                .cancel
+                .as_ref()
+                .map(|c| c.is_cancelled())
+                .unwrap_or(false)
+            {
+                return (Err("Task cancelled".to_string()), trace);
+            }
+
             // Canonical prompt compilation for the current context.
             let compiled = self.prompt_builder.compile_context(&context);
 
@@ -681,7 +796,7 @@ impl CanonicalRuntime {
 
             // Execute through ProviderRuntime gates.
             match self
-                .stream_once(&decision, &compiled.prompt, req.on_chunk)
+                .stream_once(&decision, &compiled.prompt, req.on_chunk, opts)
                 .await
             {
                 Ok(full) => {
@@ -693,7 +808,7 @@ impl CanonicalRuntime {
                                     tool: call.name.clone(),
                                     args: call.arguments.clone(),
                                 });
-                                let result = self.execute_tool(call).await;
+                                let result = self.execute_tool(call, req.emit, opts).await;
                                 (req.emit)(AgentEvent::ToolCompleted {
                                     tool: call.name.clone(),
                                     result: result.clone(),
@@ -736,6 +851,7 @@ impl CanonicalRuntime {
         decision: &ProviderRoutingDecision,
         prompt: &str,
         on_chunk: &(dyn Fn(&str) + Send + Sync),
+        opts: &TaskOptions,
     ) -> std::result::Result<String, String> {
         let provider_id = decision.provider_id().clone();
 
@@ -767,6 +883,14 @@ impl CanonicalRuntime {
                 Ok(mut rx) => {
                     let mut full = String::new();
                     while let Some(chunk) = rx.recv().await {
+                        if opts
+                            .cancel
+                            .as_ref()
+                            .map(|c| c.is_cancelled())
+                            .unwrap_or(false)
+                        {
+                            return Err("Task cancelled".to_string());
+                        }
                         full.push_str(&chunk);
                         on_chunk(&chunk);
                     }
@@ -799,14 +923,46 @@ impl CanonicalRuntime {
         }
     }
 
-    /// Execute a single tool call via the registry.
-    async fn execute_tool(&mut self, call: &ToolCall) -> String {
+    /// Execute a single tool call via the registry, streaming PTY output live
+    /// when the tool supports it.
+    async fn execute_tool(
+        &mut self,
+        call: &ToolCall,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        opts: &TaskOptions,
+    ) -> String {
+        let cancel = opts.cancel.clone();
         match self
             .tool_registry
-            .execute(&call.name, &call.arguments)
+            .execute_stream(&call.name, &call.arguments, cancel)
             .await
         {
-            Ok(result) => result,
+            Ok(mut stream) => {
+                let mut output = String::new();
+                while let Some(chunk) = stream.chunks.next().await {
+                    if !chunk.text.is_empty() {
+                        // Route live output exactly once: through the dedicated
+                        // PTY sink when provided, otherwise through the event
+                        // stream.
+                        match &opts.on_pty {
+                            Some(on_pty) => on_pty("task", &chunk.text),
+                            None => emit(AgentEvent::PtyOutput {
+                                console: "task".to_string(),
+                                content: chunk.text.clone(),
+                            }),
+                        }
+                        output.push_str(&chunk.text);
+                    }
+                    if chunk.is_final {
+                        break;
+                    }
+                }
+                if output.trim().is_empty() {
+                    "…".to_string()
+                } else {
+                    output
+                }
+            }
             Err(e) => format!("Error: {}", e),
         }
     }
@@ -815,17 +971,19 @@ impl CanonicalRuntime {
     fn fail(
         &mut self,
         req: &TaskRequest<'_>,
-        graph: &mut TaskGraph,
+        graph: Option<&mut TaskGraph>,
         root_id: &str,
         error: String,
         mut diag: TaskDiagnostics,
         started: Instant,
     ) -> TaskResult {
         diag.total_ms = started.elapsed().as_millis() as u64;
-        graph.update_status(root_id, TaskStatus::Failed);
-        (req.emit)(AgentEvent::TaskGraphUpdated {
-            graph: graph.clone(),
-        });
+        if let Some(graph) = graph {
+            graph.update_status(root_id, TaskStatus::Failed);
+            (req.emit)(AgentEvent::TaskGraphUpdated {
+                graph: graph.clone(),
+            });
+        }
 
         if let Ok(mut recovery) = RecoveryEngine::new() {
             if let Ok(plan) = recovery.handle_failure("main", req.task, &error) {
@@ -850,6 +1008,267 @@ impl CanonicalRuntime {
             diagnostics: diag,
         }
     }
+
+    // =====================================================================
+    // Direct streaming commands (`!`, /build, /test, /playwright, verify)
+    // =====================================================================
+
+    /// Run a tool through the canonical tool platform, streaming PTY output to
+    /// the live console and emitting authoritative lifecycle events. Used by
+    /// shell commands (`!`), engineering commands (`/build`, `/test`,
+    /// `/playwright`) and the verification phase. Never fakes events: each
+    /// event corresponds to a real process state transition.
+    pub async fn run_tool_streaming(
+        &mut self,
+        tool_name: &str,
+        console_id: &str,
+        args: &str,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        cancel: CancellationToken,
+    ) -> CommandOutcome {
+        (emit)(AgentEvent::ToolStarted {
+            tool: tool_name.to_string(),
+            args: args.to_string(),
+        });
+
+        let outcome = match self
+            .tool_registry
+            .execute_stream(tool_name, args, Some(cancel))
+            .await
+        {
+            Ok(mut stream) => {
+                let mut output = String::new();
+                let mut exit_code = -1;
+                let mut cancelled = false;
+                let mut status = "unknown".to_string();
+
+                while let Some(chunk) = stream.chunks.next().await {
+                    if !chunk.text.is_empty() {
+                        output.push_str(&chunk.text);
+                        (emit)(AgentEvent::PtyOutput {
+                            console: console_id.to_string(),
+                            content: chunk.text,
+                        });
+                    }
+                    if let Some(meta) = &chunk.metadata {
+                        if let Some(code) = meta.strip_prefix("exit:") {
+                            exit_code = code.parse().unwrap_or(-1);
+                        } else if meta == "cancelled" {
+                            cancelled = true;
+                        } else if meta == "timeout" {
+                            status = "timed out".to_string();
+                        } else if meta == "error" {
+                            status = "error".to_string();
+                        }
+                    }
+                    if chunk.is_final {
+                        break;
+                    }
+                }
+
+                if status == "unknown" {
+                    status = if cancelled {
+                        "cancelled".to_string()
+                    } else if exit_code == 0 {
+                        "completed".to_string()
+                    } else {
+                        "failed".to_string()
+                    };
+                }
+
+                (emit)(AgentEvent::PtyExited {
+                    console: console_id.to_string(),
+                    exit_code,
+                    status: status.clone(),
+                });
+                (emit)(AgentEvent::ToolCompleted {
+                    tool: tool_name.to_string(),
+                    result: output.clone(),
+                    success: exit_code == 0,
+                });
+
+                CommandOutcome {
+                    success: exit_code == 0,
+                    exit_code,
+                    output,
+                    cancelled,
+                }
+            }
+            Err(e) => {
+                (emit)(AgentEvent::ToolCompleted {
+                    tool: tool_name.to_string(),
+                    result: format!("Error: {}", e),
+                    success: false,
+                });
+                CommandOutcome::from_err(format!("Error: {}", e))
+            }
+        };
+
+        outcome
+    }
+
+    /// Run a shell command directly through the PTY console path.
+    pub async fn run_shell(
+        &mut self,
+        command: &str,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        cancel: CancellationToken,
+    ) -> CommandOutcome {
+        let console_id = uuid::Uuid::new_v4().to_string();
+        self.run_tool_streaming("run_command", &console_id, command, emit, cancel)
+            .await
+    }
+
+    /// Determine the build/test commands for the workspace, if any.
+    fn verify_commands(&self) -> (Option<(String, String)>, Option<(String, String)>) {
+        let root = &self.workspace_root;
+        if root.join("Cargo.toml").exists() {
+            (
+                Some(("cargo build".to_string(), "cargo build".to_string())),
+                Some(("cargo test".to_string(), "cargo test".to_string())),
+            )
+        } else if root.join("package.json").exists() {
+            let has_build = {
+                let content =
+                    std::fs::read_to_string(root.join("package.json")).unwrap_or_default();
+                content.contains("\"build\"")
+            };
+            let build = if has_build {
+                Some(("npm run build".to_string(), "npm run build".to_string()))
+            } else {
+                Some(("tsc --noEmit".to_string(), "tsc --noEmit".to_string()))
+            };
+            (
+                build,
+                Some(("npm test".to_string(), "npm test".to_string())),
+            )
+        } else {
+            (None, None)
+        }
+    }
+
+    /// Run the explicit verification phase (build then tests) for the task.
+    ///
+    /// Each step runs a real command through the canonical tool path, streams
+    /// to the live console, and records the authoritative exit code. The
+    /// returned string is appended to the task response; `None` means no
+    /// verification was applicable (e.g. no build system detected).
+    async fn verify_task(
+        &mut self,
+        req: &TaskRequest<'_>,
+        opts: &TaskOptions,
+        diag: &mut TaskDiagnostics,
+        started: Instant,
+    ) -> Option<(VerificationSummary, String)> {
+        let (build, test) = self.verify_commands();
+        let (build_label, build_cmd) = build?;
+        let test_pair = test;
+
+        (req.emit)(AgentEvent::AgentStatusChanged {
+            agent: "main".to_string(),
+            status: AgentStatus::Testing,
+        });
+
+        let cancel = opts.cancel.clone().unwrap_or_else(CancellationToken::new);
+        let mut steps = Vec::new();
+        let mut lines = Vec::new();
+        let mut all_passed = true;
+
+        let console_build = uuid::Uuid::new_v4().to_string();
+        let build_outcome = self
+            .run_tool_streaming(
+                "run_command",
+                &console_build,
+                &build_cmd,
+                req.emit,
+                cancel.clone(),
+            )
+            .await;
+        steps.push(VerificationStep {
+            label: build_label.clone(),
+            command: build_cmd.clone(),
+            success: build_outcome.success,
+            exit_code: build_outcome.exit_code,
+            output_tail: tail(&build_outcome.output, 400),
+        });
+        let build_ok = build_outcome.success;
+        if !build_ok {
+            all_passed = false;
+        }
+
+        if let Some((test_label, test_cmd)) = test_pair {
+            // Only run tests when the build passed; a failing build makes the
+            // test step meaningless.
+            if build_ok {
+                let console_test = uuid::Uuid::new_v4().to_string();
+                let test_outcome = self
+                    .run_tool_streaming(
+                        "run_command",
+                        &console_test,
+                        &test_cmd,
+                        req.emit,
+                        cancel.clone(),
+                    )
+                    .await;
+                steps.push(VerificationStep {
+                    label: test_label.clone(),
+                    command: test_cmd.clone(),
+                    success: test_outcome.success,
+                    exit_code: test_outcome.exit_code,
+                    output_tail: tail(&test_outcome.output, 400),
+                });
+                if !test_outcome.success {
+                    all_passed = false;
+                }
+            } else {
+                steps.push(VerificationStep {
+                    label: test_label.clone(),
+                    command: test_cmd.clone(),
+                    success: false,
+                    exit_code: -1,
+                    output_tail: "skipped: build failed".to_string(),
+                });
+            }
+        }
+
+        if all_passed {
+            lines.push(format!(
+                "Verification passed: {} ✓",
+                steps
+                    .iter()
+                    .map(|s| s.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        } else {
+            lines.push(format!(
+                "Verification {}:",
+                steps
+                    .iter()
+                    .any(|s| !s.success)
+                    .then_some("failed")
+                    .unwrap_or("passed")
+            ));
+            for step in &steps {
+                let mark = if step.success { "✓" } else { "✗" };
+                lines.push(format!(
+                    "  {} {} (exit {})",
+                    mark, step.label, step.exit_code
+                ));
+                if !step.success {
+                    for line in step.output_tail.lines().take(6) {
+                        lines.push(format!("    {}", line));
+                    }
+                }
+            }
+        }
+        diag.total_ms = started.elapsed().as_millis() as u64;
+        diag.verification = Some(VerificationSummary {
+            steps: steps.clone(),
+        });
+
+        Some((VerificationSummary { steps }, lines.join("\n")))
+    }
 }
 
 // =========================================================================
@@ -857,15 +1276,37 @@ impl CanonicalRuntime {
 // =========================================================================
 
 /// Build the shared tool registry for the ReAct loop.
-fn build_tool_registry() -> ToolRegistry {
+fn build_tool_registry(workspace_root: &Path) -> ToolRegistry {
+    let root = workspace_root.to_path_buf();
     ToolRegistry::new()
         .register(Arc::new(crate::tools::ListFiles))
         .register(Arc::new(crate::tools::ReadFile))
         .register(Arc::new(crate::tools::CreateFile))
         .register(Arc::new(crate::tools::EditFile))
-        .register(Arc::new(crate::tools::RunCommand::new()))
+        .register(Arc::new(
+            crate::tools::RunCommand::new()
+                .with_working_directory(root.to_string_lossy().to_string()),
+        ))
         .register(Arc::new(crate::tools::GitStatus))
         .register(Arc::new(crate::tools::GitDiff))
+        .register(Arc::new(crate::tools::PlaywrightTool::new(root)))
+}
+
+/// Keep the tail of a large output string for diagnostics.
+fn tail(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let tail: String = s
+            .chars()
+            .rev()
+            .take(max_chars)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("…{}", tail)
+    }
 }
 
 /// Load engineering memory for a workspace root.

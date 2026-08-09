@@ -56,6 +56,20 @@ pub enum AgentEvent {
     StreamChunk {
         content: String,
     },
+    /// Live output from a PTY-backed process belonging to the task. This is
+    /// authoritative streamed output, not a synthetic status message.
+    PtyOutput {
+        /// Opaque identifier of the console the chunk belongs to.
+        console: String,
+        content: String,
+    },
+    /// A PTY-backed process exited (or was terminated). Carries the real exit
+    /// state so the UI never fabricates completion.
+    PtyExited {
+        console: String,
+        exit_code: i32,
+        status: String,
+    },
     Log {
         level: String,
         message: String,
@@ -91,6 +105,8 @@ impl AgentEvent {
             AgentEvent::AgentFailed { agent, .. } => format!("Agent {} failed", agent),
             AgentEvent::TaskGraphUpdated { .. } => "Task graph updated".to_string(),
             AgentEvent::StreamChunk { .. } => "streaming".to_string(),
+            AgentEvent::PtyOutput { .. } => "console output".to_string(),
+            AgentEvent::PtyExited { status, .. } => format!("console {}", status),
             AgentEvent::Log { level, message } => format!("[{}] {}", level, message),
         }
     }

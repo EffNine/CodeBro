@@ -174,19 +174,20 @@ pub struct Dashboard {
     pub show_welcome: bool,
     /// Most recent provider/tool error surfaced to the user.
     pub last_error: Option<String>,
+    /// Verbose mode: reveal tool calls, routing decisions, provider details,
+    /// and internal diagnostics. Off by default (minimal).
+    pub verbose: bool,
+    /// Compact mode: reduce secondary activity further.
+    pub compact: bool,
+    /// Current operation being performed (shown as the "current operation"
+    /// line under the title).
+    pub current_operation: Option<String>,
 }
 
 impl Dashboard {
     pub fn new() -> Self {
-        let mut status_monitor = AgentStatusMonitor::new();
-        for agent in [
-            "main", "research", "planning", "coding", "testing", "review",
-        ] {
-            status_monitor.register_agent(agent);
-        }
-
         Dashboard {
-            status_monitor,
+            status_monitor: AgentStatusMonitor::new(),
             activity_log: VecDeque::new(),
             active_tools: VecDeque::new(),
             memory_notifications: VecDeque::new(),
@@ -194,7 +195,8 @@ impl Dashboard {
             task_graph: None,
             animation: AnimationState::new(),
             max_log_entries: 200,
-            show_agents: true,
+            // Default view is task-focused: panels are overlays, not fixtures.
+            show_agents: false,
             show_task_graph: false,
             show_memory: false,
             show_trace: false,
@@ -213,16 +215,22 @@ impl Dashboard {
             palette_index: 0,
             show_welcome: true,
             last_error: None,
+            verbose: false,
+            compact: false,
+            current_operation: None,
         }
     }
 
     pub fn handle_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::AgentStarted { agent, task } => {
+                // Agents appear only when they become active.
+                self.status_monitor.register_agent(&agent);
                 self.status_monitor
                     .update_status(&agent, AgentStatus::Thinking);
                 self.status_monitor.update_task(&agent, task.clone());
                 self.animation.start_activity(ActivityType::Thinking);
+                self.set_operation(format!("{}: {}", agent, task));
                 self.log("info", format!("Agent {} started: {}", agent, task));
             }
             AgentEvent::AgentProgress {
@@ -230,13 +238,17 @@ impl Dashboard {
                 progress,
                 action,
             } => {
+                self.status_monitor.register_agent(&agent);
                 self.status_monitor.update_progress(&agent, progress);
-                self.status_monitor.update_action(&agent, action);
+                self.status_monitor.update_action(&agent, action.clone());
+                self.log("info", format!("{}  {}", agent, action));
             }
             AgentEvent::AgentStatusChanged { agent, status } => {
+                self.status_monitor.register_agent(&agent);
                 self.status_monitor.update_status(&agent, status.clone());
                 self.apply_activity(&status);
-                self.log("info", format!("Agent {} -> {}", agent, status));
+                self.set_operation(format!("{}: {}", agent, status));
+                self.log_verbose("info", format!("Agent {} -> {}", agent, status));
             }
             AgentEvent::ToolStarted { tool, args } => {
                 self.active_tools.push_front(ToolView {
@@ -245,7 +257,8 @@ impl Dashboard {
                     status: ToolStatus::Running,
                     result: None,
                 });
-                self.log("tool", format!("Tool started: {}", tool));
+                self.set_operation(format!("{} {}", tool, sanitize_args(&args)));
+                self.log("tool", format!("{} {}", tool, sanitize_args(&args)));
             }
             AgentEvent::ToolCompleted {
                 tool,
@@ -262,11 +275,7 @@ impl Dashboard {
                 }
                 self.log(
                     "tool",
-                    format!(
-                        "Tool {} {}",
-                        tool,
-                        if success { "completed" } else { "failed" }
-                    ),
+                    format!("{} {}", tool, if success { "completed" } else { "failed" }),
                 );
             }
             AgentEvent::TaskUpdated {
@@ -281,7 +290,7 @@ impl Dashboard {
                     message: summary.clone(),
                     timestamp: chrono::Local::now().to_rfc3339(),
                 });
-                self.log("memory", format!("Memory updated: {}", summary));
+                self.log_verbose("memory", format!("Memory updated: {}", summary));
             }
             AgentEvent::SkillUpdated {
                 skill,
@@ -294,7 +303,7 @@ impl Dashboard {
                     confidence_after,
                     timestamp: chrono::Local::now().to_rfc3339(),
                 });
-                self.log(
+                self.log_verbose(
                     "skill",
                     format!(
                         "Skill updated: {} confidence {:.2} -> {:.2}",
@@ -303,11 +312,13 @@ impl Dashboard {
                 );
             }
             AgentEvent::AgentCompleted { agent, .. } => {
+                self.status_monitor.register_agent(&agent);
                 self.status_monitor
                     .update_status(&agent, AgentStatus::Completed);
                 self.log("info", format!("Agent {} completed", agent));
             }
             AgentEvent::AgentFailed { agent, error } => {
+                self.status_monitor.register_agent(&agent);
                 self.status_monitor
                     .update_status(&agent, AgentStatus::Failed);
                 self.last_error = Some(error.clone());
@@ -315,11 +326,23 @@ impl Dashboard {
             }
             AgentEvent::TaskGraphUpdated { graph } => {
                 self.set_task_graph(graph);
-                self.log("task", "Task graph updated".to_string());
             }
             AgentEvent::StreamChunk { content } => {
                 self.streaming_buffer.push_str(&content);
                 self.is_streaming = true;
+            }
+            AgentEvent::PtyOutput { console, content } => {
+                self.log_verbose("console", format!("{}: {}", console, content.trim_end()));
+            }
+            AgentEvent::PtyExited {
+                console,
+                exit_code,
+                status,
+            } => {
+                self.log(
+                    "console",
+                    format!("{} {} (exit {})", console, status, exit_code),
+                );
             }
             AgentEvent::Log { level, message } => {
                 if level == "coordination" {
@@ -327,6 +350,19 @@ impl Dashboard {
                 }
                 self.log(&level, message);
             }
+        }
+    }
+
+    /// Set the current operation (shown under the title bar).
+    fn set_operation(&mut self, op: String) {
+        self.current_operation = Some(op);
+    }
+
+    /// Log only when verbose mode is enabled (internal noise stays hidden in
+    /// the default minimal mode).
+    fn log_verbose(&mut self, level: &str, message: String) {
+        if self.verbose {
+            self.log(level, message);
         }
     }
 
@@ -514,10 +550,12 @@ mod tests {
     #[test]
     fn test_dashboard_new() {
         let dashboard = Dashboard::new();
-        assert_eq!(dashboard.status_monitor.count(), 6);
+        // No agents are pre-registered: agents appear only when active.
+        assert_eq!(dashboard.status_monitor.count(), 0);
         assert!(dashboard.activity_log.is_empty());
-        assert!(dashboard.show_agents);
+        assert!(!dashboard.show_agents);
         assert!(!dashboard.show_task_graph);
+        assert!(!dashboard.verbose);
     }
 
     #[test]
@@ -528,6 +566,7 @@ mod tests {
             task: "Find auth code".to_string(),
         });
         assert!(dashboard.animation.is_active());
+        assert_eq!(dashboard.status_monitor.count(), 1);
         assert!(!dashboard.activity_log.is_empty());
     }
 
@@ -538,6 +577,7 @@ mod tests {
             agent: "coding".to_string(),
             status: AgentStatus::Executing,
         });
+        // Status change registers the agent dynamically.
         let state = dashboard.status_monitor.get("coding").unwrap();
         assert_eq!(state.status, AgentStatus::Executing);
     }
@@ -707,5 +747,60 @@ mod tests {
 
         dashboard.dismiss_welcome();
         assert!(!dashboard.show_welcome);
+    }
+
+    #[test]
+    fn test_dashboard_verbose_gates_internal_logs() {
+        let mut dashboard = Dashboard::new();
+        dashboard.handle_event(AgentEvent::AgentStatusChanged {
+            agent: "main".to_string(),
+            status: AgentStatus::Thinking,
+        });
+        // Minimal mode: status transitions are not logged as activity.
+        assert!(dashboard.activity_log.is_empty());
+
+        dashboard.verbose = true;
+        dashboard.handle_event(AgentEvent::AgentStatusChanged {
+            agent: "main".to_string(),
+            status: AgentStatus::Planning,
+        });
+        assert!(!dashboard.activity_log.is_empty());
+    }
+
+    #[test]
+    fn test_dashboard_current_operation() {
+        let mut dashboard = Dashboard::new();
+        assert!(dashboard.current_operation.is_none());
+        dashboard.handle_event(AgentEvent::ToolStarted {
+            tool: "run_command".to_string(),
+            args: "cargo test".to_string(),
+        });
+        assert_eq!(
+            dashboard.current_operation.as_deref(),
+            Some("run_command cargo test")
+        );
+    }
+
+    #[test]
+    fn test_dashboard_pty_events() {
+        let mut dashboard = Dashboard::new();
+        dashboard.handle_event(AgentEvent::PtyOutput {
+            console: "c1".to_string(),
+            content: "building…\n".to_string(),
+        });
+        assert!(
+            dashboard.activity_log.is_empty(),
+            "PTY output is verbose-only"
+        );
+
+        dashboard.handle_event(AgentEvent::PtyExited {
+            console: "c1".to_string(),
+            exit_code: 0,
+            status: "completed".to_string(),
+        });
+        assert!(
+            !dashboard.activity_log.is_empty(),
+            "PTY exit is always logged"
+        );
     }
 }

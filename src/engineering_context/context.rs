@@ -253,7 +253,6 @@ mod tests {
     fn test_diagnostics_present() {
         let ctx = sample_context();
         assert!(!ctx.diagnostics.creation_time.is_empty());
-        assert!(ctx.diagnostics.build_duration_ms >= 0);
     }
 
     #[test]

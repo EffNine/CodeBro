@@ -9,116 +9,34 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui::Terminal;
 use std::io::stdout;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent::events::AgentEvent;
 use crate::agent::status::AgentStatus;
+use crate::agent::task_graph::TaskStatus;
 use crate::config::Config;
 use crate::tui::animation::progress_bar;
-use crate::tui::app::{MessageRole, TuiApp};
+use crate::tui::app::{MessageRole, PendingAction, TuiApp};
+use crate::tui::commands::{self, CommandNamespace};
+use crate::tui::console::PtyConsole;
 use crate::tui::dashboard::Dashboard;
 use crate::tui::events::{self, Shortcut};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Every slash command and its description. Source of truth for /help, the
-/// command palette, and TAB autocompletion.
-const SLASH_COMMANDS: &[(&str, &str, &str)] = &[
-    ("/help", "Show help", "List all commands"),
-    (
-        "/model",
-        "Pick a model",
-        "Open the interactive model picker",
-    ),
-    ("/agents", "Show agent status", "Agent status + progress"),
-    ("/tasks", "Show task graph", "Current task graph"),
-    (
-        "/memory",
-        "Show memory changes",
-        "Recent memory notifications",
-    ),
-    (
-        "/skills",
-        "Show skill changes",
-        "Recent skill confidence changes",
-    ),
-    ("/sessions", "List sessions", "Recent session history"),
-    (
-        "/replay <id>",
-        "Replay a session",
-        "Replay a session timeline",
-    ),
-    ("/config", "Open config", "View/edit configuration"),
-    (
-        "/status",
-        "Show status",
-        "Pipeline, workspace and tool state",
-    ),
-    ("/metrics", "Task metrics", "Toggle metrics panel"),
-    (
-        "/apply <file>",
-        "Propose a change",
-        "Stage a reviewed file change (no writes)",
-    ),
-    (
-        "/approve [verify-cmd]",
-        "Apply pending change",
-        "Apply + optionally verify the staged change",
-    ),
-    (
-        "/copy",
-        "Copy conversation",
-        "Copy the conversation to the clipboard",
-    ),
-    // P5: Developer Experience
-    (
-        "/settings",
-        "Open settings",
-        "View and edit all settings interactively",
-    ),
-    (
-        "/settings:apply",
-        "Apply settings",
-        "Save pending settings changes",
-    ),
-    (
-        "/settings:discard",
-        "Discard settings",
-        "Revert all pending settings changes",
-    ),
-    (
-        "/providers",
-        "Show providers",
-        "View and manage AI providers",
-    ),
-    ("/health", "Check health", "Test provider connections"),
-    (
-        "/discover",
-        "Discover workspace",
-        "Scan workspace for integrations and capabilities",
-    ),
-    (
-        "/workspace",
-        "Show workspace",
-        "Display workspace detection results",
-    ),
-    (
-        "/onboard",
-        "Re-run onboarding",
-        "Run the first-run setup wizard",
-    ),
-];
-
-fn match_slash_command(input: &str) -> Vec<String> {
-    let token = input.split_whitespace().next().unwrap_or("");
-    if !token.starts_with('/') || token.len() < 2 {
-        return Vec::new();
+/// Truncates a string to `width` Unicode characters (never panics on long text).
+pub fn truncate_to(s: &str, width: usize) -> String {
+    let count = s.chars().count();
+    if count <= width {
+        s.to_string()
+    } else if width == 0 {
+        String::new()
+    } else {
+        let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
-    SLASH_COMMANDS
-        .iter()
-        .map(|c| c.0.split_whitespace().next().unwrap().to_string())
-        .filter(|name| name.starts_with(token))
-        .collect()
 }
 
 pub fn run(mut app: TuiApp) -> Result<()> {
@@ -134,16 +52,11 @@ pub fn run(mut app: TuiApp) -> Result<()> {
     enable_raw_mode()?;
     let mut out = io_stdout();
     out.execute(EnterAlternateScreen)?;
-    // Bracketed paste lets multi-line pastes arrive as one Paste event instead
-    // of being split into Enter presses (the prompt stays together).
     out.execute(EnableBracketedPaste)?;
-    // Mouse capture keeps the wheel scrolling the app (conversation) instead of
-    // the whole terminal.
     out.execute(EnableMouseCapture)?;
 
     let result = run_loop(&mut app);
 
-    // Always restore the terminal, even if the loop errored.
     let _ = out.execute(DisableMouseCapture);
     let _ = out.execute(DisableBracketedPaste);
     let _ = out.execute(LeaveAlternateScreen);
@@ -156,8 +69,6 @@ fn run_loop(app: &mut TuiApp) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, rx) = std::sync::mpsc::channel();
-    // Reuse the same sender the event loop reads so responses / stream chunks /
-    // agent events sent by spawned tasks actually reach the UI.
     app.tx = tx.clone();
     events::start_event_loop(tx)?;
 
@@ -180,8 +91,6 @@ fn run_loop(app: &mut TuiApp) -> Result<()> {
             needs_redraw = true;
         }
 
-        // Non-blocking poll with a fixed frame interval so the spinner
-        // animates smoothly without spinning the CPU at 100%.
         match rx.recv_timeout(FRAME_INTERVAL) {
             Ok(msg) => {
                 let handled = handle_event(msg, app);
@@ -221,6 +130,7 @@ fn handle_event(msg: events::AppEvent, app: &mut TuiApp) -> bool {
             app.dashboard.clear_error();
             app.add_message(MessageRole::Assistant, content);
             app.end_task();
+            app.cancel_token = None;
             true
         }
         events::AppEvent::StreamChunk(content) => {
@@ -230,7 +140,6 @@ fn handle_event(msg: events::AppEvent, app: &mut TuiApp) -> bool {
         }
         events::AppEvent::AgentEvent(event) => {
             app.handle_agent_event(event.clone());
-            // Dismiss welcome on first meaningful activity.
             if matches!(event, AgentEvent::AgentStarted { .. }) {
                 app.dashboard.dismiss_welcome();
             }
@@ -285,15 +194,16 @@ fn handle_event(msg: events::AppEvent, app: &mut TuiApp) -> bool {
 fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
     match key.kind {
         KeyEventKind::Press => {
-            // Model picker takes over keyboard input while open.
             if app.dashboard.model_picker.is_open() {
                 handle_model_picker_key(key, app);
                 return;
             }
-
-            // Command palette takes over keyboard input while open.
             if app.dashboard.show_command_palette {
                 handle_palette_key(key, app);
+                return;
+            }
+            if app.pending_confirmation.is_some() {
+                handle_confirmation_key(key, app);
                 return;
             }
 
@@ -304,11 +214,16 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
 
             match key.code {
                 KeyCode::Tab => {
-                    // Slash-command autocompletion while typing a command.
-                    if app.input.starts_with('/') {
-                        let candidates = match_slash_command(&app.input);
-                        app.dashboard
-                            .autocomplete_command(&mut app.input, candidates);
+                    // Context-aware completion for `/`, `//`, `!`.
+                    if app.input.starts_with('/') || app.input.starts_with('!') {
+                        let candidates = commands::completion_candidates(&app.input, app);
+                        let names: Vec<String> =
+                            candidates.iter().map(|c| c.command.to_string()).collect();
+                        if names.is_empty() {
+                            app.dashboard.autocomplete.clear();
+                        } else {
+                            app.dashboard.autocomplete_command(&mut app.input, names);
+                        }
                     }
                 }
                 KeyCode::Up => {
@@ -340,7 +255,6 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                     }
                 }
                 KeyCode::Enter => {
-                    // Shift+Enter inserts a newline for multi-line input.
                     if key
                         .modifiers
                         .contains(crossterm::event::KeyModifiers::SHIFT)
@@ -352,29 +266,32 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                     let input = app.input.trim().to_string();
                     if !input.is_empty() {
                         app.push_history(input.clone());
-                        if input.starts_with('/') {
-                            handle_command(&input, app);
-                            app.clear_input();
-                            return;
-                        }
-                        app.add_message(MessageRole::User, input.clone());
                         app.clear_input();
-                        app.is_loading = true;
-                        app.begin_task(input.clone());
-                        app.dashboard
-                            .animation
-                            .start_activity(crate::tui::animation::ActivityType::Thinking);
-                        let config = app.config.clone();
-                        let tx = app.tx.clone();
-                        tokio::spawn(async move {
-                            run_chat_pipeline(&config, &input, &tx).await;
-                        });
+                        submit_input(input, app);
                     }
                 }
                 KeyCode::Backspace => app.backspace(),
-                KeyCode::Char(c) => app.insert_char(c),
+                KeyCode::Char(c) => {
+                    app.insert_char(c);
+                    // Live-filter the completion list while typing a command.
+                    if app.input.starts_with('/') || app.input.starts_with('!') {
+                        let candidates = commands::completion_candidates(&app.input, app);
+                        app.dashboard.autocomplete =
+                            candidates.iter().map(|c| c.command.to_string()).collect();
+                        if app.dashboard.autocomplete.is_empty() {
+                            app.dashboard.autocomplete_index = 0;
+                        }
+                    }
+                }
                 KeyCode::Esc => {
-                    app.dashboard.toggle_command_palette();
+                    if !app.dashboard.autocomplete.is_empty() {
+                        app.dashboard.autocomplete.clear();
+                        app.dashboard.autocomplete_index = 0;
+                    } else if app.dashboard.show_command_palette {
+                        app.dashboard.toggle_command_palette();
+                    } else if app.dashboard.model_picker.is_open() {
+                        app.dashboard.model_picker.close();
+                    }
                 }
                 _ => {}
             }
@@ -383,154 +300,424 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
     }
 }
 
-fn handle_model_picker_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
-    use crossterm::event::KeyCode;
-
-    match key.code {
-        KeyCode::Up => app.dashboard.model_picker.prev(),
-        KeyCode::Down => app.dashboard.model_picker.next(),
-        KeyCode::PageUp => {
-            for _ in 0..5 {
-                app.dashboard.model_picker.prev();
-            }
-        }
-        KeyCode::PageDown => {
-            for _ in 0..5 {
-                app.dashboard.model_picker.next();
-            }
-        }
-        KeyCode::Enter => {
-            if let Some(model) = app.dashboard.model_picker.selected() {
-                app.apply_model(model);
-            }
-        }
-        KeyCode::Esc => {
-            app.dashboard.model_picker.close();
-        }
-        KeyCode::Backspace => {
-            app.dashboard.model_picker.filter.pop();
-            app.dashboard.model_picker.index = 0;
-        }
-        KeyCode::Char(c) => {
-            if app.dashboard.model_picker.loading {
+/// Submit an input line: `/`, `//`, `!` commands or a natural-language task.
+fn submit_input(input: String, app: &mut TuiApp) {
+    match commands::namespace_of(&input) {
+        Some(CommandNamespace::Shell) => {
+            let command = input.trim_start_matches('!').trim().to_string();
+            if command.is_empty() {
                 return;
             }
-            app.dashboard.model_picker.filter.push(c);
-            app.dashboard.model_picker.index = 0;
+            if is_dangerous_shell(&command) {
+                app.pending_confirmation = Some((
+                    format!(
+                        "This command may be destructive. Proceed? `{}` (y/n)",
+                        command
+                    ),
+                    PendingAction::RunShell(command),
+                ));
+                return;
+            }
+            run_command_task(app, "shell", command);
         }
-        _ => {}
+        Some(CommandNamespace::Engineering) => {
+            handle_engineering_command(&input, app);
+        }
+        Some(CommandNamespace::Runtime) => {
+            handle_runtime_command(&input, app);
+        }
+        None => {
+            app.add_message(MessageRole::User, input.clone());
+            app.is_loading = true;
+            app.begin_task(input.clone());
+            app.dashboard
+                .animation
+                .start_activity(crate::tui::animation::ActivityType::Thinking);
+            let token = app.begin_cancellable_task();
+            let config = app.config.clone();
+            let tx = app.tx.clone();
+            let conversation = conversation_from(app);
+            tokio::spawn(async move {
+                run_chat_pipeline(&config, &input, conversation, &tx, token).await;
+            });
+        }
     }
 }
 
-fn handle_palette_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
-    use crossterm::event::KeyCode;
-    let filtered = palette_entries(&app.dashboard.palette_query);
-    match key.code {
-        KeyCode::Char(c) => {
-            app.dashboard.palette_query.push(c);
-            app.dashboard.palette_index = 0;
+fn handle_confirmation_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
+    let confirmed = matches!(
+        key.code,
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y')
+    );
+    let cancelled = matches!(
+        key.code,
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N')
+    );
+    if let Some((_, action)) = app.pending_confirmation.take() {
+        if confirmed {
+            confirm_action(action, app);
+        } else {
+            app.add_message(MessageRole::System, "Action cancelled".to_string());
         }
-        KeyCode::Backspace => {
-            app.dashboard.palette_query.pop();
-            app.dashboard.palette_index = 0;
-        }
-        KeyCode::Up => {
-            if !filtered.is_empty() {
-                app.dashboard.palette_index =
-                    (app.dashboard.palette_index + filtered.len() - 1) % filtered.len();
-            }
-        }
-        KeyCode::Down | KeyCode::Tab => {
-            if !filtered.is_empty() {
-                app.dashboard.palette_index = (app.dashboard.palette_index + 1) % filtered.len();
-            }
-        }
-        KeyCode::Enter => {
-            if let Some(cmd) = filtered
-                .get(app.dashboard.palette_index)
-                .map(|c| c.0.to_string())
-            {
-                app.dashboard.toggle_command_palette();
-                app.add_message(MessageRole::User, cmd.clone());
-                handle_command(&cmd, app);
-                app.is_loading = false;
-                app.dashboard.show_command_palette = false;
-            } else {
-                app.dashboard.toggle_command_palette();
-            }
-        }
-        KeyCode::Esc => {
-            app.dashboard.toggle_command_palette();
-        }
-        _ => {}
+    } else if cancelled {
+        // Nothing pending; Esc is a no-op here.
     }
 }
 
-fn palette_entries(filter: &str) -> Vec<(&'static str, &'static str)> {
-    let f = filter.to_lowercase();
-    SLASH_COMMANDS
-        .iter()
-        .filter(|(name, short, desc)| {
-            f.is_empty()
-                || name.to_lowercase().contains(&f)
-                || short.to_lowercase().contains(&f)
-                || desc.to_lowercase().contains(&f)
-        })
-        .map(|(name, _short, desc)| (*name, *desc))
-        .collect()
+fn confirm_action(action: PendingAction, app: &mut TuiApp) {
+    match action {
+        PendingAction::RunShell(command) => {
+            app.add_message(MessageRole::System, format!("Running `{}`", command));
+            run_command_task(app, "shell", command);
+        }
+        PendingAction::ApproveChange => execute_approve(app),
+        PendingAction::RejectChange => execute_reject(app),
+    }
 }
 
-fn handle_command(cmd: &str, app: &mut TuiApp) {
-    let cmd_parts: Vec<&str> = cmd.split_whitespace().collect();
-    let command = cmd_parts.first().copied().unwrap_or("");
+/// Apply the staged change, with an optional verification gate.
+fn execute_approve(app: &mut TuiApp) {
+    let mut plan = match app.pending_change.take() {
+        Some(plan) => plan,
+        None => {
+            app.add_message(
+                MessageRole::System,
+                "No pending change to approve.".to_string(),
+            );
+            return;
+        }
+    };
+    let verify = crate::tools::detect_workspace_root()
+        .join(".git")
+        .exists()
+        .then(|| "git status --porcelain".to_string());
+    match plan.apply_and_verify(verify.as_deref()) {
+        Ok(msg) => {
+            app.add_message(MessageRole::System, msg);
+            if let Err(e) = save_session(app) {
+                app.add_message(MessageRole::System, format!("Save error: {}", e));
+            }
+        }
+        Err(e) => {
+            app.add_message(
+                MessageRole::System,
+                format!("Approval rejected the change: {}", e),
+            );
+        }
+    }
+}
+
+/// Discard the staged change without writing anything.
+fn execute_reject(app: &mut TuiApp) {
+    if app.pending_change.take().is_some() {
+        app.add_message(
+            MessageRole::System,
+            "Pending change rejected; files were not modified.".to_string(),
+        );
+    }
+}
+
+/// Dangerous shell patterns that always require confirmation.
+fn is_dangerous_shell(command: &str) -> bool {
+    let c = command.trim();
+    let patterns: &[&str] = &[
+        "rm -rf",
+        "rm -fr",
+        "rm -r -f",
+        "git push --force",
+        "git push -f",
+        "chmod -R 777",
+        "chmod 777",
+        "mkfs",
+        "dd if=",
+        "shutdown",
+        "reboot",
+        ":(){",
+    ];
+    patterns.iter().any(|p| c.contains(p))
+}
+
+// ─── Command dispatch ─────────────────────────────────────────────────────
+
+fn handle_engineering_command(input: &str, app: &mut TuiApp) {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    let command = parts.first().copied().unwrap_or("");
+    let args = parts.get(1..).map(|p| p.join(" ")).unwrap_or_default();
 
     match command {
         "/help" => {
-            let lines: Vec<String> = SLASH_COMMANDS
-                .iter()
-                .map(|(name, short, desc)| format!("{} - {} ({})", name, short, desc))
-                .collect();
-            app.add_message(
-                MessageRole::System,
-                format!("Commands:\n{}", lines.join("\n")),
-            );
-        }
-        "/config" => {
-            let cfg = &app.config;
-            let api = if cfg.api_key.is_some() {
-                "set (hidden)"
-            } else {
-                "unset"
-            };
-            let model = if cfg.model.trim().is_empty() {
-                "(auto-detect)".to_string()
-            } else {
-                cfg.model.clone()
-            };
-            let root = crate::tools::detect_workspace_root();
-            app.add_message(
-                MessageRole::System,
-                format!(
-                    "Config:\n  provider: {}\n  base_url: {}\n  model: {}\n  api_key: {}\n  workspace: {}",
-                    cfg.provider, cfg.base_url, model, api, root.display()
-                ),
-            );
+            app.add_message(MessageRole::System, help_text(app));
         }
         "/status" => {
             let root = crate::tools::detect_workspace_root();
-            let toolable =
-                crate::tools::is_toolable(&cmd_parts.get(1).copied().unwrap_or("status"));
+            let model = if app.config.model.trim().is_empty() {
+                "auto".to_string()
+            } else {
+                app.config.model.clone()
+            };
             app.add_message(
                 MessageRole::System,
                 format!(
-                    "Status:\n  workspace: {}\n  tool pipeline: {}\n  streaming: {}",
+                    "Status:\n  workspace: {}\n  model: {}\n  provider: {}\n  task: {}",
                     root.display(),
-                    if toolable { "enabled" } else { "idle" },
-                    app.dashboard.is_streaming
+                    model,
+                    app.config.provider,
+                    if app.has_active_task() {
+                        "running"
+                    } else {
+                        "idle"
+                    }
                 ),
             );
         }
-        "/sessions" => {
+        "/build" => {
+            app.add_message(MessageRole::System, "Building project…".to_string());
+            let cmd = build_command(app);
+            run_command_task(app, "build", cmd);
+        }
+        "/test" => {
+            app.add_message(MessageRole::System, "Running tests…".to_string());
+            let cmd = test_command(app);
+            run_command_task(app, "test", cmd);
+        }
+        "/benchmark" => {
+            app.add_message(MessageRole::System, "Running benchmarks…".to_string());
+            let cmd = if app.workspace_has("Cargo.toml") {
+                "cargo bench".to_string()
+            } else {
+                "npm run benchmark".to_string()
+            };
+            run_command_task(app, "benchmark", cmd);
+        }
+        "/doctor" => {
+            app.add_message(
+                MessageRole::System,
+                "Running project health checks…".to_string(),
+            );
+            let cmd = if app.workspace_has("Cargo.toml") {
+                "cargo check".to_string()
+            } else if app.workspace_has("package.json") {
+                "npm run lint".to_string()
+            } else {
+                "git status --short".to_string()
+            };
+            run_command_task(app, "doctor", cmd);
+        }
+        "/playwright" => {
+            app.add_message(MessageRole::System, "Running Playwright tests…".to_string());
+            run_playwright_task(app, &args);
+        }
+        "/review" => {
+            let cmd = if app.workspace_has(".git") {
+                "git diff --stat".to_string()
+            } else {
+                "git status".to_string()
+            };
+            run_command_task(app, "review", cmd);
+        }
+        "/search" => {
+            let pattern = args.trim();
+            if pattern.is_empty() {
+                app.add_message(MessageRole::System, "Usage: /search <pattern>".to_string());
+                return;
+            }
+            let cmd = format!(
+                "grep -rn --exclude-dir=node_modules --exclude-dir=target --exclude-dir=.git \"{}\" .",
+                pattern.replace('"', "\\\"")
+            );
+            run_command_task(app, "search", cmd);
+        }
+        "/refactor" | "/fix" | "/explain" => {
+            // Task-based commands: route through the canonical runtime so the
+            // full engineering interaction loop applies.
+            let task = if args.trim().is_empty() {
+                format!(
+                    "{}",
+                    match command {
+                        "/refactor" => "Refactor the project",
+                        "/fix" => "Fix the last error or failing test in the project",
+                        _ => "Explain the project",
+                    }
+                )
+            } else {
+                format!(
+                    "{} {}",
+                    match command {
+                        "/refactor" => "Refactor",
+                        "/fix" => "Fix",
+                        _ => "Explain",
+                    },
+                    args.trim()
+                )
+            };
+            submit_task(app, task);
+        }
+        "/apply" => {
+            let file = parts.get(1).cloned().unwrap_or("");
+            let new_content = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
+            if file.is_empty() || new_content.trim().is_empty() {
+                app.add_message(
+                    MessageRole::System,
+                    "Usage: /apply <file> <new content>".to_string(),
+                );
+                return;
+            }
+            let path = crate::tools::detect_workspace_root().join(file);
+            if !path.exists() {
+                app.add_message(
+                    MessageRole::System,
+                    format!("Target not found: {}", path.display()),
+                );
+                return;
+            }
+            match crate::tools::ChangePlan::propose(&path, &new_content) {
+                Ok(plan) => {
+                    app.add_message(
+                        MessageRole::System,
+                        format!(
+                            "Staged change for {} (not applied). Review, then run //approve:\n{}",
+                            path.display(),
+                            plan.preview()
+                        ),
+                    );
+                    app.pending_change = Some(plan);
+                }
+                Err(e) => {
+                    app.add_message(MessageRole::System, format!("Could not stage change: {e}"));
+                }
+            }
+        }
+        "/copy" => {
+            if app.copy_to_clipboard(&app.conversation_text()) {
+                app.add_message(
+                    MessageRole::System,
+                    "Conversation copied to clipboard".to_string(),
+                );
+            } else {
+                app.add_message(
+                    MessageRole::System,
+                    "Copy failed (no clipboard tool found)".to_string(),
+                );
+            }
+        }
+        _ => {
+            app.add_message(
+                MessageRole::System,
+                format!("Unknown command: {}. Type /help for commands.", command),
+            );
+        }
+    }
+}
+
+fn handle_runtime_command(input: &str, app: &mut TuiApp) {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    let command = parts.first().copied().unwrap_or("");
+    let arg = parts.get(1).copied().unwrap_or("");
+
+    match command {
+        "//model" => {
+            if arg.is_empty() {
+                app.add_message(
+                    MessageRole::System,
+                    format!("Current model: {}", {
+                        if app.config.model.trim().is_empty() {
+                            "auto".to_string()
+                        } else {
+                            app.config.model.clone()
+                        }
+                    }),
+                );
+                app.open_model_picker();
+            } else {
+                app.apply_model(arg.to_string());
+            }
+        }
+        "//provider" => {
+            if arg.is_empty() {
+                let status = app.provider_status_text();
+                app.add_message(MessageRole::System, format!("Providers:\n{}", status));
+            } else if let Err(e) = app.switch_provider(arg) {
+                app.add_message(MessageRole::System, format!("Provider error: {}", e));
+            }
+        }
+        "//apikey" => {
+            let key = parts.get(2).copied().unwrap_or("");
+            let provider = if arg.is_empty() {
+                app.provider_manager
+                    .as_ref()
+                    .and_then(|pm| pm.active_provider().cloned())
+                    .unwrap_or_else(|| "openai".to_string())
+            } else {
+                arg.to_string()
+            };
+            if key.is_empty() {
+                app.add_message(
+                    MessageRole::System,
+                    "Usage: //apikey <provider> <key>".to_string(),
+                );
+                return;
+            }
+            match app.set_provider_api_key(&provider, key) {
+                Ok(()) => {
+                    app.add_message(
+                        MessageRole::System,
+                        format!("API key set for {} (stored securely)", provider),
+                    );
+                }
+                Err(e) => {
+                    app.add_message(MessageRole::System, format!("API key error: {}", e));
+                }
+            }
+        }
+        "//settings" => {
+            app.toggle_settings();
+            if let Some(ref sm) = app.settings {
+                app.add_message(MessageRole::System, sm.summary());
+            }
+        }
+        "//preferences" => {
+            app.add_message(
+                MessageRole::System,
+                format!(
+                    "Preferences:\n  verbosity: {}\n  compact: {}",
+                    if app.dashboard.verbose {
+                        "verbose"
+                    } else {
+                        "minimal"
+                    },
+                    app.dashboard.compact
+                ),
+            );
+        }
+        "//profile" => {
+            if arg.is_empty() {
+                app.add_message(
+                    MessageRole::System,
+                    format!("Profile directory: {:?}", Config::config_dir()),
+                );
+            } else {
+                app.add_message(
+                    MessageRole::System,
+                    format!(
+                        "Profile switching for '{}' is not implemented; using default.",
+                        arg
+                    ),
+                );
+            }
+        }
+        "//session" | "//resume" => {
+            if command == "//resume" {
+                let sessions = app.list_sessions();
+                if let Some(last) = sessions.first() {
+                    app.add_message(
+                        MessageRole::System,
+                        format!("Most recent session:\n{}", last),
+                    );
+                } else {
+                    app.add_message(MessageRole::System, "No sessions found".to_string());
+                }
+                return;
+            }
             let sessions = app.list_sessions();
             if sessions.is_empty() {
                 app.add_message(MessageRole::System, "No sessions found".to_string());
@@ -541,46 +728,40 @@ fn handle_command(cmd: &str, app: &mut TuiApp) {
                 );
             }
         }
-        "/replay" => {
-            let id = cmd_parts.get(1).copied().unwrap_or("");
-            if let Some(tracker) = app.session_tracker.as_ref() {
-                if let Ok(session) = tracker.store().load_session(id) {
-                    let timeline = session.replay_timeline();
-                    app.add_message(
-                        MessageRole::System,
-                        format!(
-                            "Session {} - {}\n{}",
-                            session.id,
-                            session.task,
-                            timeline.join("\n")
-                        ),
-                    );
-                } else {
-                    app.add_message(MessageRole::System, format!("Session not found: {}", id));
-                }
-            }
+        "//theme" => {
+            app.add_message(
+                MessageRole::System,
+                format!(
+                    "Theme: {} (muted). //theme <name> not yet supported.",
+                    if app.dashboard.compact {
+                        "compact"
+                    } else {
+                        "default"
+                    }
+                ),
+            );
         }
-        "/agents" => {
-            let entries = app.dashboard.agent_entries();
-            let text: Vec<String> = entries
-                .iter()
-                .map(|e| format!("{} - {} ({:.0}%)", e.name, e.status, e.progress * 100.0))
-                .collect();
-            app.add_message(MessageRole::System, format!("Agents:\n{}", text.join("\n")));
+        "//verbose" => {
+            app.dashboard.verbose = !app.dashboard.verbose;
+            app.add_message(
+                MessageRole::System,
+                format!(
+                    "Verbose mode: {}",
+                    if app.dashboard.verbose { "on" } else { "off" }
+                ),
+            );
         }
-        "/tasks" => {
-            let entries = app.dashboard.graph_entries();
-            if entries.is_empty() {
-                app.add_message(MessageRole::System, "No active task graph".to_string());
-            } else {
-                let text: Vec<String> = entries
-                    .iter()
-                    .map(|(desc, agent, status)| format!("[{}] {} - {}", status, agent, desc))
-                    .collect();
-                app.add_message(MessageRole::System, format!("Tasks:\n{}", text.join("\n")));
-            }
+        "//compact" => {
+            app.dashboard.compact = !app.dashboard.compact;
+            app.add_message(
+                MessageRole::System,
+                format!(
+                    "Compact mode: {}",
+                    if app.dashboard.compact { "on" } else { "off" }
+                ),
+            );
         }
-        "/memory" => {
+        "//memory" => {
             let notifications: Vec<String> = app
                 .dashboard
                 .memory_notifications
@@ -597,7 +778,37 @@ fn handle_command(cmd: &str, app: &mut TuiApp) {
                 );
             }
         }
-        "/skills" => {
+        "//mcp" => {
+            if app.workspace_panel.mcp_servers.is_empty() {
+                app.add_message(
+                    MessageRole::System,
+                    "Scanning for MCP servers… (run //mcp again to list)".to_string(),
+                );
+                trigger_workspace_discovery(app);
+                return;
+            }
+            let servers: Vec<String> = app
+                .workspace_panel
+                .mcp_servers
+                .iter()
+                .map(|s| {
+                    format!(
+                        "  {} ({})",
+                        s.name,
+                        if s.available {
+                            "available"
+                        } else {
+                            "unavailable"
+                        }
+                    )
+                })
+                .collect();
+            app.add_message(
+                MessageRole::System,
+                format!("MCP servers:\n{}", servers.join("\n")),
+            );
+        }
+        "//skills" => {
             let notifications: Vec<String> = app
                 .dashboard
                 .skill_notifications
@@ -619,163 +830,330 @@ fn handle_command(cmd: &str, app: &mut TuiApp) {
                 );
             }
         }
-        "/metrics" => {
+        "//plugins" => {
+            app.add_message(
+                MessageRole::System,
+                "Plugins: loaded via the plugin SDK. None installed in this session.".to_string(),
+            );
+        }
+        "//update" => {
+            app.add_message(
+                MessageRole::System,
+                format!(
+                    "CodeBro v{} — the latest installed build. Auto-update is not enabled.",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            );
+        }
+        "//version" => {
+            app.add_message(
+                MessageRole::System,
+                format!(
+                    "CodeBro v{}\n  workspace: {}\n  provider: {}\n  model: {}",
+                    env!("CARGO_PKG_VERSION"),
+                    crate::tools::detect_workspace_root().display(),
+                    app.config.provider,
+                    app.config.model
+                ),
+            );
+        }
+        "//export" => {
+            let path = if arg.is_empty() {
+                "codebro-export.json".to_string()
+            } else {
+                arg.to_string()
+            };
+            match app.export_state(&path) {
+                Ok(p) => app.add_message(
+                    MessageRole::System,
+                    format!("Exported session/config to {}", p.display()),
+                ),
+                Err(e) => app.add_message(MessageRole::System, format!("Export error: {}", e)),
+            }
+        }
+        "//import" => {
+            if arg.is_empty() {
+                app.add_message(MessageRole::System, "Usage: //import <file>".to_string());
+                return;
+            }
+            match app.import_state(arg) {
+                Ok(()) => app.add_message(MessageRole::System, format!("Imported from {}", arg)),
+                Err(e) => app.add_message(MessageRole::System, format!("Import error: {}", e)),
+            }
+        }
+        "//clear" => {
+            app.should_clear = true;
+        }
+        "//tasks" => {
+            let entries = app.dashboard.graph_entries();
+            if entries.is_empty() {
+                app.add_message(MessageRole::System, "No active task graph".to_string());
+            } else {
+                let text: Vec<String> = entries
+                    .iter()
+                    .map(|(desc, agent, status)| format!("[{}] {} - {}", status, agent, desc))
+                    .collect();
+                app.add_message(MessageRole::System, format!("Tasks:\n{}", text.join("\n")));
+            }
+        }
+        "//agents" => {
+            let entries = app.dashboard.agent_entries();
+            if entries.is_empty() {
+                app.add_message(MessageRole::System, "No agents active".to_string());
+            } else {
+                let text: Vec<String> = entries
+                    .iter()
+                    .map(|e| format!("{} - {} ({:.0}%)", e.name, e.status, e.progress * 100.0))
+                    .collect();
+                app.add_message(MessageRole::System, format!("Agents:\n{}", text.join("\n")));
+            }
+        }
+        "//metrics" => {
             app.dashboard.toggle_metrics();
         }
-        "/apply" => {
-            // Code-change workflow step 1: propose + preview. NO writes happen.
-            let root = crate::tools::detect_workspace_root();
-            let file = cmd_parts.get(1).cloned().unwrap_or("");
-            let new_content = cmd_parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
-            if file.is_empty() || new_content.trim().is_empty() {
-                app.add_message(
-                    MessageRole::System,
-                    "Usage: /apply <file> <new content>".to_string(),
-                );
-                return;
-            }
-            let path = root.join(file);
-            if !path.exists() {
-                app.add_message(
-                    MessageRole::System,
-                    format!("Target not found: {}", root.join(file).display()),
-                );
-                return;
-            }
-            match crate::tools::ChangePlan::propose(&path, &new_content) {
-                Ok(plan) => {
-                    app.add_message(
-                        MessageRole::System,
-                        format!(
-                            "Staged change for {} (not applied). Review, then run /approve [verify-cmd]:\n{}",
-                            path.display(),
-                            plan.preview()
-                        ),
-                    );
-                    app.pending_change = Some(plan);
-                }
-                Err(e) => {
-                    app.add_message(MessageRole::System, format!("Could not stage change: {e}"));
-                }
-            }
-        }
-        "/approve" => {
-            // Code-change workflow step 2: explicit approval -> apply -> verify.
-            if app.pending_change.is_none() {
+        "//approve" => {
+            if let Some(plan) = &app.pending_change {
+                let path = plan.path().display().to_string();
+                app.pending_confirmation = Some((
+                    format!(
+                        "This will apply the staged change to {}. Proceed? (y/n)",
+                        path
+                    ),
+                    PendingAction::ApproveChange,
+                ));
+            } else {
                 app.add_message(
                     MessageRole::System,
                     "No pending change. Stage one with /apply <file> <new content>.".to_string(),
                 );
-                return;
-            }
-            let verify = cmd_parts.get(1).map(|c| c.to_string()).or_else(|| {
-                // Default verification gate when the workspace is a git repo.
-                crate::tools::detect_workspace_root()
-                    .join(".git")
-                    .exists()
-                    .then(|| "git status --porcelain".to_string())
-            });
-            let mut plan = app.pending_change.take().unwrap();
-            match plan.apply_and_verify(verify.as_deref()) {
-                Ok(msg) => {
-                    app.add_message(MessageRole::System, msg);
-                    if let Err(e) = save_session(app) {
-                        app.add_message(MessageRole::System, format!("Save error: {e}"));
-                    }
-                }
-                Err(e) => {
-                    app.add_message(
-                        MessageRole::System,
-                        format!("Approval rejected the change: {e}"),
-                    );
-                }
             }
         }
-        "/model" => {
-            app.open_model_picker();
-        }
-        "/copy" => {
-            if app.copy_to_clipboard(&app.conversation_text()) {
-                app.add_message(
-                    MessageRole::System,
-                    "Conversation copied to clipboard".to_string(),
-                );
+        "//reject" => {
+            if let Some(plan) = &app.pending_change {
+                let path = plan.path().display().to_string();
+                app.pending_confirmation = Some((
+                    format!(
+                        "This will discard the staged change to {}. Proceed? (y/n)",
+                        path
+                    ),
+                    PendingAction::RejectChange,
+                ));
             } else {
                 app.add_message(
                     MessageRole::System,
-                    "Copy failed (no clipboard tool found)".to_string(),
+                    "No pending change to reject.".to_string(),
                 );
             }
         }
-        _ if cmd.starts_with("/settings")
-            || cmd.starts_with("/providers")
-            || cmd.starts_with("/health")
-            || cmd.starts_with("/discover")
-            || cmd.starts_with("/workspace")
-            || cmd.starts_with("/onboard") =>
-        {
-            app.handle_settings_command(cmd);
-        }
-        _ => {
-            app.add_message(MessageRole::System, format!("Unknown command: {}", command));
-        }
-    }
-}
-
-fn handle_shortcut(shortcut: Shortcut, app: &mut TuiApp) {
-    match shortcut {
-        Shortcut::ToggleAgents => app.dashboard.toggle_agents(),
-        Shortcut::ToggleTaskGraph => app.dashboard.toggle_task_graph(),
-        Shortcut::ToggleMemory => app.dashboard.toggle_memory(),
-        Shortcut::SaveSession => {
+        "//save" => {
             if let Err(e) = save_session(app) {
                 app.add_message(MessageRole::System, format!("Save error: {}", e));
+            } else {
+                app.add_message(MessageRole::System, "Session saved".to_string());
             }
         }
-        Shortcut::ToggleTrace => app.dashboard.toggle_trace(),
-        Shortcut::ClearLogs => app.dashboard.clear_logs(),
-        Shortcut::CancelTask => {
-            app.is_loading = false;
-            app.dashboard.end_streaming();
-            app.dashboard
-                .log("info", "Task cancelled by user".to_string());
-        }
-        Shortcut::Quit => {
-            app.should_quit = true;
-        }
-        Shortcut::OpenCommandPalette => {
-            app.dashboard.toggle_command_palette();
-        }
-        Shortcut::ToggleMetrics => {
-            app.dashboard.toggle_metrics();
-        }
-        Shortcut::ToggleCoordination => {
-            app.dashboard.toggle_coordination();
+        _ => {
+            app.add_message(
+                MessageRole::System,
+                format!("Unknown runtime command: {}. Type /help.", command),
+            );
         }
     }
 }
 
-fn save_session(app: &TuiApp) -> Result<()> {
-    let session_dir = std::path::Path::new(".codebro");
-    if !session_dir.exists() {
-        std::fs::create_dir_all(session_dir)?;
+fn help_text(app: &TuiApp) -> String {
+    let mut lines = vec![
+        format!(
+            "CodeBro v{} — engineering commands, runtime commands, shell.",
+            env!("CARGO_PKG_VERSION")
+        ),
+        "".to_string(),
+        "  /  engineering   operate on the project".to_string(),
+    ];
+    for spec in commands::ENGINEERING_COMMANDS {
+        lines.push(format!("    {}  — {}", spec.usage, spec.description));
     }
-    let session_path = session_dir.join(format!("session_{}.json", app.session_id));
-    let json = serde_json::to_string_pretty(&app.messages)?;
-    std::fs::write(&session_path, json)?;
-    Ok(())
+    lines.push("".to_string());
+    lines.push("  //  runtime      operate on CodeBro".to_string());
+    for spec in commands::RUNTIME_COMMANDS {
+        if commands::is_applicable(spec, app) {
+            lines.push(format!("    {}  — {}", spec.usage, spec.description));
+        }
+    }
+    lines.push("".to_string());
+    lines.push("  !  shell        execute directly in the shell".to_string());
+    lines.push("    e.g. !git status, !cargo test, !ls".to_string());
+    lines.push("".to_string());
+    lines.push(
+        "  Shortcuts: Ctrl+P commands · Ctrl+C cancel · Ctrl+L clear · Esc dismiss".to_string(),
+    );
+    lines.join("\n")
+}
+
+/// Submit a natural-language engineering task through the canonical runtime.
+fn submit_task(app: &mut TuiApp, task: String) {
+    app.add_message(MessageRole::User, task.clone());
+    app.is_loading = true;
+    app.begin_task(task.clone());
+    app.dashboard
+        .animation
+        .start_activity(crate::tui::animation::ActivityType::Thinking);
+    let token = app.begin_cancellable_task();
+    let config = app.config.clone();
+    let tx = app.tx.clone();
+    let conversation = conversation_from(app);
+    tokio::spawn(async move {
+        run_chat_pipeline(&config, &task, conversation, &tx, token).await;
+    });
+}
+
+/// Kick off an async workspace discovery scan; results arrive as
+/// `AppEvent::WorkspaceDiscovered`.
+fn trigger_workspace_discovery(app: &TuiApp) {
+    let tx = app.tx.clone();
+    tokio::spawn(async move {
+        let root = crate::tools::detect_workspace_root();
+        let engine = crate::workspace_discovery::DiscoveryEngine::new(root.clone());
+        let discovery = engine.discover();
+        let scanner = crate::capability_discovery::CapabilityScanner::new(root.clone());
+        let capabilities = scanner.scan();
+        let mcp_servers = crate::workspace_discovery::discover_mcp_servers(&root);
+        let _ = tx.send(events::AppEvent::WorkspaceDiscovered {
+            discovery,
+            capabilities,
+            mcp_servers,
+        });
+    });
+}
+
+/// Run a real shell/build/test command through the canonical PTY tool path.
+fn run_command_task(app: &mut TuiApp, label: &str, command: String) {
+    app.is_loading = true;
+    let token = app.begin_cancellable_task();
+    let tx = app.tx.clone();
+    let config = app.config.clone();
+    let workspace = crate::tools::detect_workspace_root();
+    app.add_message(MessageRole::System, format!("[{}] {}", label, command));
+    tokio::spawn(async move {
+        let emit_tx = tx.clone();
+        let emit = move |event: AgentEvent| {
+            let _ = emit_tx.send(events::AppEvent::AgentEvent(event));
+        };
+        let mut runtime = match crate::canonical_runtime::CanonicalRuntime::new(config) {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                let _ = tx.send(events::AppEvent::Response(format!(
+                    "Runtime initialization failed: {e}"
+                )));
+                return;
+            }
+        };
+        let outcome = runtime.run_shell(&command, &emit, token).await;
+        let status = if outcome.cancelled {
+            "Task cancelled"
+        } else if outcome.success {
+            "Completed"
+        } else {
+            "Failed"
+        };
+        let _ = tx.send(events::AppEvent::Response(format!(
+            "[{}] {}\n{}",
+            status,
+            command,
+            outcome.output.trim_end()
+        )));
+        let _ = workspace;
+    });
+}
+
+/// Run the Playwright tool through the canonical tool path.
+fn run_playwright_task(app: &mut TuiApp, args: &str) {
+    app.is_loading = true;
+    let token = app.begin_cancellable_task();
+    let tx = app.tx.clone();
+    let config = app.config.clone();
+    let args = args.to_string();
+    tokio::spawn(async move {
+        let emit_tx = tx.clone();
+        let emit = move |event: AgentEvent| {
+            let _ = emit_tx.send(events::AppEvent::AgentEvent(event));
+        };
+        let mut runtime = match crate::canonical_runtime::CanonicalRuntime::new(config) {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                let _ = tx.send(events::AppEvent::Response(format!(
+                    "Runtime initialization failed: {e}"
+                )));
+                return;
+            }
+        };
+        let console_id = uuid::Uuid::new_v4().to_string();
+        let outcome = runtime
+            .run_tool_streaming("playwright_test", &console_id, &args, &emit, token)
+            .await;
+        let status = if outcome.cancelled {
+            "cancelled"
+        } else if outcome.success {
+            "passed"
+        } else {
+            "failed"
+        };
+        let _ = tx.send(events::AppEvent::Response(format!(
+            "[playwright {}]\n{}",
+            status,
+            outcome.output.trim_end()
+        )));
+    });
+}
+
+fn build_command(app: &TuiApp) -> String {
+    if app.workspace_has("Cargo.toml") {
+        "cargo build".to_string()
+    } else if app.workspace_has("package.json") {
+        "npm run build".to_string()
+    } else {
+        "make".to_string()
+    }
+}
+
+fn test_command(app: &TuiApp) -> String {
+    if app.workspace_has("Cargo.toml") {
+        "cargo test".to_string()
+    } else if app.workspace_has("package.json") {
+        "npm test".to_string()
+    } else {
+        "make test".to_string()
+    }
+}
+
+/// Build the conversation history from the session messages for the
+/// engineering context (recent user/assistant turns only).
+fn conversation_from(app: &TuiApp) -> Vec<crate::engineering_context::ConversationMessage> {
+    let mut out = Vec::new();
+    for msg in app.messages.iter().rev().take(20) {
+        let role = match msg.role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::System => "system",
+        };
+        out.push(crate::engineering_context::ConversationMessage {
+            role: role.to_string(),
+            content: msg.content.clone(),
+        });
+    }
+    out.reverse();
+    out
 }
 
 /// Wires a chat submission into the canonical runtime:
 /// identity → memory → context assembly → EngineeringContext → PromptBuilder →
 /// IntelligentProviderRouter → ProviderRuntime → provider, streaming to the TUI.
-///
-/// The TUI remains responsible for input, rendering and diagnostics visibility;
-/// all execution concerns are owned by the canonical runtime.
 async fn run_chat_pipeline(
     config: &Config,
     task: &str,
+    conversation: Vec<crate::engineering_context::ConversationMessage>,
     tx: &std::sync::mpsc::Sender<events::AppEvent>,
+    token: crate::cancellation::CancellationToken,
 ) {
     let emit_tx = tx.clone();
     let emit = move |event: AgentEvent| {
@@ -785,6 +1163,13 @@ async fn run_chat_pipeline(
     let on_chunk = move |chunk: &str| {
         let _ = chunk_tx.send(events::AppEvent::StreamChunk(chunk.to_string()));
     };
+    let pty_tx = tx.clone();
+    let on_pty = Arc::new(move |_console: &str, content: &str| {
+        let _ = pty_tx.send(events::AppEvent::AgentEvent(AgentEvent::PtyOutput {
+            console: "task".to_string(),
+            content: content.to_string(),
+        }));
+    });
 
     let mut runtime = match crate::canonical_runtime::CanonicalRuntime::new(config.clone()) {
         Ok(runtime) => runtime,
@@ -798,12 +1183,16 @@ async fn run_chat_pipeline(
 
     let request = crate::canonical_runtime::TaskRequest {
         task,
-        conversation: Vec::new(),
+        conversation,
         emit: &emit,
         on_chunk: &on_chunk,
     };
+    let options = crate::canonical_runtime::TaskOptions {
+        cancel: Some(token),
+        on_pty: Some(on_pty),
+    };
 
-    let result = runtime.run_task(&request).await;
+    let result = runtime.run_task_with_options(&request, options).await;
 
     if result.success {
         let _ = tx.send(events::AppEvent::Response(result.response));
@@ -816,58 +1205,54 @@ async fn run_chat_pipeline(
     }
 }
 
+// ─── Layout ───────────────────────────────────────────────────────────────
+
 struct PanelLayout {
     title_h: u16,
-    conv_h: u16,
-    agents_h: u16,
+    op_h: u16,
+    output_h: u16,
     activity_h: u16,
+    agents_h: u16,
     graph_h: u16,
     metrics_h: u16,
     coord_h: u16,
-    shortcuts_h: u16,
-    palette_h: u16,
     input_h: u16,
 }
 
-const MIN_CONV: u16 = 4;
-const BORDER: u16 = 2;
+const MIN_OUTPUT: u16 = 4;
 
+/// The default view is the task output: title, current operation, output,
+/// a concise live-activity line, and input. Everything else (agents, task
+/// graph, metrics, coordination) is an overlay opened on demand.
 fn compute_layout(app: &TuiApp, total_h: u16) -> PanelLayout {
     let title_h: u16 = 1;
-    let shortcuts_h: u16 = 1;
+    let op_h: u16 = 1;
     let input_h: u16 = 3;
-    let fixed: u16 = title_h + shortcuts_h + input_h;
 
-    let agent_count = app.dashboard.status_monitor.count() as u16;
-    let agents_h = if app.dashboard.show_agents {
-        (agent_count + BORDER).min(10)
-    } else {
-        0
-    };
-    let activity_h: u16 = 6;
-    let graph_len = app.dashboard.graph_entries().len() as u16;
-    let graph_h = if app.dashboard.show_task_graph {
-        (graph_len + BORDER).min(10)
-    } else {
-        0
-    };
-    let metrics_h = if app.dashboard.show_metrics { 6 } else { 0 };
-    let coord_h = if app.dashboard.show_coordination {
+    let activity_h: u16 = if app.dashboard.compact {
+        1
+    } else if app.dashboard.verbose {
         8
     } else {
-        0
+        4
     };
-    let palette_h = if app.dashboard.show_command_palette {
-        12
+
+    let agents_h = if app.dashboard.show_agents { 5 } else { 0 };
+    let graph_h = if app.dashboard.show_task_graph { 5 } else { 0 };
+    let metrics_h = if app.dashboard.show_metrics { 6 } else { 0 };
+    let coord_h = if app.dashboard.show_coordination {
+        6
     } else {
         0
     };
 
-    let mut optional: [u16; 6] = [agents_h, activity_h, graph_h, metrics_h, coord_h, palette_h];
-    let mut conv_h = total_h.saturating_sub(fixed + optional.iter().sum::<u16>());
+    let fixed: u16 = title_h + op_h + input_h;
+    let optional: [u16; 5] = [agents_h, graph_h, metrics_h, coord_h, activity_h];
 
-    // Shrink optional panels (largest first) until the conversation has room.
-    while conv_h < MIN_CONV {
+    let mut output_h = total_h.saturating_sub(fixed + optional.iter().sum::<u16>());
+    // Shrink optional panels (largest first) until the output has room.
+    let mut optional = optional;
+    while output_h < MIN_OUTPUT {
         let mut max_i: Option<usize> = None;
         let mut max_v: u16 = 0;
         for (i, &h) in optional.iter().enumerate() {
@@ -880,19 +1265,18 @@ fn compute_layout(app: &TuiApp, total_h: u16) -> PanelLayout {
             Some(i) => optional[i] = optional[i].saturating_sub(1),
             None => break,
         }
-        conv_h = total_h.saturating_sub(fixed + optional.iter().sum::<u16>());
+        output_h = total_h.saturating_sub(fixed + optional.iter().sum::<u16>());
     }
 
     PanelLayout {
         title_h,
-        conv_h,
+        op_h,
+        output_h,
+        activity_h: optional[4],
         agents_h: optional[0],
-        activity_h: optional[1],
-        graph_h: optional[2],
-        metrics_h: optional[3],
-        coord_h: optional[4],
-        palette_h: optional[5],
-        shortcuts_h,
+        graph_h: optional[1],
+        metrics_h: optional[2],
+        coord_h: optional[3],
         input_h,
     }
 }
@@ -902,14 +1286,13 @@ fn split_panels(area: Rect, layout: &PanelLayout) -> std::rc::Rc<[Rect]> {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(layout.title_h),
-            Constraint::Length(layout.conv_h),
-            Constraint::Length(layout.agents_h),
+            Constraint::Length(layout.op_h),
+            Constraint::Min(MIN_OUTPUT),
             Constraint::Length(layout.activity_h),
+            Constraint::Length(layout.agents_h),
             Constraint::Length(layout.graph_h),
             Constraint::Length(layout.metrics_h),
             Constraint::Length(layout.coord_h),
-            Constraint::Length(layout.shortcuts_h),
-            Constraint::Length(layout.palette_h),
             Constraint::Length(layout.input_h),
         ])
         .split(area)
@@ -918,105 +1301,47 @@ fn split_panels(area: Rect, layout: &PanelLayout) -> std::rc::Rc<[Rect]> {
 fn ui(f: &mut Frame, app: &TuiApp) {
     let size = f.size();
     let layout = compute_layout(app, size.height);
-
     let chunks = split_panels(size, &layout);
 
     render_title(f, app, chunks[0]);
-
-    render_conversation(f, app, chunks[1]);
-
-    if layout.agents_h > 0 {
-        render_agents(f, app, chunks[2]);
-    }
+    render_operation(f, app, chunks[1]);
+    render_output(f, app, chunks[2]);
 
     if layout.activity_h > 0 {
-        render_activity_log(f, &app.dashboard, chunks[3]);
+        render_activity(f, &app.dashboard, chunks[3], layout.activity_h as usize);
     }
-
+    if layout.agents_h > 0 {
+        render_agents(f, app, chunks[4]);
+    }
     if layout.graph_h > 0 {
-        render_task_graph(f, app, chunks[4]);
+        render_task_graph(f, app, chunks[5]);
     }
-
     if layout.metrics_h > 0 {
-        render_metrics(f, app, chunks[5]);
+        render_metrics(f, app, chunks[6]);
     }
-
     if layout.coord_h > 0 {
-        render_coordination(f, app, chunks[6]);
+        render_coordination(f, app, chunks[7]);
     }
 
-    render_shortcuts(f, chunks[7]);
+    render_input(f, app, chunks[8]);
 
-    if layout.palette_h > 0 {
+    // Command palette overlay.
+    if app.dashboard.show_command_palette {
         render_command_palette(f, app, chunks[8]);
     }
 
-    render_input(f, app, chunks[9]);
+    // Autocomplete overlay.
+    if !app.dashboard.autocomplete.is_empty() && !app.dashboard.model_picker.is_open() {
+        render_autocomplete(f, app, chunks[8]);
+    }
 
     if app.dashboard.model_picker.is_open() {
         render_model_picker(f, app);
     }
 
-    // Slash-command autocomplete popup sits just above the input row.
-    if !app.dashboard.autocomplete.is_empty() && !app.dashboard.model_picker.is_open() {
-        render_autocomplete(f, app, chunks[9]);
+    if let Some((message, _)) = &app.pending_confirmation {
+        render_confirmation(f, message, chunks[8]);
     }
-}
-
-fn render_autocomplete(f: &mut Frame, app: &TuiApp, input_area: Rect) {
-    let mut entries: Vec<String> = app
-        .dashboard
-        .autocomplete
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let marker = if i == app.dashboard.autocomplete_index {
-                "▶ "
-            } else {
-                "  "
-            };
-            let desc = SLASH_COMMANDS
-                .iter()
-                .find(|d| d.0.split_whitespace().next().unwrap_or("") == c)
-                .map(|d| d.2)
-                .unwrap_or("");
-            format!("{}{}  {}", marker, c, desc)
-        })
-        .collect();
-    entries.truncate(6);
-
-    let width = input_area.width.min(input_area.width.max(40));
-    let height = (entries.len() as u16 + BORDER).min(input_area.y.saturating_sub(2));
-    if height < 2 {
-        return;
-    }
-    let top = input_area.y.saturating_sub(height);
-    let popup = Rect::new(input_area.x, top, width, height);
-
-    let lines: Vec<Line> = entries
-        .iter()
-        .map(|e| {
-            let sel = e.starts_with("▶");
-            Line::from(Span::styled(
-                e.clone(),
-                if sel {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                },
-            ))
-        })
-        .collect();
-
-    let para = Paragraph::new(Text::from(lines)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(" Complete (Tab cycles) "),
-    );
-    f.render_widget(para, popup);
 }
 
 fn render_title(f: &mut Frame, app: &TuiApp, area: Rect) {
@@ -1030,111 +1355,67 @@ fn render_title(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     let mut spans = vec![
         Span::styled(
-            "CODEBRO",
+            "codebro",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "WS:",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(workspace, style_if(workspace, Color::Green)),
-        Span::styled(" ", Style::default()),
-        Span::styled(
-            "Model:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(model, Style::default().fg(Color::Yellow)),
-        Span::styled(" ", Style::default()),
-        Span::styled(
-            "Tools:",
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if app.dashboard.is_streaming {
-                "running"
-            } else {
-                "armed"
-            },
-            Style::default().fg(Color::Magenta),
-        ),
+        Span::styled(" ", Style::default().fg(Color::DarkGray)),
+        Span::styled(workspace, Style::default().fg(Color::Green)),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(model, Style::default().fg(Color::DarkGray)),
     ];
-    if app.dashboard.is_streaming {
+
+    // Restrained status indicators: a single spinner while working.
+    if app.dashboard.animation.is_active() {
         spans.push(Span::styled(
             format!(" {}", app.dashboard.animation.spinner_char()),
             Style::default().fg(Color::Cyan),
         ));
     }
-    let title = Paragraph::new(Line::from(spans))
-        .style(Style::default().fg(Color::Cyan))
-        .alignment(ratatui::layout::Alignment::Left);
+
+    let title = Paragraph::new(Line::from(spans));
     f.render_widget(title, area);
 }
 
-fn style_if(_text: &str, color: Color) -> Style {
-    Style::default().fg(color)
+fn render_operation(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let op = app
+        .dashboard
+        .current_operation
+        .as_deref()
+        .unwrap_or("ready");
+    let line = Paragraph::new(Line::from(Span::styled(
+        truncate_to(op, area.width.saturating_sub(2) as usize),
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(line, area);
 }
 
-fn render_conversation(f: &mut Frame, app: &TuiApp, area: Rect) {
+fn render_output(f: &mut Frame, app: &TuiApp, area: Rect) {
     if area.height < 2 {
         return;
     }
-    let inner_w = area.width.saturating_sub(BORDER) as usize;
-    let mut lines: Vec<Line> = Vec::new();
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Startup/welcome banner shown until the first response arrives.
-    if app.dashboard.show_welcome && app.messages.is_empty() {
-        let root = crate::tools::detect_workspace_root();
-        let project = root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("workspace");
-        let model = if app.config.model.trim().is_empty() {
-            "auto-detect".to_string()
-        } else {
-            app.config.model.clone()
-        };
-        let ready_text = format!(
-            "CODEBRO v{}\n\n  Workspace: {}    Model: {}\n  Tools: armed    Status: ready\n\n  Enter a task to begin (Ctrl+P for commands)",
-            env!("CARGO_PKG_VERSION"),
-            project,
-            model,
-        );
-        for line in ready_text.lines() {
-            let color = if line.starts_with("CODEBRO") {
-                Color::Cyan
-            } else if line.starts_with("  ") {
-                Color::DarkGray
-            } else {
-                Color::White
-            };
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(color),
-            )));
-        }
+    if app.dashboard.show_welcome && app.messages.is_empty() && !app.has_console_content() {
+        // A single-line hint, not a full-screen welcome.
+        lines.push(Line::from(Span::styled(
+            "  Type a task, or / for commands · // for runtime · ! for shell · Ctrl+P palette",
+            Style::default().fg(Color::DarkGray),
+        )));
     } else {
-        // Error banner if a recent error is pending.
         if let Some(ref err) = app.dashboard.last_error {
             lines.push(Line::from(Span::styled(
-                format!(" ! Error: {}", truncate(err, inner_w)),
+                format!("  ! {}", truncate_to(err, inner_w)),
                 Style::default().fg(Color::Red),
             )));
             lines.push(Line::from(""));
         }
 
-        // Streaming assistant output renders live with a spinner.
         if app.dashboard.is_streaming && !app.dashboard.streaming_buffer.is_empty() {
             lines.push(Line::from(Span::styled(
-                format!("[AI] {} ", app.dashboard.animation.spinner_char()),
+                format!("{} ", app.dashboard.animation.spinner_char()),
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
@@ -1148,81 +1429,99 @@ fn render_conversation(f: &mut Frame, app: &TuiApp, area: Rect) {
         }
 
         for msg in app.messages.iter() {
-            let (role_label, _role_color, border_color): (_, Color, Color) = match msg.role {
-                MessageRole::User => ("YOU", Color::Green, Color::Green),
-                MessageRole::Assistant => ("AI", Color::Blue, Color::Blue),
-                MessageRole::System => ("SYS", Color::Yellow, Color::Yellow),
+            let (label, color): (&str, Color) = match msg.role {
+                MessageRole::User => ("you", Color::Green),
+                MessageRole::Assistant => ("codebro", Color::Blue),
+                MessageRole::System => ("•", Color::Yellow),
             };
-
-            // Distinct header bar for each message so roles are visually separated.
             lines.push(Line::from(Span::styled(
-                format!("{} {} {}", "───", role_label, "─".repeat(20)),
-                Style::default()
-                    .fg(border_color)
-                    .add_modifier(Modifier::BOLD),
+                format!("{}", label),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             )));
 
-            // Content: LLM messages go through the markdown renderer; user and
-            // system messages render verbatim but still wrapped.
             if msg.role == MessageRole::Assistant {
                 for md_line in crate::tui::markdown::render_markdown(&msg.content, inner_w) {
                     lines.push(md_line);
                 }
             } else {
-                let content = msg.content.lines().next().unwrap_or("");
-                let rest: Vec<_> = msg.content.lines().skip(1).collect();
-                let style = match msg.role {
-                    MessageRole::User => Style::default().fg(Color::Green),
-                    MessageRole::System => Style::default().fg(Color::Yellow),
-                    _ => Style::default(),
-                };
-                lines.push(Line::from(Span::styled(content.to_string(), style)));
-                for r in rest {
-                    lines.push(Line::from(Span::styled(r.to_string(), style)));
+                for (i, content_line) in msg.content.lines().enumerate() {
+                    let style = match msg.role {
+                        MessageRole::User => Style::default().fg(Color::Green),
+                        MessageRole::System => Style::default().fg(Color::Yellow),
+                        _ => Style::default(),
+                    };
+                    lines.push(Line::from(Span::styled(
+                        if i == 0 {
+                            content_line.to_string()
+                        } else {
+                            format!("  {}", content_line)
+                        },
+                        style,
+                    )));
                 }
             }
             lines.push(Line::from(""));
         }
-    }
 
-    if app.messages.is_empty() && !app.dashboard.show_welcome {
-        lines.push(Line::from(Span::styled(
-            "  No conversation yet — enter a task to begin.",
-            Style::default().fg(Color::DarkGray),
-        )));
+        // The live task console: appended, never replaced.
+        if let Some(console) = app.active_console_ref() {
+            if !console.is_empty() {
+                lines.push(Line::from(""));
+                lines.extend(console.render_lines(inner_w));
+            }
+        }
     }
 
     let total_lines = lines.len() as u16;
-    let view_h = area.height.saturating_sub(BORDER);
+    let view_h = area.height;
     let max_scroll = total_lines.saturating_sub(view_h);
     let scroll = max_scroll.saturating_sub(app.scroll_from_bottom as u16);
 
-    let conversation = Paragraph::new(Text::from(lines))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" Conversation ")
-                .title_style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-        )
+    let output = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: true })
         .scroll((scroll, 0));
-    f.render_widget(conversation, area);
+    f.render_widget(output, area);
 }
 
-fn render_agents(f: &mut Frame, app: &TuiApp, area: Rect) {
-    if area.height < 2 {
+fn render_activity(f: &mut Frame, dashboard: &Dashboard, area: Rect, max_lines: usize) {
+    if area.height < 1 {
         return;
     }
     let mut lines = Vec::new();
+    let entries: Vec<_> = dashboard.activity_log.iter().take(max_lines).collect();
+    for entry in entries {
+        let color = match entry.level.as_str() {
+            "error" => Color::Red,
+            "tool" => Color::Cyan,
+            "task" => Color::Green,
+            "console" => Color::Blue,
+            _ => Color::DarkGray,
+        };
+        let msg = truncate_to(&entry.message, area.width.saturating_sub(2) as usize);
+        lines.push(Line::from(Span::styled(
+            format!("  {}", msg),
+            Style::default().fg(color),
+        )));
+    }
+    let paragraph = Paragraph::new(Text::from(lines));
+    f.render_widget(paragraph, area);
+}
+
+fn render_agents(f: &mut Frame, app: &TuiApp, area: Rect) {
+    if area.height < 1 {
+        return;
+    }
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  agents  (Ctrl+A to close)",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
     let entries = app.dashboard.agent_entries();
     if entries.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  No active agents",
+            "  no active agents",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
@@ -1231,176 +1530,80 @@ fn render_agents(f: &mut Frame, app: &TuiApp, area: Rect) {
                 AgentStatus::Completed => ("✓", Color::Green),
                 AgentStatus::Failed => ("✗", Color::Red),
                 AgentStatus::Idle => ("○", Color::DarkGray),
-                AgentStatus::Executing => ("⟳", Color::Yellow),
-                AgentStatus::Thinking
-                | AgentStatus::Searching
-                | AgentStatus::Analysing
-                | AgentStatus::Planning
-                | AgentStatus::Testing
-                | AgentStatus::Reviewing => {
-                    let spinner = app.dashboard.animation.spinner_char();
-                    (spinner, Color::Cyan)
-                }
+                _ => ("⟳", Color::Yellow),
             };
-
-            let bar = progress_bar(entry.progress, 10);
+            let bar = progress_bar(entry.progress, 8);
+            let name = truncate_to(&entry.name, 12);
             let action = entry.action.as_deref().unwrap_or("");
-            let name = truncate(&entry.name, 10);
-            let status_str = truncate(entry.status.as_str(), 12);
-            let action = truncate(action, 30);
-
             lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+                Span::styled(name, Style::default().fg(Color::White)),
                 Span::styled(
-                    format!(" {} ", icon),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    format!(" [{}] {}", bar, truncate_to(action, 30)),
+                    Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled(
-                    format!("{:10}", name),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(" {:12}", status_str), Style::default().fg(color)),
-                Span::styled(format!(" [{}]", bar), Style::default().fg(Color::Magenta)),
-                Span::raw(format!(" {}", action)),
             ]));
         }
     }
-
-    let agents_block = Paragraph::new(Text::from(lines)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Agents (Ctrl+A)"),
-    );
-    f.render_widget(agents_block, area);
-}
-
-fn render_activity_log(f: &mut Frame, dashboard: &Dashboard, area: Rect) {
-    if area.height < 2 {
-        return;
-    }
-    let mut lines = Vec::new();
-    let entries: Vec<_> = dashboard.activity_log.iter().take(8).collect();
-    if entries.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  Waiting for task",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        for entry in entries {
-            let color = match entry.level.as_str() {
-                "error" => Color::Red,
-                "tool" => Color::Cyan,
-                "memory" => Color::Green,
-                "skill" => Color::Magenta,
-                "task" => Color::Yellow,
-                _ => Color::Gray,
-            };
-            let ts = truncate(&entry.timestamp, 9);
-            let msg = truncate(&entry.message, area.width.saturating_sub(14) as usize);
-            lines.push(Line::from(vec![
-                Span::styled(format!("[{}] ", ts), Style::default().fg(Color::DarkGray)),
-                Span::styled(msg, Style::default().fg(color)),
-            ]));
-        }
-    }
-
-    let log_block = Paragraph::new(Text::from(lines))
-        .block(Block::default().borders(Borders::ALL).title("Activity"))
-        .wrap(Wrap { trim: true });
-    f.render_widget(log_block, area);
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn render_task_graph(f: &mut Frame, app: &TuiApp, area: Rect) {
-    if area.height < 2 {
+    if area.height < 1 {
         return;
     }
     let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  task graph  (Ctrl+G to close)",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
     let entries = app.dashboard.graph_entries();
     if entries.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  No task running",
+            "  no task running",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        let mut prev_level = 0;
-
-        for (desc, agent, status) in entries {
+        for (desc, agent, status) in entries.iter().take(4) {
             let icon = match status {
-                crate::agent::task_graph::TaskStatus::Completed => "✓",
-                crate::agent::task_graph::TaskStatus::Failed => "✗",
-                crate::agent::task_graph::TaskStatus::Running => "⟳",
+                TaskStatus::Completed => "✓",
+                TaskStatus::Failed => "✗",
+                TaskStatus::Running => "⟳",
                 _ => "○",
             };
-            let color = match status {
-                crate::agent::task_graph::TaskStatus::Completed => Color::Green,
-                crate::agent::task_graph::TaskStatus::Failed => Color::Red,
-                crate::agent::task_graph::TaskStatus::Running => Color::Yellow,
-                _ => Color::DarkGray,
-            };
-
-            let connector = if prev_level > 0 { "  |" } else { "" };
-            let agent = truncate(&agent, 10);
-            let desc = truncate(&desc, area.width.saturating_sub(20) as usize);
-            lines.push(Line::from(vec![
-                Span::styled(connector, Style::default().fg(Color::DarkGray)),
-                Span::styled(format!(" {} ", icon), Style::default().fg(color)),
-                Span::styled(format!("{:10}", agent), Style::default().fg(Color::Cyan)),
-                Span::styled(desc, Style::default().fg(Color::White)),
-            ]));
-            prev_level = 1;
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {} {}: {}",
+                    icon,
+                    truncate_to(agent, 10),
+                    truncate_to(desc, 50)
+                ),
+                Style::default().fg(Color::White),
+            )));
         }
     }
-
-    let graph_block = Paragraph::new(Text::from(lines)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Task Graph (Ctrl+G)"),
-    );
-    f.render_widget(graph_block, area);
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn render_metrics(f: &mut Frame, app: &TuiApp, area: Rect) {
-    if area.height < 2 {
+    if area.height < 1 {
         return;
     }
     let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  metrics  (Ctrl+V to close)",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
 
     let agent_count = app.dashboard.status_monitor.count();
     let active_count = app.dashboard.status_monitor.active_count();
-    let progress = if agent_count > 0 {
-        app.dashboard
-            .status_monitor
-            .list()
-            .iter()
-            .map(|s| s.progress)
-            .sum::<f32>()
-            / agent_count as f32
-    } else {
-        0.0
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled(
-            "Agents:",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(" {} ({} active)", agent_count, active_count)),
-        Span::styled(
-            "   Progress:",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(" {:.0}%", progress * 100.0)),
-    ]));
-
-    let bar = progress_bar(progress, 20);
     lines.push(Line::from(Span::styled(
-        format!("[{}]", bar),
-        Style::default().fg(Color::Magenta),
+        format!("  agents {} ({} active)", agent_count, active_count),
+        Style::default().fg(Color::DarkGray),
     )));
 
     let total_tokens = app
@@ -1415,62 +1618,164 @@ fn render_metrics(f: &mut Frame, app: &TuiApp, area: Rect) {
         .as_ref()
         .map(|m| m.estimated_cost_usd(&app.config.model))
         .unwrap_or(0.0);
-    let duration_ms = app
-        .dashboard
-        .metrics
-        .as_ref()
-        .map(|m| m.total_duration_ms)
-        .unwrap_or(0);
-
-    lines.push(Line::from(vec![
-        Span::styled(
-            "Tokens:",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  tokens {} · cost {}",
+            crate::metrics::format_token_count(total_tokens),
+            crate::metrics::format_cost_usd(cost)
         ),
-        Span::raw(format!(
-            " {}",
-            crate::metrics::format_token_count(total_tokens)
-        )),
-        Span::styled(
-            "   Cost:",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(" {}", crate::metrics::format_cost_usd(cost))),
-    ]));
+        Style::default().fg(Color::DarkGray),
+    )));
 
-    lines.push(Line::from(vec![
-        Span::styled(
-            "Time:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(
-            " {}",
-            crate::session::format_duration_ms(duration_ms)
-        )),
-    ]));
-
-    let metrics_block = Paragraph::new(Text::from(lines)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Task Metrics (Ctrl+V)"),
-    );
-    f.render_widget(metrics_block, area);
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
-fn render_command_palette(f: &mut Frame, app: &TuiApp, area: Rect) {
-    if area.height < 2 {
+fn render_coordination(f: &mut Frame, app: &TuiApp, area: Rect) {
+    if area.height < 1 {
         return;
     }
-    let entries = palette_entries(&app.dashboard.palette_query);
-
     let mut lines = Vec::new();
-    // Filter line at the top.
+    lines.push(Line::from(Span::styled(
+        "  coordination  (Ctrl+O to close)",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for msg in app.dashboard.recent_messages.iter().take(3) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                truncate_to(msg, area.width.saturating_sub(4) as usize)
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let prefix = if app.dashboard.animation.is_active() {
+        format!("{}> ", app.dashboard.animation.spinner_char())
+    } else {
+        "> ".to_string()
+    };
+
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_w = area.width.saturating_sub(2) as usize;
+    if inner_h == 0 {
+        return;
+    }
+
+    let (display_lines, cursor_line_rel, cursor_col) =
+        input_display_lines(&app.input, app.input_cursor, inner_h, inner_w);
+
+    let mut text_lines = Vec::new();
+    for (i, line) in display_lines.iter().enumerate() {
+        let full = if i == 0 {
+            format!("{}{}", prefix, line)
+        } else {
+            line.clone()
+        };
+        text_lines.push(Line::from(truncate_to(&full, area.width as usize)));
+    }
+
+    let paragraph = Paragraph::new(Text::from(text_lines)).style(Style::default().fg(Color::White));
+    f.render_widget(paragraph, area);
+
+    if area.width >= 4 && area.height >= 2 {
+        let x_off = if cursor_line_rel == 0 {
+            prefix.chars().count() + cursor_col
+        } else {
+            cursor_col
+        };
+        let x = (area.x + x_off as u16).min(area.x + area.width.saturating_sub(2));
+        let y = (area.y + cursor_line_rel as u16).min(area.y + area.height.saturating_sub(2));
+        f.set_cursor(x, y);
+    }
+}
+
+fn render_confirmation(f: &mut Frame, message: &str, input_area: Rect) {
+    let width = input_area.width.min(80);
+    let height = 3u16;
+    let x = input_area.x;
+    let y = input_area.y.saturating_sub(height);
+    let popup = Rect::new(x, y, width, height);
+    let lines = vec![
+        Line::from(Span::styled("  ", Style::default().fg(Color::Yellow))),
+        Line::from(Span::styled(
+            format!("  {}", truncate_to(message, width as usize)),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "  y/Enter = proceed · n/Esc = cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(Text::from(lines)), popup);
+}
+
+fn render_autocomplete(f: &mut Frame, app: &TuiApp, input_area: Rect) {
+    let entries: Vec<String> = app.dashboard.autocomplete.iter().take(6).cloned().collect();
+    if entries.is_empty() {
+        return;
+    }
+    let width = input_area.width.min(60);
+    let height = (entries.len() as u16 + 1).min(input_area.y.saturating_sub(2));
+    if height < 2 {
+        return;
+    }
+    let top = input_area.y.saturating_sub(height);
+    let popup = Rect::new(input_area.x, top, width, height);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let selected = i == app.dashboard.autocomplete_index;
+        let spec = commands::all_commands().find(|s| s.command == entry.as_str());
+        let desc = spec.map(|s| s.description).unwrap_or("");
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "> " } else { "  " },
+                if selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::styled(
+                entry.clone(),
+                if selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ),
+            Span::styled(
+                format!(
+                    "  {}",
+                    truncate_to(desc, width.saturating_sub(entry.len() as u16 + 4) as usize)
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), popup);
+}
+
+fn render_command_palette(f: &mut Frame, app: &TuiApp, input_area: Rect) {
+    let query = app.dashboard.palette_query.clone();
+    let entries = palette_entries(&query);
+    let width = input_area.width.min(70);
+    let height = (entries.len() as u16 + 2).min(input_area.y.saturating_sub(2));
+    if height < 3 {
+        return;
+    }
+    let top = input_area.y.saturating_sub(height);
+    let popup = Rect::new(input_area.x, top, width, height);
+
+    let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(
             "search> ",
@@ -1478,7 +1783,7 @@ fn render_command_palette(f: &mut Frame, app: &TuiApp, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(app.dashboard.palette_query.clone()),
+        Span::styled(query.clone(), Style::default().fg(Color::White)),
         Span::styled(
             format!("  ({} matches)", entries.len()),
             Style::default().fg(Color::DarkGray),
@@ -1493,167 +1798,31 @@ fn render_command_palette(f: &mut Frame, app: &TuiApp, area: Rect) {
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
+            Style::default().fg(Color::Gray)
         };
         lines.push(Line::from(vec![
+            Span::styled(if selected { "> " } else { "  " }, style),
+            Span::styled(cmd.clone(), style),
             Span::styled(
-                if selected {
-                    "▶ ".to_string()
-                } else {
-                    "  ".to_string()
-                },
-                style,
-            ),
-            Span::styled(cmd.to_string(), style),
-            Span::styled(
-                format!("  {}", desc),
-                style.fg(if selected {
-                    Color::Black
-                } else {
-                    Color::DarkGray
-                }),
+                format!("  {}", truncate_to(desc, width as usize)),
+                Style::default().fg(Color::DarkGray),
             ),
         ]));
     }
 
-    let palette = Paragraph::new(Text::from(lines)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(" Command Palette (Ctrl+P) "),
-    );
-    f.render_widget(palette, area);
+    f.render_widget(Paragraph::new(Text::from(lines)), popup);
 }
 
-fn render_coordination(f: &mut Frame, app: &TuiApp, area: Rect) {
-    if area.height < 2 {
-        return;
-    }
-    let mut lines = Vec::new();
-
-    let status = app.dashboard.status_monitor.get_all_status();
-    lines.push(Line::from(vec![Span::styled(
-        "Agent Communication:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-
-    for (agent, status) in &status {
-        let icon = match status.as_str() {
-            "completed" => "✓",
-            "failed" => "✗",
-            "working" => "⟳",
-            _ => "○",
-        };
-        let agent = truncate(agent, 10);
-        let status = truncate(status, 20);
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {} ", icon), Style::default().fg(Color::Green)),
-            Span::styled(format!("{:10}", agent), Style::default().fg(Color::White)),
-            Span::styled(status, Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
-    if !app.dashboard.recent_messages.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            "Recent Messages:",
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        for msg in app.dashboard.recent_messages.iter().take(3) {
-            let msg = truncate(msg, area.width.saturating_sub(4) as usize);
-            lines.push(Line::from(Span::raw(format!("  {}", msg))));
-        }
-    }
-
-    let coordination = Paragraph::new(Text::from(lines)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Coordination (Ctrl+O)"),
-    );
-    f.render_widget(coordination, area);
-}
-
-fn render_shortcuts(f: &mut Frame, area: Rect) {
-    let shortcuts = [
-        Shortcut::ToggleAgents,
-        Shortcut::ToggleTaskGraph,
-        Shortcut::ToggleMemory,
-        Shortcut::ToggleMetrics,
-        Shortcut::OpenCommandPalette,
-        Shortcut::ToggleCoordination,
-        Shortcut::ClearLogs,
-        Shortcut::CancelTask,
-        Shortcut::Quit,
-    ];
-
-    let mut spans = Vec::new();
-    for (i, shortcut) in shortcuts.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        }
-        spans.push(Span::styled(
-            shortcut.label(),
-            Style::default().fg(Color::Blue),
-        ));
-    }
-
-    let hint = Paragraph::new(Line::from(spans))
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(hint, area);
-}
-
-fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let prefix = if app.dashboard.animation.is_active() {
-        format!("{} > ", app.dashboard.animation.spinner_char())
-    } else {
-        "> ".to_string()
-    };
-
-    let inner_h = area.height.saturating_sub(BORDER) as usize;
-    let inner_w = area.width.saturating_sub(BORDER) as usize;
-    if inner_h == 0 {
-        return;
-    }
-
-    let (display_lines, cursor_line_rel, cursor_col) =
-        input_display_lines(&app.input, app.input_cursor, inner_h, inner_w);
-
-    let mut text_lines = Vec::new();
-    for (i, line) in display_lines.iter().enumerate() {
-        // Prefix only on the first visible line.
-        let full = if i == 0 {
-            format!("{}{}", prefix, line)
-        } else {
-            line.clone()
-        };
-        text_lines.push(Line::from(truncate(&full, area.width as usize)));
-    }
-
-    let paragraph = Paragraph::new(Text::from(text_lines))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Input (Enter=send, Shift+Enter=newline)"),
-        )
-        .style(Style::default().fg(Color::Yellow));
-    f.render_widget(paragraph, area);
-
-    // Place the cursor on the correct line and column.
-    if area.width >= 4 && area.height >= 3 {
-        let x_off = if cursor_line_rel == 0 {
-            prefix.chars().count() + cursor_col
-        } else {
-            cursor_col
-        };
-        let x = (area.x + 1 + x_off as u16).min(area.x + area.width.saturating_sub(2));
-        let y = (area.y + 1 + cursor_line_rel as u16).min(area.y + area.height.saturating_sub(2));
-        f.set_cursor(x, y);
-    }
+fn palette_entries(filter: &str) -> Vec<(String, &'static str)> {
+    let f = filter.to_lowercase();
+    commands::all_commands()
+        .filter(|spec| {
+            f.is_empty()
+                || spec.command.to_lowercase().contains(&f)
+                || spec.description.to_lowercase().contains(&f)
+        })
+        .map(|spec| (spec.command.to_string(), spec.description))
+        .collect()
 }
 
 fn render_model_picker(f: &mut Frame, app: &TuiApp) {
@@ -1715,7 +1884,7 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
                 ));
             } else {
                 spans.push(Span::styled(
-                    truncate(model, width.saturating_sub(6)),
+                    truncate_to(model, width.saturating_sub(6)),
                     Style::default().fg(if selected {
                         Color::Yellow
                     } else {
@@ -1744,22 +1913,128 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
     f.render_widget(widget, area);
 }
 
-/// Truncates a line to fit `width` Unicode characters (never panics on long text).
-fn truncate(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count <= width {
-        s.to_string()
-    } else if width == 0 {
-        String::new()
-    } else {
-        let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
-        out.push('…');
-        out
+fn handle_model_picker_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
+    match key.code {
+        KeyCode::Up => app.dashboard.model_picker.prev(),
+        KeyCode::Down => app.dashboard.model_picker.next(),
+        KeyCode::PageUp => {
+            for _ in 0..5 {
+                app.dashboard.model_picker.prev();
+            }
+        }
+        KeyCode::PageDown => {
+            for _ in 0..5 {
+                app.dashboard.model_picker.next();
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(model) = app.dashboard.model_picker.selected() {
+                app.apply_model(model);
+            }
+        }
+        KeyCode::Esc => {
+            app.dashboard.model_picker.close();
+        }
+        KeyCode::Backspace => {
+            app.dashboard.model_picker.filter.pop();
+            app.dashboard.model_picker.index = 0;
+        }
+        KeyCode::Char(c) => {
+            if app.dashboard.model_picker.loading {
+                return;
+            }
+            app.dashboard.model_picker.filter.push(c);
+            app.dashboard.model_picker.index = 0;
+        }
+        _ => {}
     }
 }
 
-fn truncate_line(s: &str, width: u16) -> String {
-    truncate(s, width as usize)
+fn handle_palette_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
+    let filtered = palette_entries(&app.dashboard.palette_query);
+    match key.code {
+        KeyCode::Char(c) => {
+            app.dashboard.palette_query.push(c);
+            app.dashboard.palette_index = 0;
+        }
+        KeyCode::Backspace => {
+            app.dashboard.palette_query.pop();
+            app.dashboard.palette_index = 0;
+        }
+        KeyCode::Up => {
+            if !filtered.is_empty() {
+                app.dashboard.palette_index =
+                    (app.dashboard.palette_index + filtered.len() - 1) % filtered.len();
+            }
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            if !filtered.is_empty() {
+                app.dashboard.palette_index = (app.dashboard.palette_index + 1) % filtered.len();
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(cmd) = filtered
+                .get(app.dashboard.palette_index)
+                .map(|c| c.0.clone())
+            {
+                app.dashboard.toggle_command_palette();
+                app.add_message(MessageRole::User, cmd.clone());
+                app.dashboard.show_command_palette = false;
+                app.is_loading = false;
+                submit_input(cmd, app);
+            } else {
+                app.dashboard.toggle_command_palette();
+            }
+        }
+        KeyCode::Esc => {
+            app.dashboard.toggle_command_palette();
+        }
+        _ => {}
+    }
+}
+
+fn handle_shortcut(shortcut: Shortcut, app: &mut TuiApp) {
+    match shortcut {
+        Shortcut::ToggleAgents => app.dashboard.toggle_agents(),
+        Shortcut::ToggleTaskGraph => app.dashboard.toggle_task_graph(),
+        Shortcut::ToggleMemory => app.dashboard.toggle_memory(),
+        Shortcut::SaveSession => {
+            if let Err(e) = save_session(app) {
+                app.add_message(MessageRole::System, format!("Save error: {}", e));
+            }
+        }
+        Shortcut::ToggleTrace => app.dashboard.toggle_trace(),
+        Shortcut::ClearLogs => {
+            app.dashboard.clear_logs();
+            app.clear_screen();
+        }
+        Shortcut::CancelTask => {
+            app.cancel_current_task();
+        }
+        Shortcut::Quit => {
+            app.should_quit = true;
+        }
+        Shortcut::OpenCommandPalette => {
+            app.dashboard.toggle_command_palette();
+        }
+        Shortcut::ToggleMetrics => {
+            app.dashboard.toggle_metrics();
+        }
+        Shortcut::ToggleCoordination => {
+            app.dashboard.toggle_coordination();
+        }
+    }
+}
+
+fn save_session(app: &TuiApp) -> Result<()> {
+    let session_dir = std::path::Path::new(".codebro");
+    if !session_dir.exists() {
+        std::fs::create_dir_all(session_dir)?;
+    }
+    let session_path = session_dir.join(format!("session_{}.json", app.session_id));
+    let json = serde_json::to_string_pretty(&app.messages)?;
+    std::fs::write(&session_path, json)?;
+    Ok(())
 }
 
 /// Returns the lines of the input buffer that should be rendered and the
@@ -1794,7 +2069,7 @@ fn input_display_lines(
 
     let mut display = Vec::new();
     for line in lines.iter().skip(first).take(last - first) {
-        display.push(truncate(line, inner_w));
+        display.push(truncate_to(line, inner_w));
     }
 
     (display, cursor_line.saturating_sub(first), cursor_col)
@@ -1818,17 +2093,9 @@ mod tests {
     #[test]
     fn test_input_display_lines_multiline() {
         let input = "line one\nline two\nline three";
-        // cursor at end
         let (lines, l, c) = input_display_lines(input, input.len(), 2, 50);
         assert_eq!(lines, vec!["line two", "line three"]);
         assert_eq!((l, c), (1, 10));
-    }
-
-    #[test]
-    fn test_input_display_lines_empty() {
-        let (lines, l, c) = input_display_lines("", 0, 3, 50);
-        assert_eq!(lines, vec![""]);
-        assert_eq!((l, c), (0, 0));
     }
 
     #[test]
@@ -1840,144 +2107,73 @@ mod tests {
 
     #[test]
     fn test_truncate_short() {
-        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate_to("hello", 10), "hello");
     }
 
     #[test]
     fn test_truncate_long() {
-        let out = truncate("a very long line of text", 10);
+        let out = truncate_to("a very long line of text", 10);
         assert_eq!(out.chars().count(), 10);
         assert!(out.ends_with('…'));
     }
 
     #[test]
     fn test_truncate_zero() {
-        assert_eq!(truncate("hello", 0), "");
+        assert_eq!(truncate_to("hello", 0), "");
     }
 
     #[test]
-    fn test_compute_layout_small_terminal() {
+    fn test_layout_default_is_task_focused() {
+        let app = make_app();
+        let layout = compute_layout(&app, 40);
+        // Default: no overlay panels open.
+        assert_eq!(layout.agents_h, 0);
+        assert_eq!(layout.graph_h, 0);
+        assert_eq!(layout.metrics_h, 0);
+        assert_eq!(layout.coord_h, 0);
+        // Output dominates.
+        assert!(layout.output_h >= MIN_OUTPUT);
+        assert!(layout.activity_h >= 1);
+        assert!(layout.input_h >= 3);
+    }
+
+    #[test]
+    fn test_layout_overlays_are_optional() {
         let mut app = make_app();
         app.dashboard.show_agents = true;
         app.dashboard.show_task_graph = true;
         app.dashboard.show_metrics = true;
-        app.dashboard.show_coordination = true;
-        app.dashboard.show_command_palette = true;
-
-        let layout = compute_layout(&app, 24);
-        // Conversation must keep a usable minimum even with all panels open.
-        assert!(layout.conv_h >= MIN_CONV);
-        assert!(layout.input_h >= 3);
-        // Total allocated must never exceed the terminal height.
+        let layout = compute_layout(&app, 40);
+        assert!(layout.agents_h > 0);
+        assert!(layout.graph_h > 0);
+        assert!(layout.metrics_h > 0);
+        assert!(layout.output_h >= MIN_OUTPUT);
         let total = layout.title_h
-            + layout.conv_h
-            + layout.agents_h
+            + layout.op_h
+            + layout.output_h
             + layout.activity_h
+            + layout.agents_h
             + layout.graph_h
             + layout.metrics_h
             + layout.coord_h
-            + layout.shortcuts_h
-            + layout.palette_h
             + layout.input_h;
-        assert!(total <= 24);
+        assert!(total <= 40);
     }
 
     #[test]
-    fn test_compute_layout_large_terminal() {
-        let mut app = make_app();
-        app.dashboard.show_agents = true;
-        app.dashboard.show_task_graph = true;
-
-        let layout = compute_layout(&app, 40);
-        assert!(layout.conv_h >= MIN_CONV);
-        assert!(layout.agents_h > 0);
-        assert!(layout.graph_h > 0);
-    }
-
-    #[test]
-    fn test_compute_layout_no_panels() {
-        let mut app = make_app();
-        app.dashboard.show_agents = false;
-        app.dashboard.show_task_graph = false;
-        app.dashboard.show_metrics = false;
-        app.dashboard.show_coordination = false;
-        app.dashboard.show_command_palette = false;
-
-        let layout = compute_layout(&app, 24);
-        assert_eq!(layout.agents_h, 0);
-        assert_eq!(layout.graph_h, 0);
-        assert_eq!(layout.metrics_h, 0);
-        assert!(layout.conv_h >= MIN_CONV);
-    }
-
-    #[test]
-    fn test_compute_layout_extreme_small() {
+    fn test_layout_extreme_small() {
         let app = make_app();
-        // A 10-row terminal must not panic and must keep input + title.
         let layout = compute_layout(&app, 10);
         assert!(layout.title_h >= 1);
         assert!(layout.input_h >= 3);
     }
 
     #[test]
-    fn test_compute_layout_default_panels() {
-        let app = make_app();
-        // Agents panel is on by default; verify it gets space on a normal terminal.
-        let layout = compute_layout(&app, 24);
-        assert!(layout.agents_h > 0);
-    }
-
-    #[test]
-    fn test_match_slash_command_completes() {
-        let matches = match_slash_command("/mo");
-        assert!(matches.iter().any(|m| m == "/model"));
-    }
-
-    #[test]
-    fn test_match_slash_command_empty_missing_slash() {
-        assert!(match_slash_command("model").is_empty());
-        assert!(match_slash_command("/").is_empty());
-    }
-
-    #[test]
-    fn test_palette_filters_substring() {
-        let entries = palette_entries("copy");
-        assert!(entries.iter().any(|(name, _)| *name == "/copy"));
-        let all = palette_entries("");
-        assert!(all.iter().any(|(name, _)| *name == "/help"));
-    }
-
-    #[test]
-    fn test_autocomplete_replaces_input() {
-        let mut app = make_app();
-        app.input = "/mo".to_string();
-        app.dashboard
-            .autocomplete_command(&mut app.input, vec!["/model".to_string()]);
-        assert_eq!(app.input, "/model");
-    }
-
-    #[test]
-    fn test_slash_commands_include_required() {
-        let required = [
-            "/help",
-            "/model",
-            "/agents",
-            "/memory",
-            "/skills",
-            "/sessions",
-            "/tasks",
-            "/replay",
-            "/config",
-            "/status",
-        ];
-        for r in required {
-            assert!(
-                SLASH_COMMANDS
-                    .iter()
-                    .any(|(n, _, _)| n.split_whitespace().next().unwrap_or("") == r),
-                "missing {}",
-                r
-            );
-        }
+    fn test_dangerous_shell_detection() {
+        assert!(is_dangerous_shell("rm -rf /tmp/foo"));
+        assert!(is_dangerous_shell("git push --force origin main"));
+        assert!(!is_dangerous_shell("git status"));
+        assert!(!is_dangerous_shell("cargo test"));
+        assert!(!is_dangerous_shell("rm file.txt"));
     }
 }

@@ -52,6 +52,10 @@ pub struct ToolContext {
     pub requires_confirmation: bool,
     /// Correlation ID for tracing across modules.
     pub correlation_id: String,
+    /// Optional cooperative cancellation token for long-running tools
+    /// (e.g. PTY-backed shell execution). Not persisted.
+    #[serde(skip)]
+    pub cancellation: Option<crate::cancellation::CancellationToken>,
 }
 
 impl ToolContext {
@@ -67,6 +71,7 @@ impl ToolContext {
             args: args.to_string(),
             requires_confirmation: false,
             correlation_id: Uuid::new_v4().to_string(),
+            cancellation: None,
         }
     }
 
@@ -124,6 +129,14 @@ impl ToolContextBuilder {
         self
     }
 
+    /// Attach a cooperative cancellation token so long-running tools can stop
+    /// promptly when the user cancels the task (Ctrl+C).
+    pub fn with_cancellation(mut self, token: crate::cancellation::CancellationToken) -> Self {
+        self.context.cancellation = Some(token);
+        self
+    }
+
+    /// Build the context.
     pub fn build(self) -> ToolContext {
         self.context
     }

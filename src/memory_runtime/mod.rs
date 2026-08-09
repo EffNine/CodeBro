@@ -220,7 +220,6 @@ mod tests {
             .unwrap();
 
         let diag = runtime.diagnostics();
-        assert!(diag.total_hits >= 0);
     }
 
     #[test]

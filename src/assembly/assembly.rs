@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_render_sections() {
-        let mut frags = vec![
+        let frags = vec![
             ContextFragment::new(
                 ContextSource::UserRequest,
                 ContextPriority::Critical,

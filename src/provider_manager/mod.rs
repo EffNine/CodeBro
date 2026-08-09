@@ -97,6 +97,9 @@ impl std::fmt::Display for HealthStatus {
 pub struct ProviderEntry {
     pub id: ProviderId,
     pub base_url: String,
+    /// In-memory API key. Never serialized to `providers.json` — keys live in
+    /// the dedicated secure credential store (`credentials.json`, mode 0600).
+    #[serde(skip)]
     pub api_key: Option<String>,
     pub current_model: String,
     pub health: HealthStatus,
@@ -139,12 +142,18 @@ pub struct ProviderManager {
     providers: HashMap<String, ProviderEntry>,
     active_provider: Option<String>,
     config_dir: PathBuf,
+    /// Secure credential store; never serialized into `providers.json`.
+    #[serde(skip)]
+    credentials: crate::credentials::CredentialStore,
 }
 
 impl ProviderManager {
     pub fn new(config_dir: PathBuf) -> Self {
+        let mut credentials = crate::credentials::CredentialStore::new(config_dir.clone());
+        let _ = credentials.load();
         ProviderManager {
             config_dir,
+            credentials,
             ..Default::default()
         }
     }
@@ -229,6 +238,8 @@ impl ProviderManager {
             .get_mut(provider_id)
             .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_id))?;
         entry.api_key = Some(key.to_string());
+        // Secrets go to the dedicated secure store, never to providers.json.
+        self.credentials.set(provider_id, key)?;
         Ok(())
     }
 
@@ -238,6 +249,7 @@ impl ProviderManager {
             .get_mut(provider_id)
             .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_id))?;
         entry.api_key = None;
+        self.credentials.delete(provider_id)?;
         Ok(())
     }
 
@@ -413,11 +425,18 @@ impl ProviderManager {
 
     // ─── Persistence ─────────────────────────────────────────────────────
 
+    /// Persist provider configuration. API keys are excluded by the
+    /// `#[serde(skip)]` on [`ProviderEntry::api_key`]; secrets live in the
+    /// secure credential store (`credentials.json`, mode 0600). A legacy
+    /// `providers.json` that still contains inline keys is migrated on load
+    /// and never re-written here.
     pub fn persist(&self) -> Result<()> {
         let config_path = self.config_dir.join("providers.json");
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(&config_path, json)
             .with_context(|| format!("Failed to write providers to {:?}", config_path))?;
+        // Keep the credential file in sync even if only a key was set.
+        let _ = self.credentials.persist();
         Ok(())
     }
 
@@ -428,10 +447,36 @@ impl ProviderManager {
         }
         let content = std::fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read providers from {:?}", config_path))?;
+
+        // Migration: legacy files may contain inline `api_key` values. Move
+        // them into the secure credential store, then treat them as if they
+        // were already stored there. Existing credentials are never destroyed.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(providers) = value.get("providers").and_then(|v| v.as_object()) {
+                for (id, entry) in providers {
+                    if let Some(key) = entry.get("api_key").and_then(|k| k.as_str()) {
+                        if !key.trim().is_empty() {
+                            let _ = self.credentials.set(id, key);
+                        }
+                    }
+                }
+            }
+        }
+
         let loaded: ProviderManager =
             serde_json::from_str(&content).with_context(|| "Failed to parse providers.json")?;
         self.providers = loaded.providers;
         self.active_provider = loaded.active_provider;
+
+        // Merge stored credentials back into memory so providers keep working
+        // without being re-entered.
+        for id in self.providers.keys().cloned().collect::<Vec<_>>() {
+            if let Some(key) = self.credentials.get(&id).map(|k| k.to_string()) {
+                if let Some(entry) = self.providers.get_mut(&id) {
+                    entry.api_key = Some(key);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -627,5 +672,78 @@ mod tests {
         pm.register_builtin();
         pm.set_api_key("openai", "sk-1234567890abcdef").unwrap();
         assert_eq!(pm.api_key_masked("openai"), Some("••••cdef".to_string()));
+    }
+
+    #[test]
+    fn test_api_key_not_persisted_to_providers_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().to_path_buf();
+
+        let mut pm = ProviderManager::new(config_dir.clone());
+        pm.register_builtin();
+        pm.set_api_key("openai", "sk-super-secret-key-1234567890")
+            .unwrap();
+        pm.set_active("openai").unwrap();
+        pm.persist().unwrap();
+
+        let providers_json = std::fs::read_to_string(config_dir.join("providers.json")).unwrap();
+        assert!(
+            !providers_json.contains("sk-super-secret-key-1234567890"),
+            "API key leaked into providers.json: {}",
+            providers_json
+        );
+
+        // The key lives in the dedicated credential file.
+        let credentials_json =
+            std::fs::read_to_string(config_dir.join("credentials.json")).unwrap();
+        assert!(credentials_json.contains("sk-super-secret-key-1234567890"));
+    }
+
+    #[test]
+    fn test_legacy_providers_json_migrates_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().to_path_buf();
+        // Simulate a legacy plaintext providers.json.
+        let legacy = serde_json::json!({
+            "providers": {
+                "openai": {
+                    "id": "OpenAI",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-legacy-plaintext-key",
+                    "current_model": "",
+                    "health": "Unknown",
+                    "last_health_check": null,
+                    "latency_ms": null
+                }
+            },
+            "active_provider": "openai",
+            "config_dir": "/tmp"
+        });
+        std::fs::write(config_dir.join("providers.json"), legacy.to_string()).unwrap();
+
+        let mut pm = ProviderManager::new(config_dir.clone());
+        pm.register_builtin();
+        pm.load().unwrap();
+
+        assert!(
+            pm.has_api_key("openai"),
+            "migrated key must be usable in memory"
+        );
+        assert_eq!(pm.api_key_masked("openai"), Some("••••-key".to_string()));
+    }
+
+    #[test]
+    fn test_clear_api_key_removes_from_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().to_path_buf();
+        let mut pm = ProviderManager::new(config_dir.clone());
+        pm.register_builtin();
+        pm.set_api_key("openai", "sk-1234567890abcdef").unwrap();
+        pm.clear_api_key("openai").unwrap();
+        assert!(!pm.has_api_key("openai"));
+        let mut reloaded = ProviderManager::new(config_dir.clone());
+        reloaded.register_builtin();
+        reloaded.load().unwrap();
+        assert!(!reloaded.has_api_key("openai"));
     }
 }

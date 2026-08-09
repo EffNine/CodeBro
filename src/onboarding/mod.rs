@@ -252,14 +252,15 @@ impl OnboardingManager {
         fs::create_dir_all(&self.config_dir)?;
         fs::write(&config_path, config_content)?;
 
-        // Store API key in a secure location (keychain if available, otherwise config)
-        let key_path = self.config_dir.join(".api_key");
-        fs::write(&key_path, api_key)?;
-        #[cfg(unix)]
-        std::process::Command::new("chmod")
-            .args(["600", key_path.to_string_lossy().as_ref()])
-            .status()
-            .ok();
+        // Store API key in the secure credential store (never plaintext JSON).
+        let mut store = crate::credentials::CredentialStore::new(self.config_dir.clone());
+        store.set(provider_id.as_str(), api_key)?;
+
+        // Migrate: remove the legacy plaintext key file if it exists.
+        let legacy_key_path = self.config_dir.join(".api_key");
+        if legacy_key_path.exists() {
+            let _ = std::fs::remove_file(&legacy_key_path);
+        }
 
         Ok(())
     }

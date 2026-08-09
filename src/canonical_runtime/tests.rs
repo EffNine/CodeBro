@@ -958,3 +958,173 @@ async fn test_prompt_contract_recommends_not_interrogates() {
         .prompt
         .contains("Never run destructive commands without explicit user confirmation"));
 }
+
+// =========================================================================
+// Sprint 28 — PTY streaming tool path & explicit verification
+// =========================================================================
+
+#[tokio::test]
+async fn test_run_tool_streaming_emits_authoritative_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
+
+    let (events, emit) = event_sink();
+
+    let outcome = runtime
+        .run_tool_streaming(
+            "run_command",
+            "c1",
+            "printf 'live\\noutput\\n'",
+            &emit,
+            Default::default(),
+        )
+        .await;
+
+    assert!(outcome.success, "exit code must be 0");
+    assert_eq!(outcome.exit_code, 0);
+    assert!(
+        outcome.output.contains("live"),
+        "streamed output must be captured: {}",
+        outcome.output
+    );
+
+    let snapshot = events.lock().unwrap().clone();
+    assert!(
+        snapshot
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolStarted { tool, .. } if tool == "run_command")),
+        "must emit real ToolStarted"
+    );
+    assert!(
+        snapshot.iter().any(|e| matches!(
+            e,
+            AgentEvent::PtyOutput { console, .. } if console == "c1"
+        )),
+        "must emit real PtyOutput chunks"
+    );
+    assert!(
+        snapshot.iter().any(|e| matches!(
+            e,
+            AgentEvent::PtyExited { console, exit_code, .. } if console == "c1" && *exit_code == 0
+        )),
+        "must emit real PtyExited with the exit code"
+    );
+    assert!(
+        snapshot
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCompleted { success: true, .. })),
+        "must emit ToolCompleted for the real run"
+    );
+}
+
+#[tokio::test]
+async fn test_run_tool_streaming_captures_failure_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
+
+    let (_events, emit) = event_sink();
+    let outcome = runtime
+        .run_tool_streaming("run_command", "c2", "exit 7", &emit, Default::default())
+        .await;
+
+    assert!(!outcome.success);
+    assert_eq!(outcome.exit_code, 7);
+}
+
+#[tokio::test]
+async fn test_run_tool_streaming_respects_cancellation() {
+    use crate::cancellation::CancellationToken;
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
+
+    let (_events, emit) = event_sink();
+    let token = CancellationToken::new();
+    // Cancel immediately: the PTY receives SIGINT before/while starting.
+    token.cancel();
+    let outcome = runtime
+        .run_tool_streaming("run_command", "c3", "sleep 30", &emit, token)
+        .await;
+    assert!(outcome.cancelled, "cancelled outcome expected");
+}
+
+#[tokio::test]
+async fn test_verify_commands_detects_cargo_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
+    let (build, test) = runtime.verify_commands();
+    assert_eq!(
+        build.map(|(l, c)| (l, c)),
+        Some(("cargo build".into(), "cargo build".into()))
+    );
+    assert_eq!(
+        test.map(|(l, c)| (l, c)),
+        Some(("cargo test".into(), "cargo test".into()))
+    );
+}
+
+#[tokio::test]
+async fn test_verify_commands_none_for_unknown_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
+    let (build, test) = runtime.verify_commands();
+    assert!(build.is_none());
+    assert!(test.is_none());
+}
+
+#[tokio::test]
+async fn test_verify_task_runs_real_build_and_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    // A minimal crate that compiles: cargo build + cargo test should pass.
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"vt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src").join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[cfg(test)]\nmod tests { #[test] fn ok() {} }\n",
+    )
+    .unwrap();
+
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
+    let (_events, emit) = event_sink();
+
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "verify me",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &|_| {},
+    };
+    let mut diag = crate::canonical_runtime::TaskDiagnostics::new("verify me");
+    let result = runtime
+        .verify_task(
+            &req,
+            &Default::default(),
+            &mut diag,
+            std::time::Instant::now(),
+        )
+        .await;
+
+    let (summary, text) = result.expect("verification applicable");
+    assert!(
+        summary.steps.iter().all(|s| s.success),
+        "build and test must pass for a valid crate: {}",
+        text
+    );
+    assert!(text.contains("Verification passed"));
+    assert!(diag.verification.is_some());
+}

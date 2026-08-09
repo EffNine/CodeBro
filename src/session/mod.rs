@@ -130,6 +130,22 @@ impl Session {
                 Some(false),
             ),
             AgentEvent::StreamChunk { .. } => return,
+            AgentEvent::PtyOutput { console, .. } => (
+                "console".to_string(),
+                "pty_output".to_string(),
+                Some(console.clone()),
+                None,
+            ),
+            AgentEvent::PtyExited {
+                console,
+                exit_code,
+                status,
+            } => (
+                "console".to_string(),
+                format!("pty_{}", status),
+                Some(format!("{} (exit {})", console, exit_code)),
+                Some(*exit_code == 0),
+            ),
             AgentEvent::Log { level, message } => (
                 "log".to_string(),
                 format!("log_{}", level),

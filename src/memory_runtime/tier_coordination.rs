@@ -136,18 +136,16 @@ impl TierCoordinator {
             return Ok(0);
         }
 
-        let mut to_evict = Vec::new();
-
-        match policy.eviction {
+        let to_evict = match policy.eviction {
             EvictionPolicy::LRU => {
                 let mut sorted = entries;
                 sorted.sort_by(|a, b| a.last_accessed.cmp(&b.last_accessed));
-                to_evict = sorted;
+                sorted
             }
             EvictionPolicy::LFU => {
                 let mut sorted = entries;
                 sorted.sort_by(|a, b| a.access_count.cmp(&b.access_count));
-                to_evict = sorted;
+                sorted
             }
             EvictionPolicy::LowestImportance => {
                 let mut sorted = entries;
@@ -157,7 +155,7 @@ impl TierCoordinator {
                         .partial_cmp(&a.metadata.importance)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                to_evict = sorted;
+                sorted
             }
             EvictionPolicy::LowestConfidence => {
                 let mut sorted = entries;
@@ -167,14 +165,14 @@ impl TierCoordinator {
                         .partial_cmp(&a.metadata.confidence)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                to_evict = sorted;
+                sorted
             }
             EvictionPolicy::FIFO => {
                 let mut sorted = entries;
                 sorted.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-                to_evict = sorted;
+                sorted
             }
-        }
+        };
 
         // Evict low-priority entries
         let eviction_count = to_evict.len() / 4; // Evict bottom 25%
@@ -404,6 +402,6 @@ mod tests {
             .unwrap();
 
         let summary = coordinator.diagnostics();
-        assert!(summary.total_hits > 0 || summary.total_misses >= 0);
+        assert!(summary.total_hits > 0 || summary.total_misses > 0);
     }
 }

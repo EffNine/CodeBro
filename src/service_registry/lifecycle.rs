@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn test_recover_from_error() {
         let mut reg = ServiceRegistry::new();
-        let mut lc = ServiceLifecycle::new(reg.clone());
+        let lc = ServiceLifecycle::new(reg.clone());
         reg.register(make_svc("s1", "test", "1.0.0", "p")).unwrap();
         lc.error(&ServiceId::new("s1").unwrap(), "crash").unwrap();
 
@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn test_error_from_error_fails() {
         let mut reg = ServiceRegistry::new();
-        let mut lc = ServiceLifecycle::new(reg.clone());
+        let lc = ServiceLifecycle::new(reg.clone());
         reg.register(make_svc("s1", "test", "1.0.0", "p")).unwrap();
         lc.error(&ServiceId::new("s1").unwrap(), "crash1").unwrap();
 

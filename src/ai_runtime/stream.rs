@@ -178,8 +178,8 @@ impl StreamPipeline {
     /// Process all events and produce a StreamingOutput.
     pub fn process(&mut self) -> AIRRuntimeResult<StreamingOutput> {
         let mut output = StreamingOutput::new();
-        let mut tokens = 0usize;
-        let mut start_time = std::time::SystemTime::now()
+        let tokens = 0usize;
+        let start_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;

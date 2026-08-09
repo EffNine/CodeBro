@@ -57,6 +57,8 @@ pub mod executor;
 pub mod filesystem;
 pub mod git;
 pub mod patch;
+pub mod playwright;
+pub mod pty;
 pub mod router;
 pub mod shell;
 
@@ -71,7 +73,9 @@ pub use hooks::{
 pub use lifecycle::{LifecycleError, LifecycleManager, ToolLifecycleState};
 pub use metadata::{ToolDefinition, ToolMetadata};
 pub use provider::{BuiltInProvider, ProviderRegistry, ToolProvider};
-pub use streaming::{channel_stream, sync_to_stream, AsyncTool, StreamChunk, StreamResult};
+pub use streaming::{
+    channel_stream, channel_stream_factory, sync_to_stream, AsyncTool, StreamChunk, StreamResult,
+};
 
 // Re-export existing types
 pub use change::ChangePlan;
@@ -79,6 +83,7 @@ pub use executor::{detect_workspace_root, is_toolable, run_tool_pipeline};
 pub use filesystem::{CreateFile, EditFile, ListFiles, ReadFile};
 pub use git::{GitDiff, GitStatus};
 pub use patch::{FilePatch, PatchEngine, PatchSet};
+pub use playwright::PlaywrightTool;
 pub use router::{SmartToolRouter, ToolSelection};
 pub use shell::{RunCommand, ShellCommandRecord, ShellHistory};
 
@@ -87,6 +92,14 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn execute(&self, args: &str) -> anyhow::Result<String>;
+
+    /// If this tool supports streaming output (e.g. PTY-backed processes),
+    /// return a handle to its [`AsyncTool`] implementation. The default is
+    /// `None`; tools that stream override this. This is the single discovery
+    /// seam the registry uses to route to [`streaming::AsyncTool`].
+    fn as_async(&self) -> Option<&dyn AsyncTool> {
+        None
+    }
 }
 
 /// Dispatcher for executing tools (re-exported from dispatcher).

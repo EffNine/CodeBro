@@ -66,6 +66,18 @@ impl ShellHistory {
     }
 }
 
+/// The result of a completed shell run: raw streams plus the authoritative
+/// exit code. Unlike [`RunCommand::execute`], a non-zero exit is a value, not
+/// an error — callers that need the exit code (test runners, verification)
+/// use this.
+#[derive(Debug, Clone)]
+pub struct RunResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub duration_ms: u128,
+}
+
 pub struct RunCommand {
     pub timeout_secs: u64,
     pub working_directory: Option<String>,
@@ -109,6 +121,32 @@ impl RunCommand {
 
     fn execute_with_timeout_async(&self, args: &str) -> Result<(String, String, i32, u128)> {
         self.execute_child(args, self.timeout_secs)
+    }
+
+    /// Run a command and return the raw result (exit code, streams). Records
+    /// shell history. This is the primary entry point for callers that need
+    /// the exit code as a value rather than an error.
+    pub fn run(&self, args: &str) -> Result<RunResult> {
+        let working_directory = self
+            .working_directory
+            .clone()
+            .unwrap_or_else(|| ".".to_string());
+        let (stdout, stderr, exit_code, duration_ms) =
+            self.execute_child(args, self.timeout_secs)?;
+        let success = exit_code == 0;
+        self.record_command(
+            args,
+            &working_directory,
+            success,
+            Some(exit_code),
+            duration_ms,
+        );
+        Ok(RunResult {
+            stdout,
+            stderr,
+            exit_code,
+            duration_ms,
+        })
     }
 
     /// Spawns `sh -c​(args)`, polls for completion up to `timeout_secs`, then
@@ -215,6 +253,14 @@ fn cap_output(stdout: &str, stderr: &str) -> (String, String) {
 
 /// Redacts bearer tokens and API keys so tool output never leaks credentials
 /// into the conversation, context, or session logs.
+///
+/// Public so the PTY streaming path can redact live output with the exact same
+/// rules as the blocking path. This is the single secret-redaction authority
+/// for tool output.
+pub fn redact_secrets_public(s: &str) -> String {
+    redact_secrets(s)
+}
+
 fn redact_secrets(s: &str) -> String {
     use regex::Regex;
     // sk-..., common API key headers, and bearer tokens.
@@ -270,29 +316,123 @@ impl super::Tool for RunCommand {
         "Execute a shell command with timeout and history tracking"
     }
 
+    fn as_async(&self) -> Option<&dyn super::AsyncTool> {
+        Some(self)
+    }
+
     fn execute(&self, args: &str) -> Result<String> {
-        let working_directory = self
-            .working_directory
-            .clone()
-            .unwrap_or_else(|| ".".to_string());
-
-        let (stdout, stderr, exit_code, duration) = self.execute_with_timeout(args)?;
-
-        let success = exit_code == 0;
-        self.record_command(args, &working_directory, success, Some(exit_code), duration);
-
-        if success {
-            Ok(stdout)
+        let result = self.run(args)?;
+        if result.exit_code == 0 {
+            Ok(result.stdout)
         } else {
             Err(anyhow::anyhow!(
                 "Command failed (exit {}): {}\n{}",
-                exit_code,
-                stderr,
-                stdout
+                result.exit_code,
+                result.stderr,
+                result.stdout
             ))
         }
     }
 }
+
+impl Clone for RunCommand {
+    fn clone(&self) -> Self {
+        RunCommand {
+            timeout_secs: self.timeout_secs,
+            working_directory: self.working_directory.clone(),
+            environment: self.environment.clone(),
+            shell_history_path: self.shell_history_path.clone(),
+        }
+    }
+}
+
+/// PTY-backed streaming execution for shell commands.
+///
+/// This is the authoritative live path: output is emitted as it is produced by
+/// the process, ANSI sequences preserved, never batched until completion. The
+/// result stream's final chunk carries the exit status. Cancellation and
+/// timeouts are enforced by the PTY task.
+impl super::AsyncTool for RunCommand {
+    fn name(&self) -> &str {
+        "run_command"
+    }
+
+    fn execute_stream(
+        &self,
+        args: &str,
+        context: &super::context::ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<super::StreamResult>> + Send>> {
+        let timeout = Duration::from_secs(self.timeout_secs);
+        let timeout_secs = self.timeout_secs;
+        let working_directory = self.working_directory.clone();
+        let environment = self.environment.clone();
+        let cancel = context.cancellation.clone();
+        let args = args.to_string();
+
+        Box::pin(async move {
+            let config = super::pty::PtyConfig {
+                command: args.clone(),
+                working_directory: working_directory.map(PathBuf::from),
+                environment,
+                timeout: Some(timeout),
+                max_output: MAX_TOOL_OUTPUT,
+            };
+            let cancel = cancel.unwrap_or_default();
+            let mut rx = super::pty::spawn_pty(config, cancel);
+
+            let stream = super::channel_stream_factory("run_command", move |tx| loop {
+                match rx.blocking_recv() {
+                    Some(super::pty::PtyEvent::Output(content)) => {
+                        if tx
+                            .blocking_send(super::StreamChunk::new(&content, false))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Some(super::pty::PtyEvent::Exited { exit_code }) => {
+                        let _ = tx.blocking_send(super::StreamChunk {
+                            text: String::new(),
+                            is_final: true,
+                            metadata: Some(format!("exit:{}", exit_code)),
+                        });
+                        break;
+                    }
+                    Some(super::pty::PtyEvent::Cancelled) => {
+                        let _ = tx.blocking_send(super::StreamChunk {
+                            text: "\n[Cancelled by user]".to_string(),
+                            is_final: true,
+                            metadata: Some("cancelled".to_string()),
+                        });
+                        break;
+                    }
+                    Some(super::pty::PtyEvent::TimedOut) => {
+                        let _ = tx.blocking_send(super::StreamChunk {
+                            text: format!("\n[Command timed out after {}s]", timeout_secs),
+                            is_final: true,
+                            metadata: Some("timeout".to_string()),
+                        });
+                        break;
+                    }
+                    Some(super::pty::PtyEvent::Error(e)) => {
+                        let _ = tx.blocking_send(super::StreamChunk {
+                            text: format!("\n[Error: {}]", e),
+                            is_final: true,
+                            metadata: Some("error".to_string()),
+                        });
+                        break;
+                    }
+                    None => break,
+                }
+            });
+
+            Ok(super::StreamResult::new(stream, "run_command"))
+        })
+    }
+}
+
+use std::future::Future;
+use std::pin::Pin;
 
 impl Default for RunCommand {
     fn default() -> Self {
@@ -425,5 +565,26 @@ mod tests {
         let (out, _) = cap_output(&big, "");
         assert!(out.len() < big.len(), "long output was not truncated");
         assert!(out.contains("truncated"));
+    }
+
+    #[test]
+    fn test_async_stream_live_output_via_pty() {
+        use crate::tools::context::ToolContext;
+        use crate::tools::streaming::{AsyncTool, StreamResult};
+        use futures::StreamExt;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tool = RunCommand::new().with_timeout(30);
+        let ctx = ToolContext::new("run_command", "printf 'alpha\\nbeta\\n'");
+        let result = rt.block_on(async {
+            let stream = tool
+                .execute_stream("printf 'alpha\\nbeta\\n'", &ctx)
+                .await
+                .unwrap();
+            let collected = stream.collect().await.unwrap();
+            collected
+        });
+        assert!(result.contains("alpha"), "got: {}", result);
+        assert!(result.contains("beta"), "got: {}", result);
     }
 }

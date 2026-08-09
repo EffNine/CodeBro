@@ -251,6 +251,103 @@ impl ToolRegistry {
         }
     }
 
+    /// Execute a tool and stream its output, with full hook and diagnostic
+    /// support. Tools that implement [`crate::tools::AsyncTool`] produce live
+    /// output; all other tools yield a single final chunk. This is the
+    /// streaming half of the canonical tool execution path — permission,
+    /// lifecycle and hook enforcement are identical to [`ToolRegistry::execute`].
+    pub async fn execute_stream(
+        &mut self,
+        name: &str,
+        args: &str,
+        cancel: Option<crate::cancellation::CancellationToken>,
+    ) -> Result<crate::tools::StreamResult> {
+        let context = ToolContext::builder(name, args);
+        let context = match cancel {
+            Some(token) => context.with_cancellation(token).build(),
+            None => context.build(),
+        };
+        self.execute_stream_with_context(context).await
+    }
+
+    /// Execute a tool and stream its output using a pre-built context.
+    pub async fn execute_stream_with_context(
+        &mut self,
+        context: ToolContext,
+    ) -> Result<crate::tools::StreamResult> {
+        let tool_name = context.tool_name.clone();
+
+        // Check if tool exists first
+        if !self.tools.contains_key(&tool_name) {
+            return Err(anyhow::anyhow!("Unknown tool: {}", tool_name));
+        }
+
+        // Check lifecycle state
+        if !self.lifecycle.is_active(&tool_name) {
+            return Err(anyhow::anyhow!(
+                "Tool '{}' is not active (state: {:?})",
+                tool_name,
+                self.lifecycle.state(&tool_name)
+            ));
+        }
+
+        // Check permission
+        let permission = self.check_permission(&context);
+        match permission {
+            PermissionDecision::Allowed { .. } => {}
+            PermissionDecision::Ask { .. } => {
+                return Err(anyhow::anyhow!(
+                    "Tool '{}' requires confirmation",
+                    tool_name
+                ));
+            }
+            PermissionDecision::Denied { reason } => {
+                return Err(anyhow::anyhow!("Tool '{}' denied: {}", tool_name, reason));
+            }
+        }
+
+        // Run before-execute hooks
+        let mut mutable_context = context.clone();
+        self.hooks.before_execute(&mut mutable_context)?;
+
+        // Execute the tool (streaming).
+        let stream_result = self.dispatch_stream(&mutable_context).await?;
+
+        // Record diagnostics (streaming path: outcome is known from the final
+        // chunk metadata once consumed, so record conservatively as success).
+        if let Some(meta) = self.metadata.get_mut(&tool_name) {
+            meta.record_success(0.0);
+        }
+
+        Ok(stream_result)
+    }
+
+    /// Dispatch a streaming tool execution (internal).
+    async fn dispatch_stream(&self, context: &ToolContext) -> Result<crate::tools::StreamResult> {
+        let tool_name = context.tool_name.clone();
+        match self.tools.get(&tool_name) {
+            Some(tool) => {
+                let args = context.args.clone();
+                let context = context.clone();
+                if let Some(async_tool) = tool.as_async() {
+                    // Streaming path: await directly. The PTY machinery runs
+                    // on its own OS threads; this future only drives the
+                    // channel.
+                    async_tool.execute_stream(&args, &context).await
+                } else {
+                    // No streaming support: synthesize a single final chunk.
+                    let tool = tool.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::tools::sync_to_stream(tool.as_ref(), &args, &context)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Tool execution panic: {}", e))?
+                }
+            }
+            None => Err(anyhow::anyhow!("Unknown tool: {}", context.tool_name)),
+        }
+    }
+
     /// Execute a tool with a pre-built context.
     pub async fn execute_with_context(&mut self, context: ToolContext) -> Result<ToolResult> {
         let tool_name = context.tool_name.clone();

@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 use crate::config::Config;
+use crate::tui::console::{ConsoleStatus, PtyConsole};
 use crate::tui::dashboard::Dashboard;
 use anyhow::Result;
 use serde::Serialize;
@@ -7,6 +8,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 
 use crate::agent::events::AgentEvent;
+use crate::cancellation::CancellationToken;
 use crate::tui::events::{self, AppEvent};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -14,6 +16,17 @@ pub enum MessageRole {
     User,
     Assistant,
     System,
+}
+
+/// A destructive/confirmable action awaiting explicit user confirmation.
+#[derive(Debug, Clone)]
+pub enum PendingAction {
+    /// A `!` shell command flagged as potentially destructive.
+    RunShell(String),
+    /// `//approve` (applies the staged change).
+    ApproveChange,
+    /// `//reject` (discards the staged change).
+    RejectChange,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,6 +66,15 @@ pub struct TuiApp {
     pub provider_panel: ProviderPanel,
     /// P5: Workspace discovery panel
     pub workspace_panel: WorkspacePanel,
+    /// Live PTY consoles, in start order. Bounded; the newest is the active one.
+    pub consoles: VecDeque<PtyConsole>,
+    /// Id of the console currently shown in the task output area.
+    pub active_console: Option<String>,
+    /// Cooperative cancellation token for the current in-flight task (Ctrl+C).
+    pub cancel_token: Option<CancellationToken>,
+    /// A destructive/confirmable action awaiting explicit user confirmation
+    /// (preview → confirm → execute).
+    pub pending_confirmation: Option<(String, PendingAction)>,
 }
 
 /// UI state for the provider management panel
@@ -157,6 +179,10 @@ impl TuiApp {
             settings_panel: crate::settings::SettingsPanel::new(),
             provider_panel: ProviderPanel::new(),
             workspace_panel: WorkspacePanel::new(),
+            consoles: VecDeque::new(),
+            active_console: None,
+            cancel_token: None,
+            pending_confirmation: None,
         })
     }
 
@@ -400,6 +426,16 @@ impl TuiApp {
         }
 
         match event.clone() {
+            AgentEvent::PtyOutput { console, content } => {
+                self.route_pty_output(&console, &content);
+            }
+            AgentEvent::PtyExited {
+                console,
+                exit_code,
+                status,
+            } => {
+                self.route_pty_exit(&console, exit_code, &status);
+            }
             AgentEvent::AgentStarted { agent, .. } => {
                 self.dashboard.log("info", format!("{} started", agent));
             }
@@ -447,6 +483,142 @@ impl TuiApp {
             }
             _ => {}
         }
+    }
+
+    // ─── Live PTY consoles ─────────────────────────────────────────────
+
+    /// Find a console by id, or create one (bounded to the newest 12 consoles).
+    pub fn ensure_console(&mut self, id: &str, label: &str) -> usize {
+        if let Some(idx) = self.consoles.iter().position(|c| c.id == id) {
+            return idx;
+        }
+        self.consoles
+            .push_back(PtyConsole::new(id.to_string(), label.to_string()));
+        self.active_console = Some(id.to_string());
+        while self.consoles.len() > 12 {
+            self.consoles.pop_front();
+        }
+        self.consoles.len() - 1
+    }
+
+    /// Route a live PTY chunk to the owning console (append-only).
+    pub fn route_pty_output(&mut self, console: &str, content: &str) {
+        let idx = self.ensure_console(console, console);
+        if let Some(c) = self.consoles.get_mut(idx) {
+            c.append(content);
+        }
+    }
+
+    /// Route a PTY exit event to the owning console and finalize its status.
+    pub fn route_pty_exit(&mut self, console: &str, exit_code: i32, status: &str) {
+        let idx = self.ensure_console(console, console);
+        let status = match status {
+            "cancelled" => ConsoleStatus::Cancelled,
+            "timed out" => ConsoleStatus::TimedOut,
+            "error" => ConsoleStatus::Error,
+            _ => ConsoleStatus::Exited { exit_code },
+        };
+        if let Some(c) = self.consoles.get_mut(idx) {
+            c.finish(status);
+        }
+    }
+
+    /// Prepare a fresh cancellation token for a new in-flight task.
+    pub fn begin_cancellable_task(&mut self) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.cancel_token = Some(token.clone());
+        token
+    }
+
+    /// Cancel the current in-flight task (Ctrl+C semantics).
+    pub fn cancel_current_task(&mut self) {
+        if let Some(token) = &self.cancel_token {
+            token.cancel();
+        }
+        self.dashboard
+            .log("info", "Task cancelled by user".to_string());
+        self.is_loading = false;
+        self.dashboard.end_streaming();
+    }
+
+    /// Whether a cancellable task is currently in flight.
+    pub fn has_active_task(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .map(|t| !t.is_cancelled())
+            .unwrap_or(false)
+            && self.is_loading
+    }
+
+    /// The currently active console, if any.
+    pub fn active_console_ref(&self) -> Option<&PtyConsole> {
+        self.active_console
+            .as_ref()
+            .and_then(|id| self.consoles.iter().find(|c| &c.id == id))
+    }
+
+    /// Whether the active console has any output to show.
+    pub fn has_console_content(&self) -> bool {
+        self.active_console_ref()
+            .map(|c| !c.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Whether a file exists in the workspace root.
+    pub fn workspace_has(&self, name: &str) -> bool {
+        crate::tools::detect_workspace_root().join(name).exists()
+    }
+
+    // ─── Export / Import (//export, //import) ───────────────────────────
+
+    /// Export the current config (no secrets) and conversation to a JSON file.
+    pub fn export_state(&self, path: &str) -> Result<std::path::PathBuf> {
+        let p = std::path::PathBuf::from(path);
+        let state = serde_json::json!({
+            "config": {
+                "provider": self.config.provider,
+                "base_url": self.config.base_url,
+                "model": self.config.model,
+            },
+            "messages": self.messages,
+        });
+        std::fs::write(&p, serde_json::to_string_pretty(&state)?)?;
+        Ok(p)
+    }
+
+    /// Import config (no secrets) and conversation from a JSON file.
+    pub fn import_state(&mut self, path: &str) -> Result<()> {
+        let content = std::fs::read_to_string(path)?;
+        let state: serde_json::Value = serde_json::from_str(&content)?;
+        if let Some(cfg) = state.get("config") {
+            if let Some(p) = cfg.get("provider").and_then(|v| v.as_str()) {
+                self.config.provider = p.to_string();
+            }
+            if let Some(b) = cfg.get("base_url").and_then(|v| v.as_str()) {
+                self.config.base_url = b.to_string();
+            }
+            if let Some(m) = cfg.get("model").and_then(|v| v.as_str()) {
+                self.config.model = m.to_string();
+            }
+            let _ = self.config.persist_model();
+        }
+        if let Some(msgs) = state.get("messages").and_then(|v| v.as_array()) {
+            self.messages.clear();
+            for m in msgs {
+                let role = match m.get("role").and_then(|r| r.as_str()) {
+                    Some("user") => MessageRole::User,
+                    Some("system") => MessageRole::System,
+                    _ => MessageRole::Assistant,
+                };
+                if let Some(content) = m.get("content").and_then(|c| c.as_str()) {
+                    self.messages.push_back(Message {
+                        role,
+                        content: content.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Opens the interactive model picker and fetches the provider's models.
@@ -721,78 +893,6 @@ impl TuiApp {
             if index < wd.proposals.len() {
                 wd.proposals[index].enabled = !wd.proposals[index].enabled;
                 wd.proposals[index].approved = wd.proposals[index].enabled;
-            }
-        }
-    }
-
-    // ─── P5: Slash Commands ──────────────────────────────────────────────
-
-    pub fn handle_settings_command(&mut self, cmd: &str) {
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        match parts.first().copied() {
-            Some("/settings") => {
-                self.toggle_settings();
-                if let Some(ref sm) = self.settings {
-                    self.add_message(MessageRole::System, sm.summary());
-                }
-            }
-            Some("/settings:apply") => {
-                if let Err(e) = self.apply_settings_changes() {
-                    self.add_message(MessageRole::System, format!("Settings error: {}", e));
-                }
-            }
-            Some("/settings:discard") => {
-                self.discard_settings_changes();
-                self.add_message(
-                    MessageRole::System,
-                    "Settings changes discarded".to_string(),
-                );
-            }
-            Some("/providers") => {
-                self.toggle_provider_manager();
-                let status = self.provider_status_text();
-                self.add_message(MessageRole::System, format!("Providers:\n{}", status));
-            }
-            Some("/health") => {
-                self.check_provider_health();
-                self.add_message(
-                    MessageRole::System,
-                    "Checking provider health...".to_string(),
-                );
-            }
-            Some("/discover") => {
-                self.add_message(MessageRole::System, "Discovering workspace...".to_string());
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    // Discovery runs in a detached context
-                    let root = crate::tools::detect_workspace_root();
-                    let engine = crate::workspace_discovery::DiscoveryEngine::new(root.clone());
-                    let discovery = engine.discover();
-                    let scanner = crate::capability_discovery::CapabilityScanner::new(root.clone());
-                    let cap_discovery = scanner.scan();
-                    let mcp = crate::workspace_discovery::discover_mcp_servers(&root);
-                    let _ = tx.send(events::AppEvent::WorkspaceDiscovered {
-                        discovery,
-                        capabilities: cap_discovery,
-                        mcp_servers: mcp,
-                    });
-                });
-            }
-            Some("/workspace") => {
-                let summary = self.workspace_summary();
-                self.add_message(MessageRole::System, format!("Workspace:\n{}", summary));
-            }
-            Some("/onboard") => {
-                self.add_message(
-                    MessageRole::System,
-                    "Run `codebro onboard` from the command line to re-run onboarding.".to_string(),
-                );
-            }
-            _ => {
-                self.add_message(
-                    MessageRole::System,
-                    format!("Unknown settings command: {}", cmd),
-                );
             }
         }
     }
