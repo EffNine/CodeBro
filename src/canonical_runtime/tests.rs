@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::agent::events::AgentEvent;
 use crate::canonical_runtime::CanonicalRuntime;
 use crate::config::Config;
-use crate::engineering_context::ConversationMessage;
+use crate::engineering_context::{ContextFragment, ConversationMessage};
 use crate::provider_runtime::{Priority, RetryPolicy};
 use crate::providers::Provider;
 
@@ -627,8 +627,33 @@ async fn perf_measurement_report() {
 // Sprint 27 — Engineering Objective & Lazy Execution
 // =========================================================================
 
+use crate::engineering_objective::{EngineeringObjective, EngineeringObjectiveRuntime};
+
+/// Write a configured objective file for a workspace (explicit persistence).
+fn write_objective(root: &std::path::Path, objective: EngineeringObjective) {
+    let mut rt = EngineeringObjectiveRuntime::new(root);
+    rt.create(objective).expect("write objective");
+}
+
+fn sample_objective() -> EngineeringObjective {
+    EngineeringObjective::new(
+        "Build a terminal-native engineering intelligence runtime.",
+        "CodeBro is a trustworthy engineering intelligence runtime for developers.",
+        "Make CodeBro capable of maintaining software projects.",
+        "Sprint 27 — Engineering Objective & Lazy Execution.",
+    )
+    .with_success_criteria(vec![
+        "All production tasks use the canonical runtime.".to_string()
+    ])
+    .with_non_goals(vec![
+        "General chatbot".to_string(),
+        "IDE replacement".to_string(),
+    ])
+    .with_source("docs/vision/CODEBRO_VISION.md")
+}
+
 #[tokio::test]
-async fn test_objective_reaches_engineering_context() {
+async fn test_missing_objective_is_empty_and_unconfigured() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
         CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
@@ -639,84 +664,132 @@ async fn test_objective_reaches_engineering_context() {
         .await
         .unwrap();
 
-    // The documented default objective is always installed.
+    // A workspace without an objective file stays empty/unconfigured.
     assert!(
-        !context.objective.is_empty(),
-        "objective should be always-on"
+        context.objective.is_empty(),
+        "CodeBro must not install its own objective into an arbitrary workspace"
     );
-    assert!(!context.objective.end_goal.is_empty());
-    assert!(!context.objective.current_objective.is_empty());
-    // The default objective is persisted to the workspace.
-    assert!(runtime
-        .objective()
-        .expect("objective runtime")
-        .objective_exists());
+    // No objective file is silently created.
+    let objective_path = dir
+        .path()
+        .join(".codebro")
+        .join("engineering_objective.json");
+    assert!(
+        !objective_path.exists(),
+        "a missing objective must not be persisted"
+    );
+    // No goal alignment for an unconfigured objective.
+    assert!(context.goal_alignment.is_none());
 }
 
 #[tokio::test]
-async fn test_objective_always_on_in_compiled_prompt() {
+async fn test_missing_objective_does_not_break_task_execution() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
         CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
-    runtime.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
+    runtime.with_retry_policy(RetryPolicy::immediate(1));
+    runtime.register_provider(Arc::new(MockProvider::new(
+        "mock",
+        vec!["done".to_string()],
+    )));
 
-    let (_context, compiled) = runtime
-        .compile_for_task("implement indexed workspace retrieval", no_conversation())
-        .await
-        .unwrap();
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "explain the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
 
-    // The compact objective block reaches the prompt.
-    assert!(compiled.prompt.contains("END GOAL"));
-    assert!(compiled.prompt.contains("CURRENT OBJECTIVE"));
-    assert!(compiled.prompt.contains("CURRENT MILESTONE"));
-    assert!(compiled.prompt.contains("CURRENT TASK"));
+    let result = runtime.run_task(&req).await;
+    assert!(
+        result.success,
+        "missing objective must never break task execution: {:?}",
+        result.error
+    );
 }
 
 #[tokio::test]
-async fn test_goal_alignment_computed_deterministically() {
+async fn test_configured_objective_loads_and_reaches_prompt() {
     let dir = tempfile::tempdir().unwrap();
+    write_objective(dir.path(), sample_objective());
+
     let mut runtime =
         CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
     runtime.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
 
     let (context, compiled) = runtime
-        .compile_for_task("maintain the software project", no_conversation())
+        .compile_for_task("implement indexed workspace retrieval", no_conversation())
         .await
         .unwrap();
 
-    // Alignment is always present when an objective exists.
-    assert!(context.goal_alignment.is_some());
-    // And it is reflected in the compiled prompt.
+    // The configured objective loads into the context.
+    assert_eq!(context.objective, sample_objective());
+    // Compact always-on block reaches the prompt.
+    assert!(compiled.prompt.contains("END GOAL"));
+    assert!(compiled.prompt.contains("CURRENT OBJECTIVE"));
+    assert!(compiled.prompt.contains("CURRENT MILESTONE"));
+    assert!(compiled.prompt.contains("CURRENT TASK"));
     assert!(compiled.prompt.contains("TASK ALIGNMENT"));
 }
 
 #[tokio::test]
-async fn test_goal_alignment_unclear_warns_in_prompt() {
+async fn test_goal_alignment_computed_deterministically() {
     let dir = tempfile::tempdir().unwrap();
+    write_objective(dir.path(), sample_objective());
+
     let mut runtime =
         CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
     runtime.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
 
-    let (_context, compiled) = runtime
-        .compile_for_task("book a flight and plan a calendar", no_conversation())
+    let (context, _compiled) = runtime
+        .compile_for_task("maintain the software project", no_conversation())
         .await
         .unwrap();
 
-    assert!(compiled.prompt.contains("TASK ALIGNMENT"));
+    assert!(context.goal_alignment.is_some());
+    // "maintain" + "software" both appear in the configured objective.
+    assert_eq!(
+        context.goal_alignment,
+        Some(crate::engineering_objective::GoalAlignment::Direct)
+    );
 }
 
 #[tokio::test]
-async fn test_objective_persisted_and_reloaded() {
+async fn test_objective_is_workspace_scoped() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    write_objective(dir_a.path(), sample_objective());
+
+    let mut runtime_a =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir_a.path()).unwrap();
+    runtime_a.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
+    let (ctx_a, _) = runtime_a
+        .compile_for_task("explain the project", no_conversation())
+        .await
+        .unwrap();
+    assert!(!ctx_a.objective.is_empty());
+
+    // A different workspace does not inherit workspace A's objective.
+    let mut runtime_b =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir_b.path()).unwrap();
+    runtime_b.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
+    let (ctx_b, _) = runtime_b
+        .compile_for_task("explain the project", no_conversation())
+        .await
+        .unwrap();
+    assert!(ctx_b.objective.is_empty());
+}
+
+#[tokio::test]
+async fn test_objective_persisted_explicitly_and_reloaded() {
     let dir = tempfile::tempdir().unwrap();
 
-    {
-        let mut runtime =
-            CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
-        // Constructing the runtime installs and persists the default objective.
-        assert!(runtime.objective().is_some());
-    }
+    // Explicit persistence: write the objective, then reload through the
+    // canonical runtime.
+    write_objective(dir.path(), sample_objective());
 
-    // A fresh runtime over the same root reloads the persisted objective.
     let mut runtime =
         CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
     runtime.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
@@ -724,7 +797,7 @@ async fn test_objective_persisted_and_reloaded() {
         .compile_for_task("explain the project", no_conversation())
         .await
         .unwrap();
-    assert!(!context.objective.end_goal.is_empty());
+    assert_eq!(context.objective.end_goal, sample_objective().end_goal);
 }
 
 #[tokio::test]
@@ -787,4 +860,101 @@ async fn test_objective_pipeline_end_to_end() {
 
     let result = runtime.run_task(&req).await;
     assert!(result.success, "e2e failure: {:?}", result.error);
+}
+
+// =========================================================================
+// Fragment deduplication (content-aware fingerprints)
+// =========================================================================
+
+#[test]
+fn test_dedup_same_source_same_content_removes_duplicate() {
+    let mut frags = vec![
+        ContextFragment {
+            source: "tool_result".to_string(),
+            content: "output one".to_string(),
+            relevance_score: 0.9,
+        },
+        ContextFragment {
+            source: "tool_result".to_string(),
+            content: "output one".to_string(),
+            relevance_score: 0.9,
+        },
+    ];
+    super::dedup_fragments(&mut frags);
+    assert_eq!(frags.len(), 1, "identical fragments must deduplicate");
+}
+
+#[test]
+fn test_dedup_same_source_different_content_preserves() {
+    // Equal-length, same-source, different content must NOT collide.
+    let mut frags = vec![
+        ContextFragment {
+            source: "tool_result".to_string(),
+            content: "abcdefghij".to_string(),
+            relevance_score: 0.9,
+        },
+        ContextFragment {
+            source: "tool_result".to_string(),
+            content: "klmnopqrst".to_string(),
+            relevance_score: 0.9,
+        },
+    ];
+    super::dedup_fragments(&mut frags);
+    assert_eq!(
+        frags.len(),
+        2,
+        "distinct equal-length fragments must survive"
+    );
+}
+
+#[test]
+fn test_dedup_different_source_same_content_preserves() {
+    let mut frags = vec![
+        ContextFragment {
+            source: "tool_result".to_string(),
+            content: "same content".to_string(),
+            relevance_score: 0.9,
+        },
+        ContextFragment {
+            source: "agent_analysis".to_string(),
+            content: "same content".to_string(),
+            relevance_score: 0.8,
+        },
+    ];
+    super::dedup_fragments(&mut frags);
+    assert_eq!(frags.len(), 2, "different sources must survive");
+}
+
+// =========================================================================
+// Interaction contract — Recommend, don't interrogate
+// =========================================================================
+
+#[tokio::test]
+async fn test_prompt_contract_recommends_not_interrogates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
+
+    let (_context, compiled) = runtime
+        .compile_for_task("fix the auth bug", no_conversation())
+        .await
+        .unwrap();
+
+    // The model-facing contract recommends, executes low-risk actions, and
+    // no longer asks for confirmation on every routine step.
+    assert!(compiled.prompt.contains("Recommend, don't interrogate"));
+    assert!(
+        !compiled
+            .prompt
+            .contains("Ask for clarification when requirements are ambiguous"),
+        "routine actions must not require unnecessary confirmation"
+    );
+    assert!(!compiled
+        .prompt
+        .contains("Always explain what you are about to do before doing it"));
+    // Consequential actions still require confirmation.
+    assert!(compiled
+        .prompt
+        .contains("Never run destructive commands without explicit user confirmation"));
 }

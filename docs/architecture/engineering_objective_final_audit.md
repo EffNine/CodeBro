@@ -26,7 +26,13 @@ Fields: `end_goal`, `project_vision`, `current_objective`,
 `current_milestone`, `success_criteria`, `non_goals`, `source`,
 `schema_version`. Compact only — never stores full documents.
 
-Authority precedence (documented and enforced by ordering + source pointer):
+**Workspace objective is optional.** When `.codebro/engineering_objective.json`
+is absent, the objective stays empty and unconfigured. CodeBro never invents
+an objective and never installs its own product goal into an arbitrary
+workspace. A missing objective never breaks task execution.
+
+Authority precedence is a **declared hierarchy** (documented ordering +
+`source` provenance metadata), not a dynamically enforced resolution engine:
 
 ```text
 Product Vision > Architecture / ADR > Current Objective > Sprint / Milestone > Task > Temporary Memory
@@ -56,17 +62,22 @@ No flattening into dozens of fields; the objective stays compact.
 | Tier | Store | Lifetime |
 |------|-------|----------|
 | Persistent | `.codebro/project_identity.json` (+ projections) | across sessions |
-| Persistent | `.codebro/engineering_objective.json` | across sessions |
+| Persistent (optional) | `.codebro/engineering_objective.json` | across sessions; explicit writes only, empty when absent |
 | Persistent | `.codebro/engineering_memory.json` | across sessions |
 | Task-scoped | `EngineeringContext.conversation` | per task, bounded + budgeted |
 | Task-scoped | Tool results, agent analysis fragments | per task |
 | Runtime-only | Provider state, breakers, latency, diagnostics | never persisted to project knowledge |
 
-Runtime noise is never persisted into project knowledge.
+Runtime noise is never persisted into project knowledge. Persisted
+objectives can become stale; CodeBro does not auto-synchronize them with
+sprint documentation (deferred).
 
 ## 4. Token / Context Strategy
 
-- Always-on objective block ≈ 100–300 tokens (`LazyExecutionPolicy` budget 300).
+- Always-on objective block ≈ 100–300 tokens (design budget 300). Only
+  configured fields are included; an unconfigured objective emits no section.
+- Always-on vs on-demand: `project_vision`, `success_criteria`, `non_goals`,
+  and authoritative documents are on-demand context, never auto-injected.
 - Conversation bounded: `max_conversation_messages = 20`,
   `max_conversation_tokens = 1500`, newest-first.
 - Existing budget system remains authoritative (`assembly::budget`,
@@ -78,13 +89,16 @@ Runtime noise is never persisted into project knowledge.
 
 `LazyExecutionPolicy` + `ChangeScope` (`src/engineering_objective/alignment.rs`):
 
-- `classify_change_scope` → `Required` / `Recommended` / `Unrelated`.
-- Only `Required` runs automatically; `Recommended` requires justification;
-  `Unrelated` is left alone.
+- `classify_change_scope` → `Required` / `Recommended` / `Unrelated` —
+  **advisory guidance only**, never semantic authorization. Lexical overlap
+  must never authorize destructive or high-impact behavior.
 - `prefers_reuse` → existing implementation/abstraction preferred.
 - `should_stop` → stop once the outcome is achieved and validation passes.
 
 Workflow: `Inspect → Understand → Retrieve → Reuse → Change → Validate → Stop`.
+The execution contract is carried by the canonical prompt (system identity):
+recommend don't interrogate, reuse first, keep scope tight, validate, then
+stop.
 
 ## 6. Canonical Runtime Integration
 
@@ -163,15 +177,18 @@ with no production impact — deferred.
 | Item | Notes |
 |------|-------|
 | `ai_runtime::RuntimeRouter` | Self-contained prototype; no production consumers. Keep + document (Sprint 27 decision); removal deferred. |
-| Default objective values | Derived from repo docs; must be kept in sync as docs evolve. |
-| Goal alignment is heuristic | Deliberately never blocks execution; may mislabel. |
+| Objective provisioning | No automatic objective extraction from repository docs (future work). Missing objectives stay unconfigured. |
+| Goal alignment / scope heuristics | Deliberately advisory; never block execution and never authorize destructive behavior. |
 | Pre-existing clippy warnings (4) | In `ai_runtime`/`memory_runtime`; unrelated to Sprint 27, not introduced here. |
 | Conversation bounding | Simple newest-first window; no explicit task-boundary markers yet. |
+| Persisted objective staleness | Persisted objectives can go stale; no auto-synchronization (deferred). |
 
 ## 12. Deferred Work
 
 - Wiring objective edits/updates into the TUI (a maintenance surface, not
   required for awareness).
+- Automatic objective extraction/reconciliation from repository docs
+  (explicitly out of scope for the correction pass).
 - Fine-grained document retrieval ranking weighted by objective relevance
   beyond token overlap.
 - A dedicated sprint to remove the self-contained `ai_runtime` module if it
@@ -182,10 +199,11 @@ with no production impact — deferred.
 ```text
 cargo fmt --check   PASS
 cargo check         PASS (4 pre-existing warnings)
-cargo test          PASS (2415 passed; 0 failed; 1 ignored)
+cargo test          PASS (2428 passed; 0 failed; 1 ignored)
 cargo clippy        PASS (4 pre-existing warnings, none new)
 cargo build         PASS
 ```
 
-Baseline (pre-sprint): `cargo test` 2393 passed. Final: 2415 passed
-(+22 new tests). No regressions.
+Baseline (pre-Sprint 27): `cargo test` 2361 passed. After Sprint 27:
+2415 passed. After the correction pass: 2428 passed (+67 over baseline,
++13 over the initial Sprint 27 landing). No regressions.

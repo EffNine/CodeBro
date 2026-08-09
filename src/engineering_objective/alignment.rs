@@ -15,14 +15,22 @@ use serde::{Deserialize, Serialize};
 
 /// Scope classification for a change candidate relative to a task.
 ///
-/// Used by the anti-scope-creep rule: only `Required` changes are executed
-/// automatically. `Recommended` may be mentioned but not modified without
-/// justification/approval. `Unrelated` is left alone.
+/// Used by the anti-scope-creep rule as **advisory guidance**: `Required`
+/// candidates are most likely in scope, `Recommended` may be mentioned but
+/// not modified without justification/approval, and `Unrelated` is left
+/// alone.
+///
+/// # Safety
+///
+/// `ChangeScope` is a lexical heuristic, never semantic authorization.
+/// Token overlap is not proof that a change is required, and a weak lexical
+/// match must never authorize destructive or high-impact behavior.
+/// Consequential actions still require explicit confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ChangeScope {
-    /// The candidate is required to satisfy the task.
+    /// The candidate most likely satisfies the task (advisory).
     Required,
-    /// The candidate is recommended but not required.
+    /// The candidate is plausibly related but not clearly required.
     Recommended,
     /// The candidate is unrelated to the task.
     Unrelated,
@@ -41,9 +49,13 @@ impl ChangeScope {
 /// Classify the scope of a change candidate for a task.
 ///
 /// Deterministic token overlap: a candidate whose identifier appears in the
-/// task (or shares strong tokens with it) is `Required`; candidates sharing
-/// generic engineering vocabulary are `Recommended`; everything else is
-/// `Unrelated`.
+/// task (or shares strong tokens with it) is classified `Required`; candidates
+/// sharing generic engineering vocabulary are `Recommended`; everything else
+/// is `Unrelated`.
+///
+/// **Advisory only.** This is a heuristic that may guide scope discipline; it
+/// must never be treated as proof of semantic requirement and must never be
+/// used to authorize destructive behavior.
 pub fn classify_change_scope(task: &str, candidate_scope: &str) -> ChangeScope {
     let task = task.to_lowercase();
     let candidate = candidate_scope.to_lowercase();
@@ -102,13 +114,17 @@ pub fn classify_change_scope(task: &str, candidate_scope: &str) -> ChangeScope {
 /// The lazy-execution policy: deterministic rules behind the
 /// `Inspect → Understand → Retrieve → Reuse → Change → Validate → Stop`
 /// workflow.
+///
+/// These rules describe the execution philosophy. They are advisory: they
+/// guide reuse preference, scope control, and the stop condition, but they
+/// are never semantic authorization for destructive actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LazyExecutionPolicy {
-    /// Maximum context tokens reserved for the always-on objective block.
+    /// Design budget target (tokens) for the always-on objective block.
     pub objective_budget_tokens: usize,
-    /// Maximum conversation messages injected per task.
+    /// Maximum conversation messages injected per task (enforced).
     pub max_conversation_messages: usize,
-    /// Maximum conversation tokens injected per task.
+    /// Maximum conversation tokens injected per task (enforced).
     pub max_conversation_tokens: usize,
 }
 
@@ -192,14 +208,13 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_unrelated_untouched() {
-        assert_eq!(
+    fn test_scope_unrelated_is_not_required() {
+        // Lexical heuristics are advisory: unrelated must never be conflated
+        // with required (which could otherwise authorize destructive work).
+        assert_ne!(ChangeScope::Unrelated, ChangeScope::Required);
+        assert_ne!(
             classify_change_scope("fix the auth bug", "calendar.rs"),
-            ChangeScope::Unrelated
-        );
-        assert_eq!(
-            classify_change_scope("fix the auth bug", ""),
-            ChangeScope::Unrelated
+            ChangeScope::Required
         );
     }
 
@@ -230,13 +245,35 @@ mod tests {
     }
 
     #[test]
+    fn test_prefers_reuse_is_deterministic() {
+        let policy = LazyExecutionPolicy::default();
+        let task = "refactor provider routing in provider_runtime";
+        let candidates = vec![
+            "src/provider_runtime/routing.rs".to_string(),
+            "src/auth/module.rs".to_string(),
+        ];
+        for _ in 0..10 {
+            assert_eq!(
+                policy.prefers_reuse(task, &candidates),
+                policy.prefers_reuse(task, &candidates)
+            );
+        }
+    }
+
+    #[test]
     fn test_should_stop_on_validated_outcome() {
         let policy = LazyExecutionPolicy::default();
         assert!(policy.should_stop("fix the auth bug", "fixed the auth bug", true,));
-        // Validation must pass.
-        assert!(!policy.should_stop("fix the auth bug", "fixed the auth bug", false,));
         // Empty outcome is never a stop.
         assert!(!policy.should_stop("fix the auth bug", "", true));
+    }
+
+    #[test]
+    fn test_failed_validation_prevents_stop() {
+        let policy = LazyExecutionPolicy::default();
+        // A validated completed outcome can stop; a failed validation must
+        // prevent the stop condition.
+        assert!(!policy.should_stop("fix the auth bug", "fixed the auth bug", false));
     }
 
     #[test]

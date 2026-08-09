@@ -250,10 +250,12 @@ impl EngineeringContextBuilder {
                 return Err(ContextBuildError::InvalidWorkspace);
             }
         }
-        // Check for duplicate fragments by source+content fingerprint.
+        // Check for duplicate fragments by source+content fingerprint. The
+        // fingerprint is content-aware: same source with different content is
+        // never treated as a duplicate, even when the lengths match.
         let mut seen = std::collections::BTreeSet::new();
         for frag in &self.context_fragments {
-            let fingerprint = format!("{}:{}", frag.source, frag.content.len());
+            let fingerprint = fragment_fingerprint(&frag.source, &frag.content);
             if !seen.insert(fingerprint) {
                 return Err(ContextBuildError::DuplicateFragment(frag.source.clone()));
             }
@@ -284,6 +286,18 @@ fn estimate_context_tokens(
         + conversation_tokens
         + user_request.len() / 4
         + system_prompt.len() / 4
+}
+
+/// Deterministic, content-aware fragment fingerprint.
+///
+/// Joins source and full content with a NUL separator so two fragments with
+/// the same source and equal length but different content never collide.
+fn fragment_fingerprint(source: &str, content: &str) -> String {
+    let mut fp = String::with_capacity(source.len() + content.len() + 1);
+    fp.push_str(source);
+    fp.push('\u{0}');
+    fp.push_str(content);
+    fp
 }
 
 #[cfg(test)]
@@ -415,6 +429,34 @@ mod tests {
             }
             other => panic!("Expected DuplicateFragment error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_builder_preserves_same_length_distinct_fragments() {
+        // Two fragments with the same source and equal length but different
+        // content must NOT be treated as duplicates (content-aware fingerprint).
+        let ctx = EngineeringContextBuilder::new()
+            .project(ProjectIdentity::new("proj", "rust"))
+            .task(IntentPlan {
+                detected_goal: "test".to_string(),
+                intent_type: "General".to_string(),
+                confidence: 0.5,
+                ambiguity: false,
+                ambiguity_reason: None,
+            })
+            .context_fragment(ContextFragment {
+                source: "tool_result".to_string(),
+                content: "abcdefghij".to_string(),
+                relevance_score: 0.9,
+            })
+            .context_fragment(ContextFragment {
+                source: "tool_result".to_string(),
+                content: "klmnopqrst".to_string(),
+                relevance_score: 0.9,
+            })
+            .build()
+            .expect("distinct equal-length fragments must be accepted");
+        assert_eq!(ctx.fragment_count(), 2);
     }
 
     #[test]

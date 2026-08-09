@@ -60,6 +60,11 @@ task alongside project identity. It survives restarts.
 Persistent, authoritative goals make behavior stable across sessions and
 teams.
 
+**The workspace objective is optional.** When no objective file exists,
+CodeBro does **not** invent goals and does **not** install its own product
+objective into an arbitrary repository. The objective stays empty and
+unconfigured, and task execution proceeds normally.
+
 ### 2.3 Full project context must NOT be sent on every request
 
 Only the compact objective block, relevant fragments, and budgeted
@@ -81,11 +86,16 @@ remain the retrieval path.
 
 `LazyExecutionPolicy` encodes *smallest correct change*, scope control
 (`Required`/`Recommended`/`Unrelated`), reuse preference, and a stop
-condition.
+condition. These are advisory rules carried by the execution contract (the
+canonical prompt), not a new execution engine.
 
 **Why:** Each speculative abstraction and unrelated refactor compounds into
 maintenance debt. The lazy discipline keeps the codebase minimal and
 reviewable.
+
+**Safety:** lexical heuristics are advisory, never semantic authorization. A
+weak token match must never authorize destructive or high-impact behavior;
+consequential actions still require explicit confirmation.
 
 ### 2.6 "Smallest correct change" beats "smallest patch"
 
@@ -102,6 +112,17 @@ No unsolicited follow-up refactoring.
 
 **Why:** Unrequested work erodes trust and increases review burden. The
 developer decides what else matters.
+
+### 2.8 Recommend, don't interrogate
+
+CodeBro infers obvious engineering intent and executes low-risk, clearly
+implied actions without unnecessary confirmation. It requests confirmation
+only for destructive, irreversible, externally consequential, or high-impact
+actions, and asks only when genuinely blocked by missing information.
+
+**Why:** An engineering runtime that asks permission for every routine step
+interrogates the user instead of helping. Confirmation is reserved for what
+actually matters.
 
 ---
 

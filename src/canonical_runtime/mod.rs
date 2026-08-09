@@ -880,58 +880,27 @@ fn build_memory(
 
 /// Load the engineering objective for a workspace root.
 ///
-/// Loads the persisted `.codebro/engineering_objective.json` when present;
-/// otherwise installs the documented default objective (derived from the
-/// repository's project documentation) so goal awareness is always-on.
+/// The workspace objective is **optional**. When
+/// `.codebro/engineering_objective.json` exists it is loaded; otherwise the
+/// objective stays empty and unconfigured. CodeBro never invents or persists
+/// an objective for a workspace (in particular it never installs its own
+/// product goal into an arbitrary repository). A missing objective never
+/// breaks task execution.
 fn build_objective(root: &Path) -> Option<EngineeringObjectiveRuntime> {
     let mut runtime = EngineeringObjectiveRuntime::new(root);
     match runtime.load() {
         Ok(true) => Some(runtime),
         Ok(false) => {
-            let _ = runtime.install_default(default_objective());
+            // No objective file: keep the runtime empty and unconfigured.
+            // Do NOT install a guessed objective and do NOT persist one.
             Some(runtime)
         }
         Err(e) => {
             tracing::warn!("Engineering objective load failed: {}", e);
-            let _ = runtime.install_default(default_objective());
+            // Fall back to an empty unconfigured runtime; never guess goals.
             Some(runtime)
         }
     }
-}
-
-/// The documented default objective for the CodeBro project.
-///
-/// Values are distilled from the repository's existing project documentation
-/// (`docs/vision/CODEBRO_VISION.md`, `docs/vision/NON_GOALS.md`,
-/// `docs/vision/PROJECT_IDENTITY.md`) and the current sprint definition.
-/// The objective never stores full documents — only compact references.
-fn default_objective() -> EngineeringObjective {
-    EngineeringObjective::new(
-        "Build a terminal-native engineering intelligence runtime.",
-        "CodeBro is the most trustworthy, transparent, and configurable engineering intelligence runtime for professional developers.",
-        "Make CodeBro capable of maintaining software projects: understand why a task matters, retrieve only the needed context, and apply the smallest correct change.",
-        "Sprint 27 — Engineering Objective & Lazy Execution.",
-    )
-    .with_success_criteria(vec![
-        "All production tasks use the canonical runtime.".to_string(),
-        "The model receives compact objective context (100-300 tokens), not full documents.".to_string(),
-        "Relevant context selection beats full-document injection.".to_string(),
-        "Lazy-by-default execution: smallest correct change, then stop.".to_string(),
-        "No regressions in cargo check / test / clippy / build.".to_string(),
-    ])
-    .with_non_goals(vec![
-        "General chatbot".to_string(),
-        "Personal assistant".to_string(),
-        "Calendar or scheduling".to_string(),
-        "Email client".to_string(),
-        "Web browser".to_string(),
-        "Project management platform".to_string(),
-        "IDE replacement".to_string(),
-        "Deployment platform".to_string(),
-        "Cloud dashboard".to_string(),
-        "Social features".to_string(),
-    ])
-    .with_source("docs/vision/CODEBRO_VISION.md, docs/vision/NON_GOALS.md, docs/vision/PROJECT_IDENTITY.md, current sprint definition")
 }
 
 /// Bound a conversation to the current task: recent messages first, capped
@@ -980,10 +949,15 @@ fn extract_keywords(task: &str) -> Vec<String> {
         .collect()
 }
 
-/// Deduplicate fragments by the same fingerprint the builder rejects.
+/// Deduplicate fragments by the same content-aware fingerprint the builder
+/// accepts. Two distinct fragments with equal length never collide.
 fn dedup_fragments(fragments: &mut Vec<ContextFragment>) {
     let mut seen = std::collections::BTreeSet::new();
-    fragments.retain(|f| seen.insert(format!("{}:{}", f.source, f.content.len())));
+    fragments.retain(|f| {
+        seen.insert(crate::assembly::sources::fragment_fingerprint(
+            &f.source, &f.content,
+        ))
+    });
 }
 
 /// A coarse language hint for a file path.

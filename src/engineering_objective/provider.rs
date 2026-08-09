@@ -137,8 +137,12 @@ impl EngineeringObjectiveRuntime {
         Ok(())
     }
 
-    /// Install a default objective derived from the repository's documented
-    /// project goals and persist it. Used when no objective file exists.
+    /// Explicitly install a default objective and persist it.
+    ///
+    /// This is an **explicit, opt-in** operation (e.g. during onboarding or
+    /// configuration). The runtime never calls it automatically: a workspace
+    /// without an objective file stays empty and unconfigured. CodeBro does
+    /// not guess or persist project goals for a workspace.
     pub fn install_default(
         &mut self,
         objective: EngineeringObjective,

@@ -197,7 +197,7 @@ Lazy does not mean low quality. It means *do not create complexity until complex
 - Run the appropriate tests/checks, then STOP.
 
 **In practice:**
-- `ChangeScope` (Required / Recommended / Unrelated) governs what is executed automatically (ADR-013).
+- `ChangeScope` (Required / Recommended / Unrelated) provides advisory scope guidance; lexical heuristics are never semantic authorization (ADR-013).
 - `LazyExecutionPolicy` encodes reuse preference and the stop condition.
 - Every task follows: `Inspect → Understand → Retrieve → Reuse → Change → Validate → Stop`.
 

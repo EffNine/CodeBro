@@ -48,11 +48,17 @@ The hierarchy is represented by the compact `EngineeringObjective` struct in
 The model never receives full documents. It only sees the compact block
 produced by `EngineeringObjective::render_compact` (≈100–300 tokens).
 
+> **The workspace objective is optional.** The example values above are
+> illustrative. CodeBro never invents an objective for a workspace and never
+> installs its own product goal into an arbitrary repository. When
+> `.codebro/engineering_objective.json` is absent, the objective stays empty
+> and unconfigured, and task execution proceeds normally.
+
 ---
 
 ## 3. Authority Model
 
-Goal information must have explicit authority. The documented precedence:
+Goal information has an explicit **declared authority hierarchy**:
 
 ```text
 Product Vision
@@ -66,11 +72,12 @@ Product Vision
 - Values come from the repository's project documentation
   (`docs/vision/`, `docs/architecture/`, `docs/ADR/`, roadmap, and the
   current sprint definition). They are never invented.
-- Each objective records an optional `source` pointer to the authoritative
-  document.
-- If sources conflict, the authoritative source wins per the precedence
-  above. Contradictory information is never silently merged; uncertainty is
-  exposed via `GoalAlignment::Unclear` (`⚠ Task alignment unclear`).
+- Each objective records an optional `source` pointer (provenance metadata)
+  to the authoritative document.
+- This is a **declared hierarchy, not a dynamically enforced
+  source-resolution engine**. The runtime does not claim that a stale
+  objective automatically overrides authoritative repository documents.
+  Future source reconciliation is explicitly deferred.
 
 ### Document authority tags
 
@@ -101,12 +108,23 @@ pattern:
 `EngineeringObjectiveRuntime` (`src/engineering_objective/provider.rs`):
 
 1. **Load** — reads the persisted file, verifying workspace root and schema.
-2. **Create / install_default** — writes the objective; the default is
-   derived from the repository's documented project goals.
+   When no file exists, the objective remains empty and unconfigured.
+2. **Create / install_default** — explicit, opt-in writes only. The runtime
+   never calls these automatically; a missing objective is never guessed or
+   persisted.
 3. **Snapshot** — returns an immutable `EngineeringObjective` per task.
 
 Persistence is explicit only (`persist()`), matching engineering memory
-conventions. The runtime never writes during task execution.
+conventions. The runtime never writes during task execution, and the model
+never silently rewrites the objective.
+
+### Objective freshness
+
+A persisted objective can become stale (e.g. a `current_milestone` that names
+an earlier sprint). CodeBro does **not** silently rewrite or auto-synchronize
+it with sprint documentation during task execution. Persisted state is
+preserved until explicitly updated. Future objective/document synchronization
+is deferred.
 
 ---
 
@@ -177,6 +195,27 @@ Critical Constraints
 Task Alignment
 ```
 
+Only fields that are actually configured are included. If the objective is
+unconfigured, the objective section is omitted entirely — no placeholder
+bloat.
+
+### On-demand context
+
+Stored objective data is **not** automatically injected into every prompt.
+The following are contextual/on-demand and may be retrieved when relevant:
+
+```text
+PROJECT VISION
+SUCCESS CRITERIA
+NON-GOALS
+AUTHORITATIVE DOCUMENTS
+RELEVANT ADRs
+```
+
+This is a documentation boundary, not a new retrieval engine: the always-on
+block stays compact, and richer objective detail is treated as on-demand
+without speculative infrastructure.
+
 This is rendered by the Prompt Builder's `engineering_objective` section and
 targets roughly 100–300 tokens.
 
@@ -237,19 +276,43 @@ overrides user intent.
 ## 9. Lazy by Default
 
 The objective model is paired with the `LazyExecutionPolicy`
-(`src/engineering_objective/alignment.rs`), encoding:
+(`src/engineering_objective/alignment.rs`), encoding the execution
+philosophy:
 
 > CodeBro prefers the smallest correct change, reuses existing project
 > capabilities, avoids speculative abstractions, validates its work, and
 > stops when the requested outcome is achieved.
 
+The runtime follows `Inspect → Understand → Retrieve → Reuse → Change →
+Validate → Stop`.
+
 `ChangeScope` classifies work as `Required` / `Recommended` / `Unrelated`.
-Only `Required` is executed automatically; `Recommended` may be mentioned but
-not modified without justification; `Unrelated` is left alone.
+This is **advisory guidance only**. Token overlap is a lexical heuristic,
+never semantic authorization: a weak lexical match must never authorize
+destructive or high-impact behavior. Consequential actions always require
+explicit confirmation.
+
+## 10. Interaction — Recommend, don't interrogate
+
+CodeBro behaves like an experienced engineer operating inside a real
+repository:
+
+- Infer obvious engineering intent from the task and repository context.
+- Execute low-risk, clearly implied engineering actions without unnecessary
+  confirmation.
+- Suggest a preferred approach when multiple valid options exist; explain
+  meaningful trade-offs only when they matter.
+- Request confirmation for destructive, irreversible, externally
+  consequential, or high-impact actions.
+- Ask only when genuinely blocked by missing information.
+- Stop when the requested outcome is achieved and validated.
+
+The default system prompt encodes this contract. It does not instruct the
+model to "always explain" or "ask for clarification" on routine steps.
 
 ---
 
-## 10. References
+## 11. References
 
 - [Sprint 27 definition](../sprints/../README.md) (mission)
 - [ADR-013 — Engineering Objective & Lazy Execution](../ADR/ADR-013-engineering-objective-and-lazy-execution.md)

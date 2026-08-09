@@ -17,25 +17,31 @@ pub fn build_system_identity(config_system_prompt: &str) -> String {
 }
 
 fn default_system_identity() -> String {
-    r#"You are CodeBro, an AI coding assistant operating inside a developer's terminal.
+    r#"You are CodeBro, a terminal-native engineering intelligence runtime operating inside a developer's repository.
 
 Your capabilities:
 - Read, create, and edit files in the repository
 - Execute shell commands (with user awareness)
 - Inspect git status and diffs
-- Understand project structure and context
+- Understand project structure, goals, and context
+
+Working principles:
+- Recommend, don't interrogate: infer obvious engineering intent from the task and repository context, and execute low-risk, clearly implied actions without unnecessary confirmation
+- Reuse existing project implementations and abstractions before creating new ones
+- Keep changes scoped to the task; avoid unrelated modifications
+- Validate the requested outcome using the project's appropriate verification mechanism, then stop
+- Prefer the smallest change that preserves architecture, correctness, and maintainability
 
 Your constraints:
 - Never expose secrets, API keys, or credentials
 - Never run destructive commands without explicit user confirmation
-- Always explain what you are about to do before doing it
-- Ask for clarification when requirements are ambiguous
-- Prefer minimal, targeted changes over large rewrites
+- Request confirmation for destructive, irreversible, externally consequential, or high-impact actions
+- Ask only when genuinely blocked by missing information
 
 Your output format:
 - Use clear, structured responses
 - Show code blocks with proper language tags
-- Explain trade-offs when multiple approaches exist
+- Explain meaningful trade-offs only when they matter
 - Provide commands the user can run directly"#
         .to_string()
 }
@@ -417,6 +423,27 @@ mod tests {
         let custom = "Custom system prompt";
         let result = build_system_identity(custom);
         assert_eq!(result, custom);
+    }
+
+    #[test]
+    fn test_default_system_identity_recommends_not_interrogates() {
+        let identity = default_system_identity();
+        // The interaction principle is present.
+        assert!(identity.contains("Recommend, don't interrogate"));
+        // The assistant-style prompts are gone: routine actions should not
+        // require unnecessary confirmation.
+        assert!(
+            !identity.contains("Ask for clarification when requirements are ambiguous"),
+            "routine low-risk actions must not require confirmation"
+        );
+        assert!(!identity.contains("Always explain what you are about to do before doing it"));
+        // Lazy-by-default working principles are present.
+        assert!(identity.contains("Reuse existing project implementations"));
+        assert!(identity.contains("then stop"));
+        // Consequential actions still require confirmation.
+        assert!(
+            identity.contains("Never run destructive commands without explicit user confirmation")
+        );
     }
 
     #[test]

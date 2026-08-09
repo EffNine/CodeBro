@@ -414,9 +414,26 @@ pub fn rank_fragments(fragments: &mut Vec<ContextFragment>) {
 pub fn dedup_fragments(fragments: &mut Vec<ContextFragment>) {
     let mut seen = std::collections::HashSet::new();
     fragments.retain(|f| {
-        let fingerprint = format!("{}:{}", f.source, f.content.len());
+        let fingerprint = fragment_fingerprint(&f.source.to_string(), &f.content);
         seen.insert(fingerprint)
     });
+}
+
+/// A deterministic, content-aware fragment fingerprint.
+///
+/// Same source + same content → identical fingerprint.
+/// Same source + different content → different fingerprint (no length-only
+/// collisions). Different source + same content → different fingerprint.
+///
+/// The fingerprint is the source and full content joined by a NUL separator:
+/// deterministic, cheap, stable across runs, and based only on the fragment
+/// itself. No random IDs, no nondeterministic hashing.
+pub fn fragment_fingerprint(source: &str, content: &str) -> String {
+    let mut fp = String::with_capacity(source.len() + content.len() + 1);
+    fp.push_str(source);
+    fp.push('\u{0}');
+    fp.push_str(content);
+    fp
 }
 
 /// Apply a token budget and return (selected, discarded) counts.
@@ -432,4 +449,63 @@ pub fn apply_token_budget(fragments: &mut Vec<ContextFragment>, budget: usize) -
         }
     });
     (before, before - fragments.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frag(source: ContextSource, content: &str, score: f64) -> ContextFragment {
+        ContextFragment::new(source, ContextPriority::Medium, content.to_string(), score)
+    }
+
+    #[test]
+    fn test_fragment_fingerprint_content_aware() {
+        // Same source + same content → identical fingerprint.
+        assert_eq!(
+            fragment_fingerprint("tool_result", "aaaa"),
+            fragment_fingerprint("tool_result", "aaaa")
+        );
+        // Same source + different content → different fingerprint (no length
+        // collisions).
+        assert_ne!(
+            fragment_fingerprint("tool_result", "abcdefghij"),
+            fragment_fingerprint("tool_result", "klmnopqrst")
+        );
+        // Different source + same content → different fingerprint.
+        assert_ne!(
+            fragment_fingerprint("tool_result", "same content"),
+            fragment_fingerprint("agent_analysis", "same content")
+        );
+    }
+
+    #[test]
+    fn test_dedup_same_source_same_content() {
+        let mut fragments = vec![
+            frag(ContextSource::ToolResults, "output", 0.9),
+            frag(ContextSource::ToolResults, "output", 0.9),
+        ];
+        dedup_fragments(&mut fragments);
+        assert_eq!(fragments.len(), 1);
+    }
+
+    #[test]
+    fn test_dedup_same_source_different_content() {
+        let mut fragments = vec![
+            frag(ContextSource::ToolResults, "abcdefghij", 0.9),
+            frag(ContextSource::ToolResults, "klmnopqrst", 0.9),
+        ];
+        dedup_fragments(&mut fragments);
+        assert_eq!(fragments.len(), 2);
+    }
+
+    #[test]
+    fn test_dedup_different_source_same_content() {
+        let mut fragments = vec![
+            frag(ContextSource::ToolResults, "same content", 0.9),
+            frag(ContextSource::Scanner, "same content", 0.8),
+        ];
+        dedup_fragments(&mut fragments);
+        assert_eq!(fragments.len(), 2);
+    }
 }

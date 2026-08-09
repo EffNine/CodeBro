@@ -202,7 +202,7 @@ Developers have years of terminal muscle memory — `Ctrl+C` to interrupt, `Ctrl
 **CodeBro prefers the smallest correct change, reuses existing project capabilities, avoids speculative abstractions, validates its work, and stops when the requested outcome is achieved.**
 
 ### Purpose
-Lazy does not mean low quality. It means *do not create complexity until complexity is necessary*. The agent searches for existing implementations, reuses existing abstractions, follows repository conventions, applies the smallest change that preserves architecture and correctness, validates, and stops. Scope is governed by `Required` / `Recommended` / `Unrelated` — only `Required` is executed automatically.
+Lazy does not mean low quality. It means *do not create complexity until complexity is necessary*. The agent searches for existing implementations, reuses existing abstractions, follows repository conventions, applies the smallest change that preserves architecture and correctness, validates, and stops. Scope is governed by advisory `Required` / `Recommended` / `Unrelated` guidance — the classification is a lexical heuristic, never semantic authorization for destructive behavior.
 
 ### Benefits
 - Less technical debt — no speculative abstractions or unrelated refactors
@@ -213,7 +213,25 @@ Lazy does not mean low quality. It means *do not create complexity until complex
 ### Tradeoffs
 - Reuse searches add a small inspection step before acting
 - "Smallest correct change" may occasionally be larger than a naive patch when architecture demands it — the larger change must be explained
-- Enforcement is policy-driven, not automatic; it requires discipline
+- Scope heuristics are advisory; they guide but never authorize
+
+---
+
+## 12. Recommend, Don't Interrogate
+
+**CodeBro behaves like an experienced engineer: infer intent, execute low-risk actions, and ask only when it truly matters.**
+
+### Purpose
+An engineering runtime that asks permission for every routine step interrogates the developer instead of helping. When intent is clear and risk is low, CodeBro proceeds; it reports what it did. Confirmation is reserved for destructive, irreversible, externally consequential, or genuinely ambiguous decisions. It recommends a preferred approach when multiple options exist and explains meaningful trade-offs only when they matter.
+
+### Benefits
+- Faster workflows — no confirmation friction on routine engineering steps
+- The agent reads like a colleague, not a support chatbot
+- Attention is focused on decisions that actually matter
+
+### Tradeoffs
+- Requires reliable intent inference; the model must distinguish obvious from ambiguous
+- Some users may prefer more confirmation — the safety floor (destructive/high-impact actions) is never lowered
 
 ---
 
@@ -232,3 +250,4 @@ Lazy does not mean low quality. It means *do not create complexity until complex
 | Extensibility | Skills and MCP grow the tool; the core stays small |
 | Terminal Muscle Memory | CodeBro extends terminal habits; it does not replace them |
 | Lazy by Default | Smallest correct change, reuse, validate, then stop |
+| Recommend, Don't Interrogate | Infer intent, execute low-risk actions, ask only when it matters |
