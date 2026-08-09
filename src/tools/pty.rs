@@ -26,6 +26,7 @@
 use anyhow::{Context, Result};
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -145,17 +146,61 @@ pub fn spawn_pty(
     std::thread::Builder::new()
         .name("codebro-pty".to_string())
         .spawn(move || {
-            let _ = run_pty(&config, &cancel, &tx);
+            pty_worker(config, cancel, tx);
         })
         .with_context(|| "Failed to start the PTY worker thread")?;
 
     Ok(rx)
 }
 
+/// The body of the PTY worker thread. Any [`run_pty`] failure is turned into a
+/// single terminal [`PtyEvent::Error`], so the receiver always observes a
+/// terminal event — never a channel that closes silently because the producer
+/// failed.
+fn pty_worker(
+    config: PtyConfig,
+    cancel: CancellationToken,
+    tx: tokio::sync::mpsc::Sender<PtyEvent>,
+) {
+    run_pty_worker(&config, &cancel, &tx, run_pty);
+}
+
+/// The signature of a PTY runtime body (see [`run_pty`]). This is a thin,
+/// test-only-visible seam that lets the worker's error-propagation contract be
+/// validated deterministically without forcing an OS-level PTY allocation
+/// failure. Production always passes [`run_pty`].
+type PtyRun = fn(
+    &PtyConfig,
+    &CancellationToken,
+    &tokio::sync::mpsc::Sender<PtyEvent>,
+    &Arc<AtomicBool>,
+) -> Result<()>;
+
+/// Drive a [`PtyRun`] and enforce the terminal-event invariant: if the body
+/// returns an error without already having emitted a terminal event, exactly
+/// one terminal [`PtyEvent::Error`] is sent. A terminal event emitted by the
+/// body is never duplicated.
+fn run_pty_worker(
+    config: &PtyConfig,
+    cancel: &CancellationToken,
+    tx: &tokio::sync::mpsc::Sender<PtyEvent>,
+    run: PtyRun,
+) {
+    let terminal_sent = Arc::new(AtomicBool::new(false));
+    if let Err(e) = run(config, cancel, tx, &terminal_sent) {
+        // Only surface an Error if the body did not already emit a terminal
+        // event (e.g. a setup path that failed after sending one).
+        if !terminal_sent.load(Ordering::Relaxed) {
+            let _ = send_event(tx, PtyEvent::Error(format!("PTY runtime failed: {}", e)));
+        }
+    }
+}
+
 fn run_pty(
     config: &PtyConfig,
     cancel: &CancellationToken,
     tx: &tokio::sync::mpsc::Sender<PtyEvent>,
+    terminal_sent: &Arc<AtomicBool>,
 ) -> Result<()> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -177,24 +222,21 @@ fn run_pty(
         builder.env(key, value);
     }
 
-    let mut child = match pair.slave.spawn_command(builder) {
-        Ok(child) => child,
-        Err(e) => {
-            let _ = send_event(tx, PtyEvent::Error(format!("Failed to spawn: {}", e)));
-            return Err(e).context("Failed to spawn command");
-        }
-    };
+    // Fatal setup failures below return an error *without* emitting an event;
+    // the worker body emits the single terminal `Error`. No failure is ever
+    // silently discarded.
+    let mut child = pair
+        .slave
+        .spawn_command(builder)
+        .context("Failed to spawn command")?;
 
     // Read-only console: the master writer is kept alive (dropping it would
     // send EOF) but the user never types into the PTY.
     let _master_writer = pair.master.take_writer().ok();
-    let mut reader = match pair.master.try_clone_reader() {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = send_event(tx, PtyEvent::Error(format!("PTY read failed: {}", e)));
-            return Err(e).context("Failed to clone PTY reader");
-        }
-    };
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .context("Failed to clone PTY reader")?;
 
     // The child is a session leader; its pgid equals its pid, so signaling the
     // group terminates the whole tree (sh + descendants).
@@ -208,12 +250,14 @@ fn run_pty(
     // Reader thread: forwards output continuously so streaming is live, and
     // keeps draining the PTY even after the cap is hit so the child never
     // blocks on a full buffer. Sets `reader_done` at EOF so the waiter knows
-    // every byte has been surfaced. A reader-thread failure is observable:
-    // the child is terminated and an error event is emitted.
+    // every byte has been surfaced. It stops forwarding as soon as a terminal
+    // event has been emitted. A reader-thread failure is observable: the
+    // child is terminated and the error is propagated to the worker.
     let reader_tx = tx.clone();
     let max_output = config.max_output;
     let reader_exit_code = exit_code.clone();
     let reader_done_flag = reader_done.clone();
+    let reader_terminal = Arc::clone(terminal_sent);
     if let Err(e) = std::thread::Builder::new()
         .name("codebro-pty-reader".to_string())
         .spawn(move || {
@@ -223,15 +267,12 @@ fn run_pty(
                 max_output,
                 &reader_exit_code,
                 &reader_done_flag,
+                &reader_terminal,
             );
         })
     {
         signal_group(group_leader, libc::SIGKILL);
         let _ = child.wait();
-        let _ = send_event(
-            tx,
-            PtyEvent::Error(format!("Failed to start PTY reader thread: {}", e)),
-        );
         return Err(e).context("Failed to start the PTY reader thread");
     }
 
@@ -239,73 +280,139 @@ fn run_pty(
     let started = Instant::now();
     let deadline = config.timeout.map(|t| started + t);
 
+    waiter_loop(
+        &mut child,
+        group_leader,
+        cancel,
+        deadline,
+        &exit_code,
+        &reader_done,
+        terminal_sent,
+        tx,
+    )
+}
+
+/// Poll the child until it exits, the task is cancelled, the deadline passes,
+/// or `try_wait` starts failing. Exactly one terminal event is emitted (the
+/// terminal-event invariant). A `try_wait` error is fatal and bounded: the
+/// process group is terminated, the reader is drained within its grace, and an
+/// error is returned for the worker to surface as a terminal `Error` — there
+/// is no infinite polling loop, no orphan, and no hanging receiver.
+fn waiter_loop(
+    child: &mut Box<dyn Child + Send + Sync>,
+    group_leader: Option<i32>,
+    cancel: &CancellationToken,
+    deadline: Option<Instant>,
+    exit_code: &Arc<std::sync::Mutex<Option<i32>>>,
+    reader_done: &Arc<std::sync::Mutex<bool>>,
+    terminal_sent: &AtomicBool,
+    tx: &tokio::sync::mpsc::Sender<PtyEvent>,
+) -> Result<()> {
     loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            let code = status.exit_code() as i32;
-            *exit_code.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
-            wait_reader_done(&reader_done, Duration::from_secs(2));
-            let _ = send_event(tx, PtyEvent::Exited { exit_code: code });
-            return Ok(());
-        }
-
-        if cancel.is_cancelled() {
-            signal_group(group_leader, libc::SIGINT);
-            let _ = wait_for_exit(&mut child, KILL_GRACE);
-            if child.try_wait().ok().flatten().is_none() {
-                signal_group(group_leader, libc::SIGKILL);
-                let _ = child.wait();
-            }
-            if let Ok(Some(status)) = child.try_wait() {
-                *exit_code.lock().unwrap_or_else(|p| p.into_inner()) =
-                    Some(status.exit_code() as i32);
-            }
-            wait_reader_done(&reader_done, Duration::from_secs(1));
-            let _ = send_event(tx, PtyEvent::Cancelled);
-            return Ok(());
-        }
-
-        if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
-                signal_group(group_leader, libc::SIGINT);
-                let _ = wait_for_exit(&mut child, KILL_GRACE);
-                if child.try_wait().ok().flatten().is_none() {
-                    signal_group(group_leader, libc::SIGKILL);
-                    let _ = child.wait();
-                }
-                if let Ok(Some(status)) = child.try_wait() {
-                    *exit_code.lock().unwrap_or_else(|p| p.into_inner()) =
-                        Some(status.exit_code() as i32);
-                }
-                wait_reader_done(&reader_done, Duration::from_secs(1));
-                let _ = send_event(tx, PtyEvent::TimedOut);
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status.exit_code() as i32;
+                *exit_code.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
+                wait_reader_done(reader_done, Duration::from_secs(2));
+                let _ = emit_terminal(tx, terminal_sent, PtyEvent::Exited { exit_code: code });
                 return Ok(());
             }
-        }
+            Ok(None) => {
+                if cancel.is_cancelled() {
+                    signal_group(group_leader, libc::SIGINT);
+                    let _ = wait_for_exit(child, KILL_GRACE);
+                    if child.try_wait().ok().flatten().is_none() {
+                        signal_group(group_leader, libc::SIGKILL);
+                        let _ = child.wait();
+                    }
+                    if let Ok(Some(status)) = child.try_wait() {
+                        *exit_code.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(status.exit_code() as i32);
+                    }
+                    wait_reader_done(reader_done, Duration::from_secs(1));
+                    let _ = emit_terminal(tx, terminal_sent, PtyEvent::Cancelled);
+                    return Ok(());
+                }
 
-        std::thread::sleep(Duration::from_millis(10));
+                if let Some(deadline) = deadline {
+                    if Instant::now() >= deadline {
+                        signal_group(group_leader, libc::SIGINT);
+                        let _ = wait_for_exit(child, KILL_GRACE);
+                        if child.try_wait().ok().flatten().is_none() {
+                            signal_group(group_leader, libc::SIGKILL);
+                            let _ = child.wait();
+                        }
+                        if let Ok(Some(status)) = child.try_wait() {
+                            *exit_code.lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(status.exit_code() as i32);
+                        }
+                        wait_reader_done(reader_done, Duration::from_secs(1));
+                        let _ = emit_terminal(tx, terminal_sent, PtyEvent::TimedOut);
+                        return Ok(());
+                    }
+                }
+
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                // `try_wait` is failing: terminate the process group so no
+                // orphan survives, drain the reader within its grace period,
+                // then return an error. The worker emits exactly one terminal
+                // `Error`. This path can never loop indefinitely.
+                signal_group(group_leader, libc::SIGKILL);
+                let _ = wait_for_exit(child, KILL_GRACE);
+                wait_reader_done(reader_done, Duration::from_secs(1));
+                return Err(e).context("Failed to wait for PTY child");
+            }
+        }
     }
 }
 
+/// Send a terminal event exactly once. A second terminal event is refused, so
+/// the "exactly one terminal event per invocation" invariant holds on every
+/// path (exit, cancel, timeout, error).
+fn emit_terminal(
+    tx: &tokio::sync::mpsc::Sender<PtyEvent>,
+    terminal_sent: &AtomicBool,
+    event: PtyEvent,
+) -> Result<()> {
+    debug_assert!(event.is_terminal());
+    if terminal_sent.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    terminal_sent.store(true, Ordering::Relaxed);
+    let _ = tx.blocking_send(event);
+    Ok(())
+}
+
 /// Continuously read the PTY master and forward output chunks. Stops on EOF /
-/// error (which happens when the child and its session close). Output is
-/// capped at `max_output` characters for the result stream, then discarded
-/// (but still drained) so long-running processes never grow memory unboundedly
-/// and never block on a full PTY buffer.
+/// error (which happens when the child and its session close) or as soon as a
+/// terminal event has been emitted, so no `Output` ever follows the terminal
+/// event. Output is capped at `max_output` characters for the result stream,
+/// then discarded (but still drained) so long-running processes never grow
+/// memory unboundedly and never block on a full PTY buffer.
 fn read_loop(
     reader: &mut Box<dyn Read + Send>,
     tx: &tokio::sync::mpsc::Sender<PtyEvent>,
     max_output: usize,
     _exit_code: &Arc<std::sync::Mutex<Option<i32>>>,
     reader_done: &Arc<std::sync::Mutex<bool>>,
+    terminal_sent: &AtomicBool,
 ) {
     let mut buf = [0u8; 4096];
     let mut output_sent: usize = 0;
     let mut truncated = false;
 
     loop {
+        if terminal_sent.load(Ordering::Relaxed) {
+            break;
+        }
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                if terminal_sent.load(Ordering::Relaxed) {
+                    break;
+                }
                 if output_sent < max_output {
                     let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
                     let chunk = crate::tools::shell::redact_secrets_public(&chunk);
@@ -314,15 +421,19 @@ fn read_loop(
                         truncated = true;
                         let out: String = chunk.chars().take(remaining).collect();
                         output_sent = max_output;
-                        let _ = send_event(tx, PtyEvent::Output(out));
+                        if !terminal_sent.load(Ordering::Relaxed) {
+                            let _ = send_event(tx, PtyEvent::Output(out));
+                        }
                     } else {
                         output_sent += chunk.chars().count();
-                        let _ = send_event(tx, PtyEvent::Output(chunk));
+                        if !terminal_sent.load(Ordering::Relaxed) {
+                            let _ = send_event(tx, PtyEvent::Output(chunk));
+                        }
                     }
                 }
             }
         }
-        if truncated {
+        if truncated && !terminal_sent.load(Ordering::Relaxed) {
             let _ = send_event(tx, PtyEvent::Output("…[output truncated]".to_string()));
             truncated = false;
         }
@@ -671,5 +782,253 @@ mod tests {
             }
         });
         assert_eq!(exit_code, Some(0), "exit code must remain authoritative");
+    }
+
+    // ─── Sprint 28.1: worker-failure / terminal-event-invariant tests ───────
+
+    /// A fake portable-pty child whose `try_wait` always fails. Lets the
+    /// waiter's error branch be tested deterministically (no timing races).
+    #[derive(Debug)]
+    struct ErrTryWaitChild;
+
+    impl portable_pty::ChildKiller for ErrTryWaitChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(ErrTryWaitChild)
+        }
+    }
+
+    impl portable_pty::Child for ErrTryWaitChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "forced try_wait failure",
+            ))
+        }
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(1))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    /// Collect events until a terminal event or until `max_events`, so a
+    /// broken invariant fails fast instead of hanging the test runner.
+    fn drain_events(
+        rt: &Runtime,
+        rx: tokio::sync::mpsc::Receiver<PtyEvent>,
+        max_events: usize,
+    ) -> Vec<PtyEvent> {
+        let mut events = Vec::new();
+        rt.block_on(async {
+            let mut rx = rx;
+            while let Some(ev) = rx.recv().await {
+                events.push(ev.clone());
+                if ev.is_terminal() {
+                    break;
+                }
+                if events.len() >= max_events {
+                    break;
+                }
+            }
+        });
+        events
+    }
+
+    #[test]
+    fn test_worker_runtime_failure_emits_single_terminal_error() {
+        // A PTY runtime body that fails without emitting a terminal event must
+        // surface exactly one terminal Error to the receiver — the receiver
+        // can never hang because the producer failed.
+        let rt = Runtime::new().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<PtyEvent>(64);
+        run_pty_worker(
+            &PtyConfig::for_command("echo hi"),
+            &CancellationToken::new(),
+            &tx,
+            |_, _, _, _| Err(anyhow::anyhow!("forced PTY runtime failure")),
+        );
+        drop(tx);
+        let events = drain_events(&rt, rx, 16);
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one terminal event, got {:?}",
+            events
+        );
+        assert!(events[0].is_terminal());
+        assert!(
+            matches!(&events[0], PtyEvent::Error(m) if m.contains("forced PTY runtime failure")),
+            "expected an Error event, got {:?}",
+            events[0]
+        );
+    }
+
+    #[test]
+    fn test_worker_does_not_duplicate_terminal_event() {
+        // If the runtime body already emitted a terminal event before failing,
+        // the worker must not emit a second terminal event.
+        let rt = Runtime::new().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<PtyEvent>(64);
+        run_pty_worker(
+            &PtyConfig::for_command("echo hi"),
+            &CancellationToken::new(),
+            &tx,
+            |_, _, tx, terminal_sent| {
+                emit_terminal(
+                    tx,
+                    terminal_sent,
+                    PtyEvent::Error("already failed".to_string()),
+                )?;
+                Err(anyhow::anyhow!("body also returns an error"))
+            },
+        );
+        drop(tx);
+        let events = drain_events(&rt, rx, 16);
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one terminal event, got {:?}",
+            events
+        );
+        assert!(
+            matches!(&events[0], PtyEvent::Error(m) if m == "already failed"),
+            "the body's own terminal event must be preserved, got {:?}",
+            events[0]
+        );
+    }
+
+    #[test]
+    fn test_waiter_try_wait_error_is_bounded_and_clean() {
+        // The waiter must not spin forever when try_wait starts failing: it
+        // terminates the group, drains bounded, and returns an error.
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> = Box::new(ErrTryWaitChild);
+        let exit_code = Arc::new(std::sync::Mutex::new(None));
+        let reader_done = Arc::new(std::sync::Mutex::new(true)); // already drained
+        let terminal_sent = AtomicBool::new(false);
+        let (tx, rx) = tokio::sync::mpsc::channel::<PtyEvent>(64);
+
+        let start = Instant::now();
+        let err = waiter_loop(
+            &mut child,
+            None,
+            &CancellationToken::new(),
+            None,
+            &exit_code,
+            &reader_done,
+            &terminal_sent,
+            &tx,
+        )
+        .expect_err("try_wait failure must surface as an error");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "try_wait failure must not loop forever"
+        );
+        assert!(
+            err.to_string().contains("Failed to wait for PTY child"),
+            "got: {}",
+            err
+        );
+        // The waiter emits no terminal event on the error path (the worker
+        // does); the channel must close cleanly.
+        drop(tx);
+        let events = drain_events(&Runtime::new().unwrap(), rx, 16);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_terminal_event_uniqueness_across_timeout() {
+        let rt = Runtime::new().unwrap();
+        let mut config = PtyConfig::for_command("sleep 30");
+        config.timeout = Some(Duration::from_millis(200));
+        let rx = spawn_pty(config, CancellationToken::new()).unwrap();
+        let events = drain_events(&rt, rx, 32);
+        let terminals: Vec<_> = events.iter().filter(|e| e.is_terminal()).collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "expected exactly one terminal event, got {:?}",
+            events
+        );
+        assert!(matches!(terminals[0], PtyEvent::TimedOut));
+    }
+
+    #[test]
+    fn test_terminal_event_uniqueness_across_cancellation() {
+        let rt = Runtime::new().unwrap();
+        let cancel = CancellationToken::new();
+        let rx = spawn_pty(PtyConfig::for_command("sleep 30"), cancel.clone()).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        cancel.cancel();
+        let events = drain_events(&rt, rx, 32);
+        let terminals: Vec<_> = events.iter().filter(|e| e.is_terminal()).collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "expected exactly one terminal event, got {:?}",
+            events
+        );
+        assert!(matches!(terminals[0], PtyEvent::Cancelled));
+    }
+
+    #[test]
+    fn test_terminal_event_uniqueness_across_normal_exit() {
+        let rt = Runtime::new().unwrap();
+        let rx = spawn_pty(
+            PtyConfig::for_command("printf 'x'; exit 0"),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let events = drain_events(&rt, rx, 32);
+        let terminals: Vec<_> = events.iter().filter(|e| e.is_terminal()).collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "expected exactly one terminal event, got {:?}",
+            events
+        );
+        assert!(matches!(terminals[0], PtyEvent::Exited { exit_code: 0 }));
+    }
+
+    #[test]
+    fn test_no_output_after_terminal_event() {
+        // Once a terminal event has been emitted, no further Output events may
+        // follow (the reader stops forwarding on terminal_sent). Drain the
+        // whole channel (until the worker drops its sender) to prove it.
+        let rt = Runtime::new().unwrap();
+        let mut rx = spawn_pty(
+            PtyConfig::for_command("printf 'before\\n'; exit 0"),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let events = rt.block_on(async {
+            let mut all = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                all.push(ev);
+            }
+            all
+        });
+        let terminal_count = events.iter().filter(|e| e.is_terminal()).count();
+        assert_eq!(
+            terminal_count, 1,
+            "expected exactly one terminal event, got {:?}",
+            events
+        );
+        let mut seen_terminal = false;
+        for ev in &events {
+            if seen_terminal {
+                assert!(
+                    !matches!(ev, PtyEvent::Output(_)),
+                    "no Output may follow a terminal event: {:?}",
+                    events
+                );
+            }
+            if ev.is_terminal() {
+                seen_terminal = true;
+            }
+        }
     }
 }
