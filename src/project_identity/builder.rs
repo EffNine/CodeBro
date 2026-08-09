@@ -2,7 +2,7 @@
 //!
 //! Validates required metadata before build.
 
-use super::identity::{EngineeringDecision, ProjectIdentity, RoadmapItem, DecisionStatus};
+use super::identity::{DecisionStatus, EngineeringDecision, ProjectIdentity, RoadmapItem};
 
 /// Errors that can occur during identity construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,8 +161,7 @@ impl ProjectIdentityBuilder {
 
     pub fn engineering_decision(mut self, decision: EngineeringDecision) -> Self {
         self.engineering_decisions.push(decision);
-        self.engineering_decisions
-            .sort_by(|a, b| a.id.cmp(&b.id));
+        self.engineering_decisions.sort_by(|a, b| a.id.cmp(&b.id));
         self
     }
 
@@ -229,9 +228,7 @@ impl ProjectIdentityBuilder {
         let mut seen_roadmap = std::collections::BTreeSet::new();
         for item in &self.roadmap {
             if !seen_roadmap.insert(&item.id) {
-                return Err(IdentityBuildError::DuplicateRoadmapItemId(
-                    item.id.clone(),
-                ));
+                return Err(IdentityBuildError::DuplicateRoadmapItemId(item.id.clone()));
             }
         }
 
@@ -270,24 +267,14 @@ mod tests {
 
     #[test]
     fn test_builder_missing_name() {
-        let result = ProjectIdentityBuilder::new()
-            .language("rust")
-            .build();
-        assert_eq!(
-            result.unwrap_err(),
-            IdentityBuildError::MissingName
-        );
+        let result = ProjectIdentityBuilder::new().language("rust").build();
+        assert_eq!(result.unwrap_err(), IdentityBuildError::MissingName);
     }
 
     #[test]
     fn test_builder_missing_language() {
-        let result = ProjectIdentityBuilder::new()
-            .name("test-proj")
-            .build();
-        assert_eq!(
-            result.unwrap_err(),
-            IdentityBuildError::MissingLanguage
-        );
+        let result = ProjectIdentityBuilder::new().name("test-proj").build();
+        assert_eq!(result.unwrap_err(), IdentityBuildError::MissingLanguage);
     }
 
     #[test]
@@ -305,12 +292,7 @@ mod tests {
 
     #[test]
     fn test_builder_duplicate_decision_id() {
-        let decision = EngineeringDecision::new(
-            "dec-1",
-            "Use Rust",
-            "Use Rust for the core",
-            None,
-        );
+        let decision = EngineeringDecision::new("dec-1", "Use Rust", "Use Rust for the core", None);
         let result = ProjectIdentityBuilder::new()
             .name("proj")
             .language("rust")

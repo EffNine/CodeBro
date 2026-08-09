@@ -92,17 +92,16 @@ mod tests {
 
     #[test]
     fn test_constraints_with_entries() {
-        let ctx = ConstraintContext::new()
-            .with_constraints(vec![
-                EngineeringConstraint {
-                    description: "No raw SQL".to_string(),
-                    category: ConstraintCategory::Architecture,
-                },
-                EngineeringConstraint {
-                    description: "All errors wrapped".to_string(),
-                    category: ConstraintCategory::Convention,
-                },
-            ]);
+        let ctx = ConstraintContext::new().with_constraints(vec![
+            EngineeringConstraint {
+                description: "No raw SQL".to_string(),
+                category: ConstraintCategory::Architecture,
+            },
+            EngineeringConstraint {
+                description: "All errors wrapped".to_string(),
+                category: ConstraintCategory::Convention,
+            },
+        ]);
 
         assert_eq!(ctx.constraint_count(), 2);
         assert_eq!(ctx.constraints[0].description, "All errors wrapped");
@@ -135,11 +134,10 @@ mod tests {
 
     #[test]
     fn test_serialization_roundtrip() {
-        let ctx = ConstraintContext::new()
-            .add_constraint(EngineeringConstraint {
-                description: "test constraint".to_string(),
-                category: ConstraintCategory::Other,
-            });
+        let ctx = ConstraintContext::new().add_constraint(EngineeringConstraint {
+            description: "test constraint".to_string(),
+            category: ConstraintCategory::Other,
+        });
         let json = serde_json::to_string(&ctx).expect("serialize");
         let decoded: ConstraintContext = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(ctx, decoded);

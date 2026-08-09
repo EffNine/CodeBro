@@ -30,9 +30,7 @@ pub struct ValidationReport {
 
 impl ValidationReport {
     pub fn new() -> Self {
-        ValidationReport {
-            issues: Vec::new(),
-        }
+        ValidationReport { issues: Vec::new() }
     }
 
     pub fn add(&mut self, field: impl Into<String>, message: impl Into<String>) {
@@ -112,10 +110,7 @@ pub fn validate_identity(identity: &ProjectIdentity) -> ValidationReport {
     let mut seen_roadmap = std::collections::BTreeSet::new();
     for item in &identity.roadmap {
         if !seen_roadmap.insert(&item.id) {
-            report.add(
-                "roadmap",
-                format!("duplicate roadmap item id: {}", item.id),
-            );
+            report.add("roadmap", format!("duplicate roadmap item id: {}", item.id));
         }
     }
 
@@ -154,10 +149,7 @@ pub fn validate_identity(identity: &ProjectIdentity) -> ValidationReport {
     let mut seen_modules = std::collections::BTreeSet::new();
     for module in &identity.known_modules {
         if !seen_modules.insert(module) {
-            report.add(
-                "known_modules",
-                format!("duplicate module: {}", module),
-            );
+            report.add("known_modules", format!("duplicate module: {}", module));
         }
     }
 
@@ -165,10 +157,7 @@ pub fn validate_identity(identity: &ProjectIdentity) -> ValidationReport {
     let mut seen_patterns = std::collections::BTreeSet::new();
     for pattern in &identity.known_patterns {
         if !seen_patterns.insert(pattern) {
-            report.add(
-                "known_patterns",
-                format!("duplicate pattern: {}", pattern),
-            );
+            report.add("known_patterns", format!("duplicate pattern: {}", pattern));
         }
     }
 
@@ -187,10 +176,7 @@ pub fn validate_identity(identity: &ProjectIdentity) -> ValidationReport {
     let mut seen_languages = std::collections::BTreeSet::new();
     for lang in &identity.languages {
         if !seen_languages.insert(lang) {
-            report.add(
-                "languages",
-                format!("duplicate language: {}", lang),
-            );
+            report.add("languages", format!("duplicate language: {}", lang));
         }
     }
 
@@ -200,7 +186,7 @@ pub fn validate_identity(identity: &ProjectIdentity) -> ValidationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project_identity::identity::{EngineeringDecision, ProjectIdentity, DecisionStatus};
+    use crate::project_identity::identity::{DecisionStatus, EngineeringDecision, ProjectIdentity};
 
     #[test]
     fn test_valid_identity() {
@@ -208,8 +194,7 @@ mod tests {
             .with_build_system("cargo")
             .add_known_constraint("No raw SQL")
             .add_engineering_decision(
-                EngineeringDecision::new("dec-1", "Use Rust", "Use Rust", None)
-                    .accept(),
+                EngineeringDecision::new("dec-1", "Use Rust", "Use Rust", None).accept(),
             );
         let report = validate_identity(&identity);
         assert!(report.is_valid());
@@ -241,12 +226,8 @@ mod tests {
     #[test]
     fn test_duplicate_decision_ids() {
         let identity = ProjectIdentity::new("dummy", "rust")
-            .add_engineering_decision(
-                EngineeringDecision::new("dec-1", "D1", "Desc", None),
-            )
-            .add_engineering_decision(
-                EngineeringDecision::new("dec-1", "D2", "Desc2", None),
-            );
+            .add_engineering_decision(EngineeringDecision::new("dec-1", "D1", "Desc", None))
+            .add_engineering_decision(EngineeringDecision::new("dec-1", "D2", "Desc2", None));
         let report = validate_identity(&identity);
         assert!(!report.is_valid());
         assert!(report.issue_count() >= 1);
@@ -255,12 +236,12 @@ mod tests {
     #[test]
     fn test_duplicate_roadmap_item_ids() {
         let identity = ProjectIdentity::new("dummy", "rust")
-            .add_roadmap_item(
-                crate::project_identity::identity::RoadmapItem::new("item-1", "I1", None),
-            )
-            .add_roadmap_item(
-                crate::project_identity::identity::RoadmapItem::new("item-1", "I2", None),
-            );
+            .add_roadmap_item(crate::project_identity::identity::RoadmapItem::new(
+                "item-1", "I1", None,
+            ))
+            .add_roadmap_item(crate::project_identity::identity::RoadmapItem::new(
+                "item-1", "I2", None,
+            ));
         let report = validate_identity(&identity);
         assert!(!report.is_valid());
         assert!(report.issue_count() >= 1);

@@ -28,11 +28,7 @@ pub struct EngineeringMemoryEntry {
 
 impl EngineeringMemoryEntry {
     /// Create a new entry with the given id, key, and value.
-    pub fn new(
-        id: impl Into<String>,
-        key: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, key: impl Into<String>, value: impl Into<String>) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -67,8 +63,7 @@ impl EngineeringMemoryEntry {
     /// (case-insensitive).
     pub fn matches_keyword(&self, keyword: &str) -> bool {
         let kw = keyword.to_lowercase();
-        self.key.to_lowercase().contains(&kw)
-            || self.value.to_lowercase().contains(&kw)
+        self.key.to_lowercase().contains(&kw) || self.value.to_lowercase().contains(&kw)
     }
 
     /// Returns true if the entry carries at least one of the given tags.
@@ -167,7 +162,10 @@ impl EngineeringMemoryFile {
     }
 
     /// Create from existing entries.
-    pub fn from_entries(workspace_root: impl Into<String>, entries: Vec<EngineeringMemoryEntry>) -> Self {
+    pub fn from_entries(
+        workspace_root: impl Into<String>,
+        entries: Vec<EngineeringMemoryEntry>,
+    ) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

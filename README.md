@@ -73,18 +73,15 @@ codebro/
     ├── scanner/
     │   ├── mod.rs
     │   └── project.rs
-    ├── context/
-    │   ├── mod.rs
-    │   └── builder.rs
-    ├── prompt/
-    │   ├── mod.rs
-    │   └── builder.rs
     ├── dispatcher/
     │   ├── mod.rs
     │   └── registry.rs
     └── config/
         └── mod.rs
 ```
+
+> The legacy `src/context/` and `src/prompt/` modules were removed in ADR-012.
+> See the current canonical architecture in `docs/architecture/`.
 
 ### Agent Workflow
 
@@ -380,12 +377,6 @@ codebro/
 │   ├── scanner/             # Project scanner
 │   │   ├── mod.rs
 │   │   └── project.rs       # Project detection
-│   ├── context/             # Context builder
-│   │   ├── mod.rs
-│   │   └── builder.rs       # Context selection
-│   ├── prompt/              # Prompt builder
-│   │   ├── mod.rs
-│   │   └── builder.rs       # Prompt assembly
 │   ├── dispatcher/          # Tool dispatcher
 │   │   ├── mod.rs
 │   │   └── registry.rs      # Tool registry
@@ -393,6 +384,11 @@ codebro/
 │       └── mod.rs
 └── tests.rs                 # Integration tests
 ```
+
+> The legacy `src/context/` (context builder) and `src/prompt/` (prompt
+> assembly) modules were removed in ADR-012. Canonical replacements:
+> `src/assembly/` + `src/engineering_context/` and `src/prompt_builder/`
+> (`compile_context(&EngineeringContext)`).
 
 ## License
 
@@ -448,18 +444,14 @@ codebro/
     ├── scanner/
     │   ├── mod.rs
     │   └── project.rs
-    ├── context/
-    │   ├── mod.rs
-    │   └── builder.rs
-    ├── prompt/
-    │   ├── mod.rs
-    │   └── builder.rs
     ├── dispatcher/
     │   ├── mod.rs
     │   └── registry.rs
     └── config/
         └── mod.rs
 ```
+
+> The legacy `src/context/` and `src/prompt/` modules were removed in ADR-012.
 
 ### Memory Lifecycle
 
@@ -710,7 +702,14 @@ Example: "Add caching" → finds Cache interface, Database layer, Existing confi
 
 ### Intelligence Memory
 
-Stores learned codebase knowledge in `.codebro/project_memory.json`:
+> **Note:** The `IntelligenceMemory` store (`intelligence/memory/`, persisted to
+> `~/.codebro/project_memory.json`) was removed in ADR-012. Persistent project
+> knowledge is now owned by `project_identity` (`.codebro/project_identity.json`)
+> and task-relevant memory by `engineering_memory`
+> (`.codebro/engineering_memory.json`).
+
+The original v0.5 design stored learned codebase knowledge in
+`.codebro/project_memory.json`:
 
 - **Important symbols**: core functions, classes, structs, traits
 - **Architecture patterns**: discovered design patterns

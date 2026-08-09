@@ -18,9 +18,7 @@ use crate::agent::Planner;
 use crate::agent::SubAgent;
 use crate::agent::TraceStore;
 use crate::config::Config;
-use crate::context::ContextBuilder;
 use crate::dispatcher::ToolDispatcher;
-use crate::indexer::RepositoryIndex;
 use crate::scanner::ProjectInfo;
 use crate::tools::filesystem::{CreateFile, EditFile, ListFiles, ReadFile};
 use crate::tools::git::{GitDiff, GitStatus};
@@ -160,22 +158,6 @@ fn test_patch_rollback() {
     PatchEngine::rollback(&file_path, original).expect("rollback should work");
     let content = fs::read_to_string(&file_path).expect("read rolled back file");
     assert_eq!(content, original);
-}
-
-#[test]
-fn test_context_builder() {
-    let config = crate::context::ContextConfig::default();
-    let builder = ContextBuilder::new(config);
-
-    let index = RepositoryIndex::new(".".into());
-    let conversation = vec![];
-
-    let context = builder
-        .build("read the main file", &conversation, None, &index)
-        .expect("build context should work");
-
-    assert!(!context.user_request.is_empty());
-    assert!(!context.system_prompt.is_empty());
 }
 
 #[tokio::test]
@@ -1504,66 +1486,6 @@ fn test_agent_reasoning_find_patterns() {
         .expect("pattern finding should work");
 
     assert!(!patterns.is_empty());
-}
-
-#[test]
-fn test_intelligence_memory() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let memory_path = dir.path().join("project_memory.json");
-
-    let mut memory = crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path)
-        .expect("memory creation should work");
-
-    memory.record_symbol(
-        "authenticate_user".to_string(),
-        "function".to_string(),
-        "auth.rs".to_string(),
-        "Core authentication function".to_string(),
-    );
-
-    memory.record_pattern(
-        "Repository Pattern".to_string(),
-        "Uses repository pattern for data access".to_string(),
-        vec!["auth.rs".to_string(), "user.rs".to_string()],
-        0.9,
-    );
-
-    memory.record_convention("Use snake_case for function names".to_string());
-
-    memory.save().expect("memory save should work");
-
-    let loaded = crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path)
-        .expect("memory reload should work");
-
-    assert!(!loaded.get_important_symbols().is_empty());
-    assert!(!loaded.get_architecture_patterns().is_empty());
-    assert!(!loaded.get_conventions().is_empty());
-}
-
-#[test]
-fn test_intelligence_memory_analyze_project() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join("test_index.db");
-    let memory_path = dir.path().join("project_memory.json");
-
-    let mut indexer = crate::intelligence::index::CodeIndexer::new(db_path)
-        .expect("indexer creation should work");
-
-    let source = r#"pub fn authenticate_user(username: &str, password: &str) -> bool { true }"#;
-    let file_path = dir.path().join("auth.rs");
-    std::fs::write(&file_path, source).expect("write test file");
-    indexer
-        .index_file(&file_path, source)
-        .expect("indexing should work");
-
-    let mut memory = crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path)
-        .expect("memory creation should work");
-
-    memory
-        .analyze_project(&indexer)
-        .expect("project analysis should work");
-
-    assert!(!memory.get_important_symbols().is_empty());
 }
 
 // ===== v0.6 Autonomous Agent Core Tests =====
@@ -4022,8 +3944,7 @@ mod validation {
 mod p2_reliability {
     use super::*;
     use crate::reliability::{
-        CircuitBreaker, CircuitBreakerConfig, CircuitState, Diagnostics, HealthMonitor,
-        HealthStatus, MemoryLogSink, ResourceGuard, ResourceGuardConfig, ResourceStatus,
+        Diagnostics, MemoryLogSink, ResourceGuard, ResourceGuardConfig, ResourceStatus,
         RuntimeErrorCategory, StructuredLogger, TimeoutKind, TimeoutManager,
     };
     use std::sync::Arc;
@@ -4199,167 +4120,7 @@ mod p2_reliability {
     }
 
     // ---------------------------------------------------------------------------
-    // 3. Health Monitor
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_health_unknown_initially() {
-        let hm = HealthMonitor::new();
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Unknown);
-        assert_eq!(hm.check_tool("run_command"), HealthStatus::Unknown);
-    }
-
-    #[test]
-    fn test_health_becomes_healthy() {
-        let hm = HealthMonitor::new();
-        hm.record_provider_success("openai");
-        hm.record_provider_success("openai");
-        hm.record_provider_success("openai");
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Healthy);
-    }
-
-    #[test]
-    fn test_health_becomes_degraded() {
-        let hm = HealthMonitor::new();
-        hm.record_provider_failure("openai");
-        hm.record_provider_failure("openai");
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Degraded);
-    }
-
-    #[test]
-    fn test_health_becomes_unhealthy() {
-        let hm = HealthMonitor::new();
-        for _ in 0..5 {
-            hm.record_provider_failure("openai");
-        }
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Unhealthy);
-    }
-
-    #[test]
-    fn test_health_success_resets_streak() {
-        let hm = HealthMonitor::new();
-        for j in 2..5 {
-            hm.record_provider_failure("openai");
-        }
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Degraded);
-
-        for j in 2..5 {
-            hm.record_provider_success("openai");
-        }
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Healthy);
-    }
-
-    #[test]
-    fn test_health_system_healthy() {
-        let hm = HealthMonitor::new();
-        assert!(hm.is_system_healthy());
-
-        for _ in 0..5 {
-            hm.record_provider_failure("openai");
-        }
-        assert!(!hm.is_system_healthy());
-    }
-
-    // ---------------------------------------------------------------------------
-    // 4. Circuit Breaker
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_circuit_closed_initially() {
-        let cb = CircuitBreaker::new();
-        assert_eq!(cb.state(), CircuitState::Closed);
-        assert!(cb.can_execute());
-    }
-
-    #[test]
-    fn test_circuit_opens_after_threshold() {
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 3,
-            success_threshold: 1,
-            cooldown_ms: 1000,
-        });
-
-        cb.record_failure();
-        cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Closed);
-        cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Open);
-        assert!(!cb.can_execute());
-    }
-
-    #[test]
-    fn test_circuit_half_open_after_cooldown() {
-        use std::thread;
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 1,
-            cooldown_ms: 50,
-        });
-
-        cb.record_failure();
-        cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Open);
-
-        thread::sleep(Duration::from_millis(100));
-        assert!(cb.can_execute());
-        assert_eq!(cb.state(), CircuitState::HalfOpen);
-    }
-
-    #[test]
-    fn test_circuit_half_open_success_closes() {
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 1,
-            cooldown_ms: 50,
-        });
-
-        cb.record_failure();
-        cb.record_failure();
-
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(cb.can_execute());
-
-        cb.record_success();
-        assert_eq!(cb.state(), CircuitState::Closed);
-    }
-
-    #[test]
-    fn test_circuit_half_open_failure_reopens() {
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 1,
-            cooldown_ms: 50,
-        });
-
-        cb.record_failure();
-        cb.record_failure();
-
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(cb.can_execute());
-
-        cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Open);
-    }
-
-    #[test]
-    fn test_circuit_reset() {
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 1,
-            cooldown_ms: 1000,
-        });
-
-        cb.record_failure();
-        cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Open);
-
-        cb.reset();
-        assert_eq!(cb.state(), CircuitState::Closed);
-        assert!(cb.can_execute());
-    }
-
-    // ---------------------------------------------------------------------------
-    // 5. Resource Guard
+    // 3. Resource Guard
     // ---------------------------------------------------------------------------
 
     #[test]
@@ -4430,7 +4191,7 @@ mod p2_reliability {
     }
 
     // ---------------------------------------------------------------------------
-    // 6. Diagnostics
+    // 4. Diagnostics
     // ---------------------------------------------------------------------------
 
     #[test]
@@ -4518,7 +4279,7 @@ mod p2_reliability {
     }
 
     // ---------------------------------------------------------------------------
-    // 7. Structured Logging
+    // 5. Structured Logging
     // ---------------------------------------------------------------------------
 
     #[test]
@@ -4562,15 +4323,13 @@ mod p2_reliability {
     }
 
     // ---------------------------------------------------------------------------
-    // 8. Integration: Reliability with Runtime Pipeline
+    // 6. Integration: Reliability with Runtime Pipeline
     // ---------------------------------------------------------------------------
 
     #[test]
     fn test_recovery_flow() {
         let diag = Diagnostics::new();
-        let hm = HealthMonitor::new();
         let tm = TimeoutManager::new();
-        let cb = CircuitBreaker::new();
 
         tm.start_timeout("req1", TimeoutKind::Provider, "openai");
         diag.record_failure(
@@ -4580,46 +4339,12 @@ mod p2_reliability {
             Some("retry"),
             false,
         );
-        hm.record_provider_failure("openai");
-        hm.record_provider_failure("openai");
-        cb.record_failure();
 
         assert_eq!(diag.failure_count(), 1);
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Degraded);
-        assert_eq!(cb.state(), CircuitState::Closed);
-    }
+        assert!(!tm.is_expired("req1"));
 
-    #[test]
-    fn test_circuit_breaker_opens_and_recovers() {
-        use std::thread;
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 3,
-            success_threshold: 2,
-            cooldown_ms: 50,
-        });
-        let diag = Diagnostics::new();
-
-        for j in 2..5 {
-            cb.record_failure();
-            diag.record_failure(
-                RuntimeErrorCategory::ProviderTimeout,
-                "timeout",
-                "provider:test",
-                None,
-                false,
-            );
-        }
-        assert_eq!(cb.state(), CircuitState::Open);
-
-        thread::sleep(Duration::from_millis(100));
-        assert!(cb.can_execute());
-        assert_eq!(cb.state(), CircuitState::HalfOpen);
-
-        cb.record_success();
-        cb.record_success();
-        assert_eq!(cb.state(), CircuitState::Closed);
-
-        diag.record_recovery("timeout", "circuit recovered", true, 3);
+        tm.remove("req1");
+        diag.record_recovery("request timed out", "retry succeeded", true, 1);
         assert_eq!(diag.recovery_count(), 1);
     }
 }
@@ -4632,8 +4357,7 @@ mod p2_reliability {
 mod p25_validation {
     use super::*;
     use crate::reliability::{
-        CircuitBreaker, CircuitBreakerConfig, CircuitState, Diagnostics, HealthMonitor,
-        HealthStatus, LogEntry, LogLevel, LogSink, MemoryLogSink, ResourceGuard,
+        Diagnostics, LogEntry, LogLevel, LogSink, MemoryLogSink, ResourceGuard,
         ResourceGuardConfig, ResourceStatus, RuntimeErrorCategory, StructuredLogger, TimeoutKind,
         TimeoutManager,
     };
@@ -4973,414 +4697,7 @@ mod p25_validation {
     }
 
     // ===========================================================================
-    // 3. HEALTH MONITORING DEEP VALIDATION
-    // ===========================================================================
-
-    #[test]
-    fn test_health_unknown_initially() {
-        let hm = HealthMonitor::new();
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Unknown);
-        assert_eq!(hm.check_tool("run_command"), HealthStatus::Unknown);
-        assert_eq!(hm.check_runtime(), HealthStatus::Unknown);
-        assert_eq!(hm.check_resources(), HealthStatus::Unknown);
-    }
-
-    #[test]
-    fn test_health_becomes_healthy() {
-        let hm = HealthMonitor::new();
-        hm.record_provider_success("openai");
-        hm.record_provider_success("openai");
-        hm.record_provider_success("openai");
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Healthy);
-    }
-
-    #[test]
-    fn test_health_becomes_degraded() {
-        let hm = HealthMonitor::new();
-        hm.record_provider_failure("openai");
-        hm.record_provider_failure("openai");
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Degraded);
-    }
-
-    #[test]
-    fn test_health_becomes_unhealthy() {
-        let hm = HealthMonitor::new();
-        for _ in 0..5 {
-            hm.record_provider_failure("openai");
-        }
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Unhealthy);
-    }
-
-    #[test]
-    fn test_health_success_resets_streak() {
-        let hm = HealthMonitor::new();
-        for j in 2..5 {
-            hm.record_provider_failure("openai");
-        }
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Degraded);
-        for j in 2..5 {
-            hm.record_provider_success("openai");
-        }
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Healthy);
-    }
-
-    #[test]
-    fn test_health_single_failure_no_degrade() {
-        let hm = HealthMonitor::new();
-        hm.record_provider_failure("openai");
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Unknown);
-    }
-
-    #[test]
-    fn test_health_tool_tracking() {
-        let hm = HealthMonitor::new();
-        hm.record_tool_success("read_file");
-        hm.record_tool_success("read_file");
-        hm.record_tool_success("read_file");
-        assert_eq!(hm.check_tool("read_file"), HealthStatus::Healthy);
-        hm.record_tool_failure("read_file");
-        hm.record_tool_failure("read_file");
-        assert_eq!(hm.check_tool("read_file"), HealthStatus::Degraded);
-    }
-
-    #[test]
-    fn test_health_runtime_tracking() {
-        let hm = HealthMonitor::new();
-        hm.record_runtime_success();
-        hm.record_runtime_success();
-        hm.record_runtime_success();
-        assert_eq!(hm.check_runtime(), HealthStatus::Healthy);
-        hm.record_runtime_failure();
-        hm.record_runtime_failure();
-        assert_eq!(hm.check_runtime(), HealthStatus::Degraded);
-    }
-
-    #[test]
-    fn test_health_resources_tracking() {
-        let hm = HealthMonitor::new();
-        hm.record_resources_success();
-        hm.record_resources_success();
-        hm.record_resources_success();
-        assert_eq!(hm.check_resources(), HealthStatus::Healthy);
-    }
-
-    #[test]
-    fn test_health_system_healthy() {
-        let hm = HealthMonitor::new();
-        assert!(hm.is_system_healthy());
-        hm.record_provider_failure("openai");
-        hm.record_provider_failure("openai");
-        assert!(hm.is_system_healthy());
-        for j in 2..5 {
-            hm.record_provider_failure("openai");
-        }
-        assert!(!hm.is_system_healthy());
-    }
-
-    #[test]
-    fn test_health_unhealthy_count() {
-        let hm = HealthMonitor::new();
-        assert_eq!(hm.unhealthy_count(), 0);
-        hm.record_provider_failure("p1");
-        hm.record_provider_failure("p1");
-        hm.record_provider_failure("p2");
-        hm.record_provider_failure("p2");
-        hm.record_provider_failure("p2");
-        assert_eq!(hm.unhealthy_count(), 2);
-    }
-
-    #[test]
-    fn test_health_get_entry() {
-        let hm = HealthMonitor::new();
-        hm.record_provider_failure("openai");
-        hm.record_provider_failure("openai");
-        let entry = hm.get_provider_entry("openai").unwrap();
-        assert_eq!(entry.consecutive_failures, 2);
-        assert_eq!(entry.total_failures, 2);
-        assert!(entry.last_failure_time.is_some());
-    }
-
-    #[test]
-    fn test_health_provider_count() {
-        let hm = HealthMonitor::new();
-        assert_eq!(hm.provider_count(), 0);
-        hm.record_provider_success("openai");
-        assert_eq!(hm.provider_count(), 1);
-        hm.record_provider_failure("deepseek");
-        assert_eq!(hm.provider_count(), 2);
-    }
-
-    #[test]
-    fn test_health_tool_count() {
-        let hm = HealthMonitor::new();
-        assert_eq!(hm.tool_count(), 0);
-        hm.record_tool_success("read_file");
-        assert_eq!(hm.tool_count(), 1);
-    }
-
-    #[test]
-    fn test_health_thread_safety() {
-        use std::thread;
-        let hm = HealthMonitor::new();
-        let handles: Vec<_> = (0..10)
-            .map(|i| {
-                let hm = hm.clone();
-                thread::spawn(move || {
-                    for _ in 0..10 {
-                        hm.record_provider_success(&format!("provider_{}", i));
-                    }
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-        assert_eq!(hm.provider_count(), 10);
-        for i in 0..10 {
-            assert_eq!(
-                hm.check_provider(&format!("provider_{}", i)),
-                HealthStatus::Healthy
-            );
-        }
-    }
-
-    #[test]
-    fn test_health_alternating_success_failure() {
-        let hm = HealthMonitor::new();
-        hm.record_provider_success("openai");
-        // First success sets status to Healthy (unknown && no failures)
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Healthy);
-        hm.record_provider_failure("openai");
-        // One failure doesn't degrade (needs 2)
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Healthy);
-        hm.record_provider_success("openai");
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Healthy);
-        hm.record_provider_failure("openai");
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Healthy);
-    }
-
-    #[test]
-    fn test_health_recovery_to_healthy() {
-        let hm = HealthMonitor::new();
-        for _ in 0..5 {
-            hm.record_provider_failure("openai");
-        }
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Unhealthy);
-        hm.record_provider_success("openai");
-        hm.record_provider_success("openai");
-        // Still Unhealthy (needs 3 consecutive successes)
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Unhealthy);
-        hm.record_provider_success("openai");
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Healthy);
-    }
-
-    // ===========================================================================
-    // 4. CIRCUIT BREAKER DEEP VALIDATION
-    // ===========================================================================
-
-    #[test]
-    fn test_circuit_closed_initially() {
-        let cb = CircuitBreaker::new();
-        assert_eq!(cb.state(), CircuitState::Closed);
-        assert!(cb.can_execute());
-    }
-
-    #[test]
-    fn test_circuit_opens_after_threshold() {
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 3,
-            success_threshold: 1,
-            cooldown_ms: 1000,
-        });
-        cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Closed);
-        assert!(cb.can_execute());
-        cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Closed);
-        assert!(cb.can_execute());
-        cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Open);
-        assert!(!cb.can_execute());
-    }
-
-    #[test]
-    fn test_circuit_half_open_after_cooldown() {
-        use std::thread;
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 1,
-            cooldown_ms: 50,
-        });
-        cb.record_failure();
-        cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Open);
-        thread::sleep(Duration::from_millis(100));
-        assert!(cb.can_execute());
-        assert_eq!(cb.state(), CircuitState::HalfOpen);
-    }
-
-    #[test]
-    fn test_circuit_half_open_success_closes() {
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 1,
-            cooldown_ms: 50,
-        });
-        cb.record_failure();
-        cb.record_failure();
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(cb.can_execute());
-        cb.record_success();
-        assert_eq!(cb.state(), CircuitState::Closed);
-        assert!(cb.can_execute());
-    }
-
-    #[test]
-    fn test_circuit_half_open_failure_reopens() {
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 1,
-            cooldown_ms: 50,
-        });
-        cb.record_failure();
-        cb.record_failure();
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(cb.can_execute());
-        cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Open);
-        assert!(!cb.can_execute());
-    }
-
-    #[test]
-    fn test_circuit_success_resets_in_closed() {
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 3,
-            success_threshold: 1,
-            cooldown_ms: 1000,
-        });
-        cb.record_failure();
-        cb.record_failure();
-        assert_eq!(cb.failure_count(), 2);
-        cb.record_success();
-        assert_eq!(cb.failure_count(), 0);
-        cb.record_failure();
-        cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Closed);
-    }
-
-    #[test]
-    fn test_circuit_reset() {
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 1,
-            cooldown_ms: 1000,
-        });
-        cb.record_failure();
-        cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Open);
-        cb.reset();
-        assert_eq!(cb.state(), CircuitState::Closed);
-        assert!(cb.can_execute());
-    }
-
-    #[test]
-    fn test_circuit_multiple_successes_in_half_open() {
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 3,
-            cooldown_ms: 50,
-        });
-        cb.record_failure();
-        cb.record_failure();
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(cb.can_execute());
-        cb.record_success();
-        assert_eq!(cb.state(), CircuitState::HalfOpen);
-        cb.record_success();
-        assert_eq!(cb.state(), CircuitState::HalfOpen);
-        cb.record_success();
-        assert_eq!(cb.state(), CircuitState::Closed);
-    }
-
-    #[test]
-    fn test_circuit_failure_in_closed() {
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 5,
-            success_threshold: 1,
-            cooldown_ms: 1000,
-        });
-        for _ in 0..4 {
-            cb.record_failure();
-        }
-        assert_eq!(cb.state(), CircuitState::Closed);
-        assert!(cb.can_execute());
-    }
-
-    #[test]
-    fn test_circuit_thread_safety() {
-        use std::thread;
-        let cb = CircuitBreaker::new();
-        let handles: Vec<_> = (0..10)
-            .map(|_| {
-                let cb = cb.clone();
-                thread::spawn(move || {
-                    for _ in 0..100 {
-                        cb.record_success();
-                    }
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-        assert_eq!(cb.state(), CircuitState::Closed);
-    }
-
-    #[test]
-    fn test_circuit_concurrent_failures() {
-        use std::thread;
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 5,
-            success_threshold: 1,
-            cooldown_ms: 50,
-        });
-        let handles: Vec<_> = (0..10)
-            .map(|_| {
-                let cb = cb.clone();
-                thread::spawn(move || {
-                    for _ in 0..10 {
-                        cb.record_failure();
-                    }
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-        assert_eq!(cb.state(), CircuitState::Open);
-    }
-
-    #[test]
-    fn test_circuit_repeated_open_close_cycles() {
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 1,
-            cooldown_ms: 50,
-        });
-        for j in 2..5 {
-            cb.record_failure();
-            cb.record_failure();
-            assert_eq!(cb.state(), CircuitState::Open);
-            std::thread::sleep(Duration::from_millis(100));
-            assert!(cb.can_execute());
-            assert_eq!(cb.state(), CircuitState::HalfOpen);
-            cb.record_success();
-            assert_eq!(cb.state(), CircuitState::Closed);
-        }
-    }
-
-    // ===========================================================================
-    // 5. RESOURCE GUARD DEEP VALIDATION
+    // 3. RESOURCE GUARD DEEP VALIDATION
     // ===========================================================================
 
     #[test]
@@ -5515,7 +4832,7 @@ mod p25_validation {
     }
 
     // ===========================================================================
-    // 6. DIAGNOSTICS DEEP VALIDATION
+    // 4. DIAGNOSTICS DEEP VALIDATION
     // ===========================================================================
 
     #[test]
@@ -5791,7 +5108,7 @@ mod p25_validation {
     }
 
     // ===========================================================================
-    // 7. STRUCTURED LOGGING DEEP VALIDATION
+    // 5. STRUCTURED LOGGING DEEP VALIDATION
     // ===========================================================================
 
     #[test]
@@ -5938,15 +5255,13 @@ mod p25_validation {
     }
 
     // ===========================================================================
-    // 8. INTEGRATION VALIDATION
+    // 6. INTEGRATION VALIDATION
     // ===========================================================================
 
     #[test]
     fn test_integration_full_recovery_flow() {
         let diag = Diagnostics::new();
-        let hm = HealthMonitor::new();
         let tm = TimeoutManager::new();
-        let cb = CircuitBreaker::new();
 
         tm.start_timeout("req1", TimeoutKind::Provider, "openai");
         diag.record_failure(
@@ -5956,35 +5271,20 @@ mod p25_validation {
             Some("retry"),
             false,
         );
-        hm.record_provider_failure("openai");
-        hm.record_provider_failure("openai");
-        cb.record_failure();
 
         assert_eq!(diag.failure_count(), 1);
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Degraded);
-        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(!tm.is_expired("req1"));
 
-        hm.record_provider_success("openai");
-        hm.record_provider_success("openai");
-        hm.record_provider_success("openai");
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Healthy);
-
+        tm.remove("req1");
         diag.record_recovery("request timed out", "retry", true, 0);
         assert_eq!(diag.recovery_count(), 1);
     }
 
     #[test]
     fn test_integration_circuit_breaker_with_diagnostics() {
-        use std::thread;
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 3,
-            success_threshold: 2,
-            cooldown_ms: 50,
-        });
         let diag = Diagnostics::new();
 
         for j in 2..5 {
-            cb.record_failure();
             diag.record_failure(
                 RuntimeErrorCategory::ProviderTimeout,
                 "timeout",
@@ -5993,15 +5293,7 @@ mod p25_validation {
                 false,
             );
         }
-        assert_eq!(cb.state(), CircuitState::Open);
-
-        thread::sleep(Duration::from_millis(100));
-        assert!(cb.can_execute());
-        assert_eq!(cb.state(), CircuitState::HalfOpen);
-
-        cb.record_success();
-        cb.record_success();
-        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(diag.failure_count(), 3);
 
         diag.record_recovery("timeout", "circuit recovered", true, 3);
         assert_eq!(diag.recovery_count(), 1);
@@ -6041,25 +5333,29 @@ mod p25_validation {
 
     #[test]
     fn test_integration_health_and_circuit_interaction() {
-        let hm = HealthMonitor::new();
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 3,
-            success_threshold: 1,
-            cooldown_ms: 50,
-        });
+        let tm = TimeoutManager::new();
+        let diag = Diagnostics::new();
 
         for j in 2..5 {
-            hm.record_provider_failure("openai");
-            cb.record_failure();
+            tm.start_timeout(&format!("req{}", j), TimeoutKind::Provider, "openai");
+            diag.record_failure(
+                RuntimeErrorCategory::ProviderTimeout,
+                &format!("timeout {}", j),
+                "provider:openai",
+                None,
+                false,
+            );
         }
 
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Degraded);
-        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(tm.active_count(), 3);
+        assert_eq!(diag.failure_count(), 3);
 
-        hm.record_provider_success("openai");
-        hm.record_provider_success("openai");
-        hm.record_provider_success("openai");
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Healthy);
+        for j in 2..5 {
+            tm.remove(&format!("req{}", j));
+            diag.record_recovery("timeout", "retry", true, 1);
+        }
+        assert_eq!(tm.active_count(), 0);
+        assert_eq!(diag.recovery_count(), 3);
     }
 
     #[test]
@@ -6145,8 +5441,7 @@ mod p25_validation {
 mod p25_stress {
     use super::*;
     use crate::reliability::{
-        CircuitBreaker, CircuitBreakerConfig, CircuitState, Diagnostics, HealthMonitor,
-        HealthStatus, MemoryLogSink, ResourceGuard, RuntimeErrorCategory, StructuredLogger,
+        Diagnostics, MemoryLogSink, ResourceGuard, RuntimeErrorCategory, StructuredLogger,
         TimeoutKind, TimeoutManager,
     };
     use std::sync::Arc;
@@ -6154,18 +5449,10 @@ mod p25_stress {
 
     #[test]
     fn test_repeated_provider_failures() {
-        let hm = HealthMonitor::new();
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 5,
-            success_threshold: 3,
-            cooldown_ms: 10,
-        });
         let diag = Diagnostics::new();
 
         let start = Instant::now();
         for i in 0..100 {
-            hm.record_provider_failure("openai");
-            cb.record_failure();
             diag.record_failure(
                 RuntimeErrorCategory::ProviderTimeout,
                 &format!("timeout {}", i),
@@ -6176,20 +5463,16 @@ mod p25_stress {
         }
         let elapsed = start.elapsed();
 
-        assert_eq!(hm.check_provider("openai"), HealthStatus::Unhealthy);
-        assert_eq!(cb.state(), CircuitState::Open);
         assert_eq!(diag.failure_count(), 100);
         assert!(elapsed < Duration::from_secs(1));
     }
 
     #[test]
     fn test_repeated_tool_failures() {
-        let hm = HealthMonitor::new();
         let diag = Diagnostics::new();
 
         let start = Instant::now();
         for i in 0..100 {
-            hm.record_tool_failure("run_command");
             diag.record_failure(
                 RuntimeErrorCategory::ToolTimeout,
                 &format!("tool timeout {}", i),
@@ -6200,7 +5483,6 @@ mod p25_stress {
         }
         let elapsed = start.elapsed();
 
-        assert_eq!(hm.check_tool("run_command"), HealthStatus::Unhealthy);
         assert_eq!(diag.failure_count(), 100);
         assert!(elapsed < Duration::from_secs(1));
     }
@@ -6252,21 +5534,15 @@ mod p25_stress {
     #[test]
     fn test_concurrent_runtime_requests() {
         use std::thread;
-        let hm = HealthMonitor::new();
-        let cb = CircuitBreaker::new();
         let diag = Diagnostics::new();
         let tm = TimeoutManager::new();
 
         let handles: Vec<_> = (0..20)
             .map(|i| {
-                let hm = hm.clone();
-                let cb = cb.clone();
                 let diag = diag.clone();
                 let tm = tm.clone();
                 thread::spawn(move || {
                     for j in 0..50 {
-                        hm.record_provider_failure(&format!("provider_{}", i));
-                        cb.record_failure();
                         diag.record_failure(
                             RuntimeErrorCategory::ProviderTimeout,
                             &format!("timeout {}-{}", i, j),
@@ -6287,41 +5563,27 @@ mod p25_stress {
         }
         let elapsed = start.elapsed();
 
-        assert_eq!(hm.provider_count(), 20);
         assert_eq!(diag.failure_count(), 1000);
         assert!(elapsed < Duration::from_secs(2));
     }
 
     #[test]
     fn test_repeated_recovery_cycles() {
-        use std::thread;
-        let cb = CircuitBreaker::with_config(CircuitBreakerConfig {
-            failure_threshold: 3,
-            success_threshold: 2,
-            cooldown_ms: 10,
-        });
         let diag = Diagnostics::new();
 
         let start = Instant::now();
-        for _ in 0..50 {
-            cb.record_failure();
-            cb.record_failure();
-            cb.record_failure();
-            assert_eq!(cb.state(), CircuitState::Open);
-
-            thread::sleep(Duration::from_millis(20));
-            assert!(cb.can_execute());
-            assert_eq!(cb.state(), CircuitState::HalfOpen);
-
-            cb.record_success();
-            cb.record_success();
-            assert_eq!(cb.state(), CircuitState::Closed);
-
+        for i in 0..50 {
+            diag.record_failure(
+                RuntimeErrorCategory::ProviderTimeout,
+                &format!("timeout {}", i),
+                "provider:test",
+                None,
+                false,
+            );
             diag.record_recovery("timeout", "circuit recovered", true, 3);
         }
         let elapsed = start.elapsed();
 
-        assert_eq!(cb.state(), CircuitState::Closed);
         assert_eq!(diag.recovery_count(), 50);
         assert!(elapsed < Duration::from_secs(2));
     }
@@ -6343,19 +5605,21 @@ mod p25_stress {
 
     #[test]
     fn test_health_degradation_stress() {
-        let hm = HealthMonitor::new();
+        let diag = Diagnostics::new();
 
         let start = Instant::now();
         for i in 0..100 {
-            hm.record_provider_failure(&format!("provider_{}", i % 10));
+            diag.record_failure(
+                RuntimeErrorCategory::ProviderTimeout,
+                &format!("provider failure {}", i),
+                &format!("provider_{}", i % 10),
+                None,
+                false,
+            );
         }
         let elapsed = start.elapsed();
 
-        let unhealthy = (0..10)
-            .map(|i| hm.check_provider(&format!("provider_{}", i)))
-            .filter(|s| *s == HealthStatus::Unhealthy || *s == HealthStatus::Degraded)
-            .count();
-        assert!(unhealthy > 0);
+        assert_eq!(diag.failure_count(), 100);
         assert!(elapsed < Duration::from_secs(1));
     }
 
@@ -7387,19 +6651,6 @@ mod p3_validation {
     }
 
     #[test]
-    fn p3_regression_reliability_circuit_breaker() {
-        use crate::reliability::circuit_breaker::{CircuitBreaker, CircuitState};
-        let cb = CircuitBreaker::new();
-        assert_eq!(cb.state(), CircuitState::Closed);
-        cb.record_failure();
-        // May stay closed or transition to open
-        assert!(matches!(
-            cb.state(),
-            CircuitState::Closed | CircuitState::Open
-        ));
-    }
-
-    #[test]
     fn p3_regression_provider_trait_object_safe() {
         use crate::providers::Provider;
         fn assert_send_sync<T: Send + Sync>() {}
@@ -8034,75 +7285,6 @@ mod p4_intelligence_validation {
     // 8. Intelligence Memory Validation
     // ---------------------------------------------------------------------------
 
-    #[test]
-    fn test_intelligence_memory_trait_impl() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let memory_path = dir.path().join("project_memory.json");
-        let memory = crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path)
-            .expect("should create memory");
-        fn assert_trait<T: crate::intelligence::memory::IntelligenceMemoryTrait>(_t: &T) {}
-        assert_trait(&memory);
-    }
-
-    #[test]
-    fn test_intelligence_memory_record_and_query() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let memory_path = dir.path().join("project_memory.json");
-
-        // Override the config dir for testing
-        let mut memory =
-            crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path)
-                .expect("should create memory");
-
-        memory.record_symbol(
-            "authenticate_user".to_string(),
-            "function".to_string(),
-            "auth.rs".to_string(),
-            "Core auth function".to_string(),
-        );
-        memory.record_pattern(
-            "Repository Pattern".to_string(),
-            "Uses repository pattern".to_string(),
-            vec!["auth.rs".to_string()],
-            0.9,
-        );
-        memory.record_convention("Use snake_case".to_string());
-
-        memory.save().expect("save should work");
-
-        let loaded = crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path)
-            .expect("reload should work");
-
-        assert!(!loaded.get_important_symbols().is_empty());
-        assert!(!loaded.get_architecture_patterns().is_empty());
-        assert!(!loaded.get_conventions().is_empty());
-    }
-
-    #[test]
-    fn test_intelligence_memory_analyze_project() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("test.db");
-        let memory_path = dir.path().join("project_memory.json");
-
-        let mut indexer =
-            crate::intelligence::index::CodeIndexer::new(db_path).expect("should create indexer");
-
-        let source = r#"pub fn authenticate_user(username: &str, password: &str) -> bool { true }"#;
-        let file_path = dir.path().join("auth.rs");
-        std::fs::write(&file_path, source).expect("write test file");
-        indexer.index_file(&file_path, source).expect("index");
-
-        let mut memory =
-            crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path)
-                .expect("should create memory");
-
-        memory
-            .analyze_project(&indexer)
-            .expect("project analysis should work");
-
-        assert!(!memory.get_important_symbols().is_empty());
-    }
-
     // ---------------------------------------------------------------------------
     // 9. LSP Foundation Validation
     // ---------------------------------------------------------------------------
@@ -8353,17 +7535,6 @@ impl AuthProvider for MemoryAuthProvider {
             .expect("reasoning should work");
         assert!(!reasoning.steps.is_empty());
         assert!(!reasoning.plan.is_empty());
-
-        // 6. Memory
-        let mem_dir = tempfile::tempdir().expect("tempdir");
-        let memory_path = mem_dir.path().join("project_memory.json");
-        let mut memory =
-            crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path)
-                .expect("memory should work");
-        memory
-            .analyze_project(&indexer)
-            .expect("project analysis should work");
-        assert!(!memory.get_important_symbols().is_empty());
 
         // 7. Diagnostics
         let mut diag = crate::intelligence::diagnostics::IntelligenceDiagnostics::new();
@@ -9101,108 +8272,6 @@ mod p45_validation {
         let _ = engine.analyze_for_code_understanding("test.rs");
         let _ = engine.find_existing_patterns("test");
         let _ = engine.suggest_implementation_approach("test");
-    }
-
-    // =========================================================================
-    // 8. INTELLIGENCE MEMORY VALIDATION
-    // =========================================================================
-
-    #[test]
-    fn test_persistence_contract_p45() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let memory_path = dir.path().join("project_memory.json");
-        let mut memory =
-            crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path)
-                .expect("should create memory");
-
-        memory.record_symbol(
-            "foo".to_string(),
-            "function".to_string(),
-            "a.rs".to_string(),
-            "important".to_string(),
-        );
-        memory.record_pattern(
-            "pattern".to_string(),
-            "desc".to_string(),
-            vec!["a.rs".to_string()],
-            0.9,
-        );
-        memory.record_convention("use snake_case".to_string());
-
-        memory.save().expect("save");
-
-        // Verify it can be reloaded and has the data
-        let loaded = crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path)
-            .expect("reload should work");
-        assert!(loaded.get_important_symbols().len() >= 1);
-        assert!(loaded.get_architecture_patterns().len() >= 1);
-    }
-
-    #[test]
-    fn test_session_isolation_p45() {
-        let dir1 = tempfile::tempdir().expect("tempdir1");
-        let dir2 = tempfile::tempdir().expect("tempdir2");
-        let memory_path1 = dir1.path().join("project_memory.json");
-        let memory_path2 = dir2.path().join("project_memory.json");
-
-        let memory1 = crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path1)
-            .expect("memory1");
-        let memory2 = crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path2)
-            .expect("memory2");
-
-        // Different instances should be independent
-        assert!(std::mem::size_of_val(&memory1) > 0);
-        assert!(std::mem::size_of_val(&memory2) > 0);
-    }
-
-    #[test]
-    fn test_cleanup_behavior_p45() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let memory_path = dir.path().join("project_memory.json");
-        let mut memory =
-            crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path)
-                .expect("should create memory");
-
-        memory.record_symbol(
-            "foo".to_string(),
-            "function".to_string(),
-            "a.rs".to_string(),
-            "important".to_string(),
-        );
-        memory.save().expect("save");
-
-        // After save, the in-memory count should be at least 1
-        let symbols_before = memory.get_important_symbols().len();
-        assert!(
-            symbols_before >= 1,
-            "should have at least 1 symbol, got {}",
-            symbols_before
-        );
-
-        // Adding another symbol
-        memory.record_symbol(
-            "bar".to_string(),
-            "function".to_string(),
-            "b.rs".to_string(),
-            "also important".to_string(),
-        );
-        let symbols_after = memory.get_important_symbols().len();
-        assert!(
-            symbols_after >= symbols_before,
-            "should have at least as many symbols after adding"
-        );
-    }
-
-    #[test]
-    fn test_interface_stability_p45() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let memory_path = dir.path().join("project_memory.json");
-        let mut memory =
-            crate::intelligence::memory::IntelligenceMemory::new_with_path(&memory_path)
-                .expect("should create memory");
-
-        fn assert_trait<T: crate::intelligence::memory::IntelligenceMemoryTrait>(_t: &mut T) {}
-        assert_trait(&mut memory);
     }
 
     // =========================================================================

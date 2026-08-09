@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **Sprint 25 — Architecture Consolidation (ADR-012)**
+  - Removed legacy `src/context/` (v0.3 context builder) — superseded by `engineering_context` + `assembly`.
+  - Removed legacy `src/prompt/` (v0.3 prompt assembly) — zero consumers; superseded by `prompt_builder`.
+  - Removed `intelligence/memory/` (`IntelligenceMemory`) — dead duplicate of `project_identity` / `engineering_facts`.
+  - Removed `reliability/health.rs` and `reliability/circuit_breaker.rs` — duplicates of the canonical `provider_runtime` health/circuit-breaker implementation. `reliability/` now contains only provider-agnostic generic infra.
+  - Removed the legacy `PromptCompiler::compile(13 params)` and `PromptBuilder::compile()/compile_with_default_template()` APIs. `compile_context(&EngineeringContext)` is the only public compile entry point.
+  - Removed `src/indexer/` (`RepositoryIndex`) — dead once its only consumers (legacy `src/context/`) were removed.
+  - Removed orphaned uncompiled files: `src/tests/concurrency.rs`, `src/tests/p3_validation.rs`, `src/tests/validation.rs`, `src/memory_runtime/tests.rs`.
+  - Removed ~90 tests that exercised only removed abstractions; migrated remaining tests to canonical owners.
+
+### Added
+- **Sprint 25 — Architecture Consolidation**
+  - `docs/ADR/ADR-012-architecture-consolidation.md` — canonical ownership decisions for Context, Intelligence/Memory, Prompt Compiler, Provider Reliability, Task/Workflow.
+
+### Changed
+- **Sprint 25 — Architecture Consolidation**
+  - `src/runtime/context.rs` no longer depends on `reliability::HealthMonitor`.
+  - Documentation updated to reflect the canonical architecture (README, architecture manifest/snapshot, ADR-008/010, contracts, Reliability Architecture Report).
+
 ### Added
 - **Sprint 23.0 Workspace Metadata Correction**
   - `ProjectIdentityRuntime::create` and `create_minimal` now persist the runtime's `workspace_root` into both the canonical `project_identity.json` and the `workspace.json` projection.

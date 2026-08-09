@@ -8,11 +8,11 @@
 
 use std::time::Instant;
 
+use super::diagnostics::ProjectIdentityDiagnostics;
 use super::identity::{
     DecisionStatus, EngineeringDecision, ProjectIdentity, RoadmapItem, RoadmapStatus,
 };
 use super::storage::ProjectIdentityStorage;
-use super::diagnostics::ProjectIdentityDiagnostics;
 use super::validation::{validate_identity, ValidationReport};
 
 /// Changes to apply to the project identity.
@@ -206,13 +206,12 @@ impl ProjectIdentityUpdater {
         // Validate before writing anything.
         if let Err(report) = self.validate_proposal(&identity) {
             let update_time_us = update_start.elapsed().as_micros() as u64;
-            let diagnostics = ProjectIdentityDiagnostics::new(
-                super::diagnostics::IdentitySource::Loaded,
-            )
-            .with_load_time(0)
-            .with_save_time(update_time_us)
-            .with_identity_updates(self.update_count)
-            .with_validation_errors(report.issue_count() as u32);
+            let diagnostics =
+                ProjectIdentityDiagnostics::new(super::diagnostics::IdentitySource::Loaded)
+                    .with_load_time(0)
+                    .with_save_time(update_time_us)
+                    .with_identity_updates(self.update_count)
+                    .with_validation_errors(report.issue_count() as u32);
             return Some(UpdateResult {
                 identity: current.clone(),
                 diagnostics,
@@ -225,12 +224,11 @@ impl ProjectIdentityUpdater {
         if let Err(e) = self.storage.save_all(&identity) {
             let update_time_us = update_start.elapsed().as_micros() as u64;
             self.update_count += 1;
-            let diagnostics = ProjectIdentityDiagnostics::new(
-                super::diagnostics::IdentitySource::Loaded,
-            )
-            .with_load_time(0)
-            .with_save_time(update_time_us)
-            .with_identity_updates(self.update_count);
+            let diagnostics =
+                ProjectIdentityDiagnostics::new(super::diagnostics::IdentitySource::Loaded)
+                    .with_load_time(0)
+                    .with_save_time(update_time_us)
+                    .with_identity_updates(self.update_count);
             return Some(UpdateResult {
                 identity: current.clone(),
                 diagnostics,
@@ -240,12 +238,11 @@ impl ProjectIdentityUpdater {
         let save_time_us = save_start.elapsed().as_micros() as u64;
 
         self.update_count += 1;
-        let diagnostics = ProjectIdentityDiagnostics::new(
-            super::diagnostics::IdentitySource::Loaded,
-        )
-        .with_load_time(0)
-        .with_save_time(save_time_us)
-        .with_identity_updates(self.update_count);
+        let diagnostics =
+            ProjectIdentityDiagnostics::new(super::diagnostics::IdentitySource::Loaded)
+                .with_load_time(0)
+                .with_save_time(save_time_us)
+                .with_identity_updates(self.update_count);
 
         Some(UpdateResult {
             identity,
@@ -311,12 +308,8 @@ mod tests {
     fn test_update_adds_decision() {
         let (mut updater, _tmp) = setup();
         let identity = ProjectIdentity::new("test", "rust");
-        let decision = EngineeringDecision::new(
-            "dec-1",
-            "Use Axum",
-            "Use Axum for the web server",
-            None,
-        );
+        let decision =
+            EngineeringDecision::new("dec-1", "Use Axum", "Use Axum for the web server", None);
         let changes = IdentityChanges {
             add_decisions: vec![decision],
             ..Default::default()
@@ -341,24 +334,27 @@ mod tests {
         let result = updater.update(&identity, changes).expect("update");
         assert!(result.applied);
         assert!(result.identity.has_sprint());
-        assert_eq!(result.identity.current_sprint, Some("sprint-23".to_string()));
+        assert_eq!(
+            result.identity.current_sprint,
+            Some("sprint-23".to_string())
+        );
     }
 
     #[test]
     fn test_update_completes_roadmap_item() {
         let (mut updater, _tmp) = setup();
-        let identity = ProjectIdentity::new("test", "rust")
-            .add_roadmap_item(RoadmapItem::new("item-1", "Fix auth bug", None));
+        let identity = ProjectIdentity::new("test", "rust").add_roadmap_item(RoadmapItem::new(
+            "item-1",
+            "Fix auth bug",
+            None,
+        ));
         let changes = IdentityChanges {
             complete_roadmap_item: Some("item-1".to_string()),
             ..Default::default()
         };
         let result = updater.update(&identity, changes).expect("update");
         assert!(result.applied);
-        assert_eq!(
-            result.identity.roadmap[0].status,
-            RoadmapStatus::Completed
-        );
+        assert_eq!(result.identity.roadmap[0].status, RoadmapStatus::Completed);
     }
 
     #[test]
@@ -413,7 +409,10 @@ mod tests {
         };
         let result = updater.update(&identity, changes).expect("update");
         assert!(result.applied);
-        assert_eq!(result.identity.important_files, vec!["Cargo.toml", "main.rs"]);
+        assert_eq!(
+            result.identity.important_files,
+            vec!["Cargo.toml", "main.rs"]
+        );
     }
 
     #[test]
@@ -432,8 +431,7 @@ mod tests {
     #[test]
     fn test_update_persists_all_projections() {
         let (mut updater, _tmp) = setup();
-        let identity = ProjectIdentity::new("test", "rust")
-            .with_architecture_summary("layered");
+        let identity = ProjectIdentity::new("test", "rust").with_architecture_summary("layered");
         let changes = IdentityChanges {
             add_constraints: vec!["no-raw-sql".to_string()],
             set_sprint: Some("sprint-23".to_string()),

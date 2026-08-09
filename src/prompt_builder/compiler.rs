@@ -58,106 +58,10 @@ impl PromptCompiler {
         self
     }
 
-    /// Compile a prompt from all available engineering context.
-    ///
-    /// # Arguments
-    /// * `system_prompt` — system identity content
-    /// * `project_name` — project name
-    /// * `project_info` — optional project metadata
-    /// * `intent_plan` — optional intent classification result
-    /// * `relevant_files` — assembled context files
-    /// * `conversation` — conversation history messages
-    /// * `memories` — engineering memory fragments
-    /// * `arch_rules` — architecture decision facts
-    /// * `fact_count` — total engineering fact count
-    /// * `diagnostics` — engineering diagnostics
-    /// * `active_files` — paths of currently active files
-    /// * `user_request` — the raw user request
-    /// * `context_budget_remaining` — tokens available for memory injection
-    pub fn compile(
-        &self,
-        system_prompt: &str,
-        project_name: &str,
-        project_info: Option<&ProjectInfoLike>,
-        intent_plan: Option<&IntentPlanLike>,
-        relevant_files: &[ContextFileLike],
-        conversation: &[ConversationMsgLike],
-        memories: &[MemoryFragment],
-        arch_rules: &[ArchitectureRuleLike],
-        fact_count: usize,
-        diagnostics: &[DiagnosticLike],
-        active_files: &[String],
-        user_request: &str,
-        context_budget_remaining: usize,
-    ) -> CompiledPrompt {
-        let start = Instant::now();
-
-        let template_selection = select_template(intent_plan, project_info);
-        let ordering = PromptOrdering::from_template(template_selection.template);
-        let mut diag = PromptDiagnostics::new(template_selection.template, start);
-
-        let mut prompt_parts: Vec<String> = Vec::new();
-        let mut section_count = 0;
-
-        for key in &ordering.keys {
-            let section = self.build_section(
-                *key,
-                system_prompt,
-                project_name,
-                project_info,
-                intent_plan,
-                relevant_files,
-                conversation,
-                memories,
-                arch_rules,
-                fact_count,
-                diagnostics,
-                active_files,
-                user_request,
-                context_budget_remaining,
-                &template_selection,
-            );
-
-            if section.is_empty() {
-                diag.drop_section(key.as_str());
-                continue;
-            }
-
-            let header = format!("=== {} ===\n", section.label);
-            let content = format!("{}{}", header, section.content);
-            prompt_parts.push(content);
-            diag.add_section(
-                &section.label,
-                section.content.len() + header.len(),
-                section.tokens,
-            );
-            section_count += 1;
-        }
-
-        let elapsed = start.elapsed();
-        let prompt = prompt_parts.join("\n\n");
-
-        let stats = PromptStatistics::new(template_selection.template, elapsed.as_nanos() as u64)
-            .with_section_count(section_count)
-            .with_estimated_tokens(diag.estimated_tokens)
-            .with_memory_fragments(memories.len())
-            .with_context_fragments(relevant_files.len());
-
-        diag.compile_duration_ms = elapsed.as_millis() as u64;
-
-        CompiledPrompt {
-            prompt,
-            statistics: stats,
-            diagnostics: diag,
-            template_selection,
-        }
-    }
-
     /// Compile a prompt from an `EngineeringContext`.
     ///
-    /// This is the canonical entry point introduced in Sprint 22.0.
-    /// It extracts all required fields from the context and delegates
-    /// to the same compilation pipeline as the parameterised `compile`.
+    /// This is the canonical entry point. It extracts all required
+    /// fields from the context and compiles them deterministically.
     pub fn compile_context(
         &self,
         context: &crate::engineering_context::EngineeringContext,
@@ -174,13 +78,16 @@ impl PromptCompiler {
             important_files: context.project.important_files.clone(),
         });
 
-        let intent_plan = context.task.as_ref().map(|t| super::sections::IntentPlanLike {
-            detected_goal: t.detected_goal.clone(),
-            intent_type: t.intent_type.clone(),
-            confidence: t.confidence,
-            ambiguity: t.ambiguity,
-            ambiguity_reason: t.ambiguity_reason.clone(),
-        });
+        let intent_plan = context
+            .task
+            .as_ref()
+            .map(|t| super::sections::IntentPlanLike {
+                detected_goal: t.detected_goal.clone(),
+                intent_type: t.intent_type.clone(),
+                confidence: t.confidence,
+                ambiguity: t.ambiguity,
+                ambiguity_reason: t.ambiguity_reason.clone(),
+            });
 
         let relevant_files: Vec<super::sections::ContextFileLike> = context
             .context_fragments
@@ -233,7 +140,9 @@ impl PromptCompiler {
         let fact_count = context.workspace_file_count() + context.fragment_count();
 
         let context_budget_remaining = context.runtime.budget_tokens.saturating_sub(
-            context.estimated_tokens().saturating_sub(context.user_request.len() / 4),
+            context
+                .estimated_tokens()
+                .saturating_sub(context.user_request.len() / 4),
         );
 
         let mut diag = PromptDiagnostics::new(
@@ -241,8 +150,7 @@ impl PromptCompiler {
             start,
         );
 
-        let template_selection =
-            select_template(intent_plan.as_ref(), project_info.as_ref());
+        let template_selection = select_template(intent_plan.as_ref(), project_info.as_ref());
         let ordering = PromptOrdering::from_template(template_selection.template);
 
         let mut prompt_parts: Vec<String> = Vec::new();
@@ -491,10 +399,165 @@ mod tests {
         }
     }
 
+    /// Build an `EngineeringContext` from the same logical inputs the
+    /// legacy parameterised `compile` accepted.
+    fn build_context(
+        system_prompt: &str,
+        project_name: &str,
+        project_info: Option<&ProjectInfoLike>,
+        intent_plan: Option<&IntentPlanLike>,
+        relevant_files: &[ContextFileLike],
+        conversation: &[ConversationMsgLike],
+        memories: &[MemoryFragment],
+        arch_rules: &[ArchitectureRuleLike],
+        fact_count: usize,
+        diagnostics: &[DiagnosticLike],
+        active_files: &[String],
+        user_request: &str,
+        context_budget_remaining: usize,
+    ) -> crate::engineering_context::EngineeringContext {
+        use crate::engineering_context::{
+            builder::EngineeringContextBuilder,
+            constraints::{ConstraintCategory, EngineeringConstraint},
+            identity::ProjectIdentity,
+            memory::{MemoryEntry, MemoryTier},
+            runtime::RuntimeContext,
+            workspace::{WorkspaceContext, WorkspaceFile},
+            ContextFragment, ConversationMessage, EngineeringMemoryContext, IntentPlan,
+        };
+
+        let mut builder = EngineeringContextBuilder::new();
+
+        let identity = match project_info {
+            Some(info) => {
+                let mut id = ProjectIdentity::new(&info.name, &info.language);
+                if let Some(ref fw) = info.framework {
+                    id = id.with_framework(fw);
+                }
+                if let Some(ref bs) = info.build_system {
+                    id = id.with_build_system(bs);
+                }
+                if let Some(ref pm) = info.package_manager {
+                    id = id.with_package_manager(pm);
+                }
+                if let Some(ref tf) = info.testing_framework {
+                    id = id.with_testing_framework(tf);
+                }
+                if !info.important_files.is_empty() {
+                    id = id.with_important_files(info.important_files.clone());
+                }
+                id
+            }
+            None => ProjectIdentity::new(project_name, "unknown"),
+        };
+        builder = builder.project(identity);
+
+        if let Some(plan) = intent_plan {
+            builder = builder.task(IntentPlan {
+                detected_goal: plan.detected_goal.clone(),
+                intent_type: plan.intent_type.clone(),
+                confidence: plan.confidence,
+                ambiguity: plan.ambiguity,
+                ambiguity_reason: plan.ambiguity_reason.clone(),
+            });
+        } else {
+            builder = builder.with_skip_validation();
+        }
+
+        let mut fragments: Vec<ContextFragment> = Vec::new();
+        for file in relevant_files {
+            fragments.push(ContextFragment {
+                source: file.path.clone(),
+                content: file.content.clone(),
+                relevance_score: 0.9,
+            });
+        }
+        for diag in diagnostics {
+            fragments.push(ContextFragment {
+                source: "diagnostic".to_string(),
+                content: diag.message.clone(),
+                relevance_score: 0.0,
+            });
+        }
+
+        let mut workspace = WorkspaceContext::new(".");
+        let mut pad = 0;
+        while fragments.len() + pad < fact_count {
+            workspace = workspace.with_file(WorkspaceFile {
+                path: format!("__fact_{}.rs", pad),
+                language: "rust".to_string(),
+                size_bytes: 16,
+            });
+            pad += 1;
+        }
+
+        if !fragments.is_empty() {
+            builder = builder.context_fragments(fragments);
+        }
+        if pad > 0 {
+            builder = builder.workspace(workspace);
+        }
+
+        if !conversation.is_empty() {
+            builder = builder.conversation(
+                conversation
+                    .iter()
+                    .map(|m| ConversationMessage {
+                        role: m.role.clone(),
+                        content: m.content.clone(),
+                    })
+                    .collect(),
+            );
+        }
+
+        if !memories.is_empty() {
+            builder = builder.memory(
+                EngineeringMemoryContext::new()
+                    .with_entries(
+                        memories
+                            .iter()
+                            .map(|m| MemoryEntry {
+                                key: m.key.clone(),
+                                value: m.value.clone(),
+                                confidence: 0.9,
+                                tier: MemoryTier::Project,
+                            })
+                            .collect(),
+                    )
+                    .with_budget(context_budget_remaining),
+            );
+        }
+
+        if !arch_rules.is_empty() {
+            let mut constraints = crate::engineering_context::constraints::ConstraintContext::new();
+            for rule in arch_rules {
+                constraints = constraints.add_constraint(EngineeringConstraint {
+                    description: rule.description.clone(),
+                    category: ConstraintCategory::Architecture,
+                });
+            }
+            builder = builder.constraints(constraints);
+        }
+
+        if !active_files.is_empty() {
+            builder = builder.active_files(active_files.to_vec());
+        }
+
+        if context_budget_remaining > 0 {
+            builder = builder.runtime(RuntimeContext::new().with_budget(context_budget_remaining));
+        }
+
+        builder
+            .user_request(user_request)
+            .system_prompt(system_prompt)
+            .build()
+            .expect("build should succeed")
+    }
+
     #[test]
     fn test_compile_basic() {
         let compiler = PromptCompiler::new();
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "",
             "test-project",
             Some(&sample_project_info()),
@@ -508,7 +571,7 @@ mod tests {
             &[],
             "Fix the auth bug",
             1000,
-        );
+        ));
 
         assert!(!result.prompt.is_empty());
         assert!(result.statistics.section_count > 0);
@@ -521,7 +584,7 @@ mod tests {
     #[test]
     fn test_compile_empty_inputs() {
         let compiler = PromptCompiler::new();
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "",
             "empty-project",
             None,
@@ -535,7 +598,7 @@ mod tests {
             &[],
             "",
             1000,
-        );
+        ));
 
         assert!(!result.prompt.is_empty());
         assert!(result.statistics.section_count >= 2);
@@ -564,14 +627,16 @@ mod tests {
             1000,
         );
 
-        let r1 = compiler.compile(
+        let ctx1 = build_context(
             inputs.0, inputs.1, inputs.2, inputs.3, inputs.4, inputs.5, inputs.6, inputs.7,
             inputs.8, inputs.9, inputs.10, inputs.11, inputs.12,
         );
-        let r2 = compiler.compile(
+        let ctx2 = build_context(
             inputs.0, inputs.1, inputs.2, inputs.3, inputs.4, inputs.5, inputs.6, inputs.7,
             inputs.8, inputs.9, inputs.10, inputs.11, inputs.12,
         );
+        let r1 = compiler.compile_context(&ctx1);
+        let r2 = compiler.compile_context(&ctx2);
 
         assert_eq!(r1.prompt, r2.prompt);
         assert_eq!(r1.statistics.section_count, r2.statistics.section_count);
@@ -613,7 +678,7 @@ mod tests {
     #[test]
     fn test_diagnostics_tracks_sections() {
         let compiler = PromptCompiler::new();
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "You are CodeBro",
             "proj",
             Some(&sample_project_info()),
@@ -634,7 +699,7 @@ mod tests {
             &["src/main.rs".to_string()],
             "Fix it",
             1000,
-        );
+        ));
 
         assert!(result.diagnostics.total_length > 0);
         assert!(result.diagnostics.section_sizes.len() >= 3);
@@ -654,7 +719,7 @@ mod tests {
             ambiguity: false,
             ambiguity_reason: None,
         };
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "system",
             "proj",
             None,
@@ -668,7 +733,7 @@ mod tests {
             &[],
             "Plan sprint",
             1000,
-        );
+        ));
         assert_eq!(result.template_selection.template, PromptTemplate::Planning);
     }
 
@@ -682,7 +747,7 @@ mod tests {
             ambiguity: false,
             ambiguity_reason: None,
         };
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "system",
             "proj",
             None,
@@ -696,7 +761,7 @@ mod tests {
             &[],
             "Design architecture",
             1000,
-        );
+        ));
         assert_eq!(
             result.template_selection.template,
             PromptTemplate::Architecture
@@ -713,7 +778,7 @@ mod tests {
             ambiguity: false,
             ambiguity_reason: None,
         };
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "system",
             "proj",
             None,
@@ -727,7 +792,7 @@ mod tests {
             &[],
             "Write tests",
             1000,
-        );
+        ));
         assert_eq!(result.template_selection.template, PromptTemplate::Testing);
     }
 
@@ -741,7 +806,7 @@ mod tests {
             ambiguity: false,
             ambiguity_reason: None,
         };
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "system",
             "proj",
             None,
@@ -755,7 +820,7 @@ mod tests {
             &[],
             "Document API",
             1000,
-        );
+        ));
         assert_eq!(
             result.template_selection.template,
             PromptTemplate::Documentation
@@ -765,7 +830,7 @@ mod tests {
     #[test]
     fn test_compile_prefers_canonical_order() {
         let compiler = PromptCompiler::new();
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "sys",
             "proj",
             None,
@@ -779,7 +844,7 @@ mod tests {
             &[],
             "request",
             1000,
-        );
+        ));
         // System Identity should appear before User Request
         let sys_pos = result.prompt.find("System Identity").unwrap();
         let req_pos = result.prompt.find("User Request").unwrap();
@@ -790,7 +855,7 @@ mod tests {
     fn test_compile_no_hashmap_ordering() {
         // Verify determinism by compiling the same input twice
         let compiler = PromptCompiler::new();
-        let result1 = compiler.compile(
+        let ctx1 = build_context(
             "sys",
             "proj",
             Some(&sample_project_info()),
@@ -816,7 +881,7 @@ mod tests {
             "test",
             1000,
         );
-        let result2 = compiler.compile(
+        let ctx2 = build_context(
             "sys",
             "proj",
             Some(&sample_project_info()),
@@ -842,6 +907,8 @@ mod tests {
             "test",
             1000,
         );
+        let result1 = compiler.compile_context(&ctx1);
+        let result2 = compiler.compile_context(&ctx2);
         assert_eq!(result1.prompt, result2.prompt);
     }
 
@@ -863,7 +930,7 @@ mod tests {
             ambiguity: false,
             ambiguity_reason: None,
         };
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "system",
             "proj",
             None,
@@ -877,7 +944,7 @@ mod tests {
             &[],
             "test",
             1000,
-        );
+        ));
         assert!(result.prompt.contains("No raw SQL"));
         assert!(result.prompt.contains("anyhow"));
     }
@@ -895,7 +962,7 @@ mod tests {
                 message: "type mismatch".to_string(),
             },
         ];
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "system",
             "proj",
             None,
@@ -909,7 +976,7 @@ mod tests {
             &[],
             "test",
             1000,
-        );
+        ));
         assert!(result.prompt.contains("42"));
         assert!(result.prompt.contains("type mismatch"));
     }
@@ -927,7 +994,7 @@ mod tests {
                 content: "Hi there!".to_string(),
             },
         ];
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "system",
             "proj",
             None,
@@ -941,7 +1008,7 @@ mod tests {
             &[],
             "Next request",
             1000,
-        );
+        ));
         assert!(result.prompt.contains("Hello"));
         assert!(result.prompt.contains("Hi there!"));
     }
@@ -956,7 +1023,7 @@ mod tests {
             ambiguity: false,
             ambiguity_reason: None,
         };
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "system",
             "proj",
             None,
@@ -974,7 +1041,7 @@ mod tests {
             ],
             "test",
             1000,
-        );
+        ));
         assert!(result.prompt.contains("src/main.rs"));
         assert!(result.prompt.contains("src/lib.rs"));
         assert!(result.prompt.contains("Cargo.toml"));
@@ -990,7 +1057,7 @@ mod tests {
             ambiguity: true,
             ambiguity_reason: Some("Vague request".to_string()),
         };
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "system",
             "proj",
             None,
@@ -1004,7 +1071,7 @@ mod tests {
             &[],
             "Do something",
             1000,
-        );
+        ));
         assert!(result.prompt.contains("Ambiguous intent"));
         assert!(result.prompt.contains("Vague request"));
     }
@@ -1012,7 +1079,7 @@ mod tests {
     #[test]
     fn test_compiled_prompt_api() {
         let compiler = PromptCompiler::new();
-        let result = compiler.compile(
+        let result = compiler.compile_context(&build_context(
             "sys",
             "proj",
             None,
@@ -1026,7 +1093,7 @@ mod tests {
             &[],
             "req",
             1000,
-        );
+        ));
         assert!(!result.is_empty());
         assert!(result.length() > 0);
         assert!(result.estimated_tokens() > 0);
@@ -1072,11 +1139,12 @@ mod tests {
                     .with_budget(1000),
             )
             .constraints(
-                crate::engineering_context::constraints::ConstraintContext::new()
-                    .add_constraint(EngineeringConstraint {
+                crate::engineering_context::constraints::ConstraintContext::new().add_constraint(
+                    EngineeringConstraint {
                         description: "No raw SQL".to_string(),
                         category: ConstraintCategory::Architecture,
-                    }),
+                    },
+                ),
             )
             .context_fragment(ContextFragment {
                 source: "src/main.rs".to_string(),
@@ -1103,9 +1171,7 @@ mod tests {
     #[test]
     fn test_compile_context_deterministic() {
         use crate::engineering_context::{
-            builder::EngineeringContextBuilder,
-            identity::ProjectIdentity,
-            IntentPlan,
+            builder::EngineeringContextBuilder, identity::ProjectIdentity, IntentPlan,
         };
 
         let context1 = EngineeringContextBuilder::new()
@@ -1148,9 +1214,7 @@ mod tests {
     #[test]
     fn test_compile_context_empty() {
         use crate::engineering_context::{
-            builder::EngineeringContextBuilder,
-            identity::ProjectIdentity,
-            IntentPlan,
+            builder::EngineeringContextBuilder, identity::ProjectIdentity, IntentPlan,
         };
 
         let context = EngineeringContextBuilder::new()

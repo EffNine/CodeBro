@@ -71,8 +71,7 @@ impl Default for ProjectIdentityStatistics {
             roadmap_items: 0,
             known_modules: 0,
             last_update: String::new(),
-            schema_version: crate::project_identity::identity::CURRENT_SCHEMA_VERSION
-                .to_string(),
+            schema_version: crate::project_identity::identity::CURRENT_SCHEMA_VERSION.to_string(),
             important_file_count: 0,
             pattern_count: 0,
             convention_count: 0,
@@ -118,8 +117,7 @@ mod tests {
             .add_knowledge_module("db");
         let stats = ProjectIdentityStatistics::from_identity(&id);
         let json = serde_json::to_string(&stats).expect("serialize");
-        let decoded: ProjectIdentityStatistics =
-            serde_json::from_str(&json).expect("deserialize");
+        let decoded: ProjectIdentityStatistics = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(stats.known_modules, decoded.known_modules);
         assert_eq!(stats.schema_version, decoded.schema_version);
     }

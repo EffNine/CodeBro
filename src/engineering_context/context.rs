@@ -106,7 +106,9 @@ impl EngineeringContext {
             .iter()
             .map(|m| format!("[{}]: {}", m.role, m.content).len() / 4)
             .sum();
-        fragment_tokens + memory_tokens + conversation_tokens
+        fragment_tokens
+            + memory_tokens
+            + conversation_tokens
             + self.user_request.len() / 4
             + self.system_prompt.len() / 4
     }
@@ -179,11 +181,10 @@ mod tests {
                     .with_budget(1000),
             )
             .constraints(
-                ConstraintContext::new()
-                    .add_constraint(EngineeringConstraint {
-                        description: "No raw SQL".to_string(),
-                        category: ConstraintCategory::Architecture,
-                    }),
+                ConstraintContext::new().add_constraint(EngineeringConstraint {
+                    description: "No raw SQL".to_string(),
+                    category: ConstraintCategory::Architecture,
+                }),
             )
             .task(IntentPlan {
                 detected_goal: "fix bug".to_string(),

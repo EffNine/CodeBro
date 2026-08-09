@@ -63,7 +63,7 @@ pub mod diagnostics; // Platform diagnostics
 | `SemanticSearch` | `search` | Search indexed symbols |
 | `ContextBuilder` | `context` | Build context for agents |
 | `ReasoningEngine` | `reasoning` | Analyze code changes |
-| `IntelligenceMemory` | `memory` | Persist project knowledge |
+| ~~`IntelligenceMemory`~~ | ~~`memory`~~ | Removed in ADR-012 — project knowledge is owned by `project_identity`; fact model by `engineering_facts` |
 | `LspFoundation` | `lsp` | LSP protocol types |
 | `IntelligenceDiagnostics` | `diagnostics` | Platform health monitoring |
 

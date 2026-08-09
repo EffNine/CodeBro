@@ -106,14 +106,16 @@ a single type to depend on. It also:
 ### 3.2 Negative Consequences
 
 - New module (`engineering_context/`) adds to the crate surface.
-- Existing `compile(13+ params)` still exists; both APIs coexist.
+- ~~Existing `compile(13+ params)` still exists; both APIs coexist.~~ The
+  legacy `compile(13+ params)` API was removed in ADR-012; `compile_context`
+  is the sole public compile entry point.
 - Builders add indirection compared to direct field assignment.
 
 ### 3.3 Trade-offs
 
 | Aspect | Trade-off | Mitigation |
 |--------|-----------|------------|
-| API surface | Two `compile` methods exist | `compile_context` is the canonical path; `compile` remains for direct use |
+| API surface | ~~Two `compile` methods exist~~ | `compile_context` is the sole public compile API (legacy `compile` removed in ADR-012) |
 | Module count | New `engineering_context/` module | Small, focused module; well-documented |
 | Immutability | Builders must create new contexts | Clone-on-write is unnecessary; builders are cheap |
 | Serialization | Adds dependency on `serde` | Already a dependency; no new crates |
@@ -122,7 +124,7 @@ a single type to depend on. It also:
 
 | Module | Impact |
 |--------|--------|
-| `prompt_builder` | Gains `compile_context()` method; existing `compile()` preserved |
+| `prompt_builder` | ~~Gains `compile_context()` method; existing `compile()` preserved~~ `compile_context()` is the only compile entry point (ADR-012 removed `compile()`) |
 | `assembly` | Produces fragments that seed `EngineeringContext` |
 | `providers` | Reads `RuntimeContext` for provider metadata |
 | Future modules | Implement `EngineeringContextProvider` trait |
@@ -180,9 +182,9 @@ compiler.compile_context(&context);
 
 ### 5.3 Migration Steps
 
-1. New code uses `EngineeringContextBuilder` and `compile_context`.
-2. Existing code continues to use `compile(13+ params)`.
-3. Future sprints migrate callers of `compile` to `compile_context`.
+1. All code uses `EngineeringContextBuilder` and `compile_context`.
+2. ~~Existing code continues to use `compile(13+ params)`.~~ Removed in ADR-012;
+   `compile_context(&EngineeringContext)` is the only public compile entry point.
 
 ---
 

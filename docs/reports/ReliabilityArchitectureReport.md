@@ -2,7 +2,15 @@
 
 **Date:** 2026-08-05
 **Phase:** P2 Reliability Layer
-**Status:** Complete
+**Status:** Complete — superseded in part by ADR-012
+
+> **Update (ADR-012):** `src/reliability/health.rs` and
+> `src/reliability/circuit_breaker.rs` were removed in ADR-012 because they
+> duplicated the canonical provider reliability implementation in
+> `provider_runtime` (health, circuit breaker, retry, routing, failover).
+> `reliability/` now contains only provider-agnostic generic infrastructure:
+> `error.rs`, `timeout.rs`, `resource_guard.rs`, `diagnostics.rs`, `logging.rs`.
+> Sections 3.3 (Health) and 3.4 (Circuit Breaker) below are historical.
 
 ---
 
@@ -21,8 +29,6 @@ src/reliability/
 ├── mod.rs                  # Module entry, re-exports
 ├── error.rs                # RuntimeErrorCategory, classify_error()
 ├── timeout.rs              # TimeoutManager, TimeoutConfig
-├── health.rs               # HealthMonitor, HealthStatus, HealthEntry
-├── circuit_breaker.rs      # CircuitBreaker, CircuitState
 ├── resource_guard.rs       # ResourceGuard, ResourceStatus
 ├── diagnostics.rs          # Diagnostics, FailureTrace, RecoveryTrace
 └── logging.rs              # StructuredLogger, LogSink, LogEntry

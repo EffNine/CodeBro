@@ -8,7 +8,9 @@ use super::types::{
     EngineeringMemoryEntry, EngineeringMemoryMetadata, EngineeringMemoryResolveError,
     EngineeringMemoryResolveResult,
 };
-use crate::engineering_context::memory::{EngineeringMemoryContext, MemoryEntry as ContextMemoryEntry, MemoryTier as ContextMemoryTier};
+use crate::engineering_context::memory::{
+    EngineeringMemoryContext, MemoryEntry as ContextMemoryEntry, MemoryTier as ContextMemoryTier,
+};
 
 /// Fixed budgets for memory resolution.
 pub const DEFAULT_MAX_ENTRIES: usize = 20;
@@ -106,10 +108,8 @@ impl EngineeringMemoryResolver {
         });
 
         // Step 5: enforce entry budget.
-        let budgeted: Vec<&EngineeringMemoryEntry> = ranked
-            .into_iter()
-            .take(self.max_entries)
-            .collect();
+        let budgeted: Vec<&EngineeringMemoryEntry> =
+            ranked.into_iter().take(self.max_entries).collect();
 
         // Step 6: enforce token budget and map.
         let mut selected = Vec::new();
@@ -157,7 +157,14 @@ mod tests {
     use super::*;
     use crate::engineering_memory::types::{EngineeringMemoryEntry, EngineeringMemoryMetadata};
 
-    fn entry(id: &str, key: &str, value: &str, confidence: f64, importance: f64, tags: &[String]) -> EngineeringMemoryEntry {
+    fn entry(
+        id: &str,
+        key: &str,
+        value: &str,
+        confidence: f64,
+        importance: f64,
+        tags: &[String],
+    ) -> EngineeringMemoryEntry {
         let mut meta = EngineeringMemoryMetadata::new()
             .with_confidence(confidence)
             .with_importance(importance);
@@ -171,7 +178,10 @@ mod tests {
     fn test_resolve_empty_entries() {
         let resolver = EngineeringMemoryResolver::default();
         let result = resolver.resolve(&[], &["auth".to_string()], &[]);
-        assert!(matches!(result, Err(EngineeringMemoryResolveError::NoMatches)));
+        assert!(matches!(
+            result,
+            Err(EngineeringMemoryResolveError::NoMatches)
+        ));
     }
 
     #[test]
@@ -225,9 +235,7 @@ mod tests {
             entry("e1", "low", "value", 0.2, 0.5, &[]),
             entry("e2", "high", "value", 0.9, 0.8, &[]),
         ];
-        let result = resolver
-            .resolve(&entries, &[], &[])
-            .expect("resolve");
+        let result = resolver.resolve(&entries, &[], &[]).expect("resolve");
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].key, "high");
     }

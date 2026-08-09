@@ -74,10 +74,7 @@ pub fn apply_migrations(identity: ProjectIdentity) -> MigrationResult {
             let before = current.schema_version.clone();
             current = (migration.apply)(current);
             migrations_applied += 1;
-            migration_log.push(format!(
-                "migrated {} → {}",
-                before, current.schema_version
-            ));
+            migration_log.push(format!("migrated {} → {}", before, current.schema_version));
         }
     }
 
@@ -115,8 +112,7 @@ mod tests {
 
     #[test]
     fn test_migration_logs() {
-        let identity = ProjectIdentity::new("migrated", "go")
-            .with_workspace_root("/tmp/old");
+        let identity = ProjectIdentity::new("migrated", "go").with_workspace_root("/tmp/old");
         let migrated = ProjectIdentity {
             schema_version: "0.9.0".to_string(),
             ..identity

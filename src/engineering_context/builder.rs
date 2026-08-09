@@ -7,13 +7,13 @@ use std::time::Instant;
 use chrono::Utc;
 
 use super::constraints::ConstraintContext;
+use super::context::{ContextFragment, ConversationMessage, EngineeringContext, IntentPlan};
 use super::diagnostics::EngineeringContextDiagnostics;
 use super::identity::ProjectIdentity;
 use super::memory::EngineeringMemoryContext;
 use super::runtime::RuntimeContext;
 use super::statistics::EngineeringContextStatistics;
 use super::workspace::WorkspaceContext;
-use super::context::{ContextFragment, ConversationMessage, EngineeringContext, IntentPlan};
 
 /// Errors that can occur during context construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,10 +170,7 @@ impl EngineeringContextBuilder {
             .clone()
             .unwrap_or_else(ConstraintContext::new);
 
-        let runtime = self
-            .runtime
-            .clone()
-            .unwrap_or_else(RuntimeContext::new);
+        let runtime = self.runtime.clone().unwrap_or_else(RuntimeContext::new);
 
         let build_duration_ms = build_start.elapsed().as_millis() as u64;
 
@@ -194,16 +191,8 @@ impl EngineeringContextBuilder {
             workspace.file_count(),
             estimated_tokens,
         )
-        .with_provider(
-            runtime
-                .provider_name()
-                .map(|s| s.to_string()),
-        )
-        .with_template(
-            self.task
-                .as_ref()
-                .map(|t| t.intent_type.clone()),
-        );
+        .with_provider(runtime.provider_name().map(|s| s.to_string()))
+        .with_template(self.task.as_ref().map(|t| t.intent_type.clone()));
 
         let statistics = EngineeringContextStatistics::new()
             .with_file_count(workspace.file_count())
@@ -262,8 +251,7 @@ fn estimate_context_tokens(
     system_prompt: &str,
     conversation: &[ConversationMessage],
 ) -> usize {
-    let fragment_tokens: usize =
-        fragments.iter().map(|f| f.content.len() / 4).sum();
+    let fragment_tokens: usize = fragments.iter().map(|f| f.content.len() / 4).sum();
     let memory_tokens: usize = memory
         .entries
         .iter()
@@ -273,7 +261,9 @@ fn estimate_context_tokens(
         .iter()
         .map(|m| format!("[{}]: {}", m.role, m.content).len() / 4)
         .sum();
-    fragment_tokens + memory_tokens + conversation_tokens
+    fragment_tokens
+        + memory_tokens
+        + conversation_tokens
         + user_request.len() / 4
         + system_prompt.len() / 4
 }
@@ -318,11 +308,10 @@ mod tests {
                     .with_budget(500),
             )
             .constraints(
-                ConstraintContext::new()
-                    .add_constraint(EngineeringConstraint {
-                        description: "No raw SQL".to_string(),
-                        category: ConstraintCategory::Architecture,
-                    }),
+                ConstraintContext::new().add_constraint(EngineeringConstraint {
+                    description: "No raw SQL".to_string(),
+                    category: ConstraintCategory::Architecture,
+                }),
             )
             .user_request("Fix the auth bug")
             .system_prompt("You are CodeBro")
@@ -350,7 +339,10 @@ mod tests {
                 ambiguity_reason: None,
             })
             .build();
-        assert_eq!(result.unwrap_err(), ContextBuildError::MissingProjectIdentity);
+        assert_eq!(
+            result.unwrap_err(),
+            ContextBuildError::MissingProjectIdentity
+        );
     }
 
     #[test]
@@ -558,7 +550,10 @@ mod tests {
         assert_eq!(ctx.workspace.root_path, "/home/user/project");
         assert_eq!(ctx.memory.entry_count(), 2);
         assert_eq!(ctx.constraint_count(), 2);
-        assert_eq!(ctx.active_files, vec!["go.mod".to_string(), "main.go".to_string()]);
+        assert_eq!(
+            ctx.active_files,
+            vec!["go.mod".to_string(), "main.go".to_string()]
+        );
         assert_eq!(ctx.conversation.len(), 2);
         assert_eq!(ctx.runtime.provider_name(), Some("openai"));
         assert!(!ctx.is_empty());

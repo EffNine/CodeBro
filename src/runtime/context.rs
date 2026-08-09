@@ -19,7 +19,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::reliability::{HealthMonitor, ResourceGuard, TimeoutManager};
+use crate::reliability::{ResourceGuard, TimeoutManager};
 
 /// Shared context passed through every phase of the runtime pipeline.
 ///
@@ -57,9 +57,6 @@ pub struct RuntimeContext {
     /// Timeout manager shared across pipeline phases.
     pub timeout_manager: TimeoutManager,
 
-    /// Health monitor shared across pipeline phases.
-    pub health_monitor: HealthMonitor,
-
     /// Resource guard shared across pipeline phases.
     pub resource_guard: ResourceGuard,
 
@@ -81,7 +78,6 @@ impl RuntimeContext {
             act_loop_count: 0,
             max_act_loops: 5,
             timeout_manager: TimeoutManager::new(),
-            health_monitor: HealthMonitor::new(),
             resource_guard: ResourceGuard::new(),
             shutdown_requested: false,
         }
@@ -100,7 +96,6 @@ impl RuntimeContext {
             act_loop_count: 0,
             max_act_loops: 5,
             timeout_manager: TimeoutManager::new(),
-            health_monitor: HealthMonitor::new(),
             resource_guard: ResourceGuard::new(),
             shutdown_requested: false,
         }

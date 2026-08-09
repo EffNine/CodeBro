@@ -93,9 +93,7 @@ impl EngineeringMemoryStore {
     pub fn load(&self, expected_root: &str) -> Result<EngineeringMemoryFile, StorageError> {
         let path = self.memory_path();
         if !path.exists() {
-            return Err(StorageError::NotFound(
-                format!("{}", path.display()),
-            ));
+            return Err(StorageError::NotFound(format!("{}", path.display())));
         }
         let content = fs::read_to_string(&path)?;
         let file: EngineeringMemoryFile = serde_json::from_str(&content)?;
@@ -120,8 +118,7 @@ impl EngineeringMemoryStore {
             .map_err(|e| StorageError::Write(e.to_string()))?;
         f.write_all(json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
-        f.flush()
-            .map_err(|e| StorageError::Write(e.to_string()))?;
+        f.flush().map_err(|e| StorageError::Write(e.to_string()))?;
         Ok(())
     }
 
@@ -138,12 +135,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_entry(id: &str, key: &str, value: &str) -> EngineeringMemoryEntry {
-        EngineeringMemoryEntry::new(id, key, value)
-            .with_metadata(
-                EngineeringMemoryMetadata::new()
-                    .with_confidence(0.9)
-                    .with_importance(0.8),
-            )
+        EngineeringMemoryEntry::new(id, key, value).with_metadata(
+            EngineeringMemoryMetadata::new()
+                .with_confidence(0.9)
+                .with_importance(0.8),
+        )
     }
 
     fn setup() -> (EngineeringMemoryStore, TempDir) {
@@ -180,10 +176,7 @@ mod tests {
         store.save(&file).expect("save");
 
         let result = store.load("/tmp/different-project");
-        assert!(matches!(
-            result,
-            Err(StorageError::WrongWorkspaceRoot(_))
-        ));
+        assert!(matches!(result, Err(StorageError::WrongWorkspaceRoot(_))));
     }
 
     #[test]
@@ -194,10 +187,7 @@ mod tests {
         store.save(&file).expect("save");
 
         let result = store.load("/tmp/test");
-        assert!(matches!(
-            result,
-            Err(StorageError::WrongSchemaVersion(_))
-        ));
+        assert!(matches!(result, Err(StorageError::WrongSchemaVersion(_))));
     }
 
     #[test]

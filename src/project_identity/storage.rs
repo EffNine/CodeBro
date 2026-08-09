@@ -5,7 +5,7 @@
 //! ## Storage Layout
 //!
 //! | File | Content |
- //! |------|---------|
+//! |------|---------|
 //! | `project_identity.json` | Full identity snapshot |
 //! | `workspace.json` | Workspace metadata |
 //! | `architecture.json` | Architecture summary and patterns |
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::identity::{ProjectIdentity, EngineeringDecision, RoadmapItem};
+use super::identity::{EngineeringDecision, ProjectIdentity, RoadmapItem};
 
 /// Error type for storage operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,9 +90,7 @@ pub(crate) struct MetadataFile {
 impl ProjectIdentityStorage {
     /// Create a new storage backend pointing at `<workspace_root>/.codebro/`.
     pub fn new(workspace_root: impl AsRef<Path>) -> Self {
-        let codebro_dir = workspace_root
-            .as_ref()
-            .join(".codebro");
+        let codebro_dir = workspace_root.as_ref().join(".codebro");
         ProjectIdentityStorage { codebro_dir }
     }
 
@@ -154,10 +152,7 @@ impl ProjectIdentityStorage {
     }
 
     /// Write the full `ProjectIdentity` to `project_identity.json`.
-    pub fn save_identity(
-        &self,
-        identity: &ProjectIdentity,
-    ) -> Result<(), StorageError> {
+    pub fn save_identity(&self, identity: &ProjectIdentity) -> Result<(), StorageError> {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(identity)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
@@ -174,22 +169,16 @@ impl ProjectIdentityStorage {
     pub fn load_identity(&self) -> Result<ProjectIdentity, StorageError> {
         let path = self.identity_path();
         if !path.exists() {
-            return Err(StorageError::NotFound(
-                format!("{}", path.display()),
-            ));
+            return Err(StorageError::NotFound(format!("{}", path.display())));
         }
-        let content = fs::read_to_string(&path)
-            .map_err(|e| StorageError::Read(e.to_string()))?;
+        let content = fs::read_to_string(&path).map_err(|e| StorageError::Read(e.to_string()))?;
         let identity: ProjectIdentity =
             serde_json::from_str(&content).map_err(|e| StorageError::Deserialize(e.to_string()))?;
         Ok(identity)
     }
 
     /// Write workspace metadata to `workspace.json`.
-    pub fn save_workspace(
-        &self,
-        root_path: &str,
-    ) -> Result<(), StorageError> {
+    pub fn save_workspace(&self, root_path: &str) -> Result<(), StorageError> {
         self.ensure_directory()?;
         #[derive(Serialize)]
         struct WorkspaceMeta {
@@ -243,10 +232,7 @@ impl ProjectIdentityStorage {
     }
 
     /// Write engineering decisions to `engineering_decisions.json`.
-    pub fn save_decisions(
-        &self,
-        decisions: &[EngineeringDecision],
-    ) -> Result<(), StorageError> {
+    pub fn save_decisions(&self, decisions: &[EngineeringDecision]) -> Result<(), StorageError> {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(decisions)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
@@ -260,10 +246,7 @@ impl ProjectIdentityStorage {
     }
 
     /// Write constraints to `constraints.json`.
-    pub fn save_constraints(
-        &self,
-        constraints: &[String],
-    ) -> Result<(), StorageError> {
+    pub fn save_constraints(&self, constraints: &[String]) -> Result<(), StorageError> {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(constraints)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
@@ -277,10 +260,7 @@ impl ProjectIdentityStorage {
     }
 
     /// Write roadmap to `roadmap.json`.
-    pub fn save_roadmap(
-        &self,
-        items: &[RoadmapItem],
-    ) -> Result<(), StorageError> {
+    pub fn save_roadmap(&self, items: &[RoadmapItem]) -> Result<(), StorageError> {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(items)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
@@ -294,10 +274,7 @@ impl ProjectIdentityStorage {
     }
 
     /// Write current sprint to `current_sprint.json`.
-    pub fn save_sprint(
-        &self,
-        sprint: &str,
-    ) -> Result<(), StorageError> {
+    pub fn save_sprint(&self, sprint: &str) -> Result<(), StorageError> {
         self.ensure_directory()?;
         #[derive(Serialize)]
         struct SprintData {
@@ -353,12 +330,7 @@ impl ProjectIdentityStorage {
     /// the supplementary files are derived, inspectable views.
     pub fn save_all(&self, identity: &ProjectIdentity) -> Result<(), StorageError> {
         self.save_identity(identity)?;
-        self.save_workspace(
-            identity
-                .workspace_root
-                .as_deref()
-                .unwrap_or_default(),
-        )?;
+        self.save_workspace(identity.workspace_root.as_deref().unwrap_or_default())?;
         // Always write architecture projection, even when empty.
         self.save_architecture(
             identity.architecture_summary.as_deref().unwrap_or(""),
@@ -368,9 +340,7 @@ impl ProjectIdentityStorage {
         self.save_constraints(&identity.known_constraints)?;
         self.save_roadmap(&identity.roadmap)?;
         // Always write sprint projection, even when empty.
-        self.save_sprint(
-            identity.current_sprint.as_deref().unwrap_or(""),
-        )?;
+        self.save_sprint(identity.current_sprint.as_deref().unwrap_or(""))?;
         self.save_metadata(
             &identity.schema_version,
             identity.created_at.as_deref().unwrap_or_default(),
@@ -383,12 +353,9 @@ impl ProjectIdentityStorage {
     pub fn load_metadata(&self) -> Result<MetadataFile, StorageError> {
         let path = self.metadata_path();
         if !path.exists() {
-            return Err(StorageError::NotFound(
-                format!("{}", path.display()),
-            ));
+            return Err(StorageError::NotFound(format!("{}", path.display())));
         }
-        let content = fs::read_to_string(&path)
-            .map_err(|e| StorageError::Read(e.to_string()))?;
+        let content = fs::read_to_string(&path).map_err(|e| StorageError::Read(e.to_string()))?;
         let meta: MetadataFile =
             serde_json::from_str(&content).map_err(|e| StorageError::Deserialize(e.to_string()))?;
         Ok(meta)
@@ -440,19 +407,15 @@ mod tests {
     #[test]
     fn test_save_and_load_decisions() {
         let (storage, _tmp) = setup();
-        let decisions = vec![
-            EngineeringDecision::new(
-                "dec-1",
-                "Use Rust",
-                "Use Rust for the core",
-                None,
-            ),
-        ];
+        let decisions = vec![EngineeringDecision::new(
+            "dec-1",
+            "Use Rust",
+            "Use Rust for the core",
+            None,
+        )];
         storage.save_decisions(&decisions).expect("save");
-        let content = fs::read_to_string(storage.decisions_path())
-            .expect("read");
-        let loaded: Vec<EngineeringDecision> =
-            serde_json::from_str(&content).expect("parse");
+        let content = fs::read_to_string(storage.decisions_path()).expect("read");
+        let loaded: Vec<EngineeringDecision> = serde_json::from_str(&content).expect("parse");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "dec-1");
     }
@@ -465,10 +428,8 @@ mod tests {
             "Use context for timeouts".to_string(),
         ];
         storage.save_constraints(&constraints).expect("save");
-        let content = fs::read_to_string(storage.constraints_path())
-            .expect("read");
-        let loaded: Vec<String> =
-            serde_json::from_str(&content).expect("parse");
+        let content = fs::read_to_string(storage.constraints_path()).expect("read");
+        let loaded: Vec<String> = serde_json::from_str(&content).expect("parse");
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0], "No raw SQL");
     }
@@ -476,14 +437,10 @@ mod tests {
     #[test]
     fn test_save_and_load_roadmap() {
         let (storage, _tmp) = setup();
-        let items = vec![
-            RoadmapItem::new("item-1", "Fix auth bug", None),
-        ];
+        let items = vec![RoadmapItem::new("item-1", "Fix auth bug", None)];
         storage.save_roadmap(&items).expect("save");
-        let content = fs::read_to_string(storage.roadmap_path())
-            .expect("read");
-        let loaded: Vec<RoadmapItem> =
-            serde_json::from_str(&content).expect("parse");
+        let content = fs::read_to_string(storage.roadmap_path()).expect("read");
+        let loaded: Vec<RoadmapItem> = serde_json::from_str(&content).expect("parse");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "item-1");
     }
@@ -492,14 +449,12 @@ mod tests {
     fn test_save_and_load_sprint() {
         let (storage, _tmp) = setup();
         storage.save_sprint("sprint-23").expect("save");
-        let content = fs::read_to_string(storage.sprint_path())
-            .expect("read");
+        let content = fs::read_to_string(storage.sprint_path()).expect("read");
         #[derive(Deserialize)]
         struct SprintFile {
             current_sprint: String,
         }
-        let loaded: SprintFile =
-            serde_json::from_str(&content).expect("parse");
+        let loaded: SprintFile = serde_json::from_str(&content).expect("parse");
         assert_eq!(loaded.current_sprint, "sprint-23");
     }
 
@@ -531,11 +486,9 @@ mod tests {
             .add_important_file("main.go")
             .add_important_file("go.mod");
         storage.save_identity(&identity).expect("save");
-        let content1 = fs::read_to_string(storage.identity_path())
-            .expect("read");
+        let content1 = fs::read_to_string(storage.identity_path()).expect("read");
         // Re-serialise the same identity and compare.
-        let content2 = serde_json::to_string_pretty(&identity)
-            .expect("re-serialize");
+        let content2 = serde_json::to_string_pretty(&identity).expect("re-serialize");
         assert_eq!(content1.trim(), content2.trim());
     }
 
@@ -545,9 +498,12 @@ mod tests {
         let identity = ProjectIdentity::new("all-proj", "rust")
             .with_architecture_summary("layered")
             .add_knowledge_pattern("mvc")
-            .add_engineering_decision(
-                EngineeringDecision::new("dec-1", "Use Rust", "Core language", None),
-            )
+            .add_engineering_decision(EngineeringDecision::new(
+                "dec-1",
+                "Use Rust",
+                "Core language",
+                None,
+            ))
             .add_known_constraint("no-raw-sql")
             .add_roadmap_item(RoadmapItem::new("item-1", "Fix bug", None))
             .with_current_sprint("sprint-23")

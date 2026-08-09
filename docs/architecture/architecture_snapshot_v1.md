@@ -248,7 +248,12 @@ pub trait ReasoningEngine: Send + Sync {
 }
 ```
 
-### 2.8 IntelligenceMemory (Memory Interface)
+### 2.8 ~~IntelligenceMemory~~ (Removed — ADR-012)
+
+> **Removed:** `intelligence/memory/` (`IntelligenceMemory`) was deleted in
+> ADR-012 as a duplicate of the canonical `project_identity` and
+> `engineering_facts` architecture. The trait below is retained for historical
+> reference only.
 
 ```rust
 pub trait IntelligenceMemory: Send + Sync {

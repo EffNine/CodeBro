@@ -36,9 +36,7 @@ pub struct EmptyEngineeringMemoryProvider {
 
 impl EmptyEngineeringMemoryProvider {
     pub fn new(name: impl Into<String>) -> Self {
-        EmptyEngineeringMemoryProvider {
-            name: name.into(),
-        }
+        EmptyEngineeringMemoryProvider { name: name.into() }
     }
 }
 

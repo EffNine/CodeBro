@@ -96,7 +96,7 @@ The Intelligence Platform adopts a **trait-abstracted, diagnostics-rich, contrac
 | `intelligence/search/` | Exposes `SemanticSearch` trait with pluggable scoring |
 | `intelligence/context/` | Exposes `ContextBuilder` trait; integrates search + graph |
 | `intelligence/reasoning/` | Exposes `ReasoningEngine` trait |
-| `intelligence/memory/` | Exposes `IntelligenceMemory` trait |
+| ~~`intelligence/memory/`~~ | Removed in ADR-012 — project knowledge is owned by `project_identity`; fact model by `engineering_facts` |
 | `intelligence/lsp/` | Exposes `LspFoundation` trait; stubs for future LSP server |
 | `intelligence/diagnostics/` | **New** — `IntelligenceDiagnostics` trait with parse/index/graph/search/context metrics |
 

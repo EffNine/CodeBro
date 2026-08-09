@@ -18,7 +18,9 @@ use super::types::{
     EngineeringMemoryResolveError,
 };
 use crate::engineering_context::memory::EngineeringMemoryContext;
-use crate::memory_runtime::{MemoryEntry as RuntimeMemoryEntry, MemoryPolicy, MemoryRuntime, MemoryTier};
+use crate::memory_runtime::{
+    MemoryEntry as RuntimeMemoryEntry, MemoryPolicy, MemoryRuntime, MemoryTier,
+};
 use crate::project_identity::ProjectIdentityProvider;
 
 /// Errors that can occur during engineering memory operations.
@@ -241,7 +243,10 @@ impl<P: ProjectIdentityProvider + Clone> EngineeringMemoryRuntime<P> {
         task_keywords: &[String],
         active_file_tags: &[String],
     ) -> EngineeringMemoryContext {
-        match self.resolver.resolve(&self.entries, task_keywords, active_file_tags) {
+        match self
+            .resolver
+            .resolve(&self.entries, task_keywords, active_file_tags)
+        {
             Ok(context) => context,
             Err(EngineeringMemoryResolveError::NoMatches) => EngineeringMemoryContext::new(),
             Err(e) => {
@@ -282,20 +287,20 @@ impl<P: ProjectIdentityProvider + Clone> EngineeringMemoryRuntime<P> {
     fn sync_to_runtime(&mut self) {
         // Clear and rebuild the runtime's project-tier entries from our
         // canonical in-memory list. This keeps the runtime and our store in sync.
-        let project_entries: Vec<RuntimeMemoryEntry> = self
-            .entries
-            .iter()
-            .map(|e| {
-                RuntimeMemoryEntry::new(&e.id, MemoryTier::Project, &e.key, &e.value)
-                    .with_metadata(crate::memory_runtime::MemoryMetadata {
-                        importance: e.metadata.importance,
-                        confidence: e.metadata.confidence,
-                        tags: e.metadata.tags.clone(),
-                        source: e.metadata.source.clone(),
-                        context: None,
-                    })
-            })
-            .collect();
+        let project_entries: Vec<RuntimeMemoryEntry> =
+            self.entries
+                .iter()
+                .map(|e| {
+                    RuntimeMemoryEntry::new(&e.id, MemoryTier::Project, &e.key, &e.value)
+                        .with_metadata(crate::memory_runtime::MemoryMetadata {
+                            importance: e.metadata.importance,
+                            confidence: e.metadata.confidence,
+                            tags: e.metadata.tags.clone(),
+                            source: e.metadata.source.clone(),
+                            context: None,
+                        })
+                })
+                .collect();
 
         // We can't clear the runtime directly, so we rebuild by removing old
         // project entries and inserting fresh ones. The runtime is a simple
@@ -350,7 +355,8 @@ impl<P: ProjectIdentityProvider + Clone> EngineeringMemoryProvider for Engineeri
 
 /// Create an empty engineering memory runtime (for testing / stubbing).
 #[cfg(test)]
-pub fn empty_runtime() -> EngineeringMemoryRuntime<crate::project_identity::ProjectIdentityRuntime> {
+pub fn empty_runtime() -> EngineeringMemoryRuntime<crate::project_identity::ProjectIdentityRuntime>
+{
     let tmp = tempfile::tempdir().expect("temp dir");
     let mut identity = crate::project_identity::ProjectIdentityRuntime::new(tmp.path());
     let _ = identity.create_minimal("empty", "rust");
@@ -365,13 +371,12 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_entry(id: &str, key: &str, value: &str) -> EngineeringMemoryEntry {
-        EngineeringMemoryEntry::new(id, key, value)
-            .with_metadata(
-                EngineeringMemoryMetadata::new()
-                    .with_confidence(0.9)
-                    .with_importance(0.8)
-                    .with_tag("backend"),
-            )
+        EngineeringMemoryEntry::new(id, key, value).with_metadata(
+            EngineeringMemoryMetadata::new()
+                .with_confidence(0.9)
+                .with_importance(0.8)
+                .with_tag("backend"),
+        )
     }
 
     fn setup() -> (EngineeringMemoryRuntime<ProjectIdentityRuntime>, TempDir) {
@@ -385,7 +390,9 @@ mod tests {
     #[test]
     fn test_record_and_snapshot() {
         let (mut runtime, _tmp) = setup();
-        runtime.record(make_entry("e1", "language", "rust")).unwrap();
+        runtime
+            .record(make_entry("e1", "language", "rust"))
+            .unwrap();
         let snap = runtime.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].key, "language");
@@ -394,7 +401,9 @@ mod tests {
     #[test]
     fn test_update_persists_value() {
         let (mut runtime, _tmp) = setup();
-        runtime.record(make_entry("e1", "language", "rust")).unwrap();
+        runtime
+            .record(make_entry("e1", "language", "rust"))
+            .unwrap();
         runtime.update("e1", "go").unwrap();
         let snap = runtime.snapshot();
         assert_eq!(snap[0].value, "go");
@@ -403,7 +412,9 @@ mod tests {
     #[test]
     fn test_delete_removes_entry() {
         let (mut runtime, _tmp) = setup();
-        runtime.record(make_entry("e1", "language", "rust")).unwrap();
+        runtime
+            .record(make_entry("e1", "language", "rust"))
+            .unwrap();
         runtime.delete("e1").unwrap();
         assert_eq!(runtime.entry_count(), 0);
     }
@@ -418,7 +429,9 @@ mod tests {
     #[test]
     fn test_duplicate_record_fails() {
         let (mut runtime, _tmp) = setup();
-        runtime.record(make_entry("e1", "language", "rust")).unwrap();
+        runtime
+            .record(make_entry("e1", "language", "rust"))
+            .unwrap();
         let result = runtime.record(make_entry("e1", "language", "go"));
         assert!(result.is_err());
     }
@@ -426,8 +439,12 @@ mod tests {
     #[test]
     fn test_persist_and_reload() {
         let (mut runtime, _tmp) = setup();
-        runtime.record(make_entry("e1", "language", "rust")).unwrap();
-        runtime.record(make_entry("e2", "framework", "axum")).unwrap();
+        runtime
+            .record(make_entry("e1", "language", "rust"))
+            .unwrap();
+        runtime
+            .record(make_entry("e2", "framework", "axum"))
+            .unwrap();
         runtime.persist().expect("persist");
 
         // Create a fresh runtime pointing to the same directory.
@@ -451,7 +468,10 @@ mod tests {
 
         // Loading into our runtime should fail.
         let result = runtime.load();
-        assert!(matches!(result, Err(EngineeringMemoryError::WrongProject(_))));
+        assert!(matches!(
+            result,
+            Err(EngineeringMemoryError::WrongProject(_))
+        ));
         // In-memory state must be unchanged.
         assert_eq!(runtime.entry_count(), 0);
     }
@@ -467,7 +487,10 @@ mod tests {
         runtime.store.save(&file).expect("save");
 
         let result = runtime.load();
-        assert!(matches!(result, Err(EngineeringMemoryError::WrongSchema(_))));
+        assert!(matches!(
+            result,
+            Err(EngineeringMemoryError::WrongSchema(_))
+        ));
         assert_eq!(runtime.entry_count(), 0);
     }
 
@@ -481,8 +504,12 @@ mod tests {
     #[test]
     fn test_resolve_with_entries() {
         let (mut runtime, _tmp) = setup();
-        runtime.record(make_entry("e1", "auth_module", "jwt based")).unwrap();
-        runtime.record(make_entry("e2", "database", "postgres")).unwrap();
+        runtime
+            .record(make_entry("e1", "auth_module", "jwt based"))
+            .unwrap();
+        runtime
+            .record(make_entry("e2", "database", "postgres"))
+            .unwrap();
         runtime.persist().expect("persist");
 
         let mut reload = {
@@ -502,14 +529,20 @@ mod tests {
         let (mut runtime, _tmp) = setup();
         runtime
             .record(
-                EngineeringMemoryEntry::new("e1", "frontend", "react")
-                    .with_metadata(EngineeringMemoryMetadata::new().with_confidence(0.9).with_tag("ui")),
+                EngineeringMemoryEntry::new("e1", "frontend", "react").with_metadata(
+                    EngineeringMemoryMetadata::new()
+                        .with_confidence(0.9)
+                        .with_tag("ui"),
+                ),
             )
             .unwrap();
         runtime
             .record(
-                EngineeringMemoryEntry::new("e2", "backend", "axum")
-                    .with_metadata(EngineeringMemoryMetadata::new().with_confidence(0.9).with_tag("ui")),
+                EngineeringMemoryEntry::new("e2", "backend", "axum").with_metadata(
+                    EngineeringMemoryMetadata::new()
+                        .with_confidence(0.9)
+                        .with_tag("ui"),
+                ),
             )
             .unwrap();
         runtime.persist().expect("persist");
@@ -536,7 +569,9 @@ mod tests {
     fn test_memory_never_alters_project_identity() {
         let (mut runtime, _tmp) = setup();
         let before = runtime.identity_provider().snapshot();
-        runtime.record(make_entry("e1", "language", "rust")).unwrap();
+        runtime
+            .record(make_entry("e1", "language", "rust"))
+            .unwrap();
         runtime.persist().expect("persist");
         let after = runtime.identity_provider().snapshot();
         assert_eq!(before.name, after.name);
@@ -551,13 +586,17 @@ mod tests {
         let mut identity_a = ProjectIdentityRuntime::new(tmp_a.path());
         let _ = identity_a.create_minimal("proj-a", "rust");
         let mut runtime_a = EngineeringMemoryRuntime::new(tmp_a.path(), identity_a);
-        runtime_a.record(make_entry("e1", "key", "value-a")).unwrap();
+        runtime_a
+            .record(make_entry("e1", "key", "value-a"))
+            .unwrap();
         runtime_a.persist().expect("persist a");
 
         let mut identity_b = ProjectIdentityRuntime::new(tmp_b.path());
         let _ = identity_b.create_minimal("proj-b", "go");
         let mut runtime_b = EngineeringMemoryRuntime::new(tmp_b.path(), identity_b);
-        runtime_b.record(make_entry("e1", "key", "value-b")).unwrap();
+        runtime_b
+            .record(make_entry("e1", "key", "value-b"))
+            .unwrap();
         runtime_b.persist().expect("persist b");
 
         // Reload each and verify isolation.
@@ -586,7 +625,9 @@ mod tests {
     fn test_deterministic_resolve_same_inputs() {
         let (mut runtime, _tmp) = setup();
         runtime.record(make_entry("e1", "auth", "jwt")).unwrap();
-        runtime.record(make_entry("e2", "database", "postgres")).unwrap();
+        runtime
+            .record(make_entry("e2", "database", "postgres"))
+            .unwrap();
         runtime.persist().expect("persist");
 
         let reload = {

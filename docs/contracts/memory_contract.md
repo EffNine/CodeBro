@@ -1,9 +1,21 @@
 # Memory Contract
 
 **Version:** 1.0.0
-**Status:** Accepted
+**Status:** ~~Accepted~~ **Obsolete**
 **Date:** 2026-08-05
 **Owner:** CodeBro Engineering
+
+> **OBSOLETE (ADR-012):** This contract describes `IntelligenceMemory`
+> (`intelligence/memory/`, `~/.codebro/project_memory.json`), which was removed
+> in ADR-012 as a duplicate of the canonical `project_identity` /
+> `engineering_memory` architecture. Retained below for historical reference.
+> Canonical memory owners:
+> - Persistent project engineering knowledge → `src/project_identity/`
+>   (`.codebro/project_identity.json`)
+> - Curated task-relevant memory → `src/engineering_memory/`
+>   (`.codebro/engineering_memory.json`)
+> - Immutable code-understanding fact model → `src/engineering_facts/` + `src/fact_store/`
+> - Generic in-memory tiered runtime → `src/memory_runtime/`
 
 ---
 

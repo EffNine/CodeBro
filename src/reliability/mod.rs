@@ -13,16 +13,16 @@
 //!   retryability and escalation metadata.
 //! - **Timeout Management** (`timeout`): Centralized timeout handling with
 //!   per-provider and per-tool configuration.
-//! - **Health Monitoring** (`health`): Tracks health of providers, tools,
-//!   runtime, and resources with degradation thresholds.
-//! - **Circuit Breaker** (`circuit_breaker`): Prevents cascading failures
-//!   with closed → open → half-open state transitions.
 //! - **Resource Guard** (`resource_guard`): Enforces memory and operation
 //!   limits with graceful shutdown support.
 //! - **Diagnostics** (`diagnostics`): Structured failure and recovery traces
 //!   with correlation IDs for post-mortem analysis.
 //! - **Structured Logging** (`logging`): Consistent logging with correlation
 //!   IDs and pluggable log sinks.
+//!
+//! Provider health, circuit breaking, retry, routing, and failover are owned
+//! by `provider_runtime` (the canonical provider reliability owner). This
+//! module intentionally provides only provider-agnostic infrastructure.
 //!
 //! # Thread Safety
 //!
@@ -35,18 +35,14 @@
 //! existing traits (`Provider`, `Tool`, `AgentEvent`) or the state machine
 //! (`RuntimeState`). Instead, it wraps and observes existing operations.
 
-pub mod circuit_breaker;
 pub mod diagnostics;
 pub mod error;
-pub mod health;
 pub mod logging;
 pub mod resource_guard;
 pub mod timeout;
 
-pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use diagnostics::{Diagnostics, FailureTrace, RecoveryTrace};
 pub use error::{classify_error, from_message, RuntimeError, RuntimeErrorCategory};
-pub use health::{HealthMonitor, HealthStatus, HealthTarget};
 pub use logging::{ConsoleLogSink, LogEntry, LogLevel, LogSink, MemoryLogSink, StructuredLogger};
 pub use resource_guard::{ResourceGuard, ResourceGuardConfig, ResourceStatus};
 pub use timeout::{TimeoutConfig, TimeoutKind, TimeoutManager};

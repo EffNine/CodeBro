@@ -38,8 +38,7 @@ impl WorkspaceContext {
 
     pub fn with_file(mut self, file: WorkspaceFile) -> Self {
         self.relevant_files.push(file);
-        self.relevant_files
-            .sort_by(|a, b| a.path.cmp(&b.path));
+        self.relevant_files.sort_by(|a, b| a.path.cmp(&b.path));
         self
     }
 

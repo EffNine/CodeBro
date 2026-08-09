@@ -6,12 +6,9 @@
 
 use super::compiler::{CompiledPrompt, PromptCompiler};
 use super::ordering::PromptOrdering;
-use super::template::{PromptTemplate, SectionKey, TemplateSelection};
+use super::template::{PromptTemplate, TemplateSelection};
 
-use super::sections::{
-    ArchitectureRuleLike, ContextFileLike, ConversationMsgLike, DiagnosticLike, IntentPlanLike,
-    MemoryFragment, ProjectInfoLike,
-};
+use super::sections::{IntentPlanLike, ProjectInfoLike};
 
 /// The Prompt Builder — compiles engineering context into a prompt.
 ///
@@ -54,92 +51,15 @@ impl PromptBuilder {
         self
     }
 
-    /// Compile a prompt from all available context sources.
+    /// Compile a prompt from an `EngineeringContext`.
     ///
-    /// This is the main entry point. All inputs are optional; the
-    /// compiler handles missing data gracefully.
-    ///
-    /// # Arguments
-    /// * `system_prompt` — system identity content (from ContextConfig or default)
-    /// * `project_name` — project name
-    /// * `project_info` — optional project metadata from scanner
-    /// * `intent_plan` — optional intent classification from intent engine
-    /// * `relevant_files` — assembled context files from context builder
-    /// * `conversation` — conversation history messages
-    /// * `memories` — engineering memory fragments from memory runtime
-    /// * `arch_rules` — architecture decision facts from engineering facts
-    /// * `fact_count` — total engineering fact count
-    /// * `diagnostics` — engineering diagnostics
-    /// * `active_files` — currently active file paths
-    /// * `user_request` — the raw user request
-    /// * `context_budget_remaining` — token budget remaining after other sections
-    pub fn compile(
+    /// This is the canonical entry point. It delegates to the
+    /// `PromptCompiler`'s `compile_context`.
+    pub fn compile_context(
         &self,
-        system_prompt: &str,
-        project_name: &str,
-        project_info: Option<&ProjectInfoLike>,
-        intent_plan: Option<&IntentPlanLike>,
-        relevant_files: &[ContextFileLike],
-        conversation: &[ConversationMsgLike],
-        memories: &[MemoryFragment],
-        arch_rules: &[ArchitectureRuleLike],
-        fact_count: usize,
-        diagnostics: &[DiagnosticLike],
-        active_files: &[String],
-        user_request: &str,
-        context_budget_remaining: usize,
+        context: &crate::engineering_context::EngineeringContext,
     ) -> CompiledPrompt {
-        self.compiler.compile(
-            system_prompt,
-            project_name,
-            project_info,
-            intent_plan,
-            relevant_files,
-            conversation,
-            memories,
-            arch_rules,
-            fact_count,
-            diagnostics,
-            active_files,
-            user_request,
-            context_budget_remaining,
-        )
-    }
-
-    /// Compile using the default template for selection.
-    pub fn compile_with_default_template(
-        &self,
-        system_prompt: &str,
-        project_name: &str,
-        project_info: Option<&ProjectInfoLike>,
-        intent_plan: Option<&IntentPlanLike>,
-        relevant_files: &[ContextFileLike],
-        conversation: &[ConversationMsgLike],
-        memories: &[MemoryFragment],
-        arch_rules: &[ArchitectureRuleLike],
-        fact_count: usize,
-        diagnostics: &[DiagnosticLike],
-        active_files: &[String],
-        user_request: &str,
-        context_budget_remaining: usize,
-    ) -> CompiledPrompt {
-        let mut builder = self.clone();
-        builder.default_template = self.default_template;
-        builder.compile(
-            system_prompt,
-            project_name,
-            project_info,
-            intent_plan,
-            relevant_files,
-            conversation,
-            memories,
-            arch_rules,
-            fact_count,
-            diagnostics,
-            active_files,
-            user_request,
-            context_budget_remaining,
-        )
+        self.compiler.compile_context(context)
     }
 
     /// Get the selected template for a given intent (without full compilation).
@@ -165,7 +85,166 @@ impl Default for PromptBuilder {
 
 #[cfg(test)]
 mod tests {
+    use super::super::sections::{
+        ArchitectureRuleLike, ContextFileLike, ConversationMsgLike, DiagnosticLike, MemoryFragment,
+    };
+    use super::super::template::SectionKey;
     use super::*;
+
+    /// Build an `EngineeringContext` from the same logical inputs the
+    /// legacy parameterised `compile` accepted.
+    fn build_context(
+        system_prompt: &str,
+        project_name: &str,
+        project_info: Option<&ProjectInfoLike>,
+        intent_plan: Option<&IntentPlanLike>,
+        relevant_files: &[ContextFileLike],
+        conversation: &[ConversationMsgLike],
+        memories: &[MemoryFragment],
+        arch_rules: &[ArchitectureRuleLike],
+        fact_count: usize,
+        diagnostics: &[DiagnosticLike],
+        active_files: &[String],
+        user_request: &str,
+        context_budget_remaining: usize,
+    ) -> crate::engineering_context::EngineeringContext {
+        use crate::engineering_context::{
+            builder::EngineeringContextBuilder,
+            constraints::{ConstraintCategory, EngineeringConstraint},
+            identity::ProjectIdentity,
+            memory::{MemoryEntry, MemoryTier},
+            runtime::RuntimeContext,
+            workspace::{WorkspaceContext, WorkspaceFile},
+            ContextFragment, ConversationMessage, EngineeringMemoryContext, IntentPlan,
+        };
+
+        let mut builder = EngineeringContextBuilder::new();
+
+        let identity = match project_info {
+            Some(info) => {
+                let mut id = ProjectIdentity::new(&info.name, &info.language);
+                if let Some(ref fw) = info.framework {
+                    id = id.with_framework(fw);
+                }
+                if let Some(ref bs) = info.build_system {
+                    id = id.with_build_system(bs);
+                }
+                if let Some(ref pm) = info.package_manager {
+                    id = id.with_package_manager(pm);
+                }
+                if let Some(ref tf) = info.testing_framework {
+                    id = id.with_testing_framework(tf);
+                }
+                if !info.important_files.is_empty() {
+                    id = id.with_important_files(info.important_files.clone());
+                }
+                id
+            }
+            None => ProjectIdentity::new(project_name, "unknown"),
+        };
+        builder = builder.project(identity);
+
+        if let Some(plan) = intent_plan {
+            builder = builder.task(IntentPlan {
+                detected_goal: plan.detected_goal.clone(),
+                intent_type: plan.intent_type.clone(),
+                confidence: plan.confidence,
+                ambiguity: plan.ambiguity,
+                ambiguity_reason: plan.ambiguity_reason.clone(),
+            });
+        } else {
+            builder = builder.with_skip_validation();
+        }
+
+        let mut fragments: Vec<ContextFragment> = Vec::new();
+        for file in relevant_files {
+            fragments.push(ContextFragment {
+                source: file.path.clone(),
+                content: file.content.clone(),
+                relevance_score: 0.9,
+            });
+        }
+        for diag in diagnostics {
+            fragments.push(ContextFragment {
+                source: "diagnostic".to_string(),
+                content: diag.message.clone(),
+                relevance_score: 0.0,
+            });
+        }
+
+        let mut workspace = WorkspaceContext::new(".");
+        let mut pad = 0;
+        while fragments.len() + pad < fact_count {
+            workspace = workspace.with_file(WorkspaceFile {
+                path: format!("__fact_{}.rs", pad),
+                language: "rust".to_string(),
+                size_bytes: 16,
+            });
+            pad += 1;
+        }
+
+        if !fragments.is_empty() {
+            builder = builder.context_fragments(fragments);
+        }
+        if pad > 0 {
+            builder = builder.workspace(workspace);
+        }
+
+        if !conversation.is_empty() {
+            builder = builder.conversation(
+                conversation
+                    .iter()
+                    .map(|m| ConversationMessage {
+                        role: m.role.clone(),
+                        content: m.content.clone(),
+                    })
+                    .collect(),
+            );
+        }
+
+        if !memories.is_empty() {
+            builder = builder.memory(
+                EngineeringMemoryContext::new()
+                    .with_entries(
+                        memories
+                            .iter()
+                            .map(|m| MemoryEntry {
+                                key: m.key.clone(),
+                                value: m.value.clone(),
+                                confidence: 0.9,
+                                tier: MemoryTier::Project,
+                            })
+                            .collect(),
+                    )
+                    .with_budget(context_budget_remaining),
+            );
+        }
+
+        if !arch_rules.is_empty() {
+            let mut constraints = crate::engineering_context::constraints::ConstraintContext::new();
+            for rule in arch_rules {
+                constraints = constraints.add_constraint(EngineeringConstraint {
+                    description: rule.description.clone(),
+                    category: ConstraintCategory::Architecture,
+                });
+            }
+            builder = builder.constraints(constraints);
+        }
+
+        if !active_files.is_empty() {
+            builder = builder.active_files(active_files.to_vec());
+        }
+
+        if context_budget_remaining > 0 {
+            builder = builder.runtime(RuntimeContext::new().with_budget(context_budget_remaining));
+        }
+
+        builder
+            .user_request(user_request)
+            .system_prompt(system_prompt)
+            .build()
+            .expect("build should succeed")
+    }
 
     #[test]
     fn test_builder_creation() {
@@ -179,7 +258,7 @@ mod tests {
             PromptOrdering::from_keys(vec![SectionKey::SystemIdentity, SectionKey::UserRequest]);
         let builder = PromptBuilder::with_ordering(ordering);
         // Compiler has custom ordering; default should still work
-        let result = builder.compile(
+        let result = builder.compile_context(&build_context(
             "system",
             "proj",
             None,
@@ -193,14 +272,14 @@ mod tests {
             &[],
             "hello",
             1000,
-        );
+        ));
         assert!(!result.prompt.is_empty());
     }
 
     #[test]
     fn test_builder_empty_compile() {
         let builder = PromptBuilder::new();
-        let result = builder.compile(
+        let result = builder.compile_context(&build_context(
             "",
             "my-project",
             None,
@@ -214,7 +293,7 @@ mod tests {
             &[],
             "",
             1000,
-        );
+        ));
         assert!(!result.prompt.is_empty());
         assert!(result.statistics.section_count > 0);
     }
@@ -238,14 +317,16 @@ mod tests {
             500,
         );
 
-        let r1 = builder.compile(
+        let ctx1 = build_context(
             inputs.0, inputs.1, inputs.2, inputs.3, inputs.4, inputs.5, inputs.6, inputs.7,
             inputs.8, inputs.9, inputs.10, inputs.11, inputs.12,
         );
-        let r2 = builder.compile(
+        let ctx2 = build_context(
             inputs.0, inputs.1, inputs.2, inputs.3, inputs.4, inputs.5, inputs.6, inputs.7,
             inputs.8, inputs.9, inputs.10, inputs.11, inputs.12,
         );
+        let r1 = builder.compile_context(&ctx1);
+        let r2 = builder.compile_context(&ctx2);
 
         assert_eq!(r1.prompt, r2.prompt);
     }
@@ -274,7 +355,7 @@ mod tests {
             ambiguity: false,
             ambiguity_reason: None,
         };
-        let result = builder.compile(
+        let result = builder.compile_context(&build_context(
             "system",
             "myproj",
             None,
@@ -288,7 +369,7 @@ mod tests {
             &[],
             "Add auth module",
             1000,
-        );
+        ));
         assert_eq!(
             result.template_selection.template,
             PromptTemplate::Engineering
@@ -305,7 +386,7 @@ mod tests {
             ambiguity: false,
             ambiguity_reason: None,
         };
-        let result = builder.compile(
+        let result = builder.compile_context(&build_context(
             "system",
             "myproj",
             None,
@@ -319,7 +400,7 @@ mod tests {
             &[],
             "Review auth module",
             1000,
-        );
+        ));
         assert_eq!(result.template_selection.template, PromptTemplate::Review);
     }
 
@@ -333,7 +414,7 @@ mod tests {
             ambiguity: false,
             ambiguity_reason: None,
         };
-        let result = builder.compile(
+        let result = builder.compile_context(&build_context(
             "system",
             "myproj",
             None,
@@ -347,7 +428,7 @@ mod tests {
             &[],
             "Fix login bug",
             1000,
-        );
+        ));
         assert_eq!(
             result.template_selection.template,
             PromptTemplate::Debugging
@@ -364,7 +445,7 @@ mod tests {
             ambiguity: false,
             ambiguity_reason: None,
         };
-        let result = builder.compile(
+        let result = builder.compile_context(&build_context(
             "system",
             "myproj",
             None,
@@ -378,7 +459,7 @@ mod tests {
             &[],
             "Refactor auth",
             1000,
-        );
+        ));
         assert_eq!(
             result.template_selection.template,
             PromptTemplate::Refactoring
@@ -402,7 +483,7 @@ mod tests {
                 value: "no clippy warnings".to_string(),
             },
         ];
-        let result = builder.compile(
+        let result = builder.compile_context(&build_context(
             "system",
             "myproj",
             None,
@@ -416,7 +497,7 @@ mod tests {
             &[],
             "Hello",
             500,
-        );
+        ));
         assert!(result.prompt.contains("rust"));
         assert!(result.prompt.contains("axum"));
         assert!(result.prompt.contains("no clippy warnings"));
@@ -434,7 +515,7 @@ mod tests {
             testing_framework: Some("cargo test".to_string()),
             important_files: vec!["main.rs".to_string()],
         };
-        let result = builder.compile(
+        let result = builder.compile_context(&build_context(
             "system",
             "myproj",
             Some(&info),
@@ -448,7 +529,7 @@ mod tests {
             &[],
             "Hello",
             500,
-        );
+        ));
         assert!(result.prompt.contains("axum"));
         assert!(result.prompt.contains("cargo"));
         assert!(result.prompt.contains("rust"));
@@ -466,7 +547,7 @@ mod tests {
             testing_framework: None,
             important_files: vec!["main.rs".to_string(), "Cargo.toml".to_string()],
         };
-        let result = builder.compile(
+        let result = builder.compile_context(&build_context(
             "system",
             "codebro",
             Some(&info),
@@ -480,7 +561,7 @@ mod tests {
             &[],
             "Test",
             500,
-        );
+        ));
         assert!(result.prompt.contains("codebro"));
         assert!(result.prompt.contains("actix-web"));
         assert!(result.prompt.contains("main.rs"));
@@ -502,7 +583,7 @@ mod tests {
                 content: format!("Message number {}", i),
             })
             .collect();
-        let result = builder.compile(
+        let result = builder.compile_context(&build_context(
             "system",
             "large-proj",
             None,
@@ -516,7 +597,7 @@ mod tests {
             &[],
             "Process large context",
             5000,
-        );
+        ));
         assert!(!result.prompt.is_empty());
         assert!(result.statistics.section_count > 0);
     }
@@ -524,7 +605,7 @@ mod tests {
     #[test]
     fn test_builder_statistics_exposed() {
         let builder = PromptBuilder::new();
-        let result = builder.compile(
+        let result = builder.compile_context(&build_context(
             "system",
             "proj",
             None,
@@ -548,7 +629,7 @@ mod tests {
             &["src/lib.rs".to_string()],
             "hello world",
             1000,
-        );
+        ));
         assert!(result.statistics.section_count > 0);
         assert!(result.statistics.estimated_tokens > 0);
         assert_eq!(result.statistics.template, "engineering");
@@ -560,7 +641,7 @@ mod tests {
     #[test]
     fn test_builder_diagnostics_exposed() {
         let builder = PromptBuilder::new();
-        let result = builder.compile(
+        let result = builder.compile_context(&build_context(
             "system prompt",
             "proj",
             None,
@@ -577,7 +658,7 @@ mod tests {
             &[],
             "user request",
             500,
-        );
+        ));
         assert!(result.diagnostics.total_length > 0);
         assert_eq!(result.diagnostics.template_used, "engineering");
         assert!(result.diagnostics.compile_duration_ms >= 0);

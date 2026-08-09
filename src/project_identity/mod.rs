@@ -61,21 +61,21 @@ pub mod diagnostics;
 pub mod identity;
 pub mod loader;
 pub mod migration;
+pub mod runtime;
 pub mod statistics;
 pub mod storage;
 pub mod updater;
 pub mod validation;
-pub mod runtime;
 
 pub use builder::{IdentityBuildError, ProjectIdentityBuilder};
 pub use diagnostics::{IdentitySource, ProjectIdentityDiagnostics};
 pub use identity::{
-    CURRENT_SCHEMA_VERSION, DecisionStatus, EngineeringDecision, ProjectIdentity,
-    RoadmapItem, RoadmapStatus,
+    DecisionStatus, EngineeringDecision, ProjectIdentity, RoadmapItem, RoadmapStatus,
+    CURRENT_SCHEMA_VERSION,
 };
 pub use loader::{LoadError, LoadResult, ProjectIdentityLoader};
 pub use runtime::{ProjectIdentityProvider, ProjectIdentityRuntime, RuntimeError};
 pub use statistics::ProjectIdentityStatistics;
 pub use storage::{ProjectIdentityStorage, StorageError};
 pub use updater::{IdentityChanges, ProjectIdentityUpdater, UpdateResult};
-pub use validation::{ValidationIssue, ValidationReport, validate_identity};
+pub use validation::{validate_identity, ValidationIssue, ValidationReport};

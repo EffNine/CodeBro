@@ -56,8 +56,7 @@ impl ProjectIdentityDiagnostics {
             validation_errors: 0,
             identity_updates: 0,
             snapshot_generation_time_us: 0,
-            schema_version: crate::project_identity::identity::CURRENT_SCHEMA_VERSION
-                .to_string(),
+            schema_version: crate::project_identity::identity::CURRENT_SCHEMA_VERSION.to_string(),
             source,
         }
     }
@@ -140,7 +139,10 @@ mod tests {
         let d = ProjectIdentityDiagnostics::new(IdentitySource::Created);
         assert!(d.is_empty());
         assert_eq!(d.source, IdentitySource::Created);
-        assert_eq!(d.schema_version, crate::project_identity::identity::CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            d.schema_version,
+            crate::project_identity::identity::CURRENT_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -168,8 +170,7 @@ mod tests {
             .with_load_time(500)
             .with_migration_count(2);
         let json = serde_json::to_string(&d).expect("serialize");
-        let decoded: ProjectIdentityDiagnostics =
-            serde_json::from_str(&json).expect("deserialize");
+        let decoded: ProjectIdentityDiagnostics = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(d.load_time_us, decoded.load_time_us);
         assert_eq!(d.migration_count, decoded.migration_count);
         assert_eq!(d.source, decoded.source);

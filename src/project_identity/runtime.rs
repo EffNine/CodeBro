@@ -217,8 +217,9 @@ impl ProjectIdentityRuntime {
                 if migrated {
                     if let Err(e) = self.storage.save_all(&identity) {
                         let load_time_us = load_start.elapsed().as_micros() as u64;
-                        self.diagnostics = ProjectIdentityDiagnostics::new(IdentitySource::Migrated)
-                            .with_load_time(load_time_us);
+                        self.diagnostics =
+                            ProjectIdentityDiagnostics::new(IdentitySource::Migrated)
+                                .with_load_time(load_time_us);
                         return Err(RuntimeError::Storage(e));
                     }
                 }
@@ -230,15 +231,12 @@ impl ProjectIdentityRuntime {
                     .with_migration_count(if migrated { 1 } else { 0 });
                 Ok(&self.current_identity)
             }
-            Err(LoadError::Storage(super::storage::StorageError::NotFound(_))) =>
-            {
+            Err(LoadError::Storage(super::storage::StorageError::NotFound(_))) => {
                 let load_time_us = load_start.elapsed().as_micros() as u64;
                 self.diagnostics = ProjectIdentityDiagnostics::new(IdentitySource::Created)
                     .with_load_time(load_time_us);
                 Err(RuntimeError::Load(LoadError::Storage(
-                    super::storage::StorageError::NotFound(
-                        "identity file not found".to_string(),
-                    ),
+                    super::storage::StorageError::NotFound("identity file not found".to_string()),
                 )))
             }
             Err(LoadError::UnknownSchemaVersion(msg)) => {
@@ -404,9 +402,7 @@ mod tests {
     #[test]
     fn test_create_minimal() {
         let (mut runtime, _tmp) = setup();
-        let identity = runtime
-            .create_minimal("test-proj", "rust")
-            .expect("create");
+        let identity = runtime.create_minimal("test-proj", "rust").expect("create");
         assert_eq!(identity.name, "test-proj");
         assert_eq!(identity.primary_language(), "rust");
     }
@@ -436,9 +432,7 @@ mod tests {
     #[test]
     fn test_load_after_create() {
         let (mut runtime, _tmp) = setup();
-        runtime
-            .create_minimal("persisted", "rust")
-            .expect("create");
+        runtime.create_minimal("persisted", "rust").expect("create");
         let loaded = runtime.load().expect("load");
         assert_eq!(loaded.name, "persisted");
     }
@@ -453,9 +447,7 @@ mod tests {
     #[test]
     fn test_snapshot_returns_clone() {
         let (mut runtime, _tmp) = setup();
-        runtime
-            .create_minimal("snap-proj", "rust")
-            .expect("create");
+        runtime.create_minimal("snap-proj", "rust").expect("create");
         let snap = runtime.snapshot();
         assert_eq!(snap.name, "snap-proj");
         assert_eq!(snap.primary_language(), "rust");
@@ -464,9 +456,7 @@ mod tests {
     #[test]
     fn test_update_adds_constraint() {
         let (mut runtime, _tmp) = setup();
-        runtime
-            .create_minimal("upd-proj", "rust")
-            .expect("create");
+        runtime.create_minimal("upd-proj", "rust").expect("create");
         let changes = IdentityChanges {
             add_constraints: vec!["No raw SQL".to_string()],
             ..Default::default()
@@ -480,9 +470,7 @@ mod tests {
     #[test]
     fn test_update_empty_changes_returns_none() {
         let (mut runtime, _tmp) = setup();
-        runtime
-            .create_minimal("noop", "rust")
-            .expect("create");
+        runtime.create_minimal("noop", "rust").expect("create");
         let result = runtime.update(IdentityChanges::new());
         assert!(result.is_none());
     }
@@ -500,7 +488,9 @@ mod tests {
     #[test]
     fn test_validate_empty_name() {
         let (mut runtime, _tmp) = setup();
-        runtime.create_minimal("valid-proj", "rust").expect("create");
+        runtime
+            .create_minimal("valid-proj", "rust")
+            .expect("create");
         // Manually set an empty name to test validation.
         runtime.current_identity.name = String::new();
         let report = runtime.validate();
@@ -510,9 +500,7 @@ mod tests {
     #[test]
     fn test_validate_empty_languages() {
         let (mut runtime, _tmp) = setup();
-        runtime
-            .create_minimal("stat-proj", "rust")
-            .expect("create");
+        runtime.create_minimal("stat-proj", "rust").expect("create");
         let stats = runtime.statistics();
         assert_eq!(stats.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(stats.decision_count, 0);
@@ -522,15 +510,10 @@ mod tests {
     #[test]
     fn test_diagnostics_after_load() {
         let (mut runtime, _tmp) = setup();
-        runtime
-            .create_minimal("diag-proj", "rust")
-            .expect("create");
+        runtime.create_minimal("diag-proj", "rust").expect("create");
         runtime.load().expect("load");
         let diags = runtime.diagnostics();
-        assert_eq!(
-            diags.source,
-            IdentitySource::Loaded
-        );
+        assert_eq!(diags.source, IdentitySource::Loaded);
         assert!(diags.load_time_us > 0);
     }
 
@@ -566,8 +549,7 @@ mod tests {
             .architecture_summary("Monorepo");
         let identity = runtime.create(builder).expect("create");
         let json = serde_json::to_string(&identity).expect("serialize");
-        let decoded: ProjectIdentity =
-            serde_json::from_str(&json).expect("deserialize");
+        let decoded: ProjectIdentity = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(identity.name, decoded.name);
         assert_eq!(identity.languages, decoded.languages);
         assert_eq!(identity.frameworks, decoded.frameworks);
@@ -607,9 +589,7 @@ mod tests {
     #[test]
     fn test_concurrent_snapshots() {
         let (mut runtime, _tmp) = setup();
-        runtime
-            .create_minimal("conc-proj", "rust")
-            .expect("create");
+        runtime.create_minimal("conc-proj", "rust").expect("create");
         // Multiple sequential snapshots should be identical.
         let snap1 = runtime.snapshot();
         let snap2 = runtime.snapshot();
@@ -638,18 +618,16 @@ mod tests {
     #[test]
     fn test_update_refreshes_projections() {
         let (mut runtime, _tmp) = setup();
-        runtime
-            .create_minimal("proj-proj", "rust")
-            .expect("create");
+        runtime.create_minimal("proj-proj", "rust").expect("create");
         let storage = runtime.storage().clone();
         runtime
             .update(IdentityChanges {
                 add_constraints: vec!["no-raw-sql".to_string()],
                 set_sprint: Some("sprint-24".to_string()),
                 update_architecture_summary: Some("hexagonal".to_string()),
-                add_roadmap_items: vec![
-                    crate::project_identity::RoadmapItem::new("r1", "Fix auth", None),
-                ],
+                add_roadmap_items: vec![crate::project_identity::RoadmapItem::new(
+                    "r1", "Fix auth", None,
+                )],
                 ..Default::default()
             })
             .expect("some")
@@ -665,30 +643,26 @@ mod tests {
         let reloaded = storage.load_identity().expect("reload");
         assert_eq!(reloaded.known_constraints, vec!["no-raw-sql"]);
         assert_eq!(reloaded.current_sprint, Some("sprint-24".to_string()));
-        assert_eq!(
-            reloaded.architecture_summary,
-            Some("hexagonal".to_string())
-        );
+        assert_eq!(reloaded.architecture_summary, Some("hexagonal".to_string()));
         assert_eq!(reloaded.roadmap_item_count(), 1);
     }
 
     #[test]
     fn test_invalid_identity_changes_rejected_and_unchanged() {
         let (mut runtime, _tmp) = setup();
-        runtime
-            .create_minimal("safe-proj", "rust")
-            .expect("create");
+        runtime.create_minimal("safe-proj", "rust").expect("create");
         let before_name = runtime.identity().name.clone();
         let before_constraints = runtime.identity().known_constraints.clone();
 
         // Add a decision, then try to add another with the same ID.
         runtime
             .update(IdentityChanges {
-                add_decisions: vec![
-                    crate::project_identity::EngineeringDecision::new(
-                        "dup-dec", "Decision 1", "First", None,
-                    ),
-                ],
+                add_decisions: vec![crate::project_identity::EngineeringDecision::new(
+                    "dup-dec",
+                    "Decision 1",
+                    "First",
+                    None,
+                )],
                 ..Default::default()
             })
             .expect("some")
@@ -696,11 +670,12 @@ mod tests {
 
         // Now try to add a duplicate decision — should fail validation.
         let result = runtime.update(IdentityChanges {
-            add_decisions: vec![
-                crate::project_identity::EngineeringDecision::new(
-                    "dup-dec", "Decision 2", "Duplicate", None,
-                ),
-            ],
+            add_decisions: vec![crate::project_identity::EngineeringDecision::new(
+                "dup-dec",
+                "Decision 2",
+                "Duplicate",
+                None,
+            )],
             ..Default::default()
         });
         assert!(result.is_some());
@@ -708,10 +683,7 @@ mod tests {
 
         // In-memory identity must be unchanged.
         assert_eq!(runtime.identity().name, before_name);
-        assert_eq!(
-            runtime.identity().known_constraints,
-            before_constraints
-        );
+        assert_eq!(runtime.identity().known_constraints, before_constraints);
         // Canonical file must be unchanged — reload and verify.
         let reloaded = runtime.storage().load_identity().expect("reload");
         assert_eq!(reloaded.name, before_name);
@@ -726,22 +698,19 @@ mod tests {
             schema_version: "0.9.0".to_string(),
             ..ProjectIdentity::new("migrate-proj", "go")
         };
-        runtime.storage().save_identity(&old_identity).expect("save");
+        runtime
+            .storage()
+            .save_identity(&old_identity)
+            .expect("save");
 
         // First load: migrates once.
         let first = runtime.load().expect("first load");
-        assert_eq!(
-            first.schema_version,
-            CURRENT_SCHEMA_VERSION
-        );
+        assert_eq!(first.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(runtime.diagnostics().migration_count, 1);
 
         // Second load: zero migrations, clean.
         let second = runtime.load().expect("second load");
-        assert_eq!(
-            second.schema_version,
-            CURRENT_SCHEMA_VERSION
-        );
+        assert_eq!(second.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(runtime.diagnostics().migration_count, 0);
     }
 
@@ -750,16 +719,12 @@ mod tests {
         let (mut runtime, _tmp) = setup();
         // Write an identity with duplicate decision IDs.
         let identity = ProjectIdentity::new("bad-proj", "rust")
-            .add_engineering_decision(
-                crate::project_identity::EngineeringDecision::new(
-                    "dec-1", "D1", "Desc", None,
-                ),
-            )
-            .add_engineering_decision(
-                crate::project_identity::EngineeringDecision::new(
-                    "dec-1", "D2", "Desc2", None,
-                ),
-            );
+            .add_engineering_decision(crate::project_identity::EngineeringDecision::new(
+                "dec-1", "D1", "Desc", None,
+            ))
+            .add_engineering_decision(crate::project_identity::EngineeringDecision::new(
+                "dec-1", "D2", "Desc2", None,
+            ));
         runtime.storage().save_identity(&identity).expect("save");
 
         let result = runtime.load();
@@ -779,8 +744,8 @@ mod tests {
             .expect("create");
 
         // Verify workspace.json contains the runtime root.
-        let ws_content = fs::read_to_string(runtime.storage().workspace_path())
-            .expect("read workspace.json");
+        let ws_content =
+            fs::read_to_string(runtime.storage().workspace_path()).expect("read workspace.json");
         #[derive(serde::Deserialize)]
         struct WorkspaceMeta {
             root_path: String,
@@ -814,8 +779,8 @@ mod tests {
             Some(workspace_str.as_str())
         );
 
-        let ws_content = fs::read_to_string(runtime.storage().workspace_path())
-            .expect("read workspace.json");
+        let ws_content =
+            fs::read_to_string(runtime.storage().workspace_path()).expect("read workspace.json");
         #[derive(serde::Deserialize)]
         struct WorkspaceMeta {
             root_path: String,
@@ -845,8 +810,8 @@ mod tests {
         );
 
         // workspace.json projection must also use the runtime root.
-        let ws_content = fs::read_to_string(runtime.storage().workspace_path())
-            .expect("read workspace.json");
+        let ws_content =
+            fs::read_to_string(runtime.storage().workspace_path()).expect("read workspace.json");
         #[derive(serde::Deserialize)]
         struct WorkspaceMeta {
             root_path: String,
@@ -855,7 +820,11 @@ mod tests {
         assert_eq!(ws.root_path, workspace_str);
 
         // The conflicting value must not appear anywhere.
-        assert!(!identity.workspace_root.as_deref().unwrap().contains("some-other-project"));
+        assert!(!identity
+            .workspace_root
+            .as_deref()
+            .unwrap()
+            .contains("some-other-project"));
         assert!(!ws.root_path.contains("some-other-project"));
     }
 }

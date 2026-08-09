@@ -119,11 +119,7 @@ impl EngineeringDecision {
         EngineeringDecision {
             id: self.id,
             title: self.title,
-            description: format!(
-                "{} (superseded by {})",
-                self.description,
-                new_id.into()
-            ),
+            description: format!("{} (superseded by {})", self.description, new_id.into()),
             status: DecisionStatus::Superseded,
             created_at: self.created_at,
             context: self.context,
@@ -455,8 +451,7 @@ impl ProjectIdentity {
 
     pub fn add_engineering_decision(mut self, decision: EngineeringDecision) -> Self {
         self.engineering_decisions.push(decision);
-        self.engineering_decisions
-            .sort_by(|a, b| a.id.cmp(&b.id));
+        self.engineering_decisions.sort_by(|a, b| a.id.cmp(&b.id));
         self.updated_at = chrono::Utc::now().to_rfc3339();
         self
     }
@@ -540,7 +535,7 @@ impl PartialEq for ProjectIdentity {
             && self.coding_conventions == other.coding_conventions
             && self.workspace_root == other.workspace_root
             && self.schema_version == other.schema_version
-            // Intentionally ignore created_at and updated_at.
+        // Intentionally ignore created_at and updated_at.
     }
 }
 

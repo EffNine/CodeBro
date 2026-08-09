@@ -265,26 +265,26 @@ This implementation complies with all documents under `docs/vision/`:
 
 ## Public API
 
+> **Update (ADR-012):** The legacy `compile(13+ params)` API was removed.
+> `compile_context(&EngineeringContext)` is the only public compile entry point.
+
 ```rust
 // Entry point
 let builder = PromptBuilder::new();
 
-// Compile
-let compiled: CompiledPrompt = builder.compile(
-    system_prompt,
-    project_name,
-    project_info,       // Option<&ProjectInfoLike>
-    intent_plan,        // Option<&IntentPlanLike>
-    relevant_files,     // &[ContextFileLike]
-    conversation,       // &[ConversationMsgLike]
-    memories,           // &[MemoryFragment]
-    arch_rules,         // &[ArchitectureRuleLike]
-    fact_count,
-    diagnostics,        // &[DiagnosticLike]
-    active_files,       // &[String]
-    user_request,
-    context_budget_remaining,
-);
+// Compile — canonical API (ADR-010 / ADR-012)
+let context = EngineeringContextBuilder::new()
+    .project(project_identity)
+    .task(intent_plan)
+    .workspace(workspace_context)
+    .memory(memory_context)
+    .constraints(constraint_context)
+    .runtime(runtime_context)
+    .user_request(request)
+    .system_prompt(prompt)
+    .build()?;
+
+let compiled: CompiledPrompt = builder.compile_context(&context);
 
 // Access results
 compiled.prompt          // String

@@ -2,10 +2,12 @@
 
 use std::time::Instant;
 
-use super::identity::{ProjectIdentity, EngineeringDecision, RoadmapItem, DecisionStatus, RoadmapStatus};
+use super::diagnostics::{IdentitySource, ProjectIdentityDiagnostics};
+use super::identity::{
+    DecisionStatus, EngineeringDecision, ProjectIdentity, RoadmapItem, RoadmapStatus,
+};
 use super::migration::{apply_migrations, validate_schema_version, MigrationResult};
 use super::storage::{ProjectIdentityStorage, StorageError};
-use super::diagnostics::{IdentitySource, ProjectIdentityDiagnostics};
 use super::validation::{validate_identity, ValidationReport};
 
 /// Errors that can occur during identity loading.
@@ -116,13 +118,11 @@ impl ProjectIdentityLoader {
 
         let load_time_us = load_start.elapsed().as_micros() as u64;
 
-        let diagnostics = ProjectIdentityDiagnostics::new(
-            if migrated {
-                IdentitySource::Migrated
-            } else {
-                IdentitySource::Loaded
-            },
-        )
+        let diagnostics = ProjectIdentityDiagnostics::new(if migrated {
+            IdentitySource::Migrated
+        } else {
+            IdentitySource::Loaded
+        })
         .with_load_time(load_time_us)
         .with_migration_count(migration_result.migrations_applied)
         .with_schema_version(&identity.schema_version);
@@ -170,18 +170,14 @@ mod tests {
         let result = loader.load().expect("load");
         assert_eq!(result.identity.name, "loaded-proj");
         assert!(!result.migrated);
-        assert_eq!(
-            result.diagnostics.source,
-            IdentitySource::Loaded
-        );
+        assert_eq!(result.diagnostics.source, IdentitySource::Loaded);
     }
 
     #[test]
     fn test_load_with_old_schema_triggers_migration() {
         let (loader, _tmp) = setup();
         // Simulate an old schema identity.
-        let identity = ProjectIdentity::new("old-proj", "go")
-            .with_workspace_root("/tmp/old");
+        let identity = ProjectIdentity::new("old-proj", "go").with_workspace_root("/tmp/old");
         // Manually set an old schema version.
         let old_identity = ProjectIdentity {
             schema_version: "0.9.0".to_string(),
@@ -195,10 +191,7 @@ mod tests {
             super::super::identity::CURRENT_SCHEMA_VERSION
         );
         assert!(result.migrated);
-        assert_eq!(
-            result.diagnostics.source,
-            IdentitySource::Migrated
-        );
+        assert_eq!(result.diagnostics.source, IdentitySource::Migrated);
     }
 
     #[test]

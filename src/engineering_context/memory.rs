@@ -108,14 +108,12 @@ mod tests {
     #[test]
     fn test_serialization_roundtrip() {
         let mem = EngineeringMemoryContext::new()
-            .with_entries(vec![
-                MemoryEntry {
-                    key: "k1".to_string(),
-                    value: "v1".to_string(),
-                    confidence: 0.9,
-                    tier: MemoryTier::Project,
-                },
-            ])
+            .with_entries(vec![MemoryEntry {
+                key: "k1".to_string(),
+                value: "v1".to_string(),
+                confidence: 0.9,
+                tier: MemoryTier::Project,
+            }])
             .with_budget(100);
         let json = serde_json::to_string(&mem).expect("serialize");
         let decoded: EngineeringMemoryContext = serde_json::from_str(&json).expect("deserialize");

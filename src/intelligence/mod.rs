@@ -14,7 +14,6 @@
 //! | `search` | Semantic symbol search |
 //! | `context` | Context assembly for agents |
 //! | `reasoning` | Pre-modification analysis |
-//! | `memory` | Project intelligence persistence |
 //! | `lsp` | LSP protocol foundation types |
 //! | `diagnostics` | Platform health monitoring |
 
@@ -23,7 +22,6 @@ pub mod diagnostics;
 pub mod graph;
 pub mod index;
 pub mod lsp;
-pub mod memory;
 pub mod parser;
 pub mod reasoning;
 pub mod search;
@@ -48,10 +46,6 @@ pub use lsp::{
     LspHover, LspLocation, LspParameterInformation, LspPosition, LspRange, LspSignatureInformation,
     LspSymbolInformation, LspSymbolKind, LspTextDocumentIdentifier, LspTextDocumentItem,
     LspTextEdit, LspWorkspaceEdit,
-};
-pub use memory::{
-    ArchitecturePattern, DiscoveredRelationship, ImportantSymbol, IntelligenceMemory,
-    IntelligenceMemoryTrait, ProjectIntelligence, ProjectStructure,
 };
 pub use parser::{
     create_parser, create_parser_trait, parse_file, parse_source, CodeParserTrait, ParseResult,

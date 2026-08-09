@@ -130,15 +130,6 @@ codebro/
 │   │   │   └── intelligence.rs
 │   │   └── diagnostics.rs         # Platform health monitoring (P4)
 │   │
-│   ├── context/                   # Legacy context builder (token-budget)
-│   │   ├── mod.rs
-│   │   └── builder.rs
-│   ├── prompt/                    # Legacy prompt assembly
-│   │   ├── mod.rs
-│   │   └── builder.rs
-│   ├── indexer/                   # Legacy repo indexer
-│   │   ├── mod.rs
-│   │   └── scanner.rs
 │   ├── scanner/                   # Project scanner
 │   │   ├── mod.rs
 │   │   └── project.rs
@@ -505,7 +496,7 @@ model = "gpt-4o"
 | `SemanticSearchTrait` | `search` | Symbol search and ranking |
 | `ContextBuilderTrait` | `context` | Context assembly for agents |
 | `ReasoningEngineTrait` | `reasoning` | Pre-modification analysis |
-| `IntelligenceMemoryTrait` | `memory` | Project knowledge persistence |
+| ~~`IntelligenceMemoryTrait`~~ | ~~`memory`~~ | Removed in ADR-012 — project knowledge is owned by `project_identity`; fact model by `engineering_facts` |
 | `LspFoundationTrait` | `lsp` | LSP protocol foundation |
 | `IntelligenceDiagnosticsTrait` | `diagnostics` | Platform health monitoring |
 
