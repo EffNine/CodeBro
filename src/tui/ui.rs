@@ -134,8 +134,7 @@ fn handle_event(msg: events::AppEvent, app: &mut TuiApp) -> bool {
             true
         }
         events::AppEvent::StreamChunk(content) => {
-            app.dashboard.streaming_buffer.push_str(&content);
-            app.dashboard.is_streaming = true;
+            app.dashboard.push_stream_chunk(&content);
             true
         }
         events::AppEvent::AgentEvent(event) => {
@@ -206,6 +205,12 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                 handle_confirmation_key(key, app);
                 return;
             }
+            // Masked secret input has the highest priority: keys are consumed
+            // by the secure buffer, never by the main input field.
+            if app.secure_input.is_some() {
+                handle_secure_input_key(key, app);
+                return;
+            }
 
             if let Some(shortcut) = events::check_key_shortcuts(&key) {
                 handle_shortcut(shortcut, app);
@@ -265,7 +270,12 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
 
                     let input = app.input.trim().to_string();
                     if !input.is_empty() {
-                        app.push_history(input.clone());
+                        // Inline `//apikey <provider> <key>` must never be
+                        // stored in history; the masked path is the only
+                        // accepted way to set a key.
+                        if !is_inline_apikey(&input) {
+                            app.push_history(input.clone());
+                        }
                         app.clear_input();
                         submit_input(input, app);
                     }
@@ -312,7 +322,7 @@ fn submit_input(input: String, app: &mut TuiApp) {
                 app.pending_confirmation = Some((
                     format!(
                         "This command may be destructive. Proceed? `{}` (y/n)",
-                        command
+                        crate::tools::shell::redact_secrets_public(&command)
                     ),
                     PendingAction::RunShell(command),
                 ));
@@ -344,6 +354,59 @@ fn submit_input(input: String, app: &mut TuiApp) {
     }
 }
 
+/// Whether an input line is an inline `//apikey <provider> <key>` (which must
+/// be rejected and never stored in history).
+fn is_inline_apikey(input: &str) -> bool {
+    let trimmed = input.trim();
+    if !trimmed.starts_with("//apikey") {
+        return false;
+    }
+    trimmed.split_whitespace().count() >= 3
+}
+
+/// Keys for the masked secret-input mode: printable chars append to the
+/// buffer, Backspace removes, Enter stores the secret securely, Esc cancels.
+fn handle_secure_input_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
+    let Some(state) = app.secure_input.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Char(c) => {
+            state.buffer.push(c);
+        }
+        KeyCode::Backspace => {
+            state.buffer.pop();
+        }
+        KeyCode::Enter => {
+            let provider = state.provider.clone();
+            let secret = std::mem::take(&mut state.buffer);
+            app.secure_input = None;
+            if secret.is_empty() {
+                app.add_message(
+                    MessageRole::System,
+                    "API key not set: input was empty. Run `//apikey <provider>` to retry."
+                        .to_string(),
+                );
+                return;
+            }
+            match app.set_provider_api_key(&provider, &secret) {
+                Ok(()) => {
+                    // set_provider_api_key already reports success without
+                    // echoing the value.
+                }
+                Err(e) => {
+                    app.add_message(MessageRole::System, format!("API key error: {}", e));
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.secure_input = None;
+            app.add_message(MessageRole::System, "API key input cancelled".to_string());
+        }
+        _ => {}
+    }
+}
+
 fn handle_confirmation_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
     let confirmed = matches!(
         key.code,
@@ -367,7 +430,13 @@ fn handle_confirmation_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
 fn confirm_action(action: PendingAction, app: &mut TuiApp) {
     match action {
         PendingAction::RunShell(command) => {
-            app.add_message(MessageRole::System, format!("Running `{}`", command));
+            app.add_message(
+                MessageRole::System,
+                format!(
+                    "Running `{}`",
+                    crate::tools::shell::redact_secrets_public(&command)
+                ),
+            );
             run_command_task(app, "shell", command);
         }
         PendingAction::ApproveChange => execute_approve(app),
@@ -641,7 +710,16 @@ fn handle_runtime_command(input: &str, app: &mut TuiApp) {
             }
         }
         "//apikey" => {
-            let key = parts.get(2).copied().unwrap_or("");
+            if parts.len() >= 3 {
+                // The key must never travel as a normal command argument (it
+                // would land in input history and be echoed into context).
+                app.add_message(
+                    MessageRole::System,
+                    "Inline API keys are not accepted.\nRun `//apikey <provider>` and enter the key in the masked prompt."
+                        .to_string(),
+                );
+                return;
+            }
             let provider = if arg.is_empty() {
                 app.provider_manager
                     .as_ref()
@@ -650,24 +728,31 @@ fn handle_runtime_command(input: &str, app: &mut TuiApp) {
             } else {
                 arg.to_string()
             };
-            if key.is_empty() {
+            // Validate the provider so the masked prompt never targets an
+            // unknown provider.
+            let known = app
+                .provider_manager
+                .as_ref()
+                .map(|pm| pm.list_provider_ids().contains(&provider))
+                .unwrap_or(false);
+            if !known {
                 app.add_message(
                     MessageRole::System,
-                    "Usage: //apikey <provider> <key>".to_string(),
+                    format!(
+                        "Unknown provider '{}'. Use //provider to list providers.",
+                        provider
+                    ),
                 );
                 return;
             }
-            match app.set_provider_api_key(&provider, key) {
-                Ok(()) => {
-                    app.add_message(
-                        MessageRole::System,
-                        format!("API key set for {} (stored securely)", provider),
-                    );
-                }
-                Err(e) => {
-                    app.add_message(MessageRole::System, format!("API key error: {}", e));
-                }
-            }
+            app.secure_input = Some(crate::tui::app::SecureInputState {
+                provider,
+                buffer: String::new(),
+            });
+            app.add_message(
+                MessageRole::System,
+                "Enter API key (masked). Enter to save securely, Esc to cancel.".to_string(),
+            );
         }
         "//settings" => {
             app.toggle_settings();
@@ -1033,7 +1118,17 @@ fn run_command_task(app: &mut TuiApp, label: &str, command: String) {
     let tx = app.tx.clone();
     let config = app.config.clone();
     let workspace = crate::tools::detect_workspace_root();
-    app.add_message(MessageRole::System, format!("[{}] {}", label, command));
+    // The echoed command is a conversation/persistence surface: redact obvious
+    // secrets so they never reach history, context, or exports. Execution uses
+    // the raw `command`.
+    app.add_message(
+        MessageRole::System,
+        format!(
+            "[{}] {}",
+            label,
+            crate::tools::shell::redact_secrets_public(&command)
+        ),
+    );
     tokio::spawn(async move {
         let emit_tx = tx.clone();
         let emit = move |event: AgentEvent| {
@@ -1059,7 +1154,7 @@ fn run_command_task(app: &mut TuiApp, label: &str, command: String) {
         let _ = tx.send(events::AppEvent::Response(format!(
             "[{}] {}\n{}",
             status,
-            command,
+            crate::tools::shell::redact_secrets_public(&command),
             outcome.output.trim_end()
         )));
         let _ = workspace;
@@ -1654,7 +1749,9 @@ fn render_coordination(f: &mut Frame, app: &TuiApp, area: Rect) {
 }
 
 fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let prefix = if app.dashboard.animation.is_active() {
+    let prefix = if let Some(s) = &app.secure_input {
+        format!("API key for {}: ", s.provider)
+    } else if app.dashboard.animation.is_active() {
         format!("{}> ", app.dashboard.animation.spinner_char())
     } else {
         "> ".to_string()
@@ -1666,8 +1763,18 @@ fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
         return;
     }
 
-    let (display_lines, cursor_line_rel, cursor_col) =
-        input_display_lines(&app.input, app.input_cursor, inner_h, inner_w);
+    let (display_lines, cursor_line_rel, cursor_col) = if let Some(s) = &app.secure_input {
+        // Masked secret display: the raw buffer is never rendered.
+        let masked: String = "•".repeat(s.buffer.chars().count());
+        let line = if masked.is_empty() {
+            "(secret)".to_string()
+        } else {
+            masked
+        };
+        (vec![line], 0usize, s.buffer.chars().count())
+    } else {
+        input_display_lines(&app.input, app.input_cursor, inner_h, inner_w)
+    };
 
     let mut text_lines = Vec::new();
     for (i, line) in display_lines.iter().enumerate() {

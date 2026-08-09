@@ -271,4 +271,44 @@ mod tests {
         assert!(total >= 200, "wrapped lines must keep content: {}", total);
         assert!(lines.len() > 1);
     }
+
+    #[test]
+    fn test_console_stress_stays_bounded_preserves_recent() {
+        let mut c = PtyConsole::new("c1", "stress");
+        let chunk = "0123456789abcdef".repeat(10_000); // 160k chars
+        for _ in 0..500 {
+            c.append(&chunk);
+        }
+        assert!(
+            c.len_chars() <= MAX_CONSOLE_CHARS,
+            "buffer grew unbounded: {}",
+            c.len_chars()
+        );
+        let text = c.text();
+        assert!(
+            text.chars().count() <= MAX_CONSOLE_CHARS,
+            "text() must stay bounded: {}",
+            text.chars().count()
+        );
+        // Ring-buffer semantics: the most recent output survives eviction.
+        assert!(
+            text.ends_with("0123456789abcdef"),
+            "recent output must be preserved after eviction"
+        );
+    }
+
+    #[test]
+    fn test_console_append_does_not_break_ansi_lifecycle() {
+        // Truncation must not corrupt the render path: after heavy eviction the
+        // console still renders and finishes cleanly.
+        let mut c = PtyConsole::new("c1", "cmd");
+        let big = "x".repeat(20_000);
+        for _ in 0..100 {
+            c.append(&big);
+        }
+        c.finish(ConsoleStatus::Exited { exit_code: 0 });
+        let lines = c.render_lines(80);
+        assert!(!lines.is_empty());
+        assert_eq!(c.status.label(), "passed");
+    }
 }

@@ -132,10 +132,14 @@ impl PtyEvent {
 /// terminal event. The caller shares the [`CancellationToken`]: setting it
 /// sends `SIGINT` to the child's process group, exactly like Ctrl+C in a
 /// terminal.
+///
+/// Thread creation failure is reported as an error instead of being silently
+/// dropped, so a caller can never receive a receiver that waits forever
+/// because the producer failed to start.
 pub fn spawn_pty(
     config: PtyConfig,
     cancel: CancellationToken,
-) -> tokio::sync::mpsc::Receiver<PtyEvent> {
+) -> Result<tokio::sync::mpsc::Receiver<PtyEvent>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<PtyEvent>(64);
 
     std::thread::Builder::new()
@@ -143,9 +147,9 @@ pub fn spawn_pty(
         .spawn(move || {
             let _ = run_pty(&config, &cancel, &tx);
         })
-        .ok();
+        .with_context(|| "Failed to start the PTY worker thread")?;
 
-    rx
+    Ok(rx)
 }
 
 fn run_pty(
@@ -204,12 +208,13 @@ fn run_pty(
     // Reader thread: forwards output continuously so streaming is live, and
     // keeps draining the PTY even after the cap is hit so the child never
     // blocks on a full buffer. Sets `reader_done` at EOF so the waiter knows
-    // every byte has been surfaced.
+    // every byte has been surfaced. A reader-thread failure is observable:
+    // the child is terminated and an error event is emitted.
     let reader_tx = tx.clone();
     let max_output = config.max_output;
     let reader_exit_code = exit_code.clone();
     let reader_done_flag = reader_done.clone();
-    std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("codebro-pty-reader".to_string())
         .spawn(move || {
             read_loop(
@@ -220,7 +225,15 @@ fn run_pty(
                 &reader_done_flag,
             );
         })
-        .ok();
+    {
+        signal_group(group_leader, libc::SIGKILL);
+        let _ = child.wait();
+        let _ = send_event(
+            tx,
+            PtyEvent::Error(format!("Failed to start PTY reader thread: {}", e)),
+        );
+        return Err(e).context("Failed to start the PTY reader thread");
+    }
 
     // Waiter: polls exit / cancellation / timeout and terminates the group.
     let started = Instant::now();
@@ -229,7 +242,7 @@ fn run_pty(
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             let code = status.exit_code() as i32;
-            *exit_code.lock().unwrap() = Some(code);
+            *exit_code.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
             wait_reader_done(&reader_done, Duration::from_secs(2));
             let _ = send_event(tx, PtyEvent::Exited { exit_code: code });
             return Ok(());
@@ -243,7 +256,8 @@ fn run_pty(
                 let _ = child.wait();
             }
             if let Ok(Some(status)) = child.try_wait() {
-                *exit_code.lock().unwrap() = Some(status.exit_code() as i32);
+                *exit_code.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(status.exit_code() as i32);
             }
             wait_reader_done(&reader_done, Duration::from_secs(1));
             let _ = send_event(tx, PtyEvent::Cancelled);
@@ -259,7 +273,8 @@ fn run_pty(
                     let _ = child.wait();
                 }
                 if let Ok(Some(status)) = child.try_wait() {
-                    *exit_code.lock().unwrap() = Some(status.exit_code() as i32);
+                    *exit_code.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some(status.exit_code() as i32);
                 }
                 wait_reader_done(&reader_done, Duration::from_secs(1));
                 let _ = send_event(tx, PtyEvent::TimedOut);
@@ -312,14 +327,14 @@ fn read_loop(
             truncated = false;
         }
     }
-    *reader_done.lock().unwrap() = true;
+    *reader_done.lock().unwrap_or_else(|p| p.into_inner()) = true;
 }
 
 /// Wait up to `grace` for the reader thread to drain the PTY.
 fn wait_reader_done(reader_done: &Arc<std::sync::Mutex<bool>>, grace: Duration) {
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
-        if *reader_done.lock().unwrap() {
+        if *reader_done.lock().unwrap_or_else(|p| p.into_inner()) {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -363,7 +378,7 @@ mod tests {
         config: PtyConfig,
         cancel: CancellationToken,
     ) -> (Vec<PtyEvent>, String) {
-        let mut rx = spawn_pty(config, cancel);
+        let mut rx = spawn_pty(config, cancel).unwrap();
         let mut events = Vec::new();
         let mut out = String::new();
         rt.block_on(async {
@@ -409,7 +424,8 @@ mod tests {
                 "printf 'one\\n'; sleep 0.2; printf 'two\\n'; sleep 0.2; printf 'three\\n'",
             ),
             CancellationToken::new(),
-        );
+        )
+        .unwrap();
         let mut saw_first = false;
         rt.block_on(async {
             while let Some(ev) = rx.recv().await {
@@ -462,7 +478,7 @@ mod tests {
     fn test_pty_cancellation() {
         let rt = Runtime::new().unwrap();
         let cancel = CancellationToken::new();
-        let mut rx = spawn_pty(PtyConfig::for_command("sleep 30"), cancel.clone());
+        let mut rx = spawn_pty(PtyConfig::for_command("sleep 30"), cancel.clone()).unwrap();
         std::thread::sleep(Duration::from_millis(200));
         cancel.cancel();
         let mut cancelled = false;
@@ -529,5 +545,131 @@ mod tests {
         let (_, out) = collect(&rt, config, CancellationToken::new());
         let canonical = std::fs::canonicalize(dir.path()).unwrap();
         assert!(out.contains(&canonical.to_string_lossy().to_string()));
+    }
+
+    // ─── P2: Process-group / cancellation / EOF-ordering tests ─────────────
+
+    #[test]
+    fn test_pty_cancellation_terminates_grandchildren() {
+        // `sh -c 'sleep 30 & sleep 30'` leaves two independent grandchildren.
+        // Cancel must kill the whole process group (not just sh), so the PTY
+        // closes and the Cancelled event arrives promptly.
+        let rt = Runtime::new().unwrap();
+        let cancel = CancellationToken::new();
+        let mut rx = spawn_pty(
+            PtyConfig::for_command("sleep 30 & sleep 30"),
+            cancel.clone(),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let start = Instant::now();
+        cancel.cancel();
+        let mut cancelled = false;
+        rt.block_on(async {
+            while let Some(ev) = rx.recv().await {
+                if matches!(ev, PtyEvent::Cancelled) {
+                    cancelled = true;
+                    break;
+                }
+                if ev.is_terminal() {
+                    break;
+                }
+            }
+        });
+        assert!(cancelled, "expected Cancelled event");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "process group must be killed promptly so the session closes"
+        );
+    }
+
+    #[test]
+    fn test_pty_cancellation_escalates_when_sigint_is_ignored() {
+        // `trap '' INT; sleep 30` ignores SIGINT; cancellation must escalate
+        // from SIGINT to SIGKILL after the grace period and still complete.
+        let rt = Runtime::new().unwrap();
+        let cancel = CancellationToken::new();
+        let mut rx = spawn_pty(
+            PtyConfig::for_command("trap '' INT; sleep 30"),
+            cancel.clone(),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let start = Instant::now();
+        cancel.cancel();
+        let mut cancelled = false;
+        rt.block_on(async {
+            while let Some(ev) = rx.recv().await {
+                if matches!(ev, PtyEvent::Cancelled) {
+                    cancelled = true;
+                    break;
+                }
+                if ev.is_terminal() {
+                    break;
+                }
+            }
+        });
+        assert!(
+            cancelled,
+            "expected Cancelled event even with SIGINT ignored"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "SIGKILL escalation must terminate the SIGINT-ignoring process"
+        );
+    }
+
+    #[test]
+    fn test_pty_all_output_delivered_before_exited() {
+        // EOF ordering: the Exited event must never arrive before the final
+        // output chunk has been surfaced (reader completion is ordered first).
+        let rt = Runtime::new().unwrap();
+        let mut rx = spawn_pty(
+            PtyConfig::for_command("printf 'tail-marker-xyz\\n'; exit 0"),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let mut saw_tail = false;
+        let mut saw_exit_before_tail = false;
+        rt.block_on(async {
+            while let Some(ev) = rx.recv().await {
+                match &ev {
+                    PtyEvent::Output(c) if c.contains("tail-marker-xyz") => saw_tail = true,
+                    PtyEvent::Exited { .. } if !saw_tail => {
+                        saw_exit_before_tail = true;
+                        break;
+                    }
+                    PtyEvent::Exited { .. } => break,
+                    _ => {}
+                }
+            }
+        });
+        assert!(
+            !saw_exit_before_tail,
+            "Exited was emitted before the final output chunk"
+        );
+        assert!(saw_tail, "final output chunk must be surfaced");
+    }
+
+    #[test]
+    fn test_pty_large_output_still_delivers_exit_ordering() {
+        // A large burst must still deliver Exited only after output is drained.
+        let rt = Runtime::new().unwrap();
+        let mut config = PtyConfig::for_command("yes z | head -c 500000; exit 0");
+        config.max_output = 4096;
+        let mut rx = spawn_pty(config, CancellationToken::new()).unwrap();
+        let mut exit_code = None;
+        rt.block_on(async {
+            while let Some(ev) = rx.recv().await {
+                match &ev {
+                    PtyEvent::Exited { exit_code: code } => {
+                        exit_code = Some(*code);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        assert_eq!(exit_code, Some(0), "exit code must remain authoritative");
     }
 }

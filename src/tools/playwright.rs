@@ -6,7 +6,7 @@
 //! failures. It never fakes browser execution: it invokes the actual
 //! Playwright test runner (`npx playwright test`) against the workspace.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -100,7 +100,8 @@ impl AsyncTool for PlaywrightTool {
                 max_output: super::pty::MAX_PTY_OUTPUT,
             };
             let cancel = cancel.unwrap_or_default();
-            let mut rx = super::pty::spawn_pty(config, cancel);
+            let mut rx = super::pty::spawn_pty(config, cancel)
+                .context("Failed to start PTY-backed Playwright run")?;
             let stream =
                 super::streaming::channel_stream_factory("playwright_test", move |tx| loop {
                     match rx.blocking_recv() {

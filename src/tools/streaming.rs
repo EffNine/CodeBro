@@ -117,15 +117,30 @@ pub fn sync_to_stream(
 }
 
 /// Create a channel-based stream from a producer closure.
+///
+/// If the producer thread cannot be started, the stream yields a single final
+/// error chunk instead of silently ending — the failure is observable.
 pub fn channel_stream(
     tool_name: &str,
     producer: impl FnOnce(mpsc::Sender<StreamChunk>) -> Result<()> + Send + 'static,
 ) -> StreamResult {
     let (tx, rx) = mpsc::channel::<StreamChunk>(32);
 
-    std::thread::spawn(move || {
-        let _ = producer(tx);
-    });
+    let spawned = std::thread::Builder::new()
+        .name("codebro-stream".to_string())
+        .spawn(move || {
+            let _ = producer(tx);
+        });
+    if let Err(e) = spawned {
+        let stream = stream::once(async move {
+            StreamChunk {
+                text: format!("\n[Error: failed to start stream producer: {}]", e),
+                is_final: true,
+                metadata: Some("error".to_string()),
+            }
+        });
+        return StreamResult::new(stream, tool_name);
+    }
 
     let stream = stream::unfold(rx, |mut rx| async move {
         match rx.recv().await {
@@ -142,14 +157,28 @@ pub fn channel_stream(
 /// This is the streaming primitive used by PTY-backed tools: the producer runs
 /// on a dedicated OS thread (so the async runtime is never blocked) and drives
 /// the channel with [`mpsc::Sender::blocking_send`].
+///
+/// If the producer thread cannot be started, the stream yields a single final
+/// error chunk so the failure is observable rather than a silent empty stream.
 pub fn channel_stream_factory(
     tool_name: &str,
     produce: impl FnOnce(mpsc::Sender<StreamChunk>) + Send + 'static,
 ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
     let (tx, mut rx) = mpsc::channel::<StreamChunk>(32);
-    std::thread::spawn(move || {
-        produce(tx);
-    });
+    let spawned = std::thread::Builder::new()
+        .name("codebro-stream".to_string())
+        .spawn(move || {
+            produce(tx);
+        });
+    if let Err(e) = spawned {
+        return Box::pin(stream::once(async move {
+            StreamChunk {
+                text: format!("\n[Error: failed to start stream producer: {}]", e),
+                is_final: true,
+                metadata: Some("error".to_string()),
+            }
+        }));
+    }
     Box::pin(stream::poll_fn(move |cx| rx.poll_recv(cx)))
 }
 

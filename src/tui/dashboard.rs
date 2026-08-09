@@ -6,6 +6,10 @@ use crate::tui::animation::{ActivityType, AnimationState};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+/// Maximum characters retained in the live streaming buffer. A pathological
+/// provider response (or PTY burst) cannot grow memory without bound.
+pub const MAX_STREAMING_BUFFER_CHARS: usize = 1_000_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub timestamp: String,
@@ -328,8 +332,7 @@ impl Dashboard {
                 self.set_task_graph(graph);
             }
             AgentEvent::StreamChunk { content } => {
-                self.streaming_buffer.push_str(&content);
-                self.is_streaming = true;
+                self.push_stream_chunk(&content);
             }
             AgentEvent::PtyOutput { console, content } => {
                 self.log_verbose("console", format!("{}: {}", console, content.trim_end()));
@@ -351,6 +354,24 @@ impl Dashboard {
                 self.log(&level, message);
             }
         }
+    }
+
+    /// Append a live stream chunk to the streaming buffer. The buffer is capped
+    /// so a pathological provider response (or PTY burst) can never grow memory
+    /// without bound; overflow is dropped once the cap is reached.
+    pub fn push_stream_chunk(&mut self, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        let used = self.streaming_buffer.chars().count();
+        if used >= MAX_STREAMING_BUFFER_CHARS {
+            self.is_streaming = true;
+            return;
+        }
+        let room = MAX_STREAMING_BUFFER_CHARS.saturating_sub(used);
+        let keep: String = content.chars().take(room).collect();
+        self.streaming_buffer.push_str(&keep);
+        self.is_streaming = true;
     }
 
     /// Set the current operation (shown under the title bar).
@@ -529,16 +550,20 @@ impl Default for Dashboard {
     }
 }
 
+/// Sanitize tool arguments for the activity log: redact obvious secrets using
+/// the shared authority, then truncate the summary.
 fn sanitize_args(args: &str) -> String {
-    let mut result = args.to_string();
-    if let Some(idx) = result.find("api_key") {
-        result = format!("{}<redacted>", &result[..idx]);
-    }
-    result.chars().take(80).collect()
+    crate::tools::shell::redact_secrets_public(args)
+        .chars()
+        .take(80)
+        .collect()
 }
 
 fn sanitize_result(result: &str) -> String {
-    result.chars().take(200).collect()
+    crate::tools::shell::redact_secrets_public(result)
+        .chars()
+        .take(200)
+        .collect()
 }
 
 #[cfg(test)]
@@ -626,6 +651,20 @@ mod tests {
         });
         assert!(dashboard.is_streaming);
         assert_eq!(dashboard.streaming_buffer, "I found the auth module");
+    }
+
+    #[test]
+    fn test_streaming_buffer_is_bounded() {
+        let mut dashboard = Dashboard::new();
+        let big = "x".repeat(200_000);
+        for _ in 0..30 {
+            dashboard.push_stream_chunk(&big);
+        }
+        assert!(
+            dashboard.streaming_buffer.chars().count() <= MAX_STREAMING_BUFFER_CHARS,
+            "streaming buffer grew unbounded: {}",
+            dashboard.streaming_buffer.chars().count()
+        );
     }
 
     #[test]

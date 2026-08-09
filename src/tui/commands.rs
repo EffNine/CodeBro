@@ -32,7 +32,7 @@ pub struct CommandSpec {
     /// The command token, including its prefix, without arguments
     /// (e.g. `/build`, `//verbose`).
     pub command: &'static str,
-    /// Usage with placeholders (e.g. `//apikey <provider> <key>`).
+    /// Usage with placeholders (e.g. `/build`).
     pub usage: &'static str,
     /// One-line description.
     pub description: &'static str,
@@ -143,8 +143,8 @@ pub const RUNTIME_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         namespace: CommandNamespace::Runtime,
         command: "//apikey",
-        usage: "//apikey <provider> <key>",
-        description: "Update a provider API key (stored securely)",
+        usage: "//apikey [provider]",
+        description: "Set a provider API key via a masked prompt (stored securely)",
     },
     CommandSpec {
         namespace: CommandNamespace::Runtime,

@@ -2352,6 +2352,100 @@ fn test_input_history_dedup() {
 }
 
 #[test]
+fn test_input_history_redacts_secrets() {
+    let mut app = crate::tui::TuiApp::new().expect("app");
+    let secret = "sk-input-history-secret-1234567890abcdef";
+    app.push_history(format!("!curl -H \"Authorization: Bearer {}\"", secret));
+    assert!(
+        app.input_history.iter().all(|h| !h.contains(secret)),
+        "secret must never be stored in input history: {:?}",
+        app.input_history
+    );
+}
+
+#[test]
+fn test_session_persistence_never_contains_secrets() {
+    let dir = tempdir().unwrap();
+    let store = crate::session::SessionStore::new(dir.path()).unwrap();
+    let mut session = crate::session::Session::new("hardening task");
+    let secret = "sk-session-secret-1234567890abcdef";
+    session.record_event(&crate::agent::events::AgentEvent::ToolStarted {
+        tool: "run_command".to_string(),
+        args: format!("curl -H \"Authorization: Bearer {}\"", secret),
+    });
+    session.record_event(&crate::agent::events::AgentEvent::AgentFailed {
+        agent: "main".to_string(),
+        error: format!("failed with token {}", secret),
+    });
+    store.save_session(&session).unwrap();
+    let raw = fs::read_to_string(
+        dir.path()
+            .join("sessions")
+            .join(format!("{}.json", session.id)),
+    )
+    .unwrap();
+    assert!(
+        !raw.contains(secret),
+        "session persistence leaked a secret: {}",
+        raw
+    );
+}
+
+#[test]
+fn test_export_never_contains_api_key_or_secrets() {
+    let config = Config {
+        provider: "openai".to_string(),
+        base_url: "https://api.openai.com/v1".to_string(),
+        model: "gpt-4o".to_string(),
+        api_key: Some("sk-export-secret-1234567890abcdef".to_string()),
+    };
+    let mut app = crate::tui::TuiApp::new_with_config(config).expect("app");
+    let secret = "sk-export-secret-1234567890abcdef";
+    // A command echo is redacted before it becomes a message (see
+    // run_command_task in ui.rs).
+    app.add_message(
+        crate::tui::app::MessageRole::System,
+        crate::tools::shell::redact_secrets_public(&format!(
+            "[shell] curl -H \"Authorization: Bearer {}\"",
+            secret
+        )),
+    );
+    let dir = tempdir().unwrap();
+    let out_path = dir.path().join("export.json");
+    let out = app
+        .export_state(&out_path.to_string_lossy())
+        .expect("export_state");
+    let raw = fs::read_to_string(&out).unwrap();
+    assert!(!raw.contains(secret), "export leaked the API key: {}", raw);
+    // The config export surface must never carry the in-memory api_key.
+    assert!(
+        !raw.contains("sk-export-secret"),
+        "exported config must not include the api_key value"
+    );
+}
+
+#[test]
+fn test_read_file_tool_redacts_secrets() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("credentials.json");
+    let secret = "sk-readfile-secret-1234567890abcdef";
+    fs::write(
+        &file_path,
+        format!("{{\"keys\":{{\"openai\":\"{}\"}}}}", secret),
+    )
+    .unwrap();
+    let tool = ReadFile;
+    let result = tool
+        .execute(file_path.to_str().unwrap())
+        .expect("read_file should work");
+    assert!(
+        !result.contains(secret),
+        "read_file tool leaked a secret into tool output: {}",
+        result
+    );
+}
+
+#[test]
 fn test_panel_toggle_state() {
     let mut dashboard = crate::tui::dashboard::Dashboard::new();
     // Default view is task-focused: agent panels are overlays, not fixtures.

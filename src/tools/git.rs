@@ -20,7 +20,9 @@ impl super::Tool for GitStatus {
             .with_context(|| "Failed to run git status")?;
 
         if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // Tool output is fed to model context; redact any stray credential.
+            Ok(crate::tools::shell::redact_secrets_public(&text))
         } else {
             Err(anyhow::anyhow!("git status failed"))
         }
@@ -45,7 +47,10 @@ impl super::Tool for GitDiff {
             .with_context(|| "Failed to run git diff")?;
 
         if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // A diff can surface a committed/staged credential (e.g. an .env
+            // change); redact before it reaches tool output / model context.
+            Ok(crate::tools::shell::redact_secrets_public(&text))
         } else {
             Err(anyhow::anyhow!("git diff failed"))
         }

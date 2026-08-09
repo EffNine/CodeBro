@@ -78,6 +78,7 @@ use crate::provider_runtime::{
 };
 use crate::providers::OpenAiProvider;
 use crate::scanner::ProjectInfo;
+use crate::tools::shell::redact_secrets_public;
 use crate::tools::{detect_workspace_root, is_toolable, run_tool_pipeline};
 use crate::workspace_runtime::{LocalFileSystem, WorkspaceRuntime};
 use futures::StreamExt;
@@ -806,7 +807,9 @@ impl CanonicalRuntime {
                             for call in &calls {
                                 (req.emit)(AgentEvent::ToolStarted {
                                     tool: call.name.clone(),
-                                    args: call.arguments.clone(),
+                                    // Redact the displayed args; execution uses
+                                    // the raw arguments via execute_tool below.
+                                    args: redact_secrets_public(&call.arguments),
                                 });
                                 let result = self.execute_tool(call, req.emit, opts).await;
                                 (req.emit)(AgentEvent::ToolCompleted {
@@ -1028,7 +1031,11 @@ impl CanonicalRuntime {
     ) -> CommandOutcome {
         (emit)(AgentEvent::ToolStarted {
             tool: tool_name.to_string(),
-            args: args.to_string(),
+            // Command args can contain credentials (e.g. `curl -H
+            // "Authorization: Bearer ..."`); the emitted event is the
+            // display/persistence surface and is redacted. Execution below uses
+            // the raw `args`.
+            args: redact_secrets_public(args),
         });
 
         let outcome = match self

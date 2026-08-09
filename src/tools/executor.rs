@@ -219,8 +219,11 @@ fn read_file(root: &Path, path: &Path) -> Result<String> {
     } else {
         root.join(path)
     };
-    std::fs::read_to_string(&resolved)
-        .with_context(|| format!("Failed to read file: {}", resolved.display()))
+    let content = std::fs::read_to_string(&resolved)
+        .with_context(|| format!("Failed to read file: {}", resolved.display()))?;
+    // Ground-truth context is fed to the model; redact obvious credentials so
+    // a workspace file (or a stray credentials.json) never leaks a secret.
+    Ok(crate::tools::shell::redact_secrets_public(&content))
 }
 
 /// Extracts a shell command from the task (e.g. "run cargo clippy" -> "cargo clippy").
@@ -320,11 +323,17 @@ pub fn run_tool_pipeline(task: &str, root: &Path) -> Result<PipelineResult> {
         "run_command" => match extract_command(task) {
             Some(cmd) => match run_command(root, &cmd) {
                 Ok(out) => {
-                    primary_output = format!("$ {cmd}\n{out}");
+                    primary_output = format!(
+                        "$ {}\n{out}",
+                        crate::tools::shell::redact_secrets_public(&cmd)
+                    );
                     primary_success = true;
                 }
                 Err(e) => {
-                    primary_output = format!("$ {cmd}\nerror: {e}");
+                    primary_output = format!(
+                        "$ {}\nerror: {e}",
+                        crate::tools::shell::redact_secrets_public(&cmd)
+                    );
                 }
             },
             None => {

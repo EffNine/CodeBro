@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Sprint 28 hardening** — credential lifecycle and execution integrity:
+  - `//apikey` no longer accepts an inline key. Run `//apikey [provider]` and
+    enter the secret in a masked prompt (`Enter` to store, `Esc` to cancel);
+    inline keys are rejected and never enter input history or context.
+  - `CredentialStore` (`~/.codebro/credentials.json`) persists atomically with
+    mode `0600`, refuses symlinked paths, fsyncs before rename, and surfaces
+    security-critical failures instead of ignoring them. `Debug` output
+    exposes provider presence only, never values.
+  - Secrets are redacted before reaching shell history, session files,
+    conversation/context, input history, exports, clipboard text, and
+    activity logs via the single tool redaction authority
+    (`redact_secrets_public`), extended with password/secret/token, GitHub/
+    GitLab/Slack token, and URL-credential patterns.
+  - `read_file` tool output is redacted so a workspace credential file cannot
+    leak into model context.
+
+### Fixed
+- **Sprint 28 hardening** — blocking shell execution (`execute_child`)
+  drained stdout/stderr while the child runs, eliminating pipe-buffer
+  deadlocks on large output; output stays bounded; timeouts terminate the
+  whole process group; PTY/stream thread-creation failures are surfaced as
+  errors instead of silently dropped.
+
 ### Removed
 - **Sprint 25 — Architecture Consolidation (ADR-012)**
   - Removed legacy `src/context/` (v0.3 context builder) — superseded by `engineering_context` + `assembly`.

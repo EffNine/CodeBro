@@ -41,7 +41,10 @@ impl super::Tool for ReadFile {
     fn execute(&self, args: &str) -> Result<String> {
         let content = std::fs::read_to_string(args)
             .with_context(|| format!("Failed to read file: {}", args))?;
-        Ok(content)
+        // File contents flow into tool output and model context; redact
+        // obvious credentials (e.g. a workspace copy of credentials.json)
+        // using the single secret-redaction authority.
+        Ok(crate::tools::shell::redact_secrets_public(&content))
     }
 }
 

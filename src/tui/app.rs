@@ -29,6 +29,17 @@ pub enum PendingAction {
     RejectChange,
 }
 
+/// State for the masked (secret) API-key input mode. The buffer holds the raw
+/// secret in memory only; it is never echoed, never persisted to history, and
+/// only ever passed to the secure credential store.
+#[derive(Debug, Clone)]
+pub struct SecureInputState {
+    /// The provider the key is being set for.
+    pub provider: String,
+    /// The secret typed so far (masked on screen as `•`).
+    pub buffer: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Message {
     pub role: MessageRole,
@@ -75,6 +86,9 @@ pub struct TuiApp {
     /// A destructive/confirmable action awaiting explicit user confirmation
     /// (preview → confirm → execute).
     pub pending_confirmation: Option<(String, PendingAction)>,
+    /// Active masked API-key input (set by `//apikey <provider>`). While set,
+    /// typed characters go to the masked buffer instead of the main input.
+    pub secure_input: Option<SecureInputState>,
 }
 
 /// UI state for the provider management panel
@@ -183,6 +197,7 @@ impl TuiApp {
             active_console: None,
             cancel_token: None,
             pending_confirmation: None,
+            secure_input: None,
         })
     }
 
@@ -355,8 +370,11 @@ impl TuiApp {
         if cmd.is_empty() {
             return;
         }
-        if self.input_history.last() != Some(&cmd) {
-            self.input_history.push(cmd);
+        // History is a surface that must never record a secret: store the
+        // redacted form (same authority used by tool output and shell history).
+        let stored = crate::tools::shell::redact_secrets_public(&cmd);
+        if self.input_history.last() != Some(&stored) {
+            self.input_history.push(stored);
         }
         self.history_index = None;
     }

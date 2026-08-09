@@ -154,6 +154,13 @@ impl Session {
             ),
         };
 
+        // Defense-in-depth: session files are a persistence boundary. Even
+        // though secrets are redacted at the emission points, redact the
+        // recorded detail so a secret can never reach a session file through
+        // tool args, errors, or log lines. Uses the single redaction authority
+        // from the tool platform — no separate redaction implementation.
+        let details = details.map(|d| crate::tools::shell::redact_secrets_public(&d));
+
         self.timeline.push(TimelineEntry {
             timestamp: chrono::Local::now().to_rfc3339(),
             agent,

@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 const SHELL_HISTORY_PATH: &str = ".codebro/shell_history.json";
@@ -150,8 +151,14 @@ impl RunCommand {
     }
 
     /// Spawns `sh -c​(args)`, polls for completion up to `timeout_secs`, then
-    /// kills the process tree on timeout. This actually enforces the stated
+    /// kills the process group on timeout. This actually enforces the stated
     /// timeout (previously `wait_with_output`/`output` blocked indefinitely).
+    ///
+    /// stdout/stderr are drained **while** the child runs (dedicated reader
+    /// threads) so a chatty child can never deadlock on a full pipe buffer.
+    /// The exit code remains authoritative, output stays bounded (raw bytes
+    /// capped, then redacted + truncated), and the child process group is
+    /// terminated on timeout so no descendant keeps a pipe open forever.
     fn execute_child(&self, args: &str, timeout_secs: u64) -> Result<(String, String, i32, u128)> {
         let start = std::time::Instant::now();
 
@@ -160,14 +167,35 @@ impl RunCommand {
             .spawn()
             .with_context(|| format!("Failed to spawn command: {}", args))?;
 
+        let out: Option<Box<dyn std::io::Read + Send>> = child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>);
+        let err: Option<Box<dyn std::io::Read + Send>> = child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>);
+
+        let stdout = Arc::new(std::sync::Mutex::new(BoundedBuffer::new(MAX_TOOL_OUTPUT)));
+        let stderr = Arc::new(std::sync::Mutex::new(BoundedBuffer::new(MAX_TOOL_OUTPUT)));
+
+        let readers =
+            spawn_pipe_readers(out, err, stdout.clone(), stderr.clone()).map_err(|e| {
+                let _ = child.kill();
+                let _ = child.wait();
+                e
+            })?;
+
         let deadline = start + Duration::from_secs(timeout_secs);
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        terminate_group(&mut child);
+                        // Give the reader threads a bounded moment to observe
+                        // EOF from the group kill so they can exit.
+                        let _ = join_readers(readers, Duration::from_millis(1500));
                         return Err(anyhow::anyhow!(
                             "Command timed out after {}s: {}",
                             timeout_secs,
@@ -177,7 +205,8 @@ impl RunCommand {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(e) => {
-                    let _ = child.kill();
+                    terminate_group(&mut child);
+                    let _ = join_readers(readers, Duration::from_millis(1500));
                     return Err(anyhow::anyhow!(
                         "Failed to wait for command {}: {}",
                         args,
@@ -187,22 +216,17 @@ impl RunCommand {
             }
         };
 
-        // Collect remaining pipe output now that the process has exited.
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        if let Some(mut out) = child.stdout.take() {
-            use std::io::Read;
-            let _ = out.read_to_string(&mut stdout);
-        }
-        if let Some(mut err) = child.stderr.take() {
-            use std::io::Read;
-            let _ = err.read_to_string(&mut stderr);
-        }
+        // Child has exited: its write ends are closed, so the reader threads
+        // hit EOF on their own. Wait a bounded time for them to finish so the
+        // full buffered output is present.
+        let _ = join_readers(readers, Duration::from_secs(2));
 
-        // Cap runaway output so a chatty command can't blow up the UI/context.
         let duration = start.elapsed().as_millis();
         let exit_code = status.code().unwrap_or(-1);
-        let (stdout, stderr) = cap_output(&stdout, &stderr);
+
+        let out_text = stdout.lock().unwrap_or_else(|p| p.into_inner()).text();
+        let err_text = stderr.lock().unwrap_or_else(|p| p.into_inner()).text();
+        let (stdout, stderr) = cap_output(&out_text, &err_text);
 
         Ok((
             stdout.trim().to_string(),
@@ -228,7 +252,147 @@ impl RunCommand {
             cmd.env(key, value);
         }
 
+        // The child becomes its own process-group leader so the whole tree
+        // (sh + descendants) can be signalled together on timeout. Unix-only;
+        // on other platforms `terminate_group` degrades to killing the child.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+
         cmd
+    }
+}
+
+/// A bounded, byte-capped output accumulator for one pipe stream. Once the cap
+/// is reached the stream is marked truncated and further bytes are discarded,
+/// so unbounded output can never grow memory without limit.
+struct BoundedBuffer {
+    data: String,
+    cap_bytes: usize,
+    truncated: bool,
+}
+
+impl BoundedBuffer {
+    fn new(cap_bytes: usize) -> Self {
+        BoundedBuffer {
+            data: String::with_capacity(cap_bytes.min(8192)),
+            cap_bytes,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if self.truncated {
+            return;
+        }
+        let text = String::from_utf8_lossy(bytes);
+        if self.data.len() + text.len() > self.cap_bytes {
+            let room = self.cap_bytes.saturating_sub(self.data.len());
+            self.data
+                .push_str(&text[..text.floor_char_boundary(room.min(text.len()))]);
+            self.truncated = true;
+        } else {
+            self.data.push_str(&text);
+        }
+    }
+
+    fn text(&self) -> String {
+        if self.truncated {
+            format!("{}\n…[output truncated]", self.data)
+        } else {
+            self.data.clone()
+        }
+    }
+}
+
+/// Spawn a reader thread per pipe. Thread creation failures are surfaced to
+/// the caller (never silently dropped) so a failed producer is observable.
+fn spawn_pipe_readers(
+    out: Option<Box<dyn std::io::Read + Send>>,
+    err: Option<Box<dyn std::io::Read + Send>>,
+    out_buf: Arc<std::sync::Mutex<BoundedBuffer>>,
+    err_buf: Arc<std::sync::Mutex<BoundedBuffer>>,
+) -> std::io::Result<Vec<std::thread::JoinHandle<()>>> {
+    let mut handles = Vec::new();
+    if let Some(stream) = out {
+        let buf = out_buf.clone();
+        let handle = std::thread::Builder::new()
+            .name("codebro-out".to_string())
+            .spawn(move || drain_into(stream, buf))?;
+        handles.push(handle);
+    }
+    if let Some(stream) = err {
+        let buf = err_buf.clone();
+        let handle = std::thread::Builder::new()
+            .name("codebro-err".to_string())
+            .spawn(move || drain_into(stream, buf))?;
+        handles.push(handle);
+    }
+    Ok(handles)
+}
+
+/// Read a pipe until EOF/error, forwarding bytes into the bounded buffer. The
+/// child can never block on a full pipe while this runs.
+fn drain_into(
+    mut stream: Box<dyn std::io::Read + Send>,
+    buf: Arc<std::sync::Mutex<BoundedBuffer>>,
+) {
+    use std::io::Read;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(&chunk[..n]);
+            }
+        }
+    }
+}
+
+/// Terminate the child's whole process group (Unix) or just the child (fallback).
+/// On Unix the child is its own group leader, so a negative pid kills every
+/// descendant and closes all pipe write ends.
+fn terminate_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::killpg(child.id() as i32, libc::SIGKILL);
+        }
+        let _ = child.wait();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Wait up to `grace` for reader threads to finish. Returns immediately when
+/// the deadline is reached rather than blocking forever on a pipe that a
+/// misbehaving descendant keeps open.
+fn join_readers(handles: Vec<std::thread::JoinHandle<()>>, grace: Duration) {
+    let deadline = std::time::Instant::now() + grace;
+    for handle in handles {
+        loop {
+            if handle.is_finished() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -263,12 +427,27 @@ pub fn redact_secrets_public(s: &str) -> String {
 
 fn redact_secrets(s: &str) -> String {
     use regex::Regex;
-    // sk-..., common API key headers, and bearer tokens.
+    // Common API key shapes, authorization headers, bearer tokens, and
+    // obvious key=value secrets. This is the single secret-redaction authority
+    // for tool output, PTY streaming, shell history, and session persistence.
     let patterns: &[&str] = &[
+        // OpenAI-style keys: sk-...
         r"(?i)sk-[A-Za-z0-9_-]{16,}",
+        // Bearer tokens.
         r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{20,}",
+        // api_key=..., api-key "value", apikey: value
         r#"(?i)api[_-]?key["'=:\s]+[A-Za-z0-9._-]{16,}"#,
+        // Authorization: <credential>
         r#"(?i)authorization["'=:\s]+[A-Za-z0-9._~+/=-]{16,}"#,
+        // GitHub/GitLab PATs.
+        r"(?i)\bghp_[A-Za-z0-9]{20,}\b",
+        r"(?i)\bglpat-[A-Za-z0-9_\-]{16,}\b",
+        // Slack tokens.
+        r"(?i)\bxox[baprs]-[A-Za-z0-9-]{8,}\b",
+        // password/passwd/secret/token/pwd = <value>
+        r#"(?i)(?:password|passwd|secret|token|pwd)["'=:\s]+[A-Za-z0-9._~+/=-]{8,}"#,
+        // URLs with embedded credentials: scheme://user:pass@host
+        r"(?i)://[A-Za-z0-9._~%+-]+:[^/@\s:]+@",
     ];
     let mut out = s.to_string();
     for pat in patterns {
@@ -292,8 +471,11 @@ impl RunCommand {
             let mut history =
                 ShellHistory::load(history_path).unwrap_or_else(|_| ShellHistory::new());
 
+            // Commands themselves can carry secrets (e.g. `curl -H
+            // "Authorization: Bearer ..."`); redact before persistence so the
+            // history file never records a credential in the clear.
             let record = ShellCommandRecord {
-                command: command.to_string(),
+                command: redact_secrets(command),
                 working_directory: working_directory.to_string(),
                 timestamp: chrono::Local::now().to_rfc3339(),
                 success,
@@ -378,7 +560,8 @@ impl super::AsyncTool for RunCommand {
                 max_output: MAX_TOOL_OUTPUT,
             };
             let cancel = cancel.unwrap_or_default();
-            let mut rx = super::pty::spawn_pty(config, cancel);
+            let mut rx = super::pty::spawn_pty(config, cancel)
+                .context("Failed to start PTY-backed command")?;
 
             let stream = super::channel_stream_factory("run_command", move |tx| loop {
                 match rx.blocking_recv() {
@@ -586,5 +769,182 @@ mod tests {
         });
         assert!(result.contains("alpha"), "got: {}", result);
         assert!(result.contains("beta"), "got: {}", result);
+    }
+
+    // ─── Blocking-runner regression suite (Sprint 28 hardening) ────────────
+    //
+    // These cover: normal command, non-zero exit, large stdout, large stderr,
+    // simultaneous stdout/stderr, timeout, output truncation, and
+    // sensitive-looking output. Deterministic; no network.
+
+    #[test]
+    fn test_run_command_normal() {
+        let tool = RunCommand::new().with_timeout(30);
+        let result = tool.run("printf 'normal output\\n'").unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "normal output");
+    }
+
+    #[test]
+    fn test_run_command_nonzero_exit_is_a_value() {
+        let tool = RunCommand::new().with_timeout(30);
+        let result = tool.run("echo before; exit 3").unwrap();
+        assert_eq!(result.exit_code, 3);
+        assert!(result.stdout.contains("before"));
+    }
+
+    #[test]
+    fn test_large_stdout_does_not_deadlock() {
+        // 200KB is well past the ~64KB pipe buffer: the old implementation
+        // blocked forever because output was only drained after exit.
+        let tool = RunCommand::new().with_timeout(30);
+        let result = tool.run("yes x | head -c 200000").unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.stdout.len() < 200_000,
+            "output must be capped, got {} bytes",
+            result.stdout.len()
+        );
+        assert!(result.stdout.contains("truncated"));
+    }
+
+    #[test]
+    fn test_large_stderr_does_not_deadlock() {
+        let tool = RunCommand::new().with_timeout(30);
+        let result = tool
+            .run("i=0; while [ $i -lt 20000 ]; do echo err; i=$((i+1)); done >&2")
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stderr.contains("truncated"));
+        assert!(result.stderr.len() < 200_000);
+    }
+
+    #[test]
+    fn test_simultaneous_large_stdout_and_stderr() {
+        let tool = RunCommand::new().with_timeout(30);
+        let result = tool
+            .run("i=0; while [ $i -lt 20000 ]; do echo out; echo err >&2; i=$((i+1)); done")
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.contains("out"), "stdout missing content");
+        assert!(result.stderr.contains("err"), "stderr missing content");
+        assert!(result.stdout.len() < 200_000);
+        assert!(result.stderr.len() < 200_000);
+    }
+
+    #[test]
+    fn test_timeout_terminates_the_whole_process_group() {
+        // `sleep 30` is a separate child of sh. On timeout the entire process
+        // group must be killed; otherwise the sleep survives, keeps the pipe
+        // open, and the reader threads never see EOF.
+        let tool = RunCommand::new().with_timeout(1);
+        let start = std::time::Instant::now();
+        let err = tool
+            .run("sleep 30 && echo should_not_happen")
+            .expect_err("a 30s sleep must time out under 1s");
+        assert!(err.to_string().contains("timed out"), "got: {}", err);
+        assert!(
+            start.elapsed().as_secs() < 15,
+            "group kill must release the call promptly"
+        );
+    }
+
+    #[test]
+    fn test_large_output_never_grows_memory_without_bound() {
+        // Even a pathological stream of output stays bounded in memory: the
+        // byte cap is enforced while reading, not after collecting.
+        let tool = RunCommand::new().with_timeout(30);
+        let result = tool.run("yes x | head -c 5000000").unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.len() < 1_000_000);
+        assert!(result.stdout.contains("truncated"));
+    }
+
+    #[test]
+    fn test_sensitive_output_is_redacted() {
+        let tool = RunCommand::new().with_timeout(30);
+        let secret = "sk-super-secret-1234567890abcdef";
+        let result = tool
+            .run(&format!("echo Authorization: Bearer {}", secret))
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            !result.stdout.contains(secret),
+            "secret leaked in command output: {}",
+            result.stdout
+        );
+        assert!(result.stdout.contains("REDACTED"));
+    }
+
+    #[test]
+    fn test_redact_secrets_common_forms() {
+        assert!(!redact_secrets(
+            "curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345'"
+        )
+        .contains("abcdefghijklmnopqrstuvwxyz012345"));
+        assert!(
+            !redact_secrets("export API_KEY=sk-abcdefghijklmnopqrstuvwxyz012345")
+                .contains("sk-abcdefghijklmnopqrstuvwxyz012345")
+        );
+        assert!(
+            !redact_secrets("command --token mysecretvalue123456").contains("mysecretvalue123456")
+        );
+        assert!(!redact_secrets("export SECRET=value1234567890").contains("value1234567890"));
+        assert!(!redact_secrets("xoxb-12345678-abcdefghij").contains("xoxb-12345678-abcdefghij"));
+        assert!(!redact_secrets("ghp_abcdefghijklmnopqrstuvwxyz123456")
+            .contains("ghp_abcdefghijklmnopqrstuvwxyz123456"));
+        assert!(!redact_secrets("glpat-abcdefghijklmnopqrstuvwxyz12")
+            .contains("glpat-abcdefghijklmnopqrstuvwxyz12"));
+        assert!(
+            !redact_secrets("git clone https://user:secretpassword123@github.com/x/y.git")
+                .contains("secretpassword123")
+        );
+        // Ordinary prose must survive redaction intact.
+        assert!(redact_secrets("the build passed cleanly").contains("the build passed cleanly"));
+        assert!(redact_secrets("password policy is 8 chars").contains("password policy is 8 chars"));
+    }
+
+    #[test]
+    fn test_shell_history_redacts_secrets_before_persistence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history_path = dir.path().join("shell_history.json");
+        let tool = RunCommand::new()
+            .with_history_path(history_path.clone())
+            .with_timeout(30);
+        let secret = "sk-super-secret-1234567890abcdef";
+        let command = format!(
+            "echo Authorization: Bearer {}; echo Authorization: Bearer {}",
+            secret, secret
+        );
+        tool.run(&command).unwrap();
+
+        let raw = std::fs::read_to_string(&history_path).unwrap();
+        assert!(
+            !raw.contains(secret),
+            "secret leaked into shell history file: {}",
+            raw
+        );
+        let history = ShellHistory::load(&history_path).unwrap();
+        assert!(!history.commands.is_empty());
+        assert!(
+            !history.commands.back().unwrap().command.contains(secret),
+            "secret leaked into history record"
+        );
+    }
+
+    #[test]
+    fn test_history_remains_bounded() {
+        let mut history = ShellHistory::new();
+        for i in 0..1000 {
+            history.add(ShellCommandRecord {
+                command: format!("cmd {}", i),
+                working_directory: "/tmp".to_string(),
+                timestamp: "t".to_string(),
+                success: true,
+                duration_ms: 1,
+                exit_code: Some(0),
+            });
+        }
+        assert!(history.commands.len() <= 200, "history exceeded its bound");
     }
 }
