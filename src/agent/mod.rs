@@ -19,6 +19,7 @@ pub mod skill;
 pub mod status;
 pub mod subagent;
 pub mod task_graph;
+pub mod tool_parser;
 pub mod trace;
 pub mod workspace;
 

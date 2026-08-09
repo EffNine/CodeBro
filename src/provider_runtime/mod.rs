@@ -123,8 +123,25 @@ pub struct ProviderRuntime {
 
 impl ProviderRuntime {
     pub fn new() -> Self {
-        let registry = ProviderRegistry::new();
-        let health = HealthManager::new();
+        ProviderRuntime::from_parts(
+            ProviderRegistry::new(),
+            HealthManager::new(),
+            CostTracker::new(),
+        )
+    }
+
+    /// Construct a runtime over caller-supplied shared state.
+    ///
+    /// This is an integration seam: callers that already own a
+    /// `ProviderRegistry`, `HealthManager` and `CostTracker` (for example
+    /// to share them with an `IntelligentProviderRouter`) can construct a
+    /// `ProviderRuntime` that observes exactly the same state, keeping
+    /// routing, health, cost and circuit-breaker accounting coherent.
+    pub fn from_parts(
+        registry: ProviderRegistry,
+        health: HealthManager,
+        cost: CostTracker,
+    ) -> Self {
         let discovery = ProviderDiscovery::new(registry.clone(), health.clone());
         let router = ProviderRouter::new(registry.clone(), health.clone());
         let failover = Failover::new(router.clone(), FailoverPolicy::default());
@@ -134,7 +151,7 @@ impl ProviderRuntime {
             discovery,
             router,
             failover,
-            cost: CostTracker::new(),
+            cost,
             diagnostics: ProviderDiagnostics::new(),
             retry_policy: RetryPolicy::default(),
             circuit_breakers: CircuitBreakerRegistry::new(),
@@ -173,6 +190,11 @@ impl ProviderRuntime {
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
         self
+    }
+
+    /// Set the retry policy in place.
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
+        self.retry_policy = policy;
     }
 
     pub fn retry_policy(&self) -> &RetryPolicy {

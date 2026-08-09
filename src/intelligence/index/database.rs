@@ -212,6 +212,18 @@ impl SymbolDatabase {
         Ok(count as u32)
     }
 
+    /// Distinct indexed file paths, sorted for determinism.
+    pub fn list_indexed_files(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT file FROM symbols ORDER BY file")?;
+        let files = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|f| f.ok())
+            .collect();
+        Ok(files)
+    }
+
     pub fn delete_symbols_by_file(&self, file: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM symbols WHERE file = ?1", params![file])?;
@@ -362,5 +374,50 @@ impl SymbolDatabase {
             signature: row.get(11)?,
             doc_comment: row.get(12)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intelligence::index::symbol::Symbol;
+    use crate::intelligence::index::symbol::SymbolKind;
+
+    fn symbol(name: &str, file: &str) -> Symbol {
+        Symbol {
+            id: None,
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            language: "rust".to_string(),
+            file: file.to_string(),
+            line_start: 1,
+            line_end: 1,
+            column_start: 0,
+            column_end: 0,
+            parent: None,
+            visibility: None,
+            signature: None,
+            doc_comment: None,
+        }
+    }
+
+    #[test]
+    fn test_list_indexed_files_distinct_and_sorted() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = SymbolDatabase::open(tmp.path().join("index.db")).expect("open");
+        db.insert_symbol(&symbol("a", "z.rs")).unwrap();
+        db.insert_symbol(&symbol("b", "a.rs")).unwrap();
+        db.insert_symbol(&symbol("c", "z.rs")).unwrap();
+        db.insert_symbol(&symbol("d", "m.rs")).unwrap();
+
+        let files = db.list_indexed_files().expect("list");
+        assert_eq!(files, vec!["a.rs", "m.rs", "z.rs"]);
+    }
+
+    #[test]
+    fn test_list_indexed_files_empty() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = SymbolDatabase::open(tmp.path().join("index.db")).expect("open");
+        assert!(db.list_indexed_files().expect("list").is_empty());
     }
 }

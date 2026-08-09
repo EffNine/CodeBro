@@ -9,23 +9,15 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui::Terminal;
 use std::io::stdout;
-use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::coordinator::AgentCoordinator;
 use crate::agent::events::AgentEvent;
-use crate::agent::recovery::RecoveryEngine;
 use crate::agent::status::AgentStatus;
 use crate::config::Config;
-use crate::dispatcher::ToolRegistry;
-use crate::providers::Provider;
-use crate::runtime::RuntimeState;
-use crate::tools::{GitDiff, GitStatus, ListFiles, ReadFile, RunCommand};
 use crate::tui::animation::progress_bar;
 use crate::tui::app::{MessageRole, TuiApp};
 use crate::tui::dashboard::Dashboard;
 use crate::tui::events::{self, Shortcut};
-use crate::tui::tool_parser::{self, ToolCall};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -774,8 +766,12 @@ fn save_session(app: &TuiApp) -> Result<()> {
     Ok(())
 }
 
-/// Wires a chat submission into the ReAct runtime loop:
-/// Observe (tools) -> Reason (coordinator) -> Synthesize (LLM) -> Act (tool calls) -> Synthesize.
+/// Wires a chat submission into the canonical runtime:
+/// identity → memory → context assembly → EngineeringContext → PromptBuilder →
+/// IntelligentProviderRouter → ProviderRuntime → provider, streaming to the TUI.
+///
+/// The TUI remains responsible for input, rendering and diagnostics visibility;
+/// all execution concerns are owned by the canonical runtime.
 async fn run_chat_pipeline(
     config: &Config,
     task: &str,
@@ -785,248 +781,38 @@ async fn run_chat_pipeline(
     let emit = move |event: AgentEvent| {
         let _ = emit_tx.send(events::AppEvent::AgentEvent(event));
     };
+    let chunk_tx = tx.clone();
+    let on_chunk = move |chunk: &str| {
+        let _ = chunk_tx.send(events::AppEvent::StreamChunk(chunk.to_string()));
+    };
 
-    let mut registry = build_tool_registry();
-    let provider = crate::providers::OpenAiProvider::new(config.clone());
-
-    emit(AgentEvent::AgentStarted {
-        agent: "main".to_string(),
-        task: task.to_string(),
-    });
-    emit(AgentEvent::AgentStatusChanged {
-        agent: "main".to_string(),
-        status: AgentStatus::Thinking,
-    });
-
-    // Phase 1: Observe - gather ground truth via tool pipeline.
-    let workspace_root = crate::tools::detect_workspace_root();
-    let mut tool_context = String::new();
-    let mut state = RuntimeState::Idle;
-
-    state = state
-        .try_transition(RuntimeState::Observing)
-        .unwrap_or(state);
-    emit(AgentEvent::AgentStatusChanged {
-        agent: "main".to_string(),
-        status: AgentStatus::Searching,
-    });
-
-    if crate::tools::is_toolable(task) {
-        emit(AgentEvent::Log {
-            level: "pipeline".to_string(),
-            message: format!(
-                "Workspace detected: {} | routing task through tools",
-                workspace_root.display()
-            ),
-        });
-
-        match crate::tools::run_tool_pipeline(task, &workspace_root) {
-            Ok(pipeline) => {
-                for run in &pipeline.tool_runs {
-                    emit(AgentEvent::ToolStarted {
-                        tool: run.name.clone(),
-                        args: run.args.clone(),
-                    });
-                    tool_context.push_str(&run.output);
-                    emit(AgentEvent::ToolCompleted {
-                        tool: run.name.clone(),
-                        result: run.output.clone(),
-                        success: run.success,
-                    });
-                    emit(AgentEvent::AgentProgress {
-                        agent: "main".to_string(),
-                        progress: 0.5,
-                        action: format!("Executed {}", run.name),
-                    });
-                }
-                tool_context = pipeline.context;
-            }
-            Err(e) => {
-                emit(AgentEvent::Log {
-                    level: "pipeline".to_string(),
-                    message: format!("Tool pipeline error: {e}"),
-                });
-            }
-        }
-    }
-
-    // Phase 2: Reason - coordinator analyzes with subagents.
-    state = state
-        .try_transition(RuntimeState::Reasoning)
-        .unwrap_or(state);
-    emit(AgentEvent::AgentStatusChanged {
-        agent: "main".to_string(),
-        status: AgentStatus::Planning,
-    });
-
-    let mut coordinator = AgentCoordinator::new(6);
-    let report = coordinator.run_task(task, None, &emit).await;
-
-    // Phase 3: Synthesize - LLM produces initial response.
-    state = state
-        .try_transition(RuntimeState::Synthesizing)
-        .unwrap_or(state);
-    emit(AgentEvent::AgentStatusChanged {
-        agent: "main".to_string(),
-        status: AgentStatus::Executing,
-    });
-
-    let mut prompt = format!(
-        "User task: {}
-",
-        task
-    );
-    if !tool_context.trim().is_empty() {
-        prompt.push_str(&format!(
-            "
-Repository context gathered by tools (ground truth):
-{}",
-            tool_context
-        ));
-    } else if !report.trim().is_empty() {
-        prompt.push_str(&format!(
-            "
-Agent analysis:
-{}",
-            report
-        ));
-    }
-
-    // ReAct loop: synthesize, check for tool calls, act, repeat.
-    let max_iterations = 5;
-    for _ in 0..max_iterations {
-        match call_ai_streaming(&provider, &prompt, tx).await {
-            Ok(response) => {
-                if let Ok(calls) = tool_parser::parse_tool_calls(&response) {
-                    if !calls.is_empty() {
-                        state = state.try_transition(RuntimeState::Acting).unwrap_or(state);
-                        emit(AgentEvent::Log {
-                            level: "tool".to_string(),
-                            message: format!("Detected {} tool call(s)", calls.len()),
-                        });
-
-                        for call in &calls {
-                            let result = emit_tool_call(&mut registry, call, tx, &emit).await;
-                            prompt.push_str(&format!(
-                                "
-
-Tool result for {}: {}
-",
-                                call.name, result
-                            ));
-                        }
-
-                        state = state
-                            .try_transition(RuntimeState::Synthesizing)
-                            .unwrap_or(state);
-                        continue;
-                    }
-                }
-
-                let _ = state.try_transition(RuntimeState::Completed);
-                emit(AgentEvent::AgentCompleted {
-                    agent: "main".to_string(),
-                    duration_ms: 0,
-                });
-                return;
-            }
-            Err(e) => {
-                let _ = state.try_transition(RuntimeState::Failed);
-                if let Ok(mut recovery) = RecoveryEngine::new() {
-                    if let Ok(plan) = recovery.handle_failure("main", task, &e.to_string()) {
-                        emit(AgentEvent::Log {
-                            level: "coordination".to_string(),
-                            message: format!(
-                                "Provider failure: {:?} -> {}",
-                                plan.action, plan.suggested_agent
-                            ),
-                        });
-                    }
-                }
-                emit(AgentEvent::AgentFailed {
-                    agent: "main".to_string(),
-                    error: e.to_string(),
-                });
-                let _ = tx.send(events::AppEvent::Response(report));
-                return;
-            }
-        }
-    }
-
-    let _ = state.try_transition(RuntimeState::Completed);
-    emit(AgentEvent::AgentCompleted {
-        agent: "main".to_string(),
-        duration_ms: 0,
-    });
-}
-
-/// Builds the tool registry with all available tools.
-fn build_tool_registry() -> ToolRegistry {
-    ToolRegistry::new()
-        .register(Arc::new(ListFiles))
-        .register(Arc::new(ReadFile))
-        .register(Arc::new(crate::tools::CreateFile))
-        .register(Arc::new(crate::tools::EditFile))
-        .register(Arc::new(RunCommand::new()))
-        .register(Arc::new(GitStatus))
-        .register(Arc::new(GitDiff))
-}
-
-/// Executes a tool call via the registry.
-async fn execute_tool_call(registry: &mut ToolRegistry, name: &str, args: &str) -> Result<String> {
-    registry.execute(name, args).await
-}
-
-/// Streams a response from the provider, emitting StreamChunk events.
-async fn call_ai_streaming(
-    provider: &dyn Provider,
-    prompt: &str,
-    tx: &std::sync::mpsc::Sender<events::AppEvent>,
-) -> Result<String> {
-    let mut rx = provider.stream_response(prompt).await?;
-    let mut full = String::new();
-
-    while let Some(chunk) = rx.recv().await {
-        full.push_str(&chunk);
-        let _ = tx.send(events::AppEvent::StreamChunk(chunk));
-    }
-
-    let _ = tx.send(events::AppEvent::Response(full.clone()));
-    Ok(full)
-}
-
-/// Executes a tool call and emits the corresponding events.
-async fn emit_tool_call<F>(
-    registry: &mut ToolRegistry,
-    call: &ToolCall,
-    _tx: &std::sync::mpsc::Sender<events::AppEvent>,
-    emit: F,
-) -> String
-where
-    F: Fn(AgentEvent),
-{
-    emit(AgentEvent::ToolStarted {
-        tool: call.name.clone(),
-        args: call.arguments.clone(),
-    });
-
-    match execute_tool_call(registry, &call.name, &call.arguments).await {
-        Ok(result) => {
-            emit(AgentEvent::ToolCompleted {
-                tool: call.name.clone(),
-                result: result.clone(),
-                success: true,
-            });
-            result
-        }
+    let mut runtime = match crate::canonical_runtime::CanonicalRuntime::new(config.clone()) {
+        Ok(runtime) => runtime,
         Err(e) => {
-            emit(AgentEvent::ToolCompleted {
-                tool: call.name.clone(),
-                result: e.to_string(),
-                success: false,
-            });
-            format!("Error: {}", e)
+            let _ = tx.send(events::AppEvent::Response(format!(
+                "Runtime initialization failed: {e}"
+            )));
+            return;
         }
+    };
+
+    let request = crate::canonical_runtime::TaskRequest {
+        task,
+        conversation: Vec::new(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task(&request).await;
+
+    if result.success {
+        let _ = tx.send(events::AppEvent::Response(result.response));
+    } else {
+        let msg = result
+            .error
+            .clone()
+            .unwrap_or_else(|| "Task failed".to_string());
+        let _ = tx.send(events::AppEvent::Response(format!("Task failed: {msg}")));
     }
 }
 

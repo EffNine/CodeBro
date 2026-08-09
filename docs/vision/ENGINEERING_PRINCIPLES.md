@@ -197,6 +197,26 @@ Developers have years of terminal muscle memory — `Ctrl+C` to interrupt, `Ctrl
 
 ---
 
+## 11. Lazy by Default
+
+**CodeBro prefers the smallest correct change, reuses existing project capabilities, avoids speculative abstractions, validates its work, and stops when the requested outcome is achieved.**
+
+### Purpose
+Lazy does not mean low quality. It means *do not create complexity until complexity is necessary*. The agent searches for existing implementations, reuses existing abstractions, follows repository conventions, applies the smallest change that preserves architecture and correctness, validates, and stops. Scope is governed by `Required` / `Recommended` / `Unrelated` — only `Required` is executed automatically.
+
+### Benefits
+- Less technical debt — no speculative abstractions or unrelated refactors
+- Smaller, reviewable diffs
+- Consistent behavior: the agent stops when the outcome is achieved
+- Project goals stay aligned because every task knows where it fits
+
+### Tradeoffs
+- Reuse searches add a small inspection step before acting
+- "Smallest correct change" may occasionally be larger than a naive patch when architecture demands it — the larger change must be explained
+- Enforcement is policy-driven, not automatic; it requires discipline
+
+---
+
 ## Summary
 
 | Principle | One-Line Statement |
@@ -211,3 +231,4 @@ Developers have years of terminal muscle memory — `Ctrl+C` to interrupt, `Ctrl
 | Progressive Disclosure | Information appears only when relevant |
 | Extensibility | Skills and MCP grow the tool; the core stays small |
 | Terminal Muscle Memory | CodeBro extends terminal habits; it does not replace them |
+| Lazy by Default | Smallest correct change, reuse, validate, then stop |

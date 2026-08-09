@@ -5,8 +5,11 @@ pub mod dashboard;
 pub mod diff_view;
 pub mod events;
 pub mod markdown;
-pub mod tool_parser;
 pub mod ui;
+
+/// Re-exported from the agent runtime. The ReAct tool-call parser is owned by
+/// the agent layer, not the TUI.
+pub use crate::agent::tool_parser;
 
 pub use app::TuiApp;
 pub use ui::run;

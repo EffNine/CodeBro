@@ -166,6 +166,11 @@ impl CodeIndexer {
         self.db.get_symbol_count()
     }
 
+    /// Distinct indexed file paths, sorted for determinism.
+    pub fn list_indexed_files(&self) -> Result<Vec<String>> {
+        self.db.list_indexed_files()
+    }
+
     fn detect_language(&self, path: &Path) -> String {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {

@@ -14,6 +14,7 @@ use super::memory::EngineeringMemoryContext;
 use super::runtime::RuntimeContext;
 use super::statistics::EngineeringContextStatistics;
 use super::workspace::WorkspaceContext;
+use crate::engineering_objective::{EngineeringObjective, GoalAlignment};
 
 /// Errors that can occur during context construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +51,8 @@ impl std::error::Error for ContextBuildError {}
 pub struct EngineeringContextBuilder {
     project: Option<ProjectIdentity>,
     task: Option<IntentPlan>,
+    objective: Option<EngineeringObjective>,
+    goal_alignment: Option<GoalAlignment>,
     workspace: Option<WorkspaceContext>,
     context_fragments: Vec<ContextFragment>,
     memory: Option<EngineeringMemoryContext>,
@@ -79,6 +82,16 @@ impl EngineeringContextBuilder {
 
     pub fn task(mut self, task: IntentPlan) -> Self {
         self.task = Some(task);
+        self
+    }
+
+    pub fn objective(mut self, objective: EngineeringObjective) -> Self {
+        self.objective = Some(objective);
+        self
+    }
+
+    pub fn goal_alignment(mut self, alignment: Option<GoalAlignment>) -> Self {
+        self.goal_alignment = alignment;
         self
     }
 
@@ -155,6 +168,9 @@ impl EngineeringContextBuilder {
             .clone()
             .unwrap_or_else(|| ProjectIdentity::new("unknown", "unknown"));
 
+        let objective = self.objective.clone().unwrap_or_default();
+        let goal_alignment = self.goal_alignment;
+
         let workspace = self
             .workspace
             .clone()
@@ -206,6 +222,8 @@ impl EngineeringContextBuilder {
         Ok(EngineeringContext {
             project,
             task: self.task,
+            objective,
+            goal_alignment,
             workspace,
             context_fragments: self.context_fragments,
             memory,

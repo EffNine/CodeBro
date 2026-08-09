@@ -201,8 +201,6 @@ impl CodeIndexerTrait for CodeIndexer {
     }
 
     fn get_indexed_files(&self) -> Vec<String> {
-        // Return empty since indexed_files is private; the public API
-        // doesn't expose this directly.
-        Vec::new()
+        CodeIndexer::list_indexed_files(self).unwrap_or_default()
     }
 }

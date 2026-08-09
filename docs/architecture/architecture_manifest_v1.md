@@ -290,12 +290,21 @@ ui.rs: handle_key() → handle_command() / run_chat_pipeline()
     ↓
 run_chat_pipeline() spawns tokio task
     ↓
+canonical_runtime: CanonicalRuntime::run_task()
+  identity → memory → assembly → EngineeringContext → PromptBuilder
+  → IntelligentProviderRouter → ProviderRuntime → I/O provider
+    ↓
 AgentEvent emitted → AppEvent::AgentEvent(AgentEvent)
     ↓
 ui.rs: handle_event() → dashboard.handle_event() + app.handle_agent_event()
     ↓
 render()
 ```
+
+> Sprint 26: `run_chat_pipeline` is now a thin adapter. All execution
+> (context assembly, prompt compilation, provider routing/health/retry, memory
+> resolution, project identity) is owned by `canonical_runtime::CanonicalRuntime`.
+> See `docs/architecture/canonical_runtime_integration.md`.
 
 ---
 
@@ -522,14 +531,22 @@ The Intelligence Platform architecture is defined by **ADR-008**. Any changes to
 
 | From | To | Contract |
 |------|----|----------|
-| `tui/ui.rs` | `tools::executor` | Call `run_tool_pipeline(task, root)` → `PipelineResult` |
-| `tui/ui.rs` | `agent::coordinator` | Call `coordinator.run_task(task, root, &emit)` → `String` report |
-| `tui/ui.rs` | `providers` | Use `Provider::stream_response()` — NOT raw reqwest |
+| `tui/ui.rs` | `canonical_runtime` | Call `CanonicalRuntime::run_task(TaskRequest)` → `TaskResult` |
+| `canonical_runtime` | `project_identity` | Load/create `ProjectIdentityRuntime`; one `snapshot()` per task |
+| `canonical_runtime` | `engineering_objective` | Load/create `EngineeringObjectiveRuntime`; snapshot + goal alignment per task |
+| `canonical_runtime` | `engineering_memory` | `EngineeringMemoryRuntime::resolve_for_task(keywords, tags)` |
+| `canonical_runtime` | `assembly` | `ContextAssembler::assemble(&ContextAssemblyRequest)` |
+| `canonical_runtime` | `engineering_context` | Build immutable `EngineeringContext` via `EngineeringContextBuilder` |
+| `canonical_runtime` | `prompt_builder` | `PromptBuilder::compile_context(&EngineeringContext)` → `CompiledPrompt` |
+| `canonical_runtime` | `provider_runtime::routing` | `IntelligentProviderRouter::route(&RouteRequest)` |
+| `canonical_runtime` | `provider_runtime` | `ProviderRuntime::select` gates + `report_success` / `report_failure` |
+| `canonical_runtime` | `tools::executor` | `run_tool_pipeline(task, root)` → `PipelineResult` |
+| `canonical_runtime` | `agent::coordinator` | `coordinator.run_task(task, root, &emit)` → `String` report |
+| `canonical_runtime` | `providers` | I/O provider `stream_response()` via `ProviderAdapter` |
 | `agent::coordinator` | `agent::subagent::*` | Pass `SubAgentContext`; receive `SubAgentResult` |
 | `agent::coordinator` | `agent::events` | Emit `AgentEvent` via closure |
-| `agent::coordinator` | `tools::executor` | No direct call — tools are executed in `tui/ui.rs` before coordinator |
 | `session::SessionTracker` | `agent::events` | Receive cloned `AgentEvent` to record |
-| `intelligence::*` | `tools::executor` | Future: search results feed into pipeline context |
+| `intelligence::*` | `assembly` | `CodeIndexer` sources feed context assembly (when index exists) |
 
 ### 12.2 Prohibited Contracts
 

@@ -94,6 +94,66 @@ pub fn build_current_task(intent_plan: Option<&IntentPlanLike>) -> String {
     }
 }
 
+/// Build the Engineering Objective section.
+///
+/// This is the compact, always-on goal hierarchy. It never dumps source
+/// documents — it renders only the distilled objective block plus the
+/// current task and its deterministic alignment.
+pub fn build_engineering_objective(
+    project_name: &str,
+    objective: &ObjectiveLike,
+    current_task: Option<&IntentPlanLike>,
+    alignment: Option<GoalAlignmentLike>,
+) -> String {
+    if objective.is_empty() {
+        return String::new();
+    }
+
+    let task_goal = current_task.map(|t| t.detected_goal.as_str()).unwrap_or("");
+    let alignment_str = alignment
+        .map(|a| a.as_str().to_string())
+        .unwrap_or_default();
+
+    let mut lines = Vec::new();
+    if !project_name.trim().is_empty() {
+        lines.push("PROJECT".to_string());
+        lines.push(project_name.trim().to_string());
+        lines.push(String::new());
+    }
+    if !objective.end_goal.trim().is_empty() {
+        lines.push("END GOAL".to_string());
+        lines.push(objective.end_goal.trim().to_string());
+        lines.push(String::new());
+    }
+    if !objective.current_objective.trim().is_empty() {
+        lines.push("CURRENT OBJECTIVE".to_string());
+        lines.push(objective.current_objective.trim().to_string());
+        lines.push(String::new());
+    }
+    if !objective.current_milestone.trim().is_empty() {
+        lines.push("CURRENT MILESTONE".to_string());
+        lines.push(objective.current_milestone.trim().to_string());
+        lines.push(String::new());
+    }
+    if !task_goal.trim().is_empty() {
+        lines.push("CURRENT TASK".to_string());
+        lines.push(task_goal.trim().to_string());
+        lines.push(String::new());
+    }
+    if !alignment_str.trim().is_empty() {
+        lines.push("TASK ALIGNMENT".to_string());
+        if alignment_str == "Unclear" {
+            lines.push("⚠ Task alignment unclear".to_string());
+        } else {
+            lines.push(alignment_str);
+        }
+    }
+    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
 /// Build the Engineering Constraints section from project metadata.
 pub fn build_engineering_constraints(project_info: Option<&ProjectInfoLike>) -> String {
     match project_info {
@@ -302,6 +362,45 @@ pub struct DiagnosticLike {
     pub message: String,
 }
 
+/// Lightweight objective DTO to avoid circular deps.
+#[derive(Debug, Clone, Default)]
+pub struct ObjectiveLike {
+    pub end_goal: String,
+    pub project_vision: String,
+    pub current_objective: String,
+    pub current_milestone: String,
+    pub success_criteria: Vec<String>,
+    pub non_goals: Vec<String>,
+}
+
+impl ObjectiveLike {
+    pub fn is_empty(&self) -> bool {
+        self.end_goal.trim().is_empty()
+            && self.current_objective.trim().is_empty()
+            && self.current_milestone.trim().is_empty()
+    }
+}
+
+/// Lightweight goal-alignment DTO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalAlignmentLike {
+    Direct,
+    Supporting,
+    WeaklyRelated,
+    Unclear,
+}
+
+impl GoalAlignmentLike {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GoalAlignmentLike::Direct => "Direct",
+            GoalAlignmentLike::Supporting => "Supporting",
+            GoalAlignmentLike::WeaklyRelated => "Weakly Related",
+            GoalAlignmentLike::Unclear => "Unclear",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +532,69 @@ mod tests {
         let result = build_response_instructions("engineering", "Execution");
         assert!(result.contains("engineering"));
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_build_engineering_objective_empty() {
+        let o = ObjectiveLike::default();
+        let result = build_engineering_objective("proj", &o, None, None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_engineering_objective_hierarchy() {
+        let o = ObjectiveLike {
+            end_goal: "Build a terminal-native runtime.".to_string(),
+            project_vision: "Vision".to_string(),
+            current_objective: "Maintain software projects.".to_string(),
+            current_milestone: "Sprint 27.".to_string(),
+            success_criteria: Vec::new(),
+            non_goals: Vec::new(),
+        };
+        let intent = IntentPlanLike {
+            detected_goal: "Implement indexed retrieval".to_string(),
+            intent_type: "Execution".to_string(),
+            confidence: 0.9,
+            ambiguity: false,
+            ambiguity_reason: None,
+        };
+        let result = build_engineering_objective(
+            "CodeBro",
+            &o,
+            Some(&intent),
+            Some(GoalAlignmentLike::Supporting),
+        );
+        assert!(result.contains("PROJECT"));
+        assert!(result.contains("CodeBro"));
+        assert!(result.contains("END GOAL"));
+        assert!(result.contains("CURRENT OBJECTIVE"));
+        assert!(result.contains("CURRENT MILESTONE"));
+        assert!(result.contains("CURRENT TASK"));
+        assert!(result.contains("Implement indexed retrieval"));
+        assert!(result.contains("TASK ALIGNMENT"));
+        assert!(result.contains("Supporting"));
+    }
+
+    #[test]
+    fn test_build_engineering_objective_unclear_alignment() {
+        let o = ObjectiveLike {
+            end_goal: "Goal".to_string(),
+            current_objective: "Objective".to_string(),
+            ..ObjectiveLike::default()
+        };
+        let result =
+            build_engineering_objective("proj", &o, None, Some(GoalAlignmentLike::Unclear));
+        assert!(result.contains("⚠ Task alignment unclear"));
+    }
+
+    #[test]
+    fn test_objective_like_is_empty() {
+        let o = ObjectiveLike::default();
+        assert!(o.is_empty());
+        let filled = ObjectiveLike {
+            end_goal: "g".to_string(),
+            ..ObjectiveLike::default()
+        };
+        assert!(!filled.is_empty());
     }
 }

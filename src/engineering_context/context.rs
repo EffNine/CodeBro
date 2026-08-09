@@ -9,6 +9,7 @@ use super::memory::EngineeringMemoryContext;
 use super::runtime::RuntimeContext;
 use super::statistics::EngineeringContextStatistics;
 use super::workspace::WorkspaceContext;
+use crate::engineering_objective::{EngineeringObjective, GoalAlignment};
 
 /// Intent classification result carried from context assembly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,6 +54,10 @@ pub struct EngineeringContext {
     pub project: ProjectIdentity,
     /// Current task / intent.
     pub task: Option<IntentPlan>,
+    /// Project objective hierarchy (compact).
+    pub objective: EngineeringObjective,
+    /// Goal alignment of the current task (compact metadata).
+    pub goal_alignment: Option<GoalAlignment>,
     /// Workspace metadata and relevant files.
     pub workspace: WorkspaceContext,
     /// Assembled context fragments.
@@ -86,6 +91,7 @@ impl EngineeringContext {
             && self.constraints.is_empty()
             && self.active_files.is_empty()
             && self.conversation.is_empty()
+            && self.objective.is_empty()
     }
 
     /// Estimated total token count across all content.
@@ -111,6 +117,7 @@ impl EngineeringContext {
             + conversation_tokens
             + self.user_request.len() / 4
             + self.system_prompt.len() / 4
+            + self.objective.estimated_tokens()
     }
 
     /// Returns the number of context fragments.
@@ -137,6 +144,8 @@ impl EngineeringContext {
     pub fn equals(&self, other: &EngineeringContext) -> bool {
         self.project == other.project
             && self.task == other.task
+            && self.objective == other.objective
+            && self.goal_alignment == other.goal_alignment
             && self.workspace == other.workspace
             && self.context_fragments == other.context_fragments
             && self.memory == other.memory
@@ -245,5 +254,73 @@ mod tests {
         let ctx = sample_context();
         assert!(!ctx.diagnostics.creation_time.is_empty());
         assert!(ctx.diagnostics.build_duration_ms >= 0);
+    }
+
+    #[test]
+    fn test_objective_roundtrip_through_serialization() {
+        use crate::engineering_objective::EngineeringObjective;
+
+        let objective = EngineeringObjective::new("End goal", "Vision", "Objective", "Milestone");
+        let ctx = EngineeringContextBuilder::new()
+            .with_skip_validation()
+            .project(ProjectIdentity::new("proj", "rust"))
+            .task(IntentPlan {
+                detected_goal: "task".to_string(),
+                intent_type: "Execution".to_string(),
+                confidence: 0.9,
+                ambiguity: false,
+                ambiguity_reason: None,
+            })
+            .objective(objective.clone())
+            .user_request("task")
+            .system_prompt("sys")
+            .build()
+            .expect("build");
+
+        assert_eq!(ctx.objective, objective);
+
+        let json = serde_json::to_string(&ctx).expect("serialize");
+        let decoded: EngineeringContext = serde_json::from_str(&json).expect("deserialize");
+        assert!(ctx.equals(&decoded));
+        assert_eq!(decoded.objective, objective);
+    }
+
+    #[test]
+    fn test_objective_participates_in_equality() {
+        use crate::engineering_objective::EngineeringObjective;
+
+        let with_objective = EngineeringContextBuilder::new()
+            .with_skip_validation()
+            .project(ProjectIdentity::new("proj", "rust"))
+            .task(IntentPlan {
+                detected_goal: "task".to_string(),
+                intent_type: "Execution".to_string(),
+                confidence: 0.9,
+                ambiguity: false,
+                ambiguity_reason: None,
+            })
+            .objective(EngineeringObjective::new("g", "v", "o", "m"))
+            .user_request("task")
+            .system_prompt("sys")
+            .build()
+            .expect("build");
+
+        let without_objective = EngineeringContextBuilder::new()
+            .with_skip_validation()
+            .project(ProjectIdentity::new("proj", "rust"))
+            .task(IntentPlan {
+                detected_goal: "task".to_string(),
+                intent_type: "Execution".to_string(),
+                confidence: 0.9,
+                ambiguity: false,
+                ambiguity_reason: None,
+            })
+            .user_request("task")
+            .system_prompt("sys")
+            .build()
+            .expect("build");
+
+        // Different objectives must not compare equal.
+        assert!(!with_objective.equals(&without_objective));
     }
 }

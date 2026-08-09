@@ -11,6 +11,23 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
+// =========================================================================
+// Provider-selection authority (Sprint 27 audit)
+// =========================================================================
+//
+// `ai_runtime::RuntimeRouter` is a provider-agnostic *model-selection*
+// prototype that operates on `ModelCandidate` records. It is NOT wired into
+// any production execution path: its only consumers are its own tests and
+// the `AIRuntime` wrapper. The sole production provider-selection authority
+// is `provider_runtime::routing::IntelligentProviderRouter`, which consumes
+// `RegisteredProvider` registration metadata (capabilities, cost, priority)
+// plus shared health/cost state.
+//
+// There are therefore no two competing authorities in the execution path.
+// `ai_runtime` is retained as a documented, self-contained reference for
+// capability-negotiation scoring. See
+// `docs/architecture/engineering_objective_final_audit.md` (§ Provider router).
+
 pub use capabilities::{Capability, CapabilityNegotiation, CapabilitySet, SupportedCapabilities};
 pub use diagnostics::{DiagnosticEvent, DiagnosticLevel, RuntimeDiagnostics};
 pub use request::{MessageRole, ModelRequest};

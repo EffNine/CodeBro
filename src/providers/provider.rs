@@ -20,4 +20,22 @@ pub trait Provider: Send + Sync {
                 + '_,
         >,
     >;
+
+    /// Optional provider-declared capabilities.
+    ///
+    /// When non-empty, the adapter uses these as the registered metadata
+    /// instead of the hard-coded fallback. Providers that self-describe must
+    /// include every capability they actually support (e.g. `Streaming`,
+    /// `ToolCalling`).
+    fn capabilities(&self) -> Vec<crate::provider_runtime::Capability> {
+        Vec::new()
+    }
+
+    /// Optional provider-declared pricing model.
+    ///
+    /// When `Some`, the adapter uses it as the registered cost metadata
+    /// instead of the default.
+    fn cost(&self) -> Option<crate::provider_runtime::ProviderCost> {
+        None
+    }
 }

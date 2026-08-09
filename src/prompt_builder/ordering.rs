@@ -15,6 +15,7 @@ pub const CANONICAL_ORDER: &[SectionKey] = &[
     SectionKey::SystemIdentity,
     SectionKey::ProjectIdentity,
     SectionKey::CurrentTask,
+    SectionKey::EngineeringObjective,
     SectionKey::EngineeringConstraints,
     SectionKey::RelevantContext,
     SectionKey::EngineeringMemory,
@@ -88,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_canonical_order_is_complete() {
-        assert_eq!(CANONICAL_ORDER.len(), 11);
+        assert_eq!(CANONICAL_ORDER.len(), 12);
         assert_eq!(CANONICAL_ORDER[0], SectionKey::SystemIdentity);
         assert_eq!(
             CANONICAL_ORDER[CANONICAL_ORDER.len() - 1],

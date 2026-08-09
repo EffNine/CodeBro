@@ -384,4 +384,70 @@ mod tests {
         assert!(rendered.contains("user prompt"));
         assert!(rendered.contains("memory entry"));
     }
+
+    #[test]
+    fn test_assemble_flows_tool_results_into_fragments() {
+        // Tool → ToolResult → Context Fragment → ContextAssembler →
+        // EngineeringContext. Tool results must enter the canonical
+        // fragment pipeline, not string concatenation.
+        let req = make_request("run the tests").with_tool_results(vec![
+            ContextFragment::new(
+                ContextSource::ToolResults,
+                ContextPriority::High,
+                "test output: 12 passed, 0 failed".to_string(),
+                0.9,
+            ),
+            ContextFragment::new(
+                ContextSource::ToolResults,
+                ContextPriority::Medium,
+                "coverage: 81%".to_string(),
+                0.6,
+            ),
+        ]);
+        let assembler = ContextAssembler::new(AssemblyConfig::default());
+        let result = assembler.assemble(&req).unwrap();
+
+        let tool_frags: Vec<&ContextFragment> = result
+            .fragments
+            .iter()
+            .filter(|f| f.source == ContextSource::ToolResults)
+            .collect();
+        assert_eq!(tool_frags.len(), 2);
+        assert!(tool_frags.iter().any(|f| f.content.contains("12 passed")));
+        assert!(result.statistics.total_fragments >= 3);
+    }
+
+    #[test]
+    fn test_indexer_files_become_context_fragments() {
+        // Indexed workspace files must become actual assembler fragments via
+        // the existing indexer source (get_indexed_files → fragments).
+        let tmp = tempfile::tempdir().unwrap();
+        let source = "pub fn main() {}\n";
+        let file = tmp.path().join("src").join("main.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, source).unwrap();
+
+        let db_path = tmp.path().join("index.db");
+        {
+            let mut idx = crate::intelligence::CodeIndexer::new(db_path.clone()).unwrap();
+            idx.index_file(&file, source).unwrap();
+        }
+        // A fresh indexer over the same DB reconstructs the file list from
+        // the symbol store (get_indexed_files reads the DB, not memory).
+        let idx = crate::intelligence::CodeIndexer::new(db_path).unwrap();
+
+        let req = make_request("main").with_indexer(idx);
+        let assembler = ContextAssembler::new(AssemblyConfig::default());
+        let result = assembler.assemble(&req).unwrap();
+
+        let indexer_frags: Vec<&ContextFragment> = result
+            .fragments
+            .iter()
+            .filter(|f| f.source == ContextSource::Indexer)
+            .collect();
+        assert!(
+            !indexer_frags.is_empty(),
+            "indexed file should flow into assembler fragments"
+        );
+    }
 }

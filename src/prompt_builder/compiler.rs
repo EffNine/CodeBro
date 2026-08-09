@@ -89,6 +89,33 @@ impl PromptCompiler {
                 ambiguity_reason: t.ambiguity_reason.clone(),
             });
 
+        let objective_like = {
+            let o = &context.objective;
+            super::sections::ObjectiveLike {
+                end_goal: o.end_goal.clone(),
+                project_vision: o.project_vision.clone(),
+                current_objective: o.current_objective.clone(),
+                current_milestone: o.current_milestone.clone(),
+                success_criteria: o.success_criteria.clone(),
+                non_goals: o.non_goals.clone(),
+            }
+        };
+
+        let alignment_like = context.goal_alignment.map(|a| match a {
+            crate::engineering_objective::GoalAlignment::Direct => {
+                super::sections::GoalAlignmentLike::Direct
+            }
+            crate::engineering_objective::GoalAlignment::Supporting => {
+                super::sections::GoalAlignmentLike::Supporting
+            }
+            crate::engineering_objective::GoalAlignment::WeaklyRelated => {
+                super::sections::GoalAlignmentLike::WeaklyRelated
+            }
+            crate::engineering_objective::GoalAlignment::Unclear => {
+                super::sections::GoalAlignmentLike::Unclear
+            }
+        });
+
         let relevant_files: Vec<super::sections::ContextFileLike> = context
             .context_fragments
             .iter()
@@ -163,6 +190,8 @@ impl PromptCompiler {
                 &context.project.name,
                 project_info.as_ref(),
                 intent_plan.as_ref(),
+                &objective_like,
+                alignment_like,
                 &relevant_files,
                 &conversation,
                 &memories,
@@ -217,6 +246,8 @@ impl PromptCompiler {
         project_name: &str,
         project_info: Option<&ProjectInfoLike>,
         intent_plan: Option<&IntentPlanLike>,
+        objective: &ObjectiveLike,
+        alignment: Option<GoalAlignmentLike>,
         relevant_files: &[ContextFileLike],
         conversation: &[ConversationMsgLike],
         memories: &[MemoryFragment],
@@ -240,6 +271,11 @@ impl PromptCompiler {
             SectionKey::CurrentTask => {
                 let content = build_current_task(intent_plan);
                 PromptSection::new(2, "Current Task", &content)
+            }
+            SectionKey::EngineeringObjective => {
+                let content =
+                    build_engineering_objective(project_name, objective, intent_plan, alignment);
+                PromptSection::new(3, "Engineering Objective", &content)
             }
             SectionKey::EngineeringConstraints => {
                 let content = build_engineering_constraints(project_info);
@@ -1236,5 +1272,69 @@ mod tests {
 
         assert!(!result.prompt.is_empty());
         assert!(result.statistics.section_count >= 2);
+    }
+
+    #[test]
+    fn test_compile_includes_objective_section_when_present() {
+        use crate::engineering_context::{
+            builder::EngineeringContextBuilder, identity::ProjectIdentity, IntentPlan,
+        };
+        use crate::engineering_objective::EngineeringObjective;
+
+        let objective = EngineeringObjective::new(
+            "Build a terminal-native runtime.",
+            "Vision",
+            "Maintain software projects.",
+            "Sprint 27.",
+        );
+
+        let context = EngineeringContextBuilder::new()
+            .project(ProjectIdentity::new("codebro", "rust"))
+            .task(IntentPlan {
+                detected_goal: "implement indexed retrieval".to_string(),
+                intent_type: "Execution".to_string(),
+                confidence: 0.9,
+                ambiguity: false,
+                ambiguity_reason: None,
+            })
+            .objective(objective)
+            .user_request("implement indexed retrieval")
+            .system_prompt("sys")
+            .build()
+            .expect("build should succeed");
+
+        let compiler = PromptCompiler::new();
+        let result = compiler.compile_context(&context);
+
+        assert!(result.prompt.contains("Engineering Objective"));
+        assert!(result.prompt.contains("END GOAL"));
+        assert!(result.prompt.contains("CURRENT OBJECTIVE"));
+        assert!(result.prompt.contains("CURRENT TASK"));
+    }
+
+    #[test]
+    fn test_compile_drops_objective_section_when_empty() {
+        use crate::engineering_context::{
+            builder::EngineeringContextBuilder, identity::ProjectIdentity, IntentPlan,
+        };
+
+        let context = EngineeringContextBuilder::new()
+            .project(ProjectIdentity::new("proj", "rust"))
+            .task(IntentPlan {
+                detected_goal: "fix bug".to_string(),
+                intent_type: "Execution".to_string(),
+                confidence: 0.9,
+                ambiguity: false,
+                ambiguity_reason: None,
+            })
+            .user_request("fix the bug")
+            .system_prompt("sys")
+            .build()
+            .expect("build should succeed");
+
+        let compiler = PromptCompiler::new();
+        let result = compiler.compile_context(&context);
+
+        assert!(!result.prompt.contains("Engineering Objective"));
     }
 }

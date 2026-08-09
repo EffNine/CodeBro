@@ -184,6 +184,29 @@ These design principles guide every coding decision in CodeBro. When faced with 
 
 ---
 
+### Principle 11: Lazy by Default
+
+**CodeBro prefers the smallest correct change, reuses existing project capabilities, avoids speculative abstractions, validates its work, and stops when the requested outcome is achieved.**
+
+Lazy does not mean low quality. It means *do not create complexity until complexity is necessary*.
+
+- Search for existing implementations and abstractions before inventing new ones.
+- Follow the repository's existing conventions for solving problems.
+- Prefer the smallest change that preserves architecture, correctness, maintainability, and project goals.
+- Do not change unrelated code.
+- Run the appropriate tests/checks, then STOP.
+
+**In practice:**
+- `ChangeScope` (Required / Recommended / Unrelated) governs what is executed automatically (ADR-013).
+- `LazyExecutionPolicy` encodes reuse preference and the stop condition.
+- Every task follows: `Inspect → Understand → Retrieve → Reuse → Change → Validate → Stop`.
+
+**"Smallest correct change" is not "smallest patch":** a tiny patch that
+creates severe technical debt is rejected in favor of a clean implementation
+with a smaller future cost — but the larger change must be explained.
+
+---
+
 ## 3. Principle Conflict Resolution
 
 When principles conflict, use this priority order:
@@ -198,6 +221,7 @@ When principles conflict, use this priority order:
 8. **Progressive Disclosure** > Explicit — clarity-critical
 9. **Model Agnostic** > all others — flexibility-critical
 10. **Small, Composable Components** > all others — maintainability-critical
+11. **Lazy by Default** > all others — debt-critical (when two designs both satisfy the task, the smaller correct one wins)
 
 ---
 
