@@ -1285,6 +1285,7 @@ async fn run_chat_pipeline(
     let options = crate::canonical_runtime::TaskOptions {
         cancel: Some(token),
         on_pty: Some(on_pty),
+        ..Default::default()
     };
 
     let result = runtime.run_task_with_options(&request, options).await;
@@ -1624,6 +1625,7 @@ fn render_agents(f: &mut Frame, app: &TuiApp, area: Rect) {
             let (icon, color) = match entry.status {
                 AgentStatus::Completed => ("✓", Color::Green),
                 AgentStatus::Failed => ("✗", Color::Red),
+                AgentStatus::Cancelled => ("⊘", Color::Yellow),
                 AgentStatus::Idle => ("○", Color::DarkGray),
                 _ => ("⟳", Color::Yellow),
             };

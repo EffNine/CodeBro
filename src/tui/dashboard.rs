@@ -328,6 +328,12 @@ impl Dashboard {
                 self.last_error = Some(error.clone());
                 self.log("error", format!("Agent {} failed: {}", agent, error));
             }
+            AgentEvent::AgentCancelled { agent } => {
+                self.status_monitor.register_agent(&agent);
+                self.status_monitor
+                    .update_status(&agent, AgentStatus::Cancelled);
+                self.log("info", format!("Agent {} cancelled", agent));
+            }
             AgentEvent::TaskGraphUpdated { graph } => {
                 self.set_task_graph(graph);
             }

@@ -50,6 +50,10 @@ pub enum AgentEvent {
         agent: String,
         error: String,
     },
+    /// Emitted when a task is cancelled by the user (Ctrl+C).
+    AgentCancelled {
+        agent: String,
+    },
     TaskGraphUpdated {
         graph: TaskGraph,
     },
@@ -103,6 +107,7 @@ impl AgentEvent {
             AgentEvent::SkillUpdated { skill, .. } => format!("Skill updated: {}", skill),
             AgentEvent::AgentCompleted { agent, .. } => format!("Agent {} completed", agent),
             AgentEvent::AgentFailed { agent, .. } => format!("Agent {} failed", agent),
+            AgentEvent::AgentCancelled { agent } => format!("Agent {} cancelled", agent),
             AgentEvent::TaskGraphUpdated { .. } => "Task graph updated".to_string(),
             AgentEvent::StreamChunk { .. } => "streaming".to_string(),
             AgentEvent::PtyOutput { .. } => "console output".to_string(),

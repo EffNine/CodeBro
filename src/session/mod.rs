@@ -129,6 +129,12 @@ impl Session {
                 Some(error.clone()),
                 Some(false),
             ),
+            AgentEvent::AgentCancelled { agent } => (
+                agent.clone(),
+                "agent_cancelled".to_string(),
+                None,
+                Some(false),
+            ),
             AgentEvent::StreamChunk { .. } => return,
             AgentEvent::PtyOutput { console, .. } => (
                 "console".to_string(),

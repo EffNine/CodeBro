@@ -14,6 +14,7 @@ pub enum AgentStatus {
     Reviewing,
     Completed,
     Failed,
+    Cancelled,
 }
 
 impl AgentStatus {
@@ -29,6 +30,7 @@ impl AgentStatus {
             AgentStatus::Reviewing => "reviewing",
             AgentStatus::Completed => "completed",
             AgentStatus::Failed => "failed",
+            AgentStatus::Cancelled => "cancelled",
         }
     }
 
@@ -46,7 +48,10 @@ impl AgentStatus {
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self, AgentStatus::Completed | AgentStatus::Failed)
+        matches!(
+            self,
+            AgentStatus::Completed | AgentStatus::Failed | AgentStatus::Cancelled
+        )
     }
 }
 
@@ -82,7 +87,7 @@ impl AgentState {
 
     pub fn set_status(&mut self, status: AgentStatus) {
         match status {
-            AgentStatus::Completed | AgentStatus::Failed => {
+            AgentStatus::Completed | AgentStatus::Failed | AgentStatus::Cancelled => {
                 self.completed_at = Some(chrono::Local::now().to_rfc3339());
             }
             _ => {
@@ -200,6 +205,13 @@ impl AgentStatusMonitor {
         self.agents
             .values()
             .filter(|a| a.status == AgentStatus::Failed)
+            .count()
+    }
+
+    pub fn cancelled_count(&self) -> usize {
+        self.agents
+            .values()
+            .filter(|a| a.status == AgentStatus::Cancelled)
             .count()
     }
 

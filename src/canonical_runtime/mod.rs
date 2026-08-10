@@ -84,7 +84,20 @@ use crate::workspace_runtime::{LocalFileSystem, WorkspaceRuntime};
 use futures::StreamExt;
 
 /// The number of ReAct reasoning iterations before giving up.
-const MAX_REACT_ITERATIONS: usize = 5;
+pub(crate) const MAX_REACT_ITERATIONS: usize = 5;
+
+/// Maximum tool calls allowed per reasoning iteration.
+const MAX_TOOL_CALLS_PER_ITERATION: usize = 20;
+
+/// Maximum total tool calls across the entire task.
+const MAX_TOTAL_TOOL_CALLS: usize = 100;
+
+/// Repeated-action threshold: if the same deterministic action fingerprint
+/// appears this many times in a row, the loop terminates.
+const MAX_REPEATED_ACTIONS: usize = 3;
+
+/// Default task timeout (30 seconds). Exceeding this terminates the task.
+const DEFAULT_TASK_TIMEOUT_MS: u64 = 30_000;
 
 /// A request to execute one engineering task.
 pub struct TaskRequest<'a> {
@@ -109,6 +122,15 @@ pub struct TaskOptions {
     /// output and verification output are forwarded here in addition to the
     /// event stream.
     pub on_pty: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+    /// Maximum tool calls allowed per reasoning iteration. Defaults to
+    /// `MAX_TOOL_CALLS_PER_ITERATION`.
+    pub max_tool_calls_per_iteration: Option<usize>,
+    /// Total task timeout in milliseconds. Defaults to
+    /// `DEFAULT_TASK_TIMEOUT_MS`. Zero means no timeout.
+    pub task_timeout_ms: Option<u64>,
+    /// Maximum number of verification revision attempts after a failure.
+    /// Defaults to 2.
+    pub max_verification_revisions: Option<usize>,
 }
 
 /// The outcome of a directly-invoked streaming tool run (shell commands,
@@ -161,6 +183,16 @@ pub struct TaskResult {
     pub error: Option<String>,
     /// Per-task runtime diagnostics.
     pub diagnostics: TaskDiagnostics,
+    /// Whether the task was cancelled by the user.
+    pub cancelled: bool,
+}
+
+impl TaskResult {
+    /// Returns `true` if the task reached a terminal state (completed, failed,
+    /// or cancelled).
+    pub fn is_terminal(&self) -> bool {
+        !self.response.is_empty() || self.error.is_some() || self.cancelled
+    }
 }
 
 /// The canonical task / agent runtime.
@@ -361,14 +393,7 @@ impl CanonicalRuntime {
             .map(|c| c.is_cancelled())
             .unwrap_or(false)
         {
-            return self.fail(
-                req,
-                None,
-                req.task,
-                "Task cancelled".to_string(),
-                diag,
-                started,
-            );
+            return self.cancel(req, None, req.task, diag, started);
         }
 
         // Task lifecycle: begin.
@@ -418,7 +443,7 @@ impl CanonicalRuntime {
         diag.intent = format!("{:?}", assembly.intent.intent).to_lowercase();
 
         // EngineeringContext handoff contract.
-        let context = match self.build_context(req, &identity, memory_ctx, assembly, report) {
+        let mut context = match self.build_context(req, &identity, memory_ctx, assembly, report) {
             Ok(ctx) => ctx,
             Err(e) => return self.fail(req, Some(&mut graph), &root_id, e, diag, started),
         };
@@ -443,23 +468,97 @@ impl CanonicalRuntime {
 
         match exec_result {
             Ok(mut response) => {
-                // Explicit verification phase (Understand → Recommend → Execute
-                // → Verify → Stop). Only tasks that intend to modify or debug
-                // the project are verified; a successful verification stops the
-                // task. No further work is generated after success.
+                // Verification revision loop: verify → (pass → complete |
+                // fail → bounded revise → re-execute). Only tasks that intend
+                // to modify or debug the project are verified; a successful
+                // verification stops the task. No further work is generated
+                // after success.
                 let should_verify = context
                     .task
                     .as_ref()
                     .map(|t| t.intent_type == "execution" || t.intent_type == "debugging")
                     .unwrap_or(false);
                 if should_verify {
-                    if let Some((summary, verify_response)) =
-                        self.verify_task(req, &opts, &mut diag, started).await
-                    {
-                        diag.verification = Some(summary);
-                        if !verify_response.trim().is_empty() {
-                            response.push_str("\n\n");
-                            response.push_str(&verify_response);
+                    let max_revisions = opts.max_verification_revisions.unwrap_or(2);
+                    let mut revision = 0usize;
+                    loop {
+                        let verify_result = self.verify_task(req, &opts, &mut diag, started).await;
+                        match verify_result {
+                            Some((summary, verify_response)) => {
+                                diag.verification = Some(summary);
+                                if !verify_response.trim().is_empty() {
+                                    response.push_str("\n\n");
+                                    response.push_str(&verify_response);
+                                }
+                                // Verification passed → complete.
+                                if verify_response.contains("passed") {
+                                    break;
+                                }
+                                // Verification failed → bounded revision.
+                                revision += 1;
+                                if revision >= max_revisions {
+                                    // Exhausted revision budget: task fails.
+                                    return self.fail(
+                                        req,
+                                        Some(&mut graph),
+                                        &root_id,
+                                        format!(
+                                            "Verification failed after {} revision(s)",
+                                            max_revisions
+                                        ),
+                                        diag,
+                                        started,
+                                    );
+                                }
+                                (req.emit)(AgentEvent::Log {
+                                    level: "pipeline".to_string(),
+                                    message: format!(
+                                        "Verification failed, revising (attempt {}/{})",
+                                        revision, max_revisions
+                                    ),
+                                });
+                                // Re-run the execution loop to revise.
+                                let (rev_exec, rev_trace) =
+                                    self.run_execution_loop(req, context.clone(), &opts).await;
+                                diag.provider = rev_trace.provider;
+                                diag.routing_reason = rev_trace.reason;
+                                diag.strategy = rev_trace.strategy;
+                                diag.breaker_state = rev_trace.breaker_state;
+                                diag.breaker_allowed = rev_trace.breaker_allowed;
+                                diag.routing_ms = rev_trace.routing_ms;
+                                diag.provider_execution_ms = rev_trace.exec_ms;
+                                match rev_exec {
+                                    Ok(rev_response) => {
+                                        response.push_str("\n\n");
+                                        response.push_str(&rev_response);
+                                        context = extend_context(
+                                            context,
+                                            vec![ContextFragment {
+                                                source: "revision".to_string(),
+                                                content: format!(
+                                                    "Revision {} response: {}",
+                                                    revision, rev_response
+                                                ),
+                                                relevance_score: 0.7,
+                                            }],
+                                        );
+                                    }
+                                    Err(e) => {
+                                        return self.fail(
+                                            req,
+                                            Some(&mut graph),
+                                            &root_id,
+                                            e,
+                                            diag,
+                                            started,
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                // No verification applicable (no build system).
+                                break;
+                            }
                         }
                     }
                 }
@@ -482,9 +581,17 @@ impl CanonicalRuntime {
                     response,
                     error: None,
                     diagnostics: diag,
+                    cancelled: false,
                 }
             }
-            Err(e) => self.fail(req, Some(&mut graph), &root_id, e, diag, started),
+            Err(e) => {
+                // Distinguish cancellation from other failures.
+                if e == "Task cancelled" {
+                    self.cancel(req, Some(&mut graph), &root_id, diag, started)
+                } else {
+                    self.fail(req, Some(&mut graph), &root_id, e, diag, started)
+                }
+            }
         }
     }
 
@@ -749,6 +856,14 @@ impl CanonicalRuntime {
     }
 
     /// Run the ReAct loop: compile → route → execute → act → repeat.
+    ///
+    /// Enforces the following loop guards:
+    /// - cancellation token
+    /// - max reasoning iterations
+    /// - max tool calls per iteration
+    /// - max total tool calls
+    /// - task timeout
+    /// - repeated-action detection
     async fn run_execution_loop(
         &mut self,
         req: &TaskRequest<'_>,
@@ -758,21 +873,41 @@ impl CanonicalRuntime {
         let started = Instant::now();
         let mut trace = RouteTrace::default();
         let mut context = initial_context;
+        let max_iterations = MAX_REACT_ITERATIONS;
+        let max_tool_calls_per_iter = opts
+            .max_tool_calls_per_iteration
+            .unwrap_or(MAX_TOOL_CALLS_PER_ITERATION);
+        let max_total_tool_calls = MAX_TOTAL_TOOL_CALLS;
+        let timeout_ms = opts.task_timeout_ms.unwrap_or(DEFAULT_TASK_TIMEOUT_MS);
+        let mut total_tool_calls: usize = 0;
+        let mut repeated_actions: Vec<String> = Vec::new();
 
-        for _ in 0..MAX_REACT_ITERATIONS {
-            if opts
-                .cancel
-                .as_ref()
-                .map(|c| c.is_cancelled())
-                .unwrap_or(false)
-            {
-                return (Err("Task cancelled".to_string()), trace);
+        for iteration in 0..max_iterations {
+            // 1. Cancellation check.
+            if let Some(cancel) = &opts.cancel {
+                if cancel.is_cancelled() {
+                    return (Err("Task cancelled".to_string()), trace);
+                }
             }
 
-            // Canonical prompt compilation for the current context.
+            // 2. Timeout check.
+            if timeout_ms > 0 {
+                let elapsed = started.elapsed().as_millis() as u64;
+                if elapsed >= timeout_ms {
+                    return (
+                        Err(format!(
+                            "Task timed out after {}ms (iteration {})",
+                            elapsed, iteration
+                        )),
+                        trace,
+                    );
+                }
+            }
+
+            // 3. Canonical prompt compilation for the current context.
             let compiled = self.prompt_builder.compile_context(&context);
 
-            // Authoritative provider selection.
+            // 4. Authoritative provider selection.
             let route_request = RouteRequest::new()
                 .with_capabilities(vec![Capability::Streaming, Capability::ToolCalling]);
             let decision = match self.router.route(&route_request) {
@@ -795,7 +930,7 @@ impl CanonicalRuntime {
                 };
             }
 
-            // Execute through ProviderRuntime gates.
+            // 5. Execute through ProviderRuntime gates.
             match self
                 .stream_once(&decision, &compiled.prompt, req.on_chunk, opts)
                 .await
@@ -803,12 +938,62 @@ impl CanonicalRuntime {
                 Ok(full) => {
                     if let Ok(calls) = tool_parser::parse_tool_calls(&full) {
                         if !calls.is_empty() {
+                            // Enforce per-iteration tool call limit.
+                            if total_tool_calls + calls.len() > max_total_tool_calls {
+                                return (
+                                    Err(format!(
+                                        "Maximum total tool calls ({}) exceeded",
+                                        max_total_tool_calls
+                                    )),
+                                    trace,
+                                );
+                            }
+                            if calls.len() > max_tool_calls_per_iter {
+                                return (
+                                    Err(format!(
+                                        "Maximum tool calls per iteration ({}) exceeded",
+                                        max_tool_calls_per_iter
+                                    )),
+                                    trace,
+                                );
+                            }
+
                             let mut extra = Vec::new();
                             for call in &calls {
+                                // Compute a deterministic fingerprint for repeated-action
+                                // detection: tool name + first 80 chars of arguments.
+                                let fingerprint = format!(
+                                    "{}:{}",
+                                    call.name,
+                                    &call.arguments[..call
+                                        .arguments
+                                        .char_indices()
+                                        .take(80)
+                                        .last()
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(call.arguments.len())]
+                                );
+                                repeated_actions.push(fingerprint.clone());
+                                // Trim repeated_actions to only keep the last
+                                // MAX_REPEATED_ACTIONS entries.
+                                if repeated_actions.len() > MAX_REPEATED_ACTIONS {
+                                    repeated_actions.remove(0);
+                                }
+                                // Detect repeated identical actions.
+                                if repeated_actions.len() == MAX_REPEATED_ACTIONS
+                                    && repeated_actions.iter().all(|a| a == &repeated_actions[0])
+                                {
+                                    return (
+                                        Err(format!(
+                                            "Repeated identical action detected: {}",
+                                            repeated_actions[0]
+                                        )),
+                                        trace,
+                                    );
+                                }
+
                                 (req.emit)(AgentEvent::ToolStarted {
                                     tool: call.name.clone(),
-                                    // Redact the displayed args; execution uses
-                                    // the raw arguments via execute_tool below.
                                     args: redact_secrets_public(&call.arguments),
                                 });
                                 let result = self.execute_tool(call, req.emit, opts).await;
@@ -822,6 +1007,7 @@ impl CanonicalRuntime {
                                     content: format!("Tool result for {}: {}", call.name, result),
                                     relevance_score: 0.9,
                                 });
+                                total_tool_calls += 1;
                             }
                             context = extend_context(context, extra);
                             continue;
@@ -839,7 +1025,7 @@ impl CanonicalRuntime {
 
         trace.exec_ms = started.elapsed().as_millis() as u64;
         (
-            Ok(
+            Err(
                 "Reached the maximum number of reasoning iterations without a final answer."
                     .to_string(),
             ),
@@ -1009,6 +1195,35 @@ impl CanonicalRuntime {
             response: String::new(),
             error: Some(error),
             diagnostics: diag,
+            cancelled: false,
+        }
+    }
+
+    /// Finalize a task as cancelled.
+    fn cancel(
+        &mut self,
+        req: &TaskRequest<'_>,
+        graph: Option<&mut TaskGraph>,
+        root_id: &str,
+        mut diag: TaskDiagnostics,
+        started: Instant,
+    ) -> TaskResult {
+        diag.total_ms = started.elapsed().as_millis() as u64;
+        if let Some(graph) = graph {
+            graph.update_status(root_id, TaskStatus::Cancelled);
+            (req.emit)(AgentEvent::TaskGraphUpdated {
+                graph: graph.clone(),
+            });
+        }
+        (req.emit)(AgentEvent::AgentCancelled {
+            agent: "main".to_string(),
+        });
+        TaskResult {
+            success: false,
+            response: String::new(),
+            error: Some("Task cancelled".to_string()),
+            diagnostics: diag,
+            cancelled: true,
         }
     }
 

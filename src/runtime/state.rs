@@ -23,6 +23,8 @@ pub enum RuntimeState {
     Completed,
     /// Task failed.
     Failed,
+    /// Task was cancelled by the user.
+    Cancelled,
 }
 
 impl RuntimeState {
@@ -36,9 +38,14 @@ impl RuntimeState {
                 RuntimeState::Acting,
                 RuntimeState::Completed,
                 RuntimeState::Failed,
+                RuntimeState::Cancelled,
             ],
-            RuntimeState::Acting => &[RuntimeState::Synthesizing, RuntimeState::Failed],
-            RuntimeState::Completed | RuntimeState::Failed => &[],
+            RuntimeState::Acting => &[
+                RuntimeState::Synthesizing,
+                RuntimeState::Failed,
+                RuntimeState::Cancelled,
+            ],
+            RuntimeState::Completed | RuntimeState::Failed | RuntimeState::Cancelled => &[],
         }
     }
 
@@ -57,7 +64,10 @@ impl RuntimeState {
 
     /// Returns `true` if this is a terminal state.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, RuntimeState::Completed | RuntimeState::Failed)
+        matches!(
+            self,
+            RuntimeState::Completed | RuntimeState::Failed | RuntimeState::Cancelled
+        )
     }
 
     /// Returns `true` if the runtime is currently active (not idle/terminal).
@@ -132,6 +142,7 @@ mod tests {
     fn test_completed_is_terminal() {
         assert!(RuntimeState::Completed.is_terminal());
         assert!(RuntimeState::Failed.is_terminal());
+        assert!(RuntimeState::Cancelled.is_terminal());
         assert!(!RuntimeState::Idle.is_terminal());
         assert!(!RuntimeState::Observing.is_terminal());
     }
@@ -159,6 +170,26 @@ mod tests {
     }
 
     #[test]
+    fn test_synthesizing_transitions_to_cancelled() {
+        let state = RuntimeState::Synthesizing;
+        assert!(state.try_transition(RuntimeState::Cancelled).is_ok());
+    }
+
+    #[test]
+    fn test_acting_transitions_to_cancelled() {
+        let state = RuntimeState::Acting;
+        assert!(state.try_transition(RuntimeState::Cancelled).is_ok());
+    }
+
+    #[test]
+    fn test_cancelled_is_terminal_and_invalid_from_terminal() {
+        assert!(RuntimeState::Cancelled.is_terminal());
+        let state = RuntimeState::Cancelled;
+        assert!(state.try_transition(RuntimeState::Observing).is_err());
+        assert!(state.try_transition(RuntimeState::Completed).is_err());
+    }
+
+    #[test]
     fn test_is_active() {
         assert!(!RuntimeState::Idle.is_active());
         assert!(RuntimeState::Observing.is_active());
@@ -167,5 +198,6 @@ mod tests {
         assert!(RuntimeState::Acting.is_active());
         assert!(!RuntimeState::Completed.is_active());
         assert!(!RuntimeState::Failed.is_active());
+        assert!(!RuntimeState::Cancelled.is_active());
     }
 }

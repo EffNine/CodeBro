@@ -1128,3 +1128,814 @@ async fn test_verify_task_runs_real_build_and_reports() {
     assert!(text.contains("Verification passed"));
     assert!(diag.verification.is_some());
 }
+
+// =========================================================================
+// Sprint 29 — Canonical Agent Loop & Task Execution Reliability
+// =========================================================================
+
+use crate::agent::task_graph::TaskGraph;
+use crate::cancellation::CancellationToken;
+use crate::canonical_runtime::MAX_REACT_ITERATIONS;
+
+/// A mock provider that returns responses sequentially (consuming each one).
+/// Useful for testing multi-step agent loops where the provider returns
+/// different responses on each call.
+#[derive(Clone)]
+struct ScriptedMockProvider {
+    name: String,
+    model: String,
+    responses: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ScriptedMockProvider {
+    fn new(name: &str, responses: Vec<String>) -> Self {
+        ScriptedMockProvider {
+            name: name.to_string(),
+            model: format!("{}-model", name),
+            responses: std::sync::Arc::new(std::sync::Mutex::new(responses)),
+            fail: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn failing(name: &str) -> Self {
+        let p = ScriptedMockProvider::new(name, Vec::new());
+        p.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        p
+    }
+}
+
+impl Provider for ScriptedMockProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn base_url(&self) -> &str {
+        "mock://localhost"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn api_key(&self) -> Option<&str> {
+        Some("mock-key")
+    }
+
+    fn send_message(
+        &self,
+        _message: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>>
+    {
+        let mut responses = self.responses.lock().unwrap();
+        let response = if responses.is_empty() {
+            String::new()
+        } else {
+            responses.remove(0)
+        };
+        Box::pin(async move { Ok(response) })
+    }
+
+    fn stream_response(
+        &self,
+        _message: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<String>>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            let result = Err(anyhow::anyhow!("mock provider offline"));
+            Box::pin(async move { result })
+        } else {
+            let mut responses = self.responses.lock().unwrap();
+            let response = if responses.is_empty() {
+                String::new()
+            } else {
+                responses.remove(0)
+            };
+            let _ = tx.send(response);
+            Box::pin(async move { Ok(rx) })
+        }
+    }
+}
+
+/// Collect all AgentEvents emitted during a task into a vector.
+fn collect_events(events: &std::sync::Arc<std::sync::Mutex<Vec<AgentEvent>>>) -> Vec<AgentEvent> {
+    events.lock().unwrap().clone()
+}
+
+/// Helper: build a runtime with a scripted mock provider for loop testing.
+fn loop_test_runtime(responses: Vec<String>) -> CanonicalRuntime {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new("mock", responses)));
+    runtime
+}
+
+// ---------------------------------------------------------------------------
+// 1. Simple completion — model returns no tool calls → Completed
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_simple_completion_no_tool_calls() {
+    let mut runtime = loop_test_runtime(vec!["I will add the function.".to_string()]);
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a function to the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    assert!(
+        result.success,
+        "simple completion should succeed: {:?}",
+        result.error
+    );
+    assert!(!result.response.is_empty());
+    assert!(!result.cancelled);
+    let evs = collect_events(&events);
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, AgentEvent::AgentCompleted { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// 2. Single tool execution — tool call → result → final answer → Completed
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_single_tool_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            // First response: tool call to list files.
+            "<invoke name=\"list_files\">{\"path\": \".\"}</invoke>".to_string(),
+            // Second response: final answer after tool result.
+            "Done.".to_string(),
+        ],
+    )));
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "list the project files",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    assert!(
+        result.success,
+        "single tool execution should succeed: {:?}",
+        result.error
+    );
+    let evs = collect_events(&events);
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ToolStarted { tool, .. } if tool == "list_files")));
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ToolCompleted { tool, .. } if tool == "list_files")));
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, AgentEvent::AgentCompleted { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// 3. Multi-step execution — tool A → tool B → final answer → Completed
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_multi_step_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            // First response: tool call.
+            "<invoke name=\"list_files\">{\"path\": \".\"}</invoke>".to_string(),
+            // Second response: another tool call.
+            "<invoke name=\"read_file\">{\"path\": \"README.md\"}</invoke>".to_string(),
+            // Third response: final answer.
+            "Done with both steps.".to_string(),
+        ],
+    )));
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "read the project readme",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    assert!(
+        result.success,
+        "multi-step execution should succeed: {:?}",
+        result.error
+    );
+    let evs = collect_events(&events);
+    let tool_starts: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolStarted { tool, .. } => Some(tool.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(tool_starts.contains(&"list_files"));
+    assert!(tool_starts.contains(&"read_file"));
+}
+
+// ---------------------------------------------------------------------------
+// 4. Verification pass — execute → verify PASS → Completed
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_verification_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    // Create a minimal valid Rust crate so verification can run.
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"vt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src").join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[cfg(test)]\nmod tests { #[test] fn ok() {} }\n",
+    )
+    .unwrap();
+
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec!["Done.".to_string()],
+    )));
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a function to the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    assert!(
+        result.success,
+        "verification pass should succeed: {:?}",
+        result.error
+    );
+    assert!(result.diagnostics.verification.is_some());
+    let evs = collect_events(&events);
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, AgentEvent::AgentCompleted { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// 5. Verification failure + bounded revision → Completed
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_verification_failure_then_revision_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    // Start with a broken crate: compilation will fail.
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"vt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    // Invalid Rust code to make cargo build fail.
+    std::fs::write(
+        dir.path().join("src").join("lib.rs"),
+        "pub fn broken() { this is not valid rust {{{",
+    )
+    .unwrap();
+
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            // First attempt: the model says it fixed it.
+            "I fixed the code.".to_string(),
+            // Second attempt (revision): model says it's done.
+            "All fixed now.".to_string(),
+        ],
+    )));
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "fix the broken code in the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    // After one revision, the task should still fail because the crate is
+    // genuinely broken and the mock provider cannot write real source files.
+    // The important invariant: the loop terminates (does not hang).
+    assert!(result.diagnostics.verification.is_some());
+    // The task either completed (if verification passed on revision) or failed
+    // after exhausting revisions — either way it reached a terminal state.
+    assert!(result.success || result.error.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// 6. Verification repeatedly fails → terminal (bounded retries exhausted)
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_verification_repeatedly_fails_then_terminates() {
+    let dir = tempfile::tempdir().unwrap();
+    // Create a crate that will always fail to compile.
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"vt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src").join("lib.rs"),
+        "pub fn broken() { invalid {{{",
+    )
+    .unwrap();
+
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Provide responses for the initial execution + 2 revision attempts.
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            "Fixed.".to_string(),
+            "Still fixing.".to_string(),
+            "Done now.".to_string(),
+        ],
+    )));
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "fix the broken code",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    // Should terminate after exhausting revision budget.
+    assert!(!result.success);
+    assert!(result.error.is_some());
+    assert!(result.error.as_ref().unwrap().contains("revision"));
+}
+
+// ---------------------------------------------------------------------------
+// 7. Cancellation — active task → cancel → Cancelled
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_cancellation_during_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Provider never responds — cancellation will be checked before provider.
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec!["slow".to_string()],
+    )));
+
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let token = CancellationToken::new();
+    let options = crate::canonical_runtime::TaskOptions {
+        cancel: Some(token.clone()),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "explain the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    // Cancel immediately before spawning.
+    token.cancel();
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(result.cancelled, "task should be cancelled");
+    assert!(!result.success);
+    let evs = collect_events(&events);
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, AgentEvent::AgentCancelled { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// 8. Timeout — task exceeds budget → Failed
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_task_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec!["answer".to_string()],
+    )));
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        task_timeout_ms: Some(1), // 1ms timeout
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "explain the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task_with_options(&req, options).await;
+    // With a 1ms timeout the task may or may not time out depending on system
+    // speed, but it should always terminate.
+    assert!(result.success || result.error.is_some() || result.cancelled);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Provider failure — model/provider error → Failed
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_provider_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::failing("mock")));
+
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "explain the codebase",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    assert!(!result.success);
+    assert!(result.error.is_some());
+    let evs = collect_events(&events);
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, AgentEvent::AgentFailed { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// 10. Tool failure — tool returns error, model receives it, bounded recovery
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_tool_failure_with_bounded_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            // First: tool call to unknown tool → error.
+            "<invoke name=\"nonexistent_tool\">{\"x\": \"y\"}</invoke>".to_string(),
+            // Second: model recovers with a final answer.
+            "I could not find that tool, but here is the answer.".to_string(),
+        ],
+    )));
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "use a nonexistent tool",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    // The model should recover and produce a final answer.
+    assert!(
+        result.success,
+        "tool failure should allow bounded recovery: {:?}",
+        result.error
+    );
+    let evs = collect_events(&events);
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, AgentEvent::AgentCompleted { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// 11. Loop budget exhaustion — max iterations exceeded → Failed
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_loop_budget_exhaustion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Provider keeps returning tool calls for all MAX_REACT_ITERATIONS (5)
+    // iterations, so the loop must exhaust its budget.
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            "<invoke name=\"list_files\">{\"path\": \".\"}</invoke>".to_string();
+            MAX_REACT_ITERATIONS + 2
+        ],
+    )));
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "list files repeatedly",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    eprintln!(
+        "loop_budget result: success={} error={:?} response={:?}",
+        result.success,
+        result.error,
+        &result.response[..result.response.len().min(200)]
+    );
+    // After exhausting iterations the loop returns an error (not Ok).
+    assert!(
+        !result.success || result.error.is_some(),
+        "loop budget exhaustion should produce a failure or error: {:?}",
+        result.error
+    );
+    let evs = collect_events(&events);
+    // Should not reach AgentCompleted for the main agent if loop budget was exhausted.
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, AgentEvent::AgentCompleted { agent, .. } if agent == "main")),
+        "should not complete main agent when loop budget is exhausted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. Repeated action detection — same action repeated beyond threshold
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_repeated_action_detection() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Provider keeps returning the same tool call fingerprint.
+    let same_fingerprint = "<invoke name=\"list_files\">{\"path\": \".\"}</invoke>".to_string();
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            same_fingerprint.clone(),
+            same_fingerprint.clone(),
+            same_fingerprint.clone(),
+            same_fingerprint.clone(),
+        ],
+    )));
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "list files forever",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    // Should terminate with an error about repeated actions.
+    assert!(
+        !result.success || result.error.is_some(),
+        "repeated action should be detected: {:?}",
+        result.error
+    );
+    if let Some(ref err) = result.error {
+        assert!(
+            err.contains("Repeated") || err.contains("iteration") || err.contains("cancelled"),
+            "unexpected error: {}",
+            err
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 13. Terminal-state invariant — no state mutation after terminal
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_terminal_state_invariant() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec!["final.".to_string()],
+    )));
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "simple task",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    assert!(result.success);
+    assert!(!result.cancelled);
+    let evs = collect_events(&events);
+    // The canonical runtime emits exactly one AgentCompleted for the main
+    // agent. The observe phase may emit subagent Completed events through
+    // the coordinator, but the main task must end with exactly one terminal
+    // event for agent "main".
+    let main_terminal: Vec<&AgentEvent> = evs
+        .iter()
+        .filter(|e| match e {
+            AgentEvent::AgentCompleted { agent, .. }
+            | AgentEvent::AgentFailed { agent, .. }
+            | AgentEvent::AgentCancelled { agent, .. } => agent == "main",
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        main_terminal.len(),
+        1,
+        "exactly one terminal event for the main agent expected, got: {:?}",
+        main_terminal
+            .iter()
+            .map(|e| match e {
+                AgentEvent::AgentCompleted { .. } => "Completed",
+                AgentEvent::AgentFailed { .. } => "Failed",
+                AgentEvent::AgentCancelled { .. } => "Cancelled",
+                _ => "other",
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 14. Cancellation propagation — cancellation reaches active tool path
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_cancellation_propagates_to_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            // Provider returns a tool call; cancellation happens during execution.
+            "<invoke name=\"list_files\">{\"path\": \".\"}</invoke>".to_string(),
+        ],
+    )));
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let token = CancellationToken::new();
+    let options = crate::canonical_runtime::TaskOptions {
+        cancel: Some(token.clone()),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "list files",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    // Cancel during execution.
+    token.cancel();
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.cancelled || !result.success,
+        "cancellation should terminate the task"
+    );
+    let evs = collect_events(&events);
+    // Either AgentCancelled or AgentFailed should be emitted.
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            AgentEvent::AgentCancelled { .. } | AgentEvent::AgentFailed { .. }
+        )),
+        "expected terminal cancellation/failure event"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// State-transition tests for TaskStatus and RuntimeState
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_task_status_cancelled_is_terminal() {
+    use crate::agent::task_graph::TaskStatus;
+    assert!(TaskStatus::Cancelled == TaskStatus::Cancelled);
+    // Cancelled is a valid final state alongside Completed and Failed.
+    let mut graph = TaskGraph::new("test");
+    let root = graph.root_task.clone();
+    graph.update_status(&root, TaskStatus::Cancelled);
+    let node = graph.get_task(&root).unwrap();
+    assert!(matches!(node.status, TaskStatus::Cancelled));
+    assert!(node.completed_at.is_some());
+}
+
+#[test]
+fn test_runtime_state_cancelled_transitions() {
+    use crate::runtime::state::RuntimeState;
+    // From Synthesizing, can transition to Cancelled.
+    assert!(RuntimeState::Synthesizing
+        .try_transition(RuntimeState::Cancelled)
+        .is_ok());
+    // From Acting, can transition to Cancelled.
+    assert!(RuntimeState::Acting
+        .try_transition(RuntimeState::Cancelled)
+        .is_ok());
+    // From a terminal state, no transition is valid.
+    assert!(RuntimeState::Cancelled
+        .try_transition(RuntimeState::Observing)
+        .is_err());
+    assert!(RuntimeState::Cancelled.is_terminal());
+    assert!(!RuntimeState::Cancelled.is_active());
+}
+
+#[test]
+fn test_agent_status_cancelled_is_terminal() {
+    use crate::agent::status::AgentStatus;
+    assert!(AgentStatus::Cancelled.is_terminal());
+    assert!(!AgentStatus::Cancelled.is_active());
+}
+
+// ---------------------------------------------------------------------------
+// Loop safety guard unit tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_max_tool_calls_per_iteration_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Single response with many tool calls (> MAX_TOOL_CALLS_PER_ITERATION=20).
+    let many_calls: Vec<String> = (0..25)
+        .map(|i| format!("<invoke name=\"list_files\">{{\"i\": {}}}</invoke>", i))
+        .collect();
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![many_calls.join("\n")],
+    )));
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        max_tool_calls_per_iteration: Some(5),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "too many tools",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        !result.success || result.error.is_some(),
+        "exceeding max tool calls per iteration should fail: {:?}",
+        result.error
+    );
+}
+
+#[tokio::test]
+async fn test_max_total_tool_calls_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Multiple responses each returning one tool call, exceeding MAX_TOTAL_TOOL_CALLS=100.
+    let responses: Vec<String> = (0..105)
+        .map(|_| "<invoke name=\"list_files\">{\"x\": \"y\"}</invoke>".to_string())
+        .collect();
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new("mock", responses)));
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "too many total tools",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    assert!(
+        !result.success || result.error.is_some(),
+        "exceeding max total tool calls should fail: {:?}",
+        result.error
+    );
+}

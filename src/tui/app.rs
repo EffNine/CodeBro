@@ -483,6 +483,9 @@ impl TuiApp {
                     metrics.increment_retries();
                 }
             }
+            AgentEvent::AgentCancelled { agent } => {
+                self.dashboard.log("info", format!("{} cancelled", agent));
+            }
             AgentEvent::MemoryUpdated { summary } => {
                 self.add_message(MessageRole::System, format!("Memory: {}", summary));
             }

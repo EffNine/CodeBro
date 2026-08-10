@@ -23,6 +23,7 @@ pub enum TaskStatus {
     Completed,
     Failed,
     Skipped,
+    Cancelled,
 }
 
 impl std::fmt::Display for TaskStatus {
@@ -33,6 +34,7 @@ impl std::fmt::Display for TaskStatus {
             TaskStatus::Completed => write!(f, "completed"),
             TaskStatus::Failed => write!(f, "failed"),
             TaskStatus::Skipped => write!(f, "skipped"),
+            TaskStatus::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -114,7 +116,7 @@ impl TaskGraph {
                 TaskStatus::Running => {
                     node.started_at = Some(chrono::Local::now().to_rfc3339());
                 }
-                TaskStatus::Completed | TaskStatus::Failed => {
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
                     node.completed_at = Some(chrono::Local::now().to_rfc3339());
                 }
                 _ => {}
@@ -161,8 +163,10 @@ impl TaskGraph {
     pub fn is_complete(&self) -> bool {
         self.nodes.values().all(|node| {
             node.id == self.root_task
-                || node.status == TaskStatus::Completed
-                || node.status == TaskStatus::Skipped
+                || matches!(
+                    node.status,
+                    TaskStatus::Completed | TaskStatus::Skipped | TaskStatus::Cancelled
+                )
         })
     }
 
@@ -233,10 +237,15 @@ impl TaskGraph {
             .values()
             .filter(|n| n.status == TaskStatus::Running)
             .count();
+        let cancelled = self
+            .nodes
+            .values()
+            .filter(|n| n.status == TaskStatus::Cancelled)
+            .count();
 
         format!(
-            "Task Graph: {} total, {} completed, {} failed, {} pending, {} running",
-            total, completed, failed, pending, running
+            "Task Graph: {} total, {} completed, {} failed, {} cancelled, {} pending, {} running",
+            total, completed, failed, cancelled, pending, running
         )
     }
 }
