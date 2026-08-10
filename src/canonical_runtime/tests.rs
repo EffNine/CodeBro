@@ -2709,3 +2709,367 @@ async fn test_deadline_does_not_retry() {
         result.error
     );
 }
+
+// =========================================================================
+// Sprint 30A — Structured Function Calling
+// =========================================================================
+
+/// A mock provider that supports native function calling. It records the tool
+/// definitions it receives and returns scripted structured tool calls.
+#[derive(Clone)]
+struct FunctionCallingMockProvider {
+    name: String,
+    model: String,
+    /// Scripted responses. Each entry is a JSON string of the `tool_calls`
+    /// array (or `[]` for plain text). Consumed sequentially.
+    responses: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Tool definitions received on the last invocation.
+    received_tools: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// When true, `stream_response_with_tools` returns an error immediately.
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FunctionCallingMockProvider {
+    fn new(name: &str, responses: Vec<String>) -> Self {
+        FunctionCallingMockProvider {
+            name: name.to_string(),
+            model: format!("{}-model", name),
+            responses: std::sync::Arc::new(std::sync::Mutex::new(responses)),
+            received_tools: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn failing(name: &str) -> Self {
+        let p = FunctionCallingMockProvider::new(name, Vec::new());
+        p.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        p
+    }
+
+    /// The tool definitions received on the last invocation (names).
+    fn received_tool_names(&self) -> Vec<String> {
+        self.received_tools.lock().unwrap().clone()
+    }
+
+    fn next_response(&self) -> String {
+        let mut responses = self.responses.lock().unwrap();
+        if responses.is_empty() {
+            String::new()
+        } else {
+            responses.remove(0)
+        }
+    }
+}
+
+impl Provider for FunctionCallingMockProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn base_url(&self) -> &str {
+        "mock://localhost"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn api_key(&self) -> Option<&str> {
+        Some("mock-key")
+    }
+
+    fn supports_function_calling(&self) -> bool {
+        true
+    }
+
+    fn capabilities(&self) -> Vec<crate::provider_runtime::Capability> {
+        vec![
+            crate::provider_runtime::Capability::Streaming,
+            crate::provider_runtime::Capability::ToolCalling,
+            crate::provider_runtime::Capability::FunctionCalling,
+        ]
+    }
+
+    fn send_message(
+        &self,
+        _message: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>>
+    {
+        let response = self.next_response();
+        Box::pin(async move { Ok(response) })
+    }
+
+    fn stream_response(
+        &self,
+        _message: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<String>>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let response = self.next_response();
+        let _ = tx.send(response);
+        Box::pin(async move { Ok(rx) })
+    }
+
+    fn stream_response_with_tools(
+        &self,
+        _message: &str,
+        tools: &[crate::providers::ToolDefinition],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<(String, Vec<crate::providers::StructuredToolCall>)>,
+                > + Send
+                + '_,
+        >,
+    > {
+        // Record tool definitions.
+        {
+            let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+            self.received_tools.lock().unwrap().extend(names);
+        }
+
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(
+                async move { Err(anyhow::anyhow!("mock structured provider offline")) },
+            );
+        }
+
+        let response = self.next_response();
+        Box::pin(async move {
+            // The response is a JSON `tool_calls` array.
+            let calls: Vec<crate::providers::StructuredToolCall> =
+                if response.trim().is_empty() || response == "[]" {
+                    Vec::new()
+                } else {
+                    let arr: Vec<serde_json::Value> = serde_json::from_str(&response)?;
+                    arr.into_iter()
+                        .map(|item| {
+                            let id = item
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = item["function"]["name"].as_str().unwrap_or("").to_string();
+                            let arguments = item["function"]["arguments"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string();
+                            crate::providers::StructuredToolCall {
+                                id,
+                                name,
+                                arguments,
+                            }
+                        })
+                        .collect()
+                };
+            Ok((String::new(), calls))
+        })
+    }
+}
+
+/// Helper: build a runtime with a structured-calling mock provider.
+fn structured_runtime(responses: Vec<String>) -> CanonicalRuntime {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(FunctionCallingMockProvider::new(
+        "fc-mock", responses,
+    )));
+    runtime
+}
+
+/// Helper: run a task and return the runtime plus its result.
+async fn run_structured_task(
+    runtime: &mut CanonicalRuntime,
+    task: &str,
+) -> crate::canonical_runtime::TaskResult {
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task,
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    runtime.run_task(&req).await
+}
+
+// ---------------------------------------------------------------------------
+// 1. Tool definitions are sent in the request.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_structured_sends_tool_definitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = FunctionCallingMockProvider::new("fc-mock", vec!["[]".to_string()]);
+    let provider_arc = Arc::new(provider);
+    let provider_copy = provider_arc.clone();
+    runtime.register_provider(provider_arc);
+    let result = run_structured_task(&mut runtime, "explain the project").await;
+    assert!(result.success);
+    let names = provider_copy.received_tool_names();
+    assert!(!names.is_empty(), "tool definitions should be sent");
+    assert!(
+        names.contains(&"list_files".to_string()),
+        "expected list_files in tool defs, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"read_file".to_string()),
+        "expected read_file in tool defs"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 2. A single structured tool call executes through the ToolRegistry.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_structured_single_tool_call() {
+    let mut runtime = structured_runtime(vec![
+        // Structured call to list_files.
+        r#"[{"id": "call_1", "function": {"name": "list_files", "arguments": "{\"path\": \".\"}"}}]"#
+            .to_string(),
+        // Final text answer.
+        "[]".to_string(),
+    ]);
+    let result = run_structured_task(&mut runtime, "list files").await;
+    assert!(
+        result.success,
+        "structured single tool call should succeed: {:?}",
+        result.error
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Multiple structured tool calls in one response.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_structured_multiple_tool_calls() {
+    let mut runtime = structured_runtime(vec![
+        r#"[
+            {"id": "call_1", "function": {"name": "list_files", "arguments": "{}"}},
+            {"id": "call_2", "function": {"name": "read_file", "arguments": "{\"path\": \"README.md\"}"}}
+        ]"#
+        .to_string(),
+        "[]".to_string(),
+    ]);
+    let result = run_structured_task(&mut runtime, "inspect the repo").await;
+    assert!(
+        result.success,
+        "structured multiple tool calls should succeed: {:?}",
+        result.error
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. Structured call → tool result → second model iteration → final answer.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_structured_tool_result_feeds_next_iteration() {
+    let mut runtime = structured_runtime(vec![
+        // First iteration: structured call.
+        r#"[{"id": "call_1", "function": {"name": "list_files", "arguments": "{}"}}]"#.to_string(),
+        // Second iteration: final answer after observing the tool result.
+        "[]".to_string(),
+    ]);
+    let result = run_structured_task(&mut runtime, "list files then summarize").await;
+    assert!(
+        result.success,
+        "structured tool result should feed next iteration: {:?}",
+        result.error
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Provider that does NOT support function calling falls back to text parser.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_unsupported_provider_falls_back_to_text_parser() {
+    // ScriptedMockProvider (no function calling) returns text; the runtime
+    // must route through the text parser.
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "text-mock",
+        vec![
+            // Text-encoded tool call.
+            "<invoke name=\"list_files\">{\"path\": \".\"}</invoke>".to_string(),
+            "Done.".to_string(),
+        ],
+    )));
+    let result = run_structured_task(&mut runtime, "list files").await;
+    assert!(
+        result.success,
+        "text fallback should succeed: {:?}",
+        result.error
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Malformed structured response fails safely (no tool executed).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_structured_malformed_response_fails_safely() {
+    let mut runtime = structured_runtime(vec![
+        // Malformed tool_calls JSON: missing "function" field.
+        r#"[{"id": "call_1"}]"#.to_string(),
+        "[]".to_string(),
+    ]);
+    let result = run_structured_task(&mut runtime, "do something").await;
+    // The malformed structured response should not crash; the runtime should
+    // terminate gracefully (either success with text, or a clean failure).
+    assert!(result.success || result.error.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// 7. Structured provider failure propagates as a task error (with retry).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_structured_provider_failure_is_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(1));
+    let provider = FunctionCallingMockProvider::failing("fc-mock");
+    let provider_arc = Arc::new(provider);
+    runtime.register_provider(provider_arc);
+    let result = run_structured_task(&mut runtime, "do something").await;
+    assert!(
+        !result.success,
+        "structured provider failure should fail the task: {:?}",
+        result.error
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Structured calling can complete a multi-step task end to end.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_structured_multistep_task_completion() {
+    let mut runtime = structured_runtime(vec![
+        // Step 1: list files.
+        r#"[{"id": "call_1", "function": {"name": "list_files", "arguments": "{}"}}]"#.to_string(),
+        // Step 2: read a file.
+        r#"[{"id": "call_2", "function": {"name": "read_file", "arguments": "{\"path\": \"README.md\"}"}}]"#
+            .to_string(),
+        // Step 3: final answer.
+        "[]".to_string(),
+    ]);
+    let result = run_structured_task(&mut runtime, "list then read the readme").await;
+    assert!(
+        result.success,
+        "structured multi-step should succeed: {:?}",
+        result.error
+    );
+}

@@ -5,4 +5,4 @@ mod provider;
 
 pub use models::{discover_model, fetch_models, pick_default};
 pub use openai::OpenAiProvider;
-pub use provider::Provider;
+pub use provider::{Provider, StructuredToolCall, ToolDefinition};

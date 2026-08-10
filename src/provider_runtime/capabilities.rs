@@ -36,6 +36,8 @@ pub enum Capability {
     LongContext,
     /// JSON-only mode.
     JsonMode,
+    /// Native structured function/tool calling (OpenAI-compatible).
+    FunctionCalling,
 }
 
 impl Capability {
@@ -52,6 +54,7 @@ impl Capability {
             Capability::ImageGeneration,
             Capability::LongContext,
             Capability::JsonMode,
+            Capability::FunctionCalling,
         ]
     }
 
@@ -67,6 +70,7 @@ impl Capability {
             Capability::ImageGeneration => "Image generation",
             Capability::LongContext => "Large context window",
             Capability::JsonMode => "JSON mode",
+            Capability::FunctionCalling => "Native structured function calling",
         }
     }
 
@@ -83,6 +87,7 @@ impl Capability {
             Capability::ImageGeneration => "image_generation",
             Capability::LongContext => "long_context",
             Capability::JsonMode => "json_mode",
+            Capability::FunctionCalling => "function_calling",
         }
     }
 }
@@ -101,7 +106,7 @@ impl FromStr for Capability {
             "structured_output" | "structured-output" | "structured" => {
                 Ok(Capability::StructuredOutput)
             }
-            "tool_calling" | "tool-calling" | "function_calling" => Ok(Capability::ToolCalling),
+            "tool_calling" | "tool-calling" => Ok(Capability::ToolCalling),
             "vision" | "image_input" => Ok(Capability::Vision),
             "embeddings" => Ok(Capability::Embeddings),
             "reasoning" => Ok(Capability::Reasoning),
@@ -109,6 +114,9 @@ impl FromStr for Capability {
             "image_generation" | "image-generation" | "imagegen" => Ok(Capability::ImageGeneration),
             "long_context" | "long-context" | "large_context" => Ok(Capability::LongContext),
             "json_mode" | "json-mode" | "json" => Ok(Capability::JsonMode),
+            "function_calling" | "function-calling" | "native_tools" => {
+                Ok(Capability::FunctionCalling)
+            }
             other => Err(ProviderRuntimeError::UnknownCapability(other.to_string())),
         }
     }
@@ -244,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_capability_counts_are_additive() {
-        assert_eq!(Capability::all().len(), 10);
+        assert_eq!(Capability::all().len(), 11);
     }
 
     #[test]

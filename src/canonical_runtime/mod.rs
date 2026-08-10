@@ -77,7 +77,7 @@ use crate::provider_runtime::{
     Priority, ProviderCost, ProviderId, ProviderRegistry, ProviderRuntime, RetryController,
     RetryPolicy, RouteRequest, TokenUsage,
 };
-use crate::providers::OpenAiProvider;
+use crate::providers::{OpenAiProvider, StructuredToolCall, ToolDefinition};
 use crate::scanner::ProjectInfo;
 use crate::tools::shell::redact_secrets_public;
 use crate::tools::{detect_workspace_root, is_toolable, run_tool_pipeline};
@@ -965,89 +965,114 @@ impl CanonicalRuntime {
                 };
             }
 
-            // 6. Execute through ProviderRuntime gates.
+            // 6. Build tool definitions for structured function calling when
+            //    the selected provider supports it.
+            let tool_defs: Vec<ToolDefinition> = {
+                let io = self.io_providers.get(decision.provider_id());
+                match io {
+                    Some(provider) if provider.supports_function_calling() => {
+                        self.tool_registry.tool_definitions()
+                    }
+                    _ => Vec::new(),
+                }
+            };
+
+            // 7. Execute through ProviderRuntime gates. `stream_once` returns
+            //    the assistant text plus any native structured tool calls.
             match self
-                .stream_once(&decision, &compiled.prompt, req.on_chunk, opts)
+                .stream_once(&decision, &compiled.prompt, &tool_defs, req.on_chunk, opts)
                 .await
             {
-                Ok(full) => {
+                Ok((full, structured)) => {
                     model_calls += 1;
-                    if let Ok(calls) = tool_parser::parse_tool_calls(&full) {
-                        if !calls.is_empty() {
-                            // Enforce per-iteration tool call limit.
-                            if total_tool_calls + calls.len() > max_total_tool_calls {
-                                return (
-                                    Err(format!(
-                                        "Maximum total tool calls ({}) exceeded",
-                                        max_total_tool_calls
-                                    )),
-                                    trace,
-                                );
-                            }
-                            if calls.len() > max_tool_calls_per_iter {
-                                return (
-                                    Err(format!(
-                                        "Maximum tool calls per iteration ({}) exceeded",
-                                        max_tool_calls_per_iter
-                                    )),
-                                    trace,
-                                );
-                            }
-
-                            let mut extra = Vec::new();
-                            for call in &calls {
-                                // Compute a deterministic fingerprint for repeated-action
-                                // detection: tool name + first 80 chars of arguments.
-                                let fingerprint = format!(
-                                    "{}:{}",
-                                    call.name,
-                                    &call.arguments[..call
-                                        .arguments
-                                        .char_indices()
-                                        .take(80)
-                                        .last()
-                                        .map(|(i, _)| i)
-                                        .unwrap_or(call.arguments.len())]
-                                );
-                                repeated_actions.push(fingerprint.clone());
-                                // Trim repeated_actions to only keep the last
-                                // MAX_REPEATED_ACTIONS entries.
-                                if repeated_actions.len() > MAX_REPEATED_ACTIONS {
-                                    repeated_actions.remove(0);
-                                }
-                                // Detect repeated identical actions.
-                                if repeated_actions.len() == MAX_REPEATED_ACTIONS
-                                    && repeated_actions.iter().all(|a| a == &repeated_actions[0])
-                                {
-                                    return (
-                                        Err(format!(
-                                            "Repeated identical action detected: {}",
-                                            repeated_actions[0]
-                                        )),
-                                        trace,
-                                    );
-                                }
-
-                                (req.emit)(AgentEvent::ToolStarted {
-                                    tool: call.name.clone(),
-                                    args: redact_secrets_public(&call.arguments),
-                                });
-                                let result = self.execute_tool(call, req.emit, opts).await;
-                                (req.emit)(AgentEvent::ToolCompleted {
-                                    tool: call.name.clone(),
-                                    result: result.clone(),
-                                    success: !result.starts_with("Error:"),
-                                });
-                                extra.push(ContextFragment {
-                                    source: "tool_result".to_string(),
-                                    content: format!("Tool result for {}: {}", call.name, result),
-                                    relevance_score: 0.9,
-                                });
-                                total_tool_calls += 1;
-                            }
-                            context = extend_context(context, extra);
-                            continue;
+                    // Normalize structured and text-parsed tool calls into the
+                    // same internal `ToolCall` representation.
+                    let calls: Vec<ToolCall> = if !structured.is_empty() {
+                        structured
+                            .into_iter()
+                            .map(|c| ToolCall {
+                                id: c.id,
+                                name: c.name,
+                                arguments: c.arguments,
+                            })
+                            .collect()
+                    } else {
+                        tool_parser::parse_tool_calls(&full).unwrap_or_default()
+                    };
+                    if !calls.is_empty() {
+                        // Enforce per-iteration tool call limit.
+                        if total_tool_calls + calls.len() > max_total_tool_calls {
+                            return (
+                                Err(format!(
+                                    "Maximum total tool calls ({}) exceeded",
+                                    max_total_tool_calls
+                                )),
+                                trace,
+                            );
                         }
+                        if calls.len() > max_tool_calls_per_iter {
+                            return (
+                                Err(format!(
+                                    "Maximum tool calls per iteration ({}) exceeded",
+                                    max_tool_calls_per_iter
+                                )),
+                                trace,
+                            );
+                        }
+
+                        let mut extra = Vec::new();
+                        for call in &calls {
+                            // Compute a deterministic fingerprint for repeated-action
+                            // detection: tool name + first 80 chars of arguments.
+                            let fingerprint = format!(
+                                "{}:{}",
+                                call.name,
+                                &call.arguments[..call
+                                    .arguments
+                                    .char_indices()
+                                    .take(80)
+                                    .last()
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(call.arguments.len())]
+                            );
+                            repeated_actions.push(fingerprint.clone());
+                            // Trim repeated_actions to only keep the last
+                            // MAX_REPEATED_ACTIONS entries.
+                            if repeated_actions.len() > MAX_REPEATED_ACTIONS {
+                                repeated_actions.remove(0);
+                            }
+                            // Detect repeated identical actions.
+                            if repeated_actions.len() == MAX_REPEATED_ACTIONS
+                                && repeated_actions.iter().all(|a| a == &repeated_actions[0])
+                            {
+                                return (
+                                    Err(format!(
+                                        "Repeated identical action detected: {}",
+                                        repeated_actions[0]
+                                    )),
+                                    trace,
+                                );
+                            }
+
+                            (req.emit)(AgentEvent::ToolStarted {
+                                tool: call.name.clone(),
+                                args: redact_secrets_public(&call.arguments),
+                            });
+                            let result = self.execute_tool(call, req.emit, opts).await;
+                            (req.emit)(AgentEvent::ToolCompleted {
+                                tool: call.name.clone(),
+                                result: result.clone(),
+                                success: !result.starts_with("Error:"),
+                            });
+                            extra.push(ContextFragment {
+                                source: "tool_result".to_string(),
+                                content: format!("Tool result for {}: {}", call.name, result),
+                                relevance_score: 0.9,
+                            });
+                            total_tool_calls += 1;
+                        }
+                        context = extend_context(context, extra);
+                        continue;
                     }
                     trace.exec_ms = started.elapsed().as_millis() as u64;
                     return (Ok(full), trace);
@@ -1082,9 +1107,10 @@ impl CanonicalRuntime {
         &self,
         decision: &ProviderRoutingDecision,
         prompt: &str,
+        tools: &[ToolDefinition],
         on_chunk: &(dyn Fn(&str) + Send + Sync),
         opts: &TaskOptions,
-    ) -> std::result::Result<String, String> {
+    ) -> std::result::Result<(String, Vec<StructuredToolCall>), String> {
         let provider_id = decision.provider_id().clone();
 
         let breaker = self
@@ -1105,6 +1131,12 @@ impl CanonicalRuntime {
             .get(&provider_id)
             .cloned()
             .ok_or_else(|| format!("No provider handler registered for {provider_id}"))?;
+
+        // Decide the tool-calling mode: if the provider supports native
+        // function calling and we have tool definitions, send them. Otherwise
+        // fall back to the plain text protocol (structured calls stay empty
+        // and the text parser is used downstream).
+        let use_structured = io.supports_function_calling() && !tools.is_empty();
 
         let policy = self.provider_runtime.retry_policy().clone();
         let mut retry = RetryController::new(policy);
@@ -1130,30 +1162,111 @@ impl CanonicalRuntime {
             //    arms: (a) the provider call, (b) a cancellation
             //    waiter, (c) a deadline watcher.  All three run
             //    concurrently; whichever fires first wins.
-            let rx = tokio::select! {
-                result = io.stream_response(prompt) => result,
-                _ = async {
-                    if let Some(cancel) = &opts.cancel {
-                        cancel.cancelled().await;
-                    } else {
-                        // No cancellation token: block forever so this
-                        // arm never wins.
-                        futures::future::pending::<()>().await;
-                    }
-                } => return Err("Task cancelled".to_string()),
-                _ = async {
-                    match opts.deadline {
-                        Some(dl) => tokio::time::sleep_until(dl).await,
-                        None => {
-                            // No deadline: block forever so this arm
-                            // never wins.
+            let response = if use_structured {
+                let structured_fut = io.stream_response_with_tools(prompt, tools);
+                tokio::select! {
+                    result = structured_fut => result,
+                    _ = async {
+                        if let Some(cancel) = &opts.cancel {
+                            cancel.cancelled().await;
+                        } else {
                             futures::future::pending::<()>().await;
                         }
+                    } => return Err("Task cancelled".to_string()),
+                    _ = async {
+                        match opts.deadline {
+                            Some(dl) => tokio::time::sleep_until(dl).await,
+                            None => {
+                                futures::future::pending::<()>().await;
+                            }
+                        }
+                    } => return Err("Task timed out".to_string()),
+                }
+            } else {
+                let plain_fut = io.stream_response(prompt);
+                let rx = tokio::select! {
+                    result = plain_fut => result,
+                    _ = async {
+                        if let Some(cancel) = &opts.cancel {
+                            cancel.cancelled().await;
+                        } else {
+                            futures::future::pending::<()>().await;
+                        }
+                    } => return Err("Task cancelled".to_string()),
+                    _ = async {
+                        match opts.deadline {
+                            Some(dl) => tokio::time::sleep_until(dl).await,
+                            None => {
+                                futures::future::pending::<()>().await;
+                            }
+                        }
+                    } => return Err("Task timed out".to_string()),
+                };
+                match rx {
+                    Ok(rx) => {
+                        // Receive chunks, concurrently monitoring cancellation
+                        // and deadline.
+                        let mut full = String::new();
+                        let mut rx = rx;
+                        loop {
+                            tokio::select! {
+                                chunk_opt = rx.recv() => {
+                                    match chunk_opt {
+                                        Some(chunk) => {
+                                            full.push_str(&chunk);
+                                            on_chunk(&chunk);
+                                        }
+                                        None => break, // Channel closed normally.
+                                    }
+                                }
+                                _ = async {
+                                    if let Some(cancel) = &opts.cancel {
+                                        cancel.cancelled().await;
+                                    } else {
+                                        futures::future::pending::<()>().await;
+                                    }
+                                } => {
+                                    return Err("Task cancelled".to_string());
+                                }
+                                _ = async {
+                                    match opts.deadline {
+                                        Some(dl) => tokio::time::sleep_until(dl).await,
+                                        None => {
+                                            futures::future::pending::<()>().await;
+                                        }
+                                    }
+                                } => {
+                                    return Err("Task timed out".to_string());
+                                }
+                            }
+                        }
+                        Ok((full, Vec::new()))
                     }
-                } => return Err("Task timed out".to_string()),
+                    Err(e) => {
+                        // Only retry on genuine provider errors.
+                        attempt += 1;
+                        self.provider_runtime.report_failure(&provider_id);
+                        match retry.next_attempt(std::time::Duration::ZERO, &provider_id) {
+                            Ok(delay) => {
+                                if !delay.is_zero() {
+                                    tokio::time::sleep(delay).await;
+                                }
+                                continue;
+                            }
+                            Err(_) => {
+                                return Err(format!(
+                                    "Provider {} failed after {} attempt(s): {}",
+                                    provider_id, attempt, e
+                                ));
+                            }
+                        }
+                    }
+                }
             };
-            let mut rx = match rx {
-                Ok(rx) => rx,
+
+            // 3. Handle the structured response.
+            let (full, structured) = match response {
+                Ok(result) => result,
                 Err(e) => {
                     // Only retry on genuine provider errors.
                     attempt += 1;
@@ -1175,46 +1288,10 @@ impl CanonicalRuntime {
                 }
             };
 
-            // 3. Receive chunks, concurrently monitoring cancellation
-            //    and deadline.
-            let mut full = String::new();
-            loop {
-                tokio::select! {
-                    chunk_opt = rx.recv() => {
-                        match chunk_opt {
-                            Some(chunk) => {
-                                full.push_str(&chunk);
-                                on_chunk(&chunk);
-                            }
-                            None => break, // Channel closed normally.
-                        }
-                    }
-                    _ = async {
-                        if let Some(cancel) = &opts.cancel {
-                            cancel.cancelled().await;
-                        } else {
-                            futures::future::pending::<()>().await;
-                        }
-                    } => {
-                        return Err("Task cancelled".to_string());
-                    }
-                    _ = async {
-                        match opts.deadline {
-                            Some(dl) => tokio::time::sleep_until(dl).await,
-                            None => {
-                                futures::future::pending::<()>().await;
-                            }
-                        }
-                    } => {
-                        return Err("Task timed out".to_string());
-                    }
-                }
-            }
-
             let tokens = TokenUsage::new(prompt.len() / 4, full.len() / 4);
             self.provider_runtime
                 .report_success(&provider_id, tokens, ProviderCost::default());
-            return Ok(full);
+            return Ok((full, structured));
         }
     }
 

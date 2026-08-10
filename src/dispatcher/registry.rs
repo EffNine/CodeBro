@@ -503,6 +503,36 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Convert registered tools to OpenAI-compatible tool definitions
+    /// for structured function calling.
+    ///
+    /// Each tool gets a single `input` string parameter; the tool's
+    /// `execute()` method receives the full args string verbatim.
+    pub fn tool_definitions(&self) -> Vec<crate::providers::ToolDefinition> {
+        self.names()
+            .iter()
+            .filter_map(|name| {
+                let tool = self.tools.get(name)?;
+                let desc = tool.description().to_string();
+                let parameters = serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": desc.clone()
+                        }
+                    },
+                    "required": ["input"]
+                });
+                Some(crate::providers::ToolDefinition {
+                    name: tool.name().to_string(),
+                    description: desc,
+                    parameters,
+                })
+            })
+            .collect()
+    }
+
     /// Get tools matching a capability filter.
     pub fn find_by_capability(&self, caps: ToolCapabilities) -> Vec<&ToolMetadata> {
         self.all_metadata()
