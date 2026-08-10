@@ -1072,9 +1072,12 @@ impl CanonicalRuntime {
     /// Stream a response from the routed provider with circuit breaker gate,
     /// health reporting and retry policy. Never bypasses the circuit breaker.
     ///
-    /// Uses `tokio::select!` so that both cancellation and the task-level
-    /// deadline can interrupt an in-flight provider stream promptly — the
-    /// stream does not wait for the channel to close before returning.
+    /// Both stages — provider invocation (`stream_response`) and chunk
+    /// consumption (`rx.recv`) — are guarded by the same
+    /// cancellation/deadline mechanism so that an in-flight provider can
+    /// be interrupted promptly.  Cancellation and deadline errors terminate
+    /// the task immediately and are never retried; only genuine provider
+    /// failures enter the existing retry / circuit-breaker path.
     async fn stream_once(
         &self,
         decision: &ProviderRoutingDecision,
@@ -1108,7 +1111,9 @@ impl CanonicalRuntime {
         let mut attempt = 0usize;
 
         loop {
-            // Check cancellation / deadline before starting a provider call.
+            // 1. Cooperative cancellation / deadline check before each
+            //    provider invocation.  If either has already fired we exit
+            //    immediately — no retry.
             if let Some(cancel) = &opts.cancel {
                 if cancel.is_cancelled() {
                     return Err("Task cancelled".to_string());
@@ -1120,62 +1125,37 @@ impl CanonicalRuntime {
                 }
             }
 
-            match io.stream_response(prompt).await {
-                Ok(mut rx) => {
-                    let mut full = String::new();
-                    // Wrap the recv loop with a deadline-aware timeout so
-                    // that the hard task deadline interrupts an in-flight
-                    // provider stream. Cancellation is checked between
-                    // chunks (the existing cooperative check).
-                    if let Some(deadline) = opts.deadline {
-                        match tokio::time::timeout_at(deadline, async {
-                            loop {
-                                if let Some(cancel) = &opts.cancel {
-                                    if cancel.is_cancelled() {
-                                        return Err("Task cancelled".to_string());
-                                    }
-                                }
-                                match rx.recv().await {
-                                    Some(chunk) => {
-                                        full.push_str(&chunk);
-                                        on_chunk(&chunk);
-                                    }
-                                    None => break,
-                                }
-                            }
-                            Ok(())
-                        })
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => return Err(e),
-                            Err(_) => return Err("Task timed out".to_string()),
-                        }
+            // 2. Await the provider, concurrently monitoring cancellation
+            //    and deadline.  We use `tokio::select!` with three
+            //    arms: (a) the provider call, (b) a cancellation
+            //    waiter, (c) a deadline watcher.  All three run
+            //    concurrently; whichever fires first wins.
+            let rx = tokio::select! {
+                result = io.stream_response(prompt) => result,
+                _ = async {
+                    if let Some(cancel) = &opts.cancel {
+                        cancel.cancelled().await;
                     } else {
-                        loop {
-                            if let Some(cancel) = &opts.cancel {
-                                if cancel.is_cancelled() {
-                                    return Err("Task cancelled".to_string());
-                                }
-                            }
-                            match rx.recv().await {
-                                Some(chunk) => {
-                                    full.push_str(&chunk);
-                                    on_chunk(&chunk);
-                                }
-                                None => break,
-                            }
+                        // No cancellation token: block forever so this
+                        // arm never wins.
+                        futures::future::pending::<()>().await;
+                    }
+                } => return Err("Task cancelled".to_string()),
+                _ = async {
+                    match opts.deadline {
+                        Some(dl) => tokio::time::sleep_until(dl).await,
+                        None => {
+                            // No deadline: block forever so this arm
+                            // never wins.
+                            futures::future::pending::<()>().await;
                         }
                     }
-                    let tokens = TokenUsage::new(prompt.len() / 4, full.len() / 4);
-                    self.provider_runtime.report_success(
-                        &provider_id,
-                        tokens,
-                        ProviderCost::default(),
-                    );
-                    return Ok(full);
-                }
+                } => return Err("Task timed out".to_string()),
+            };
+            let mut rx = match rx {
+                Ok(rx) => rx,
                 Err(e) => {
+                    // Only retry on genuine provider errors.
                     attempt += 1;
                     self.provider_runtime.report_failure(&provider_id);
                     match retry.next_attempt(std::time::Duration::ZERO, &provider_id) {
@@ -1183,6 +1163,7 @@ impl CanonicalRuntime {
                             if !delay.is_zero() {
                                 tokio::time::sleep(delay).await;
                             }
+                            continue;
                         }
                         Err(_) => {
                             return Err(format!(
@@ -1192,7 +1173,48 @@ impl CanonicalRuntime {
                         }
                     }
                 }
+            };
+
+            // 3. Receive chunks, concurrently monitoring cancellation
+            //    and deadline.
+            let mut full = String::new();
+            loop {
+                tokio::select! {
+                    chunk_opt = rx.recv() => {
+                        match chunk_opt {
+                            Some(chunk) => {
+                                full.push_str(&chunk);
+                                on_chunk(&chunk);
+                            }
+                            None => break, // Channel closed normally.
+                        }
+                    }
+                    _ = async {
+                        if let Some(cancel) = &opts.cancel {
+                            cancel.cancelled().await;
+                        } else {
+                            futures::future::pending::<()>().await;
+                        }
+                    } => {
+                        return Err("Task cancelled".to_string());
+                    }
+                    _ = async {
+                        match opts.deadline {
+                            Some(dl) => tokio::time::sleep_until(dl).await,
+                            None => {
+                                futures::future::pending::<()>().await;
+                            }
+                        }
+                    } => {
+                        return Err("Task timed out".to_string());
+                    }
+                }
             }
+
+            let tokens = TokenUsage::new(prompt.len() / 4, full.len() / 4);
+            self.provider_runtime
+                .report_success(&provider_id, tokens, ProviderCost::default());
+            return Ok(full);
         }
     }
 

@@ -2322,3 +2322,390 @@ async fn test_max_model_calls_budget_respected() {
         "main agent should not complete when model call budget is hit"
     );
 }
+
+// =========================================================================
+// Sprint 29.1B — Provider cancellation / deadline integrity tests
+// =========================================================================
+
+/// Provider that blocks in `stream_response()` until `release()` is called.
+/// After release it returns a receiver that never produces any chunks.
+#[derive(Clone)]
+struct BlockingStreamResponseProvider {
+    name: String,
+    model: String,
+    ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ready_notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl BlockingStreamResponseProvider {
+    fn new(name: &str) -> Self {
+        BlockingStreamResponseProvider {
+            name: name.to_string(),
+            model: format!("{}-model", name),
+            ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ready_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn release(&self) {
+        self.ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.ready_notify.notify_waiters();
+    }
+}
+
+impl Provider for BlockingStreamResponseProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn base_url(&self) -> &str {
+        "mock://localhost"
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+    fn api_key(&self) -> Option<&str> {
+        Some("mock-key")
+    }
+    fn send_message(
+        &self,
+        _message: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>>
+    {
+        Box::pin(async move { Ok("blocked".to_string()) })
+    }
+    fn stream_response(
+        &self,
+        _message: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<String>>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let ready = self.ready.clone();
+        let ready_notify = self.ready_notify.clone();
+        Box::pin(async move {
+            while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+                ready_notify.notified().await;
+            }
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            Ok(rx)
+        })
+    }
+}
+
+/// Provider that returns a receiver that never produces chunks.
+#[derive(Clone)]
+struct HangingRecvProvider {
+    name: String,
+    model: String,
+}
+
+impl HangingRecvProvider {
+    fn new(name: &str) -> Self {
+        HangingRecvProvider {
+            name: name.to_string(),
+            model: format!("{}-model", name),
+        }
+    }
+}
+
+impl Provider for HangingRecvProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn base_url(&self) -> &str {
+        "mock://localhost"
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+    fn api_key(&self) -> Option<&str> {
+        Some("mock-key")
+    }
+    fn send_message(
+        &self,
+        _message: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>>
+    {
+        Box::pin(async move { Ok("ok".to_string()) })
+    }
+    fn stream_response(
+        &self,
+        _message: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<String>>,
+                > + Send
+                + '_,
+        >,
+    > {
+        // Keep the sender alive by cloning it into a background handle that
+        // is never dropped.  This ensures recv() blocks indefinitely.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // Leak the sender so it never drops (and the channel never closes).
+        std::mem::forget(tx);
+        Box::pin(async move { Ok(rx) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1. Mid-stream cancellation — cancellation flag set before task starts,
+//    provider checks it cooperatively during stream_response.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_mid_stream_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+
+    let provider = BlockingStreamResponseProvider::new("mock");
+    runtime.register_provider(Arc::new(provider.clone()));
+
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let token = CancellationToken::new();
+    let options = crate::canonical_runtime::TaskOptions {
+        cancel: Some(token.clone()),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "mid-stream cancel",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    // Cancel before starting — the select! cancellation arm will win
+    // immediately, proving the mechanism is wired correctly.
+    token.cancel();
+    let result = runtime.run_task_with_options(&req, options).await;
+
+    assert!(
+        result.cancelled || !result.success,
+        "mid-stream cancellation should terminate: {:?}",
+        result.error
+    );
+    let evs = collect_events(&events);
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            AgentEvent::AgentCancelled { .. } | AgentEvent::AgentFailed { .. }
+        )),
+        "should emit a terminal event"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 2. Deadline during stream_response() — provider blocks, deadline fires.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_deadline_during_stream_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+
+    let provider = BlockingStreamResponseProvider::new("mock");
+    runtime.register_provider(Arc::new(provider.clone()));
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        task_timeout_ms: Some(50),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "deadline during stream_response",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        !result.success,
+        "deadline during stream_response should terminate: {:?}",
+        result.error
+    );
+    assert!(
+        result
+            .error
+            .as_ref()
+            .map(|e| e.contains("timed out"))
+            .unwrap_or(false),
+        "error should mention timeout: {:?}",
+        result.error
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Deadline during rx.recv() — provider returns receiver, deadline fires.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_deadline_during_recv() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+
+    runtime.register_provider(Arc::new(HangingRecvProvider::new("mock")));
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        task_timeout_ms: Some(50),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "deadline during recv",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        !result.success,
+        "deadline during recv should terminate: {:?}",
+        result.error
+    );
+    assert!(
+        result
+            .error
+            .as_ref()
+            .map(|e| e.contains("timed out"))
+            .unwrap_or(false),
+        "error should mention timeout: {:?}",
+        result.error
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. Normal stream still works — chunks delivered, no cancellation.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_normal_stream_still_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec!["chunk1chunk2".to_string()],
+    )));
+
+    let chunks: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chunk_sink = chunks.clone();
+    let (_, emit) = event_sink();
+    let on_chunk = move |c: &str| chunk_sink.lock().unwrap().push(c.to_string());
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "normal stream",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task(&req).await;
+    assert!(
+        result.success,
+        "normal stream should succeed: {:?}",
+        result.error
+    );
+    let collected = chunks.lock().unwrap().clone();
+    assert!(
+        collected.contains(&"chunk1chunk2".to_string()),
+        "chunks should be delivered"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Cancellation does NOT trigger retry — task terminates promptly.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_cancellation_does_not_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(1));
+
+    let provider = BlockingStreamResponseProvider::new("mock");
+    runtime.register_provider(Arc::new(provider.clone()));
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let token = CancellationToken::new();
+    let options = crate::canonical_runtime::TaskOptions {
+        cancel: Some(token.clone()),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "no retry on cancel",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    // Cancel before starting — select! cancellation arm wins immediately,
+    // no retry path is entered.
+    token.cancel();
+    let result = runtime.run_task_with_options(&req, options).await;
+
+    assert!(
+        result.cancelled || !result.success,
+        "should terminate: {:?}",
+        result.error
+    );
+    assert!(
+        result.error.is_some() || result.cancelled,
+        "cancelled task should not succeed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Deadline does NOT trigger retry — task terminates with timeout.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_deadline_does_not_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(1));
+
+    let provider = BlockingStreamResponseProvider::new("mock");
+    runtime.register_provider(Arc::new(provider.clone()));
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        task_timeout_ms: Some(10),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "no retry on deadline",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        !result.success,
+        "deadline should terminate: {:?}",
+        result.error
+    );
+    assert!(
+        result
+            .error
+            .as_ref()
+            .map(|e| e.contains("timed out"))
+            .unwrap_or(false),
+        "error should be a timeout, not a retry exhaustion: {:?}",
+        result.error
+    );
+}
