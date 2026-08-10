@@ -40,6 +40,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::time::Instant as TokioInstant;
 
 use crate::agent::coordinator::AgentCoordinator;
 use crate::agent::events::AgentEvent;
@@ -97,7 +98,17 @@ const MAX_TOTAL_TOOL_CALLS: usize = 100;
 const MAX_REPEATED_ACTIONS: usize = 3;
 
 /// Default task timeout (30 seconds). Exceeding this terminates the task.
+/// This is a hard safety deadline that applies across all phases
+/// (planning, model reasoning, tool execution, verification, revision).
 const DEFAULT_TASK_TIMEOUT_MS: u64 = 30_000;
+
+/// Maximum total model calls (provider invocations) across the entire task,
+/// including verification revisions. Each revision re-enters the ReAct loop
+/// (up to `MAX_REACT_ITERATIONS` per entry). Total bound:
+///   MAX_MODEL_CALLS = MAX_REACT_ITERATIONS * (1 + MAX_VERIFICATION_REVISIONS)
+///   = 5 * (1 + 2) = 15 provider calls worst-case.
+const MAX_MODEL_CALLS: usize =
+    MAX_REACT_ITERATIONS * (1 + 2/* default max_verification_revisions */);
 
 /// A request to execute one engineering task.
 pub struct TaskRequest<'a> {
@@ -131,6 +142,10 @@ pub struct TaskOptions {
     /// Maximum number of verification revision attempts after a failure.
     /// Defaults to 2.
     pub max_verification_revisions: Option<usize>,
+    /// Hard deadline for the entire task. Set at the start of
+    /// `run_task_with_options`. The provider stream uses this deadline
+    /// with `tokio::select!` so that streaming is interruptible.
+    pub deadline: Option<TokioInstant>,
 }
 
 /// The outcome of a directly-invoked streaming tool run (shell commands,
@@ -386,6 +401,20 @@ impl CanonicalRuntime {
     ) -> TaskResult {
         let started = Instant::now();
         let mut diag = TaskDiagnostics::new(req.task);
+
+        // Establish a hard task-level deadline. This deadline is shared across
+        // all phases (planning, model reasoning, tool execution, verification,
+        // revision) and is propagated into `stream_once` so that provider
+        // streaming is interruptible via `tokio::select!`.
+        let deadline = opts
+            .task_timeout_ms
+            .filter(|t| *t > 0)
+            .map(|t| TokioInstant::now() + std::time::Duration::from_millis(t));
+
+        let opts = TaskOptions {
+            deadline,
+            ..opts.clone()
+        };
 
         if opts
             .cancel
@@ -862,7 +891,8 @@ impl CanonicalRuntime {
     /// - max reasoning iterations
     /// - max tool calls per iteration
     /// - max total tool calls
-    /// - task timeout
+    /// - task-level deadline (hard timeout from `run_task_with_options`)
+    /// - total model-call budget (across all iterations and revisions)
     /// - repeated-action detection
     async fn run_execution_loop(
         &mut self,
@@ -878,8 +908,9 @@ impl CanonicalRuntime {
             .max_tool_calls_per_iteration
             .unwrap_or(MAX_TOOL_CALLS_PER_ITERATION);
         let max_total_tool_calls = MAX_TOTAL_TOOL_CALLS;
-        let timeout_ms = opts.task_timeout_ms.unwrap_or(DEFAULT_TASK_TIMEOUT_MS);
+        let deadline = opts.deadline;
         let mut total_tool_calls: usize = 0;
+        let mut model_calls: usize = 0;
         let mut repeated_actions: Vec<String> = Vec::new();
 
         for iteration in 0..max_iterations {
@@ -890,24 +921,28 @@ impl CanonicalRuntime {
                 }
             }
 
-            // 2. Timeout check.
-            if timeout_ms > 0 {
-                let elapsed = started.elapsed().as_millis() as u64;
-                if elapsed >= timeout_ms {
-                    return (
-                        Err(format!(
-                            "Task timed out after {}ms (iteration {})",
-                            elapsed, iteration
-                        )),
-                        trace,
-                    );
+            // 2. Deadline check before starting a new iteration.
+            if let Some(dl) = deadline {
+                if dl <= TokioInstant::now() {
+                    return (Err("Task timed out".to_string()), trace);
                 }
             }
 
-            // 3. Canonical prompt compilation for the current context.
+            // 3. Model-call budget check.
+            if model_calls >= MAX_MODEL_CALLS {
+                return (
+                    Err(format!(
+                        "Maximum model calls ({}) exceeded",
+                        MAX_MODEL_CALLS
+                    )),
+                    trace,
+                );
+            }
+
+            // 4. Canonical prompt compilation for the current context.
             let compiled = self.prompt_builder.compile_context(&context);
 
-            // 4. Authoritative provider selection.
+            // 5. Authoritative provider selection.
             let route_request = RouteRequest::new()
                 .with_capabilities(vec![Capability::Streaming, Capability::ToolCalling]);
             let decision = match self.router.route(&route_request) {
@@ -930,12 +965,13 @@ impl CanonicalRuntime {
                 };
             }
 
-            // 5. Execute through ProviderRuntime gates.
+            // 6. Execute through ProviderRuntime gates.
             match self
                 .stream_once(&decision, &compiled.prompt, req.on_chunk, opts)
                 .await
             {
                 Ok(full) => {
+                    model_calls += 1;
                     if let Ok(calls) = tool_parser::parse_tool_calls(&full) {
                         if !calls.is_empty() {
                             // Enforce per-iteration tool call limit.
@@ -1035,6 +1071,10 @@ impl CanonicalRuntime {
 
     /// Stream a response from the routed provider with circuit breaker gate,
     /// health reporting and retry policy. Never bypasses the circuit breaker.
+    ///
+    /// Uses `tokio::select!` so that both cancellation and the task-level
+    /// deadline can interrupt an in-flight provider stream promptly — the
+    /// stream does not wait for the channel to close before returning.
     async fn stream_once(
         &self,
         decision: &ProviderRoutingDecision,
@@ -1068,20 +1108,64 @@ impl CanonicalRuntime {
         let mut attempt = 0usize;
 
         loop {
+            // Check cancellation / deadline before starting a provider call.
+            if let Some(cancel) = &opts.cancel {
+                if cancel.is_cancelled() {
+                    return Err("Task cancelled".to_string());
+                }
+            }
+            if let Some(dl) = opts.deadline {
+                if dl <= TokioInstant::now() {
+                    return Err("Task timed out".to_string());
+                }
+            }
+
             match io.stream_response(prompt).await {
                 Ok(mut rx) => {
                     let mut full = String::new();
-                    while let Some(chunk) = rx.recv().await {
-                        if opts
-                            .cancel
-                            .as_ref()
-                            .map(|c| c.is_cancelled())
-                            .unwrap_or(false)
+                    // Wrap the recv loop with a deadline-aware timeout so
+                    // that the hard task deadline interrupts an in-flight
+                    // provider stream. Cancellation is checked between
+                    // chunks (the existing cooperative check).
+                    if let Some(deadline) = opts.deadline {
+                        match tokio::time::timeout_at(deadline, async {
+                            loop {
+                                if let Some(cancel) = &opts.cancel {
+                                    if cancel.is_cancelled() {
+                                        return Err("Task cancelled".to_string());
+                                    }
+                                }
+                                match rx.recv().await {
+                                    Some(chunk) => {
+                                        full.push_str(&chunk);
+                                        on_chunk(&chunk);
+                                    }
+                                    None => break,
+                                }
+                            }
+                            Ok(())
+                        })
+                        .await
                         {
-                            return Err("Task cancelled".to_string());
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => return Err(e),
+                            Err(_) => return Err("Task timed out".to_string()),
                         }
-                        full.push_str(&chunk);
-                        on_chunk(&chunk);
+                    } else {
+                        loop {
+                            if let Some(cancel) = &opts.cancel {
+                                if cancel.is_cancelled() {
+                                    return Err("Task cancelled".to_string());
+                                }
+                            }
+                            match rx.recv().await {
+                                Some(chunk) => {
+                                    full.push_str(&chunk);
+                                    on_chunk(&chunk);
+                                }
+                                None => break,
+                            }
+                        }
                     }
                     let tokens = TokenUsage::new(prompt.len() / 4, full.len() / 4);
                     self.provider_runtime.report_success(

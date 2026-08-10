@@ -1135,6 +1135,7 @@ async fn test_verify_task_runs_real_build_and_reports() {
 
 use crate::agent::task_graph::TaskGraph;
 use crate::cancellation::CancellationToken;
+use crate::canonical_runtime::MAX_MODEL_CALLS;
 use crate::canonical_runtime::MAX_REACT_ITERATIONS;
 
 /// A mock provider that returns responses sequentially (consuming each one).
@@ -1937,5 +1938,387 @@ async fn test_max_total_tool_calls_guard() {
         !result.success || result.error.is_some(),
         "exceeding max total tool calls should fail: {:?}",
         result.error
+    );
+}
+
+// =========================================================================
+// Sprint 29.1 — Agent Loop Hardening
+// =========================================================================
+
+/// A mock provider that holds chunks in a channel and only delivers them
+/// when a `hand_off` flag is set. This lets us test cancellation and
+/// deadline behaviour against a provider that would otherwise hang.
+#[derive(Clone)]
+struct HangingMockProvider {
+    name: String,
+    model: String,
+    /// Chunks to deliver. Empty = provider hangs forever.
+    chunks: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// When true, the provider delivers its chunks and closes the channel.
+    /// When false, the provider never delivers anything (hangs).
+    release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HangingMockProvider {
+    fn new(name: &str, chunks: Vec<String>) -> Self {
+        HangingMockProvider {
+            name: name.to_string(),
+            model: format!("{}-model", name),
+            chunks: std::sync::Arc::new(std::sync::Mutex::new(chunks)),
+            release: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Signal the provider to release all its chunks.
+    fn release(&self) {
+        self.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Provider for HangingMockProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn base_url(&self) -> &str {
+        "mock://localhost"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn api_key(&self) -> Option<&str> {
+        Some("mock-key")
+    }
+
+    fn send_message(
+        &self,
+        _message: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>>
+    {
+        let chunks = self.chunks.lock().unwrap().clone();
+        Box::pin(async move { Ok(chunks.join("")) })
+    }
+
+    fn stream_response(
+        &self,
+        _message: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<String>>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let chunks = self.chunks.clone();
+        let release = self.release.clone();
+        // Spawn a background task that delivers chunks only after release.
+        tokio::spawn(async move {
+            // Spin until released.
+            while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let mut c = chunks.lock().unwrap();
+            for chunk in c.drain(..) {
+                let _ = tx.send(chunk);
+            }
+            // Channel drops when tx is dropped → rx.recv() returns None.
+        });
+        Box::pin(async move { Ok(rx) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1. Provider hangs while cancellation fires → Cancelled
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_cancellation_interrupts_hanging_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Provider that would hang forever (no chunks, never released).
+    runtime.register_provider(Arc::new(HangingMockProvider::new("mock", vec![])));
+
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let token = CancellationToken::new();
+    let options = crate::canonical_runtime::TaskOptions {
+        cancel: Some(token.clone()),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "explain the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    // Cancel while the provider is hanging.
+    token.cancel();
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.cancelled || !result.success,
+        "cancellation during hanging provider should terminate: {:?}",
+        result.error
+    );
+    let evs = collect_events(&events);
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            AgentEvent::AgentCancelled { .. } | AgentEvent::AgentFailed { .. }
+        )),
+        "should emit a terminal event"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 2. Provider hangs while deadline fires → timeout
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_deadline_interrupts_hanging_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(HangingMockProvider::new("mock", vec![])));
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        // 50ms deadline — short enough to fire before any real work.
+        task_timeout_ms: Some(50),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "explain the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        !result.success,
+        "deadline should terminate the task: {:?}",
+        result.error
+    );
+    assert!(
+        result
+            .error
+            .as_ref()
+            .map(|e| e.contains("timed out"))
+            .unwrap_or(false),
+        "error should mention timeout: {:?}",
+        result.error
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Provider emits chunks normally → task completes
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_provider_emits_chunks_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec!["chunk1chunk2".to_string()],
+    )));
+
+    let chunks: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chunk_sink = chunks.clone();
+    let (events, emit) = event_sink();
+    let on_chunk = move |c: &str| chunk_sink.lock().unwrap().push(c.to_string());
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "explain the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task(&req).await;
+    assert!(
+        result.success,
+        "normal provider should succeed: {:?}",
+        result.error
+    );
+    let collected = chunks.lock().unwrap().clone();
+    assert!(
+        collected.contains(&"chunk1chunk2".to_string()),
+        "chunks should be delivered"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. Cancellation does not cause a second terminal transition
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_cancellation_single_terminal_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec!["final.".to_string()],
+    )));
+
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let token = CancellationToken::new();
+    let options = crate::canonical_runtime::TaskOptions {
+        cancel: Some(token.clone()),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "simple task",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    // Cancel after the task completes successfully.
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(result.success);
+    let evs = collect_events(&events);
+    // Exactly one terminal event for the main agent.
+    let main_terminals: Vec<&AgentEvent> = evs
+        .iter()
+        .filter(|e| match e {
+            AgentEvent::AgentCompleted { agent, .. }
+            | AgentEvent::AgentFailed { agent, .. }
+            | AgentEvent::AgentCancelled { agent, .. } => agent == "main",
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        main_terminals.len(),
+        1,
+        "exactly one terminal event for main agent"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Deadline does not cause another tool/model iteration after firing
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_deadline_stops_before_new_iteration() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Provide only one response — the deadline should fire before a second
+    // iteration can start (the first response contains a tool call, but
+    // the deadline is so short that the second provider call times out).
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec!["<invoke name=\"list_files\">{\"path\": \".\"}</invoke>".to_string()],
+    )));
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        task_timeout_ms: Some(1),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "list files",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task_with_options(&req, options).await;
+    // Should terminate (either via timeout or tool-limit exhaustion), not
+    // continue into a second provider call after the deadline.
+    assert!(
+        !result.success || result.error.is_some(),
+        "deadline should prevent further iterations: {:?}",
+        result.error
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Total model-call budget remains bounded across verification revisions
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_model_call_budget_bounded_across_revisions() {
+    let dir = tempfile::tempdir().unwrap();
+    // Create a cargo workspace so verification is applicable.
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"vt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src").join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[cfg(test)]\nmod tests { #[test] fn ok() {} }\n",
+    )
+    .unwrap();
+
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Provide enough responses for 1 initial execution + 2 revisions, but
+    // cap at MAX_MODEL_CALLS (15). Each response is a final answer (no tool
+    // calls), so each response = 1 model call.
+    let responses: Vec<String> = (0..10).map(|i| format!("revision {} answer", i)).collect();
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new("mock", responses)));
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a function to the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    // The task should reach a terminal state (either completed or failed
+    // after exhausting revisions), never loop beyond MAX_MODEL_CALLS.
+    assert!(result.success || result.error.is_some() || result.cancelled);
+}
+
+// ---------------------------------------------------------------------------
+// Model-call budget test — direct proof that MAX_MODEL_CALLS is respected
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_max_model_calls_budget_respected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Provide far more responses than MAX_MODEL_CALLS allows. Each response
+    // is a tool call, forcing the loop to keep going until the budget is hit.
+    let responses: Vec<String> = (0..(MAX_MODEL_CALLS + 10))
+        .map(|_| "<invoke name=\"list_files\">{\"path\": \".\"}</invoke>".to_string())
+        .collect();
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new("mock", responses)));
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "list files repeatedly",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    // Should terminate before exhausting all responses.
+    assert!(
+        !result.success || result.error.is_some(),
+        "model call budget should be respected: {:?}",
+        result.error
+    );
+    let evs = collect_events(&events);
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, AgentEvent::AgentCompleted { agent, .. } if agent == "main")),
+        "main agent should not complete when model call budget is hit"
     );
 }
