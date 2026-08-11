@@ -40,7 +40,7 @@ impl PermissionDecision {
 ///
 /// Called before a tool executes. If the hook denies or asks, the tool
 /// should not run (or must wait for user confirmation).
-pub trait PermissionHook: Send + Sync {
+pub trait PermissionHook: Send + Sync + std::any::Any + 'static {
     /// Check permission for a tool execution.
     fn check(&self, context: &ToolContext) -> PermissionDecision;
 }
@@ -49,7 +49,7 @@ pub trait PermissionHook: Send + Sync {
 ///
 /// Called after a tool executes. Used for audit logging, state capture,
 /// and rollback preparation.
-pub trait RollbackHook: Send + Sync {
+pub trait RollbackHook: Send + Sync + std::any::Any + 'static {
     /// Called before execution to capture state for potential rollback.
     fn before_execute(&self, context: &mut ToolContext) -> Result<()>;
 
@@ -184,8 +184,8 @@ impl std::fmt::Debug for ToolHooks {
 impl Clone for ToolHooks {
     fn clone(&self) -> Self {
         ToolHooks {
-            permission: None,
-            rollback: None,
+            permission: self.permission.as_deref().and_then(clone_box_permission),
+            rollback: self.rollback.as_deref().and_then(clone_box_rollback),
         }
     }
 }
@@ -280,35 +280,84 @@ impl HookManager {
         self.per_tool_hooks.insert(tool_name.to_string(), hooks);
     }
 
+    /// Resolve the effective hooks for a tool: per-tool hooks take
+    /// precedence; otherwise the global hooks (if any); otherwise empty
+    /// (which falls back to the capability-based default).
     pub fn get_tool_hooks(&self, tool_name: &str) -> ToolHooks {
-        // Per-tool hooks take precedence; fall back to global.
-        if let Some(_tools) = self.per_tool_hooks.get(tool_name) {
-            return ToolHooks::new();
+        if let Some(hooks) = self.per_tool_hooks.get(tool_name) {
+            return ToolHooks {
+                permission: hooks.permission.as_deref().and_then(clone_box_permission),
+                rollback: hooks.rollback.as_deref().and_then(clone_box_rollback),
+            };
         }
-
         ToolHooks {
-            permission: None,
-            rollback: None,
+            permission: self
+                .global_permission
+                .as_deref()
+                .and_then(clone_box_permission),
+            rollback: self.global_rollback.as_deref().and_then(clone_box_rollback),
         }
     }
 
     /// Check permission for a tool, combining per-tool and global hooks.
     pub fn check_permission(&self, context: &ToolContext) -> PermissionDecision {
-        let hooks = self.get_tool_hooks(&context.tool_name);
-        hooks.check_permission(context)
+        if let Some(hooks) = self.per_tool_hooks.get(&context.tool_name) {
+            if let Some(ref hook) = hooks.permission {
+                return hook.check(context);
+            }
+        }
+        if let Some(ref hook) = self.global_permission {
+            return hook.check(context);
+        }
+        CapabilityPermissionHook.check(context)
     }
 
     /// Run before-execute hooks.
     pub fn before_execute(&self, context: &mut ToolContext) -> Result<()> {
-        let hooks = self.get_tool_hooks(&context.tool_name);
-        hooks.before_execute(context)
+        if let Some(hooks) = self.per_tool_hooks.get(&context.tool_name) {
+            if let Some(ref hook) = hooks.rollback {
+                return hook.before_execute(context);
+            }
+        }
+        if let Some(ref hook) = self.global_rollback {
+            return hook.before_execute(context);
+        }
+        Ok(())
     }
 
     /// Run after-execute hooks.
     pub fn after_execute(&self, context: &ToolContext, result: &ToolResult) -> Result<()> {
-        let hooks = self.get_tool_hooks(&context.tool_name);
-        hooks.after_execute(context, result)
+        if let Some(hooks) = self.per_tool_hooks.get(&context.tool_name) {
+            if let Some(ref hook) = hooks.rollback {
+                return hook.after_execute(context, result);
+            }
+        }
+        if let Some(ref hook) = self.global_rollback {
+            return hook.after_execute(context, result);
+        }
+        Ok(())
     }
+}
+
+/// Clone a permission hook by concrete type. Built-in hook types are
+/// cloned; unknown external hooks fall back to `None` (degrading to the
+/// capability-based default rather than failing).
+fn clone_box_permission(hook: &dyn PermissionHook) -> Option<Box<dyn PermissionHook>> {
+    let any = hook as &dyn std::any::Any;
+    if let Some(cap) = any.downcast_ref::<CapabilityPermissionHook>() {
+        return Some(Box::new(cap.clone()));
+    }
+    None
+}
+
+/// Clone a rollback hook by concrete type. Built-in hook types are cloned;
+/// unknown external hooks fall back to `None`.
+fn clone_box_rollback(hook: &dyn RollbackHook) -> Option<Box<dyn RollbackHook>> {
+    let any = hook as &dyn std::any::Any;
+    if let Some(def) = any.downcast_ref::<DefaultRollbackHook>() {
+        return Some(Box::new(def.clone()));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -387,5 +436,63 @@ mod tests {
         // Global hook applies to other tools
         let ctx2 = ToolContext::new("other_tool", "args");
         assert!(mgr.check_permission(&ctx2).is_allowed());
+    }
+
+    /// A denying permission hook used to prove global hooks are enforced.
+    struct DenyAllHook;
+
+    impl PermissionHook for DenyAllHook {
+        fn check(&self, context: &ToolContext) -> PermissionDecision {
+            PermissionDecision::Denied {
+                reason: format!("deny-all for {}", context.tool_name),
+            }
+        }
+    }
+
+    #[test]
+    fn test_global_permission_hook_is_enforced() {
+        // Sprint 30C relies on a global permission hook (the research
+        // read-only boundary). Prove the hook is actually consulted by the
+        // registry's permission path.
+        let mut mgr = HookManager::new();
+        mgr.set_global_permission(Box::new(DenyAllHook));
+
+        let ctx = ToolContext::new("read_file", "src/main.rs");
+        let decision = mgr.check_permission(&ctx);
+        assert!(
+            decision.is_denied(),
+            "global permission hook must deny, got {:?}",
+            decision
+        );
+    }
+
+    #[test]
+    fn test_per_tool_permission_hook_overrides_global() {
+        // Per-tool hooks take precedence over a global hook.
+        struct AllowAllHook;
+
+        impl PermissionHook for AllowAllHook {
+            fn check(&self, _context: &ToolContext) -> PermissionDecision {
+                PermissionDecision::Allowed { reason: None }
+            }
+        }
+
+        let mut mgr = HookManager::new();
+        mgr.set_global_permission(Box::new(DenyAllHook));
+        mgr.set_tool_hooks(
+            "read_file",
+            ToolHooks::new().with_permission(Box::new(AllowAllHook)),
+        );
+
+        let ctx = ToolContext::new("read_file", "src/main.rs");
+        assert!(
+            mgr.check_permission(&ctx).is_allowed(),
+            "per-tool hook must override the global deny"
+        );
+        let other = ToolContext::new("list_files", ".");
+        assert!(
+            mgr.check_permission(&other).is_denied(),
+            "global deny still applies to other tools"
+        );
     }
 }

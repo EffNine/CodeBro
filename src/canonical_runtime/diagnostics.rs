@@ -8,6 +8,32 @@
 //! Diagnostics are collected observationally and surfaced on demand (verbose
 //! / debug modes). They never influence task execution.
 
+/// Observational diagnostics for one autonomous Research session (Sprint 30C).
+#[derive(Debug, Clone, Default)]
+pub struct ResearchDiagnostics {
+    /// Whether research produced a usable result.
+    pub completed: bool,
+    /// Why research terminated (completed / iteration_limit / tool_limit /
+    /// model_limit / timeout / cancelled / error).
+    pub termination: String,
+    /// Number of reasoning iterations.
+    pub iterations: usize,
+    /// Number of real tool calls executed.
+    pub tool_calls: usize,
+    /// Number of model (provider) calls.
+    pub model_calls: usize,
+    /// Number of files inspected.
+    pub files_inspected: usize,
+    /// Number of symbols surfaced.
+    pub symbols_found: usize,
+    /// Research duration in milliseconds.
+    pub duration_ms: u64,
+    /// Provider that executed the research.
+    pub provider: String,
+    /// Error message when research failed.
+    pub error: Option<String>,
+}
+
 /// Per-task runtime diagnostics.
 #[derive(Debug, Clone, Default)]
 pub struct TaskDiagnostics {
@@ -53,6 +79,8 @@ pub struct TaskDiagnostics {
     pub total_ms: u64,
     /// Explicit verification results (build / tests), when run.
     pub verification: Option<super::VerificationSummary>,
+    /// Autonomous research diagnostics (Sprint 30C), when research ran.
+    pub research: Option<ResearchDiagnostics>,
 }
 
 impl TaskDiagnostics {
@@ -86,5 +114,22 @@ impl TaskDiagnostics {
             self.provider_execution_ms,
             self.total_ms,
         )
+    }
+}
+
+impl From<crate::research::ResearchResult> for ResearchDiagnostics {
+    fn from(result: crate::research::ResearchResult) -> Self {
+        ResearchDiagnostics {
+            completed: result.termination.is_completed(),
+            termination: result.termination.to_string(),
+            iterations: result.iterations,
+            tool_calls: result.tool_calls,
+            model_calls: result.model_calls,
+            files_inspected: result.files_inspected.len(),
+            symbols_found: result.symbols_found.len(),
+            duration_ms: result.duration_ms,
+            provider: result.provider,
+            error: result.limitations.first().cloned(),
+        }
     }
 }

@@ -29,6 +29,7 @@
 //! ```
 
 mod diagnostics;
+pub(crate) mod execution;
 mod provider_adapter;
 #[cfg(test)]
 mod tests;
@@ -44,6 +45,7 @@ use tokio::time::Instant as TokioInstant;
 
 use crate::agent::coordinator::AgentCoordinator;
 use crate::agent::events::AgentEvent;
+use crate::agent::grounding::GroundedContext;
 use crate::agent::recovery::RecoveryEngine;
 use crate::agent::status::AgentStatus;
 use crate::agent::task_graph::{TaskGraph, TaskStatus};
@@ -74,8 +76,7 @@ use crate::prompt_builder::{CompiledPrompt, PromptBuilder};
 use crate::provider_runtime::routing::ProviderRoutingDecision;
 use crate::provider_runtime::{
     Capability, CircuitBreakerState, CostTracker, HealthManager, IntelligentProviderRouter,
-    Priority, ProviderCost, ProviderId, ProviderRegistry, ProviderRuntime, RetryController,
-    RetryPolicy, RouteRequest, TokenUsage,
+    ProviderId, ProviderRegistry, ProviderRuntime, RetryPolicy, RouteRequest,
 };
 use crate::providers::{OpenAiProvider, StructuredToolCall, ToolDefinition};
 use crate::scanner::ProjectInfo;
@@ -146,6 +147,10 @@ pub struct TaskOptions {
     /// `run_task_with_options`. The provider stream uses this deadline
     /// with `tokio::select!` so that streaming is interruptible.
     pub deadline: Option<TokioInstant>,
+    /// When true, the coordinator runs the autonomous Research subagent
+    /// (Sprint 30C) before the main execution loop and injects the
+    /// evidence-backed result into the main LLM context. Defaults to false.
+    pub research_enabled: bool,
 }
 
 /// The outcome of a directly-invoked streaming tool run (shell commands,
@@ -424,7 +429,6 @@ impl CanonicalRuntime {
         {
             return self.cancel(req, None, req.task, diag, started);
         }
-
         // Task lifecycle: begin.
         let mut graph = TaskGraph::new(req.task);
         let root_id = graph.root_task.clone();
@@ -482,6 +486,42 @@ impl CanonicalRuntime {
             Err(e) => return self.fail(req, Some(&mut graph), &root_id, e, diag, started),
         };
         diag.context_fragments = context.fragment_count();
+
+        // Autonomous Research (Sprint 30C): when enabled, run the read-only
+        // Research subagent over the grounded context and inject its
+        // evidence-backed result into the context that reaches the main LLM.
+        // Failure is isolated: a research error never crashes the main task.
+        if opts.research_enabled {
+            let research = self
+                .run_autonomous_research(req, &memory_entries, &opts)
+                .await;
+            match research {
+                Ok(result) => {
+                    let render = result.render();
+                    diag.research = Some(
+                        crate::canonical_runtime::diagnostics::ResearchDiagnostics::from(result),
+                    );
+                    context = extend_context(
+                        context,
+                        vec![ContextFragment {
+                            source: "research".to_string(),
+                            content: render,
+                            relevance_score: 0.85,
+                        }],
+                    );
+                    diag.context_fragments = context.fragment_count();
+                }
+                Err(e) => {
+                    // Failure isolation: the main task continues with the
+                    // existing context. The failure is observable but not
+                    // fatal.
+                    (req.emit)(AgentEvent::Log {
+                        level: "pipeline".to_string(),
+                        message: format!("Research subagent failed (continuing without it): {e}"),
+                    });
+                }
+            }
+        }
 
         // Canonical prompt compilation.
         let t = Instant::now();
@@ -661,6 +701,109 @@ impl CanonicalRuntime {
         let context = self.build_context(&req, &identity, memory_ctx, assembly, report)?;
         let compiled = self.prompt_builder.compile_context(&context);
         Ok((context, compiled))
+    }
+
+    /// Compile-only mode that also runs the autonomous Research subagent and
+    /// injects its result into the compiled prompt. Used by the Sprint 30C
+    /// parent-integration test: proves ResearchResult → ContextFragment →
+    /// compiled main prompt.
+    pub async fn compile_for_task_with_research(
+        &mut self,
+        task: &str,
+        conversation: Vec<ConversationMessage>,
+    ) -> std::result::Result<(EngineeringContext, CompiledPrompt), String> {
+        let noop_emit = |_: AgentEvent| {};
+        let noop_chunk = |_: &str| {};
+        let req = TaskRequest {
+            task,
+            conversation,
+            emit: &noop_emit,
+            on_chunk: &noop_chunk,
+        };
+
+        let identity = if self.identity.is_loaded() {
+            self.identity.snapshot()
+        } else {
+            ProjectIdentity::new("unknown", "unknown")
+        };
+        let keywords = extract_keywords(task);
+        let memory_ctx = self.resolve_memory(&keywords, &[]);
+        let memory_entries: Vec<String> = memory_ctx
+            .entries
+            .iter()
+            .map(|e| format!("{}: {}", e.key, e.value))
+            .collect();
+        let (assembly, report) = self.observe(&req, &memory_entries).await?;
+        let mut context = self.build_context(&req, &identity, memory_ctx, assembly, report)?;
+
+        // Assemble grounding once and run the autonomous research subagent.
+        let tool_observations: Vec<String> = Vec::new();
+        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
+            .assemble_with_extras(task, &tool_observations, &memory_entries);
+        match self
+            .run_research_task(task, grounded, &noop_emit, None)
+            .await
+        {
+            Ok(result) => {
+                let render = result.render();
+                context = extend_context(
+                    context,
+                    vec![ContextFragment {
+                        source: "research".to_string(),
+                        content: render,
+                        relevance_score: 0.85,
+                    }],
+                );
+            }
+            Err(e) => {
+                return Err(format!("Autonomous research failed: {e}"));
+            }
+        }
+
+        let compiled = self.prompt_builder.compile_context(&context);
+        Ok((context, compiled))
+    }
+
+    // =====================================================================
+    // Autonomous Research (Sprint 30C)
+    // =====================================================================
+
+    /// Run the autonomous Research subagent over a grounded context using the
+    /// runtime's shared provider state and a restricted read-only tool
+    /// registry. Returns the structured, evidence-backed [`ResearchResult`].
+    pub async fn run_research_task(
+        &self,
+        task: &str,
+        grounding: GroundedContext,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        cancel: Option<crate::cancellation::CancellationToken>,
+    ) -> std::result::Result<crate::research::ResearchResult, String> {
+        let tooling = build_research_tooling(&self.workspace_root);
+        let mut subagent = crate::research::ResearchSubagent::new(
+            self.provider_runtime.clone(),
+            self.router.clone(),
+            self.io_providers.clone(),
+            tooling,
+        );
+        let request = crate::research::ResearchRequest::new(task, self.workspace_root.clone())
+            .with_grounding(grounding);
+        Ok(subagent.run(request, emit, cancel).await)
+    }
+
+    /// Run the autonomous research subagent inside the canonical task pipeline
+    /// (used by `run_task_with_options`). Bounded by the task deadline and the
+    /// research limits; failure is isolated and reported as an error result.
+    async fn run_autonomous_research(
+        &self,
+        req: &TaskRequest<'_>,
+        memory_entries: &[String],
+        opts: &TaskOptions,
+    ) -> std::result::Result<crate::research::ResearchResult, String> {
+        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
+            .assemble_with_extras(req.task, &[], memory_entries);
+        let cancel = opts.cancel.clone();
+        self.run_research_task(req.task, grounded, req.emit, cancel)
+            .await
     }
 
     // =====================================================================
@@ -1112,12 +1255,10 @@ impl CanonicalRuntime {
     /// Stream a response from the routed provider with circuit breaker gate,
     /// health reporting and retry policy. Never bypasses the circuit breaker.
     ///
-    /// Both stages — provider invocation (`stream_response`) and chunk
-    /// consumption (`rx.recv`) — are guarded by the same
-    /// cancellation/deadline mechanism so that an in-flight provider can
-    /// be interrupted promptly.  Cancellation and deadline errors terminate
-    /// the task immediately and are never retried; only genuine provider
-    /// failures enter the existing retry / circuit-breaker path.
+    /// Delegates to the shared [`execution::stream_once`] primitive so the
+    /// main agent and the autonomous Research subagent share the exact same
+    /// breaker / health / retry / cancellation / deadline / structured-calling
+    /// behaviour.
     async fn stream_once(
         &self,
         decision: &ProviderRoutingDecision,
@@ -1126,188 +1267,16 @@ impl CanonicalRuntime {
         on_chunk: &(dyn Fn(&str) + Send + Sync),
         opts: &TaskOptions,
     ) -> std::result::Result<(String, Vec<StructuredToolCall>), String> {
-        let provider_id = decision.provider_id().clone();
-
-        let breaker = self
-            .provider_runtime
-            .circuit_breakers()
-            .get_or_create(&provider_id);
-        if !breaker.can_execute() {
-            self.provider_runtime.report_failure(&provider_id);
-            return Err(format!(
-                "Circuit breaker open for {} ({:?})",
-                provider_id,
-                breaker.state()
-            ));
-        }
-
-        let io = self
-            .io_providers
-            .get(&provider_id)
-            .cloned()
-            .ok_or_else(|| format!("No provider handler registered for {provider_id}"))?;
-
-        // Decide the tool-calling mode: if the provider supports native
-        // function calling and we have tool definitions, send them. Otherwise
-        // fall back to the plain text protocol (structured calls stay empty
-        // and the text parser is used downstream).
-        let use_structured = io.supports_function_calling() && !tools.is_empty();
-
-        let policy = self.provider_runtime.retry_policy().clone();
-        let mut retry = RetryController::new(policy);
-        let mut attempt = 0usize;
-
-        loop {
-            // 1. Cooperative cancellation / deadline check before each
-            //    provider invocation.  If either has already fired we exit
-            //    immediately — no retry.
-            if let Some(cancel) = &opts.cancel {
-                if cancel.is_cancelled() {
-                    return Err("Task cancelled".to_string());
-                }
-            }
-            if let Some(dl) = opts.deadline {
-                if dl <= TokioInstant::now() {
-                    return Err("Task timed out".to_string());
-                }
-            }
-
-            // 2. Await the provider, concurrently monitoring cancellation
-            //    and deadline.  We use `tokio::select!` with three
-            //    arms: (a) the provider call, (b) a cancellation
-            //    waiter, (c) a deadline watcher.  All three run
-            //    concurrently; whichever fires first wins.
-            let response = if use_structured {
-                let structured_fut = io.stream_response_with_tools(prompt, tools);
-                tokio::select! {
-                    result = structured_fut => result,
-                    _ = async {
-                        if let Some(cancel) = &opts.cancel {
-                            cancel.cancelled().await;
-                        } else {
-                            futures::future::pending::<()>().await;
-                        }
-                    } => return Err("Task cancelled".to_string()),
-                    _ = async {
-                        match opts.deadline {
-                            Some(dl) => tokio::time::sleep_until(dl).await,
-                            None => {
-                                futures::future::pending::<()>().await;
-                            }
-                        }
-                    } => return Err("Task timed out".to_string()),
-                }
-            } else {
-                let plain_fut = io.stream_response(prompt);
-                let rx = tokio::select! {
-                    result = plain_fut => result,
-                    _ = async {
-                        if let Some(cancel) = &opts.cancel {
-                            cancel.cancelled().await;
-                        } else {
-                            futures::future::pending::<()>().await;
-                        }
-                    } => return Err("Task cancelled".to_string()),
-                    _ = async {
-                        match opts.deadline {
-                            Some(dl) => tokio::time::sleep_until(dl).await,
-                            None => {
-                                futures::future::pending::<()>().await;
-                            }
-                        }
-                    } => return Err("Task timed out".to_string()),
-                };
-                match rx {
-                    Ok(rx) => {
-                        // Receive chunks, concurrently monitoring cancellation
-                        // and deadline.
-                        let mut full = String::new();
-                        let mut rx = rx;
-                        loop {
-                            tokio::select! {
-                                chunk_opt = rx.recv() => {
-                                    match chunk_opt {
-                                        Some(chunk) => {
-                                            full.push_str(&chunk);
-                                            on_chunk(&chunk);
-                                        }
-                                        None => break, // Channel closed normally.
-                                    }
-                                }
-                                _ = async {
-                                    if let Some(cancel) = &opts.cancel {
-                                        cancel.cancelled().await;
-                                    } else {
-                                        futures::future::pending::<()>().await;
-                                    }
-                                } => {
-                                    return Err("Task cancelled".to_string());
-                                }
-                                _ = async {
-                                    match opts.deadline {
-                                        Some(dl) => tokio::time::sleep_until(dl).await,
-                                        None => {
-                                            futures::future::pending::<()>().await;
-                                        }
-                                    }
-                                } => {
-                                    return Err("Task timed out".to_string());
-                                }
-                            }
-                        }
-                        Ok((full, Vec::new()))
-                    }
-                    Err(e) => {
-                        // Only retry on genuine provider errors.
-                        attempt += 1;
-                        self.provider_runtime.report_failure(&provider_id);
-                        match retry.next_attempt(std::time::Duration::ZERO, &provider_id) {
-                            Ok(delay) => {
-                                if !delay.is_zero() {
-                                    tokio::time::sleep(delay).await;
-                                }
-                                continue;
-                            }
-                            Err(_) => {
-                                return Err(format!(
-                                    "Provider {} failed after {} attempt(s): {}",
-                                    provider_id, attempt, e
-                                ));
-                            }
-                        }
-                    }
-                }
-            };
-
-            // 3. Handle the structured response.
-            let (full, structured) = match response {
-                Ok(result) => result,
-                Err(e) => {
-                    // Only retry on genuine provider errors.
-                    attempt += 1;
-                    self.provider_runtime.report_failure(&provider_id);
-                    match retry.next_attempt(std::time::Duration::ZERO, &provider_id) {
-                        Ok(delay) => {
-                            if !delay.is_zero() {
-                                tokio::time::sleep(delay).await;
-                            }
-                            continue;
-                        }
-                        Err(_) => {
-                            return Err(format!(
-                                "Provider {} failed after {} attempt(s): {}",
-                                provider_id, attempt, e
-                            ));
-                        }
-                    }
-                }
-            };
-
-            let tokens = TokenUsage::new(prompt.len() / 4, full.len() / 4);
-            self.provider_runtime
-                .report_success(&provider_id, tokens, ProviderCost::default());
-            return Ok((full, structured));
-        }
+        execution::stream_once(
+            &self.provider_runtime,
+            &self.io_providers,
+            decision,
+            prompt,
+            tools,
+            on_chunk,
+            opts,
+        )
+        .await
     }
 
     /// Execute a single tool call via the registry, streaming PTY output live
@@ -1710,6 +1679,13 @@ fn build_tool_registry(workspace_root: &Path) -> ToolRegistry {
         .register(Arc::new(crate::tools::GitStatus))
         .register(Arc::new(crate::tools::GitDiff))
         .register(Arc::new(crate::tools::PlaywrightTool::new(root)))
+}
+
+/// Build the restricted read-only tool registry for the autonomous Research
+/// subagent. Only allowlisted tools are present; the same implementations the
+/// main registry uses are reused (no duplication).
+fn build_research_tooling(workspace_root: &Path) -> crate::research::ResearchTooling {
+    crate::research::ResearchTooling::new(workspace_root)
 }
 
 /// Keep the tail of a large output string for diagnostics.

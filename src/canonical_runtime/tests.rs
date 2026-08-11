@@ -3460,3 +3460,279 @@ async fn test_structured_multistep_task_completion() {
         result.error
     );
 }
+
+// =========================================================================
+// Sprint 30C — Autonomous Research Subagent (parent integration)
+// =========================================================================
+
+/// A scripted provider that consumes responses sequentially AND records every
+/// prompt it receives, so tests can prove the research fragment reached the
+/// main LLM prompt.
+#[derive(Clone)]
+struct RecordingScriptedProvider {
+    name: String,
+    model: String,
+    responses: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RecordingScriptedProvider {
+    fn new(name: &str, responses: Vec<String>) -> Self {
+        RecordingScriptedProvider {
+            name: name.to_string(),
+            model: format!("{}-model", name),
+            responses: std::sync::Arc::new(std::sync::Mutex::new(responses)),
+            prompts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn next(&self) -> String {
+        let mut responses = self.responses.lock().unwrap();
+        if responses.is_empty() {
+            String::new()
+        } else {
+            responses.remove(0)
+        }
+    }
+
+    fn all_prompts(&self) -> Vec<String> {
+        self.prompts.lock().unwrap().clone()
+    }
+}
+
+impl Provider for RecordingScriptedProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn base_url(&self) -> &str {
+        "mock://localhost"
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+    fn api_key(&self) -> Option<&str> {
+        Some("mock-key")
+    }
+    fn send_message(
+        &self,
+        _message: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>>
+    {
+        let response = self.next();
+        Box::pin(async move { Ok(response) })
+    }
+    fn stream_response(
+        &self,
+        message: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<String>>,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.prompts.lock().unwrap().push(message.to_string());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let response = self.next();
+        let _ = tx.send(response);
+        Box::pin(async move { Ok(rx) })
+    }
+}
+
+/// A grounded workspace with real files whose content mentions the runtime.
+fn research_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src/canonical_runtime")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\n[dependencies]\ntokio = \"1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/canonical_runtime/mod.rs"),
+        "pub struct CanonicalRuntime {}\nimpl CanonicalRuntime {\n    pub fn run_execution_loop() {}\n    pub fn stream_once() {}\n}\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// ResearchResult → ContextFragment → compiled main prompt.
+#[tokio::test]
+async fn test_research_result_reaches_compiled_prompt() {
+    let dir = research_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            r#"<invoke name="read_file">{"path": "src/canonical_runtime/mod.rs"}</invoke>"#
+                .to_string(),
+            "The CanonicalRuntime struct defines run_execution_loop and stream_once.".to_string(),
+        ],
+    )));
+
+    let (context, compiled) = runtime
+        .compile_for_task_with_research("trace canonical runtime execution", no_conversation())
+        .await
+        .expect("compile with research");
+
+    // ResearchResult became a `research` ContextFragment.
+    let fragment = context
+        .context_fragments
+        .iter()
+        .find(|f| f.source == "research")
+        .map(|f| f.content.clone())
+        .unwrap_or_default();
+    assert!(
+        fragment.contains("Autonomous Research Findings"),
+        "research fragment must carry the rendered result:\n{}",
+        fragment
+    );
+    // The fragment carried evidence from a REAL read of the actual file.
+    assert!(
+        fragment.contains("run_execution_loop"),
+        "research fragment must carry real repository evidence:\n{}",
+        fragment
+    );
+
+    // The compiled main prompt contains the research fragment.
+    assert!(
+        compiled.prompt.contains("--- research () ---"),
+        "prompt must render the research fragment:\n{}",
+        compiled.prompt
+    );
+    assert!(
+        compiled.prompt.contains("Autonomous Research Findings"),
+        "prompt must contain the research rendering"
+    );
+    assert!(
+        compiled.prompt.contains("run_execution_loop"),
+        "prompt must contain the evidence-backed symbol"
+    );
+}
+
+/// Full chain: ResearchResult → Coordinator fragment → PromptBuilder → main
+/// provider. The main provider's prompt must contain the research result.
+#[tokio::test]
+async fn test_research_result_reaches_main_provider_prompt() {
+    let dir = research_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec![
+            // Research iteration 1: list the runtime directory.
+            r#"<invoke name="list_files">{"path": "src/canonical_runtime"}</invoke>"#.to_string(),
+            // Research iteration 2: read the runtime module.
+            r#"<invoke name="read_file">{"path": "src/canonical_runtime/mod.rs"}</invoke>"#
+                .to_string(),
+            // Research final answer.
+            "run_execution_loop is the ReAct loop entry point.".to_string(),
+            // Main loop answer.
+            "main task complete.".to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        research_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "trace canonical runtime execution",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "main task must succeed with research enabled: {:?}",
+        result.error
+    );
+    assert!(result.response.contains("main task complete"));
+
+    // The main provider's prompt (the LAST recorded prompt) contains the
+    // research fragment.
+    let prompts = provider.all_prompts();
+    assert_eq!(prompts.len(), 4, "3 research calls + 1 main call");
+    let main_prompt = prompts.last().expect("main prompt present");
+    assert!(
+        main_prompt.contains("--- research () ---"),
+        "main prompt must contain the research fragment:\n{}",
+        main_prompt
+    );
+    assert!(
+        main_prompt.contains("Autonomous Research Findings"),
+        "main prompt must contain the research rendering"
+    );
+    assert!(
+        main_prompt.contains("run_execution_loop"),
+        "main prompt must contain evidence-backed research facts"
+    );
+
+    // Research diagnostics were captured.
+    let research = result
+        .diagnostics
+        .research
+        .expect("research diagnostics recorded");
+    assert!(research.completed);
+    assert_eq!(research.iterations, 3);
+    assert_eq!(research.tool_calls, 2);
+}
+
+/// A research session that terminates abnormally (budget exhausted) must NOT
+/// crash or block the main task: the main agent continues and completes.
+#[tokio::test]
+async fn test_research_failure_is_isolated_from_main_task() {
+    let dir = research_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Research keeps calling tools until its model-call budget is exhausted;
+    // the final response is the main agent's answer.
+    let mut responses: Vec<String> = (0..4)
+        .map(|_| r#"<invoke name="list_files">{"path": "src"}</invoke>"#.to_string())
+        .collect();
+    responses.push("main answer after failed research".to_string());
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new("mock", responses)));
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        research_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "explain the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    // The main task still succeeds despite research exhausting its budget.
+    assert!(
+        result.success,
+        "main task must survive research failure: {:?}",
+        result.error
+    );
+    assert!(result
+        .response
+        .contains("main answer after failed research"));
+    let research = result
+        .diagnostics
+        .research
+        .expect("research diagnostics recorded");
+    assert_eq!(
+        research.termination, "model_limit",
+        "research must terminate abnormally (bounded error result)"
+    );
+    assert!(!research.completed);
+}

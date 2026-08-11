@@ -1285,6 +1285,10 @@ async fn run_chat_pipeline(
     let options = crate::canonical_runtime::TaskOptions {
         cancel: Some(token),
         on_pty: Some(on_pty),
+        // Autonomous research (Sprint 30C): run the read-only Research
+        // subagent before the main loop and feed its evidence-backed result
+        // into the main LLM context.
+        research_enabled: true,
         ..Default::default()
     };
 
