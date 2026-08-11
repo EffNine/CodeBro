@@ -87,6 +87,8 @@ pub struct TaskDiagnostics {
     pub research: Option<ResearchDiagnostics>,
     /// Autonomous testing diagnostics (Sprint 30D), when testing ran.
     pub testing: Option<TestingDiagnostics>,
+    /// Autonomous planning diagnostics (Sprint 30E), when planning ran.
+    pub planning: Option<PlanningDiagnostics>,
 }
 
 impl TaskDiagnostics {
@@ -189,6 +191,55 @@ impl From<crate::testing::TestingResult> for TestingDiagnostics {
             duration_ms: result.duration_ms,
             provider: result.provider,
             git_tree_unchanged,
+            error: result.limitations.first().cloned(),
+        }
+    }
+}
+
+/// Observational diagnostics for one autonomous Planning session (Sprint 30E).
+#[derive(Debug, Clone, Default)]
+pub struct PlanningDiagnostics {
+    /// Whether planning produced a usable result.
+    pub completed: bool,
+    /// Whether the final implementation plan was produced.
+    pub synthesis_complete: bool,
+    /// Why planning terminated (completed / iteration_limit / tool_limit /
+    /// model_limit / timeout / cancelled / error).
+    pub termination: String,
+    /// Number of reasoning iterations.
+    pub iterations: usize,
+    /// Number of read-only tool calls executed.
+    pub tool_calls: usize,
+    /// Number of model (provider) calls.
+    pub model_calls: usize,
+    /// Number of concrete plan steps extracted.
+    pub plan_steps: usize,
+    /// Number of affected files named by the plan.
+    pub affected_files: usize,
+    /// Number of risks surfaced by the plan.
+    pub risks: usize,
+    /// Planning duration in milliseconds.
+    pub duration_ms: u64,
+    /// Provider that executed the planning.
+    pub provider: String,
+    /// Error message when planning failed.
+    pub error: Option<String>,
+}
+
+impl From<crate::planning::PlanningResult> for PlanningDiagnostics {
+    fn from(result: crate::planning::PlanningResult) -> Self {
+        PlanningDiagnostics {
+            completed: result.termination.is_completed(),
+            synthesis_complete: result.synthesis_complete,
+            termination: result.termination.to_string(),
+            iterations: result.iterations,
+            tool_calls: result.tool_calls,
+            model_calls: result.model_calls,
+            plan_steps: result.plan.len(),
+            affected_files: result.affected_files.len(),
+            risks: result.risks.len(),
+            duration_ms: result.duration_ms,
+            provider: result.provider,
             error: result.limitations.first().cloned(),
         }
     }

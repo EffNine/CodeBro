@@ -156,6 +156,11 @@ pub struct TaskOptions {
     /// authoritative command evidence (exit codes) into the main LLM context.
     /// Defaults to false.
     pub testing_enabled: bool,
+    /// When true, the coordinator runs the autonomous Planning subagent
+    /// (Sprint 30E) before the main execution loop, consuming the Research and
+    /// Testing evidence when those ran, and injects its evidence-backed
+    /// implementation plan into the main LLM context. Defaults to false.
+    pub planning_enabled: bool,
 }
 
 /// The outcome of a directly-invoked streaming tool run (shell commands,
@@ -496,6 +501,8 @@ impl CanonicalRuntime {
         // Research subagent over the grounded context and inject its
         // evidence-backed result into the context that reaches the main LLM.
         // Failure is isolated: a research error never crashes the main task.
+        // The result is kept so the Planning phase (Sprint 30E) can consume it.
+        let mut research_result: Option<crate::research::ResearchResult> = None;
         if opts.research_enabled {
             let research = self
                 .run_autonomous_research(req, &memory_entries, &opts)
@@ -504,8 +511,11 @@ impl CanonicalRuntime {
                 Ok(result) => {
                     let render = result.render();
                     diag.research = Some(
-                        crate::canonical_runtime::diagnostics::ResearchDiagnostics::from(result),
+                        crate::canonical_runtime::diagnostics::ResearchDiagnostics::from(
+                            result.clone(),
+                        ),
                     );
+                    research_result = Some(result);
                     context = extend_context(
                         context,
                         vec![ContextFragment {
@@ -532,7 +542,9 @@ impl CanonicalRuntime {
         // Testing subagent over the grounded context and inject its
         // authoritative command evidence (real exit codes) into the context
         // that reaches the main LLM. Failure is isolated: a testing error
-        // never crashes the main task.
+        // never crashes the main task. The result is kept so the Planning
+        // phase (Sprint 30E) can consume it.
+        let mut testing_result: Option<crate::testing::TestingResult> = None;
         if opts.testing_enabled {
             let testing = self
                 .run_autonomous_testing(req, &memory_entries, &opts)
@@ -541,8 +553,11 @@ impl CanonicalRuntime {
                 Ok(result) => {
                     let render = result.render();
                     diag.testing = Some(
-                        crate::canonical_runtime::diagnostics::TestingDiagnostics::from(result),
+                        crate::canonical_runtime::diagnostics::TestingDiagnostics::from(
+                            result.clone(),
+                        ),
                     );
+                    testing_result = Some(result);
                     context = extend_context(
                         context,
                         vec![ContextFragment {
@@ -560,6 +575,50 @@ impl CanonicalRuntime {
                     (req.emit)(AgentEvent::Log {
                         level: "pipeline".to_string(),
                         message: format!("Testing subagent failed (continuing without it): {e}"),
+                    });
+                }
+            }
+        }
+
+        // Autonomous Planning (Sprint 30E): when enabled, run the read-only
+        // Planning subagent over the grounded context. Planning CONSUMES the
+        // Research and Testing evidence produced above and turns it into an
+        // evidence-backed implementation plan injected into the context that
+        // reaches the main LLM. Failure is isolated: a planning error never
+        // crashes the main task.
+        if opts.planning_enabled {
+            let planning = self
+                .run_autonomous_planning(
+                    req,
+                    &memory_entries,
+                    &opts,
+                    research_result.clone(),
+                    testing_result.clone(),
+                )
+                .await;
+            match planning {
+                Ok(result) => {
+                    let render = result.render();
+                    diag.planning = Some(
+                        crate::canonical_runtime::diagnostics::PlanningDiagnostics::from(result),
+                    );
+                    context = extend_context(
+                        context,
+                        vec![ContextFragment {
+                            source: "planning".to_string(),
+                            content: render,
+                            relevance_score: 0.85,
+                        }],
+                    );
+                    diag.context_fragments = context.fragment_count();
+                }
+                Err(e) => {
+                    // Failure isolation: the main task continues with the
+                    // existing context. The failure is observable but not
+                    // fatal.
+                    (req.emit)(AgentEvent::Log {
+                        level: "pipeline".to_string(),
+                        message: format!("Planning subagent failed (continuing without it): {e}"),
                     });
                 }
             }
@@ -871,9 +930,106 @@ impl CanonicalRuntime {
         Ok((context, compiled))
     }
 
-    // =====================================================================
-    // Autonomous Research (Sprint 30C)
-    // =====================================================================
+    /// Compile-only mode that runs the RESEARCH, TESTING and PLANNING
+    /// subagents in phase order (Sprint 30E) and injects all three results
+    /// into the compiled prompt. Planning consumes the Research/Testing
+    /// evidence. Used by the Sprint 30E parent-integration test: proves
+    /// PlanningResult → ContextFragment → compiled main prompt.
+    pub async fn compile_for_task_with_planning(
+        &mut self,
+        task: &str,
+        conversation: Vec<ConversationMessage>,
+    ) -> std::result::Result<(EngineeringContext, CompiledPrompt), String> {
+        let noop_emit = |_: AgentEvent| {};
+        let noop_chunk = |_: &str| {};
+        let req = TaskRequest {
+            task,
+            conversation,
+            emit: &noop_emit,
+            on_chunk: &noop_chunk,
+        };
+
+        let identity = if self.identity.is_loaded() {
+            self.identity.snapshot()
+        } else {
+            ProjectIdentity::new("unknown", "unknown")
+        };
+        let keywords = extract_keywords(task);
+        let memory_ctx = self.resolve_memory(&keywords, &[]);
+        let memory_entries: Vec<String> = memory_ctx
+            .entries
+            .iter()
+            .map(|e| format!("{}: {}", e.key, e.value))
+            .collect();
+        let (assembly, report) = self.observe(&req, &memory_entries).await?;
+        let mut context = self.build_context(&req, &identity, memory_ctx, assembly, report)?;
+
+        // Assemble grounding once, then run the phases in order.
+        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
+            .assemble_with_extras(task, &[], &memory_entries);
+        let research = match self
+            .run_research_task(task, grounded.clone(), &noop_emit, None)
+            .await
+        {
+            Ok(result) => {
+                let render = result.render();
+                context = extend_context(
+                    context,
+                    vec![ContextFragment {
+                        source: "research".to_string(),
+                        content: render,
+                        relevance_score: 0.85,
+                    }],
+                );
+                Some(result)
+            }
+            Err(e) => {
+                return Err(format!("Autonomous research failed: {e}"));
+            }
+        };
+        let testing = match self
+            .run_testing_task(task, grounded.clone(), &noop_emit, None)
+            .await
+        {
+            Ok(result) => {
+                let render = result.render();
+                context = extend_context(
+                    context,
+                    vec![ContextFragment {
+                        source: "testing".to_string(),
+                        content: render,
+                        relevance_score: 0.85,
+                    }],
+                );
+                Some(result)
+            }
+            Err(e) => {
+                return Err(format!("Autonomous testing failed: {e}"));
+            }
+        };
+        match self
+            .run_planning_task(task, grounded, research, testing, &noop_emit, None)
+            .await
+        {
+            Ok(result) => {
+                let render = result.render();
+                context = extend_context(
+                    context,
+                    vec![ContextFragment {
+                        source: "planning".to_string(),
+                        content: render,
+                        relevance_score: 0.85,
+                    }],
+                );
+            }
+            Err(e) => {
+                return Err(format!("Autonomous planning failed: {e}"));
+            }
+        }
+
+        let compiled = self.prompt_builder.compile_context(&context);
+        Ok((context, compiled))
+    }
     /// Run the autonomous Research subagent over a grounded context using the
     /// runtime's shared provider state and a restricted read-only tool
     /// registry. Returns the structured, evidence-backed [`ResearchResult`].
@@ -973,6 +1129,85 @@ impl CanonicalRuntime {
             .assemble_with_extras(req.task, &[], memory_entries);
         let cancel = opts.cancel.clone();
         self.run_testing_task(req.task, grounded, req.emit, cancel)
+            .await
+    }
+
+    // =====================================================================
+    // Autonomous Planning (Sprint 30E)
+    // =====================================================================
+
+    /// Run the autonomous Planning subagent over a grounded context using the
+    /// runtime's shared provider state and a restricted READ-ONLY tool
+    /// registry. Planning consumes the Research and Testing evidence, performs
+    /// targeted read-only verification reads, and returns the structured,
+    /// evidence-backed [`PlanningResult`].
+    pub async fn run_planning_task(
+        &self,
+        task: &str,
+        grounding: GroundedContext,
+        research: Option<crate::research::ResearchResult>,
+        testing: Option<crate::testing::TestingResult>,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        cancel: Option<crate::cancellation::CancellationToken>,
+    ) -> std::result::Result<crate::planning::PlanningResult, String> {
+        let tooling = build_planning_tooling(&self.workspace_root);
+        let mut subagent = crate::planning::PlanningSubagent::new(
+            self.provider_runtime.clone(),
+            self.router.clone(),
+            self.io_providers.clone(),
+            tooling,
+        );
+        let request = crate::planning::PlanningRequest::new(task, self.workspace_root.clone())
+            .with_grounding(grounding)
+            .with_research(research)
+            .with_testing(testing);
+        Ok(subagent.run(request, emit, cancel).await)
+    }
+
+    /// Run the autonomous Planning subagent with explicit session limits (the
+    /// real-provider smoke uses a larger budget than the conservative default).
+    pub async fn run_planning_task_with_limits(
+        &self,
+        task: &str,
+        grounding: GroundedContext,
+        research: Option<crate::research::ResearchResult>,
+        testing: Option<crate::testing::TestingResult>,
+        limits: crate::planning::PlanningLimits,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        cancel: Option<crate::cancellation::CancellationToken>,
+    ) -> std::result::Result<crate::planning::PlanningResult, String> {
+        let tooling = build_planning_tooling(&self.workspace_root);
+        let mut subagent = crate::planning::PlanningSubagent::new(
+            self.provider_runtime.clone(),
+            self.router.clone(),
+            self.io_providers.clone(),
+            tooling,
+        );
+        let request = crate::planning::PlanningRequest::new(task, self.workspace_root.clone())
+            .with_grounding(grounding)
+            .with_research(research)
+            .with_testing(testing)
+            .with_limits(limits);
+        Ok(subagent.run(request, emit, cancel).await)
+    }
+
+    /// Run the autonomous planning subagent inside the canonical task pipeline
+    /// (used by `run_task_with_options`). Bounded by the task deadline and the
+    /// planning limits; failure is isolated and reported as an error result.
+    /// The Research/Testing results produced earlier in the same task become
+    /// the planning input evidence.
+    async fn run_autonomous_planning(
+        &self,
+        req: &TaskRequest<'_>,
+        memory_entries: &[String],
+        opts: &TaskOptions,
+        research: Option<crate::research::ResearchResult>,
+        testing: Option<crate::testing::TestingResult>,
+    ) -> std::result::Result<crate::planning::PlanningResult, String> {
+        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
+            .assemble_with_extras(req.task, &[], memory_entries);
+        let cancel = opts.cancel.clone();
+        self.run_planning_task(req.task, grounded, research, testing, req.emit, cancel)
             .await
     }
 
@@ -1871,6 +2106,13 @@ fn build_tool_registry(workspace_root: &Path) -> ToolRegistry {
 /// main registry uses are reused (no duplication).
 fn build_research_tooling(workspace_root: &Path) -> crate::research::ResearchTooling {
     crate::research::ResearchTooling::new(workspace_root)
+}
+
+/// Build the restricted READ-ONLY tool registry for the autonomous Planning
+/// subagent (Sprint 30E). Planning never executes commands; the same tool
+/// implementations the main registry uses are reused (no duplication).
+fn build_planning_tooling(workspace_root: &Path) -> crate::planning::PlanningTooling {
+    crate::planning::PlanningTooling::new(workspace_root)
 }
 
 /// Keep the tail of a large output string for diagnostics.

@@ -23,6 +23,7 @@ mod memory_runtime;
 mod metrics;
 mod observability;
 mod onboarding;
+mod planning;
 mod plugin_sdk;
 mod preference_engine;
 mod project_identity;
