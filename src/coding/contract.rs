@@ -32,8 +32,14 @@ use super::limits::CodingLimits;
 /// How the coding session terminated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodingTermination {
-    /// The subagent applied its changes and verified them.
+    /// The subagent applied its changes and every applied change was covered
+    /// by an authoritative successful verification.
     Completed,
+    /// The subagent applied changes but the plan carried no validation
+    /// commands, so NO machine verification ran. This is NOT
+    /// completed-as-verified: the applied changes remain in the tree, honestly
+    /// marked unverified (`verified == false`, `all_verified() == false`).
+    VerificationUnavailable,
     /// The iteration budget was exhausted.
     IterationLimit,
     /// The tool-call budget was exhausted.
@@ -54,6 +60,7 @@ impl fmt::Display for CodingTermination {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CodingTermination::Completed => write!(f, "completed"),
+            CodingTermination::VerificationUnavailable => write!(f, "verification_unavailable"),
             CodingTermination::IterationLimit => write!(f, "iteration_limit"),
             CodingTermination::ToolLimit => write!(f, "tool_limit"),
             CodingTermination::ModelLimit => write!(f, "model_limit"),
@@ -66,13 +73,23 @@ impl fmt::Display for CodingTermination {
 }
 
 impl CodingTermination {
-    /// Whether the session produced a usable, verified result.
+    /// Whether the session produced a usable, machine-verified result.
+    ///
+    /// ONLY [`CodingTermination::Completed`] counts. A session that applied
+    /// changes but could not run any authoritative verification
+    /// ([`CodingTermination::VerificationUnavailable`]) is never
+    /// "completed-as-verified", no matter what the model's report claims.
     pub fn is_completed(&self) -> bool {
         matches!(self, CodingTermination::Completed)
     }
 
     /// Whether this termination requires the session's own changes to be
     /// rolled back: a hard failure (verification exhausted or an error).
+    ///
+    /// [`CodingTermination::VerificationUnavailable`] intentionally does NOT
+    /// roll back: the session's applied changes are real work that must stay
+    /// inspectable, and they are reported honestly as unverified so no caller
+    /// can mistake them for machine-verified.
     pub fn requires_rollback(&self) -> bool {
         matches!(
             self,
@@ -197,6 +214,12 @@ pub struct AppliedChange {
     /// still the session's own work before removing it on rollback).
     pub full_new: String,
     /// Whether an authoritative successful verification covered this change.
+    ///
+    /// Set ONLY by a machine verification that actually ran and succeeded
+    /// (exit code 0) — an explicit `verify` call or the completion gate. It is
+    /// NEVER set because the model finished or produced a successful-sounding
+    /// report. When the session terminates as
+    /// [`CodingTermination::VerificationUnavailable`], no change is verified.
     pub verified: bool,
     /// Whether this change was rolled back by a terminal failure.
     pub rolled_back: bool,
@@ -414,8 +437,16 @@ impl CodingResult {
         }
     }
 
-    /// Whether every applied change was covered by a successful verification
-    /// (vacuously true when nothing was applied).
+    /// Whether every applied change was actually covered by a successful
+    /// authoritative verification (vacuously true when nothing was applied).
+    ///
+    /// This is a MACHINE FACT, not a proxy for "the model finished": it is
+    /// true ONLY when each change's `verified` flag was set by an
+    /// authoritative exit-code-0 verification (an explicit `verify` or the
+    /// completion gate). A session that applied changes but could not run any
+    /// validation command terminates as
+    /// [`CodingTermination::VerificationUnavailable`] and NEVER satisfies
+    /// `all_verified()`.
     pub fn all_verified(&self) -> bool {
         self.changes.iter().all(|c| c.verified)
     }
@@ -546,6 +577,10 @@ mod tests {
     fn test_termination_display_values() {
         assert_eq!(CodingTermination::Completed.to_string(), "completed");
         assert_eq!(
+            CodingTermination::VerificationUnavailable.to_string(),
+            "verification_unavailable"
+        );
+        assert_eq!(
             CodingTermination::IterationLimit.to_string(),
             "iteration_limit"
         );
@@ -566,6 +601,7 @@ mod tests {
         assert!(CodingTermination::Error.requires_rollback());
         for termination in [
             CodingTermination::Completed,
+            CodingTermination::VerificationUnavailable,
             CodingTermination::IterationLimit,
             CodingTermination::ToolLimit,
             CodingTermination::ModelLimit,
@@ -614,6 +650,27 @@ mod tests {
         assert!(result.verification.is_empty());
         assert_eq!(result.tool_calls, 0);
         assert!(!result.synthesis_complete);
+    }
+
+    #[test]
+    fn test_verification_unavailable_is_never_completed() {
+        assert!(!CodingTermination::VerificationUnavailable.is_completed());
+        assert!(!CodingTermination::VerificationUnavailable.requires_rollback());
+        // Applied-but-unverified changes never satisfy all_verified().
+        let mut result =
+            CodingResult::failed("x", CodingTermination::VerificationUnavailable, "no-op");
+        result.changes.push(AppliedChange {
+            path: PathBuf::from("src/lib.rs"),
+            created: false,
+            unplanned: false,
+            preview: "diff".to_string(),
+            backup: "old".to_string(),
+            full_new: "new".to_string(),
+            verified: false,
+            rolled_back: false,
+        });
+        assert!(!result.all_verified());
+        assert!(result.changes[0].status() == "applied");
     }
 
     #[test]

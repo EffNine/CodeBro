@@ -4,10 +4,11 @@
 //! objective plus the evidence of Research (what exists), Testing (what
 //! works) and — crucially — the REAL `PlanningResult` (what must change and
 //! how to validate), decides which targeted change to apply, routes every
-//! mutation through the [`ChangeEngine`] (which itself routes writes through
-//! [`ChangePlan`](crate::tools::ChangePlan)/[`PatchEngine`](crate::tools::PatchEngine)),
-//! verifies through the policy-checked Testing surface, iterates, and finishes
-//! with a bounded, auditable `CodingResult`.
+//! mutation through the [`ChangeEngine`] (which routes existing-file writes
+//! through [`ChangePlan`](crate::tools::ChangePlan)/[`PatchEngine`](crate::tools::PatchEngine)
+//! and file creation through the engine's documented controlled creation
+//! seam), verifies through the policy-checked Testing surface, iterates, and
+//! finishes with a bounded, auditable `CodingResult`.
 //!
 //! ```text
 //! CodingRequest + GroundedContext + ResearchResult + TestingResult + PlanningResult
@@ -19,14 +20,17 @@
 //!      ├── propose_change → ChangeEngine (boundary / plan / ambiguity / stale)
 //!      ├── verify → TestingTooling (authoritative exit code, policy-checked)
 //!      ├── bounded revision on explicit verify failure
-//!      └── reserved final synthesis → completion gate auto-verifies
+//!      ├── reserved final synthesis → completion gate auto-verifies
+//!      │    (no plan validation commands → VerificationUnavailable — never a
+//!      │    fabricated verification)
 //!      ↓
 //! CodingResult
 //! ```
 //!
 //! Safety contract:
 //! - Coding NEVER calls raw `fs::write`/`remove_file` on source files; every
-//!   mutation is a `ChangePlan.apply` behind the engine boundary.
+//!   mutation is a `ChangePlan.apply` behind the engine boundary (file
+//!   creation stays inside the engine as the sole controlled create seam).
 //! - A terminal failure (VerificationFailed / Error) rolls back ONLY the
 //!   session's own changes, in reverse order; created files are removed only
 //!   while their content is still exactly what the session wrote.
@@ -34,7 +38,9 @@
 //!   `old` match against current content, and stale files are never clobbered.
 //! - Git history is NEVER mutated: no commits, no checkouts.
 //! - The machine owns success: verification `success` comes exclusively from
-//!   the process exit code, never from output prose.
+//!   the process exit code, never from output prose, and a session that
+//!   applied changes without any validation commands terminates as
+//!   `VerificationUnavailable` — unverified, never completed-as-verified.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -240,7 +246,10 @@ impl CodingSubagent {
                     // completion gate auto-verifies any change that has no
                     // explicit successful verification yet (using the plan's
                     // validation commands, through the authoritative Testing
-                    // surface). A gate failure is immediate and terminal.
+                    // surface). A gate failure is immediate and terminal; a
+                    // session with applied changes but NO plan validation
+                    // commands terminates as VerificationUnavailable and is
+                    // never reported as machine-verified.
                     if calls.is_empty() {
                         state.final_answer = Some(full);
                         state.synthesis_complete = true;
@@ -472,6 +481,11 @@ impl CodingSubagent {
     /// explicit successful verification is auto-verified against the plan's
     /// ordered validation commands (authoritative exit codes). A gate failure
     /// is IMMEDIATE and terminal — no revision is offered.
+    ///
+    /// If changes were applied but the plan carries NO validation commands,
+    /// the gate MUST NOT fabricate success: it terminates as
+    /// [`CodingTermination::VerificationUnavailable`] with the changes left in
+    /// place and honestly marked unverified (`verified == false`).
     async fn completion_gate(
         &mut self,
         state: &mut CodingState,
@@ -487,9 +501,14 @@ impl CodingSubagent {
         });
         let commands = state.request.plan_validation_commands();
         if commands.is_empty() {
-            // No plan validation surface: honor the model's completion.
-            state.mark_all_verified();
-            return CodingTermination::Completed;
+            // The plan offers NO validation surface, yet changes were applied.
+            // There is nothing authoritative the machine can run, so the
+            // session must not claim verification: the changes stay in place,
+            // reported honestly as unverified.
+            state.limitations.push(
+                "no validation commands in the plan: applied changes could not be machine-verified and remain unverified".to_string(),
+            );
+            return CodingTermination::VerificationUnavailable;
         }
         for command in &commands {
             let record = self
@@ -750,8 +769,11 @@ impl CodingState {
         self.changes.iter().any(|c| !c.verified && !c.rolled_back)
     }
 
-    /// Mark every outstanding change as verified (an authoritative
-    /// successful verification covered them).
+    /// Mark every outstanding change as verified. Call ONLY after an
+    /// authoritative machine verification actually ran and succeeded
+    /// (exit code 0) — via an explicit `verify` or a completed completion
+    /// gate. Never call this to "honor" model prose or when no validation
+    /// command could run.
     fn mark_all_verified(&mut self) {
         for change in &mut self.changes {
             if !change.rolled_back {
@@ -1207,6 +1229,10 @@ impl CodingState {
         }
         match termination {
             CodingTermination::Completed => {}
+            CodingTermination::VerificationUnavailable => {
+                // The completion gate records the reason when it emits this
+                // termination (the plan carried no validation commands).
+            }
             CodingTermination::IterationLimit => {
                 limitations.push("iteration limit reached".to_string());
             }

@@ -43,6 +43,10 @@ struct CodingMockProvider {
     responses: Arc<Mutex<Vec<String>>>,
     prompts: Arc<Mutex<Vec<String>>>,
     fail: Arc<AtomicBool>,
+    /// Optional side effects, one per mock response (popped in order, run
+    /// right after the LAST response is consumed) — used to simulate another
+    /// actor touching the filesystem mid-session.
+    side_effects: Arc<Mutex<Vec<Box<dyn Fn() + Send + Sync>>>>,
 }
 
 impl CodingMockProvider {
@@ -53,6 +57,7 @@ impl CodingMockProvider {
             responses: Arc::new(Mutex::new(responses)),
             prompts: Arc::new(Mutex::new(Vec::new())),
             fail: Arc::new(AtomicBool::new(false)),
+            side_effects: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -62,13 +67,30 @@ impl CodingMockProvider {
         p
     }
 
+    /// Run `effect` after the final scripted response has been consumed, i.e.
+    /// right before the runtime reacts to the last model turn. This lets a
+    /// test impersonate an external actor that changes the workspace between
+    /// the session's last action and its rollback.
+    fn with_side_effect(self, effect: impl Fn() + Send + Sync + 'static) -> Self {
+        self.side_effects.lock().unwrap().push(Box::new(effect));
+        self
+    }
+
     fn next(&self) -> String {
         let mut responses = self.responses.lock().unwrap();
-        if responses.is_empty() {
+        let response = if responses.is_empty() {
             String::new()
         } else {
             responses.remove(0)
+        };
+        let mut effects = self.side_effects.lock().unwrap();
+        if !effects.is_empty() && responses.is_empty() {
+            let effect = effects.remove(0);
+            drop(effects);
+            drop(responses);
+            effect();
         }
+        response
     }
 
     fn prompt_log(&self) -> Vec<String> {
@@ -573,18 +595,32 @@ async fn test_unplanned_change_is_recorded_by_default() {
     )
     .await;
 
-    assert_eq!(result.termination, CodingTermination::Completed);
+    assert_eq!(
+        result.termination,
+        CodingTermination::VerificationUnavailable
+    );
     assert_eq!(result.changes.len(), 1);
     assert!(
         result.changes[0].unplanned,
         "deviation must be recorded, not hidden"
     );
     assert_eq!(result.unplanned_changes.len(), 1);
+    // The plan carried no validation commands, so the applied change was NOT
+    // machine-verified and the session is NOT completed-as-verified.
+    assert!(!result.changes[0].verified, "no machine verification ran");
+    assert!(!result.all_verified());
+    assert!(
+        result.verification.is_empty(),
+        "no verification command could have run"
+    );
     // The deviation was still applied (default mode records, does not deny).
     assert!(
         dir.path().join("src/extra.rs").exists(),
         "default mode applies the unplanned change"
     );
+    // Unverified changes are left in place, honestly marked — never rolled
+    // back by VerificationUnavailable.
+    assert!(!result.changes[0].rolled_back);
 }
 
 #[tokio::test]
@@ -682,4 +718,262 @@ async fn test_provider_failure_is_bounded_error_result_with_rollback() {
     );
     let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
     assert!(lib.contains("pub fn add(a: i32, b: i32) -> i32 { a + b }"));
+}
+
+// =========================================================================
+// Sprint 30F.1 regression tests: verification semantics
+// =========================================================================
+
+/// Test 1 — the core correctness fix. A session applies a change but the plan
+/// carries NO validation commands: the completion gate must NOT fabricate
+/// verification. Termination is `VerificationUnavailable`, the change stays
+/// unverified, and `all_verified()` is false — model prose is never enough.
+#[tokio::test]
+async fn test_no_validation_commands_never_fake_verification() {
+    let dir = coding_workspace();
+    let harness = CodingHarness::new(Arc::new(CodingMockProvider::text(
+        "mock",
+        vec![sub_proposal(), final_answer()],
+    )));
+
+    let request = CodingRequest::new("add a subtract function", dir.path())
+        .with_planning(Some(make_plan_without_validation()))
+        .with_limits(CodingLimits::default());
+    let (result, _) = run_session(
+        harness,
+        dir.path(),
+        &[PathBuf::from("src/lib.rs")],
+        false,
+        request,
+    )
+    .await;
+
+    // changes_applied > 0 AND validation_commands == 0
+    // → NOT completed-as-verified, NOT all changes verified.
+    assert_eq!(
+        result.termination,
+        CodingTermination::VerificationUnavailable
+    );
+    assert!(!result.termination.is_completed());
+    assert_eq!(result.changes.len(), 1);
+    assert!(
+        !result.changes[0].verified,
+        "no machine verification ran, so verified must stay false"
+    );
+    assert!(!result.all_verified());
+    assert!(
+        result.verification.is_empty(),
+        "no validation command existed to run"
+    );
+    assert!(
+        !result.changes[0].rolled_back,
+        "VerificationUnavailable leaves applied changes in place, honestly marked"
+    );
+    assert!(
+        result
+            .limitations
+            .iter()
+            .any(|l| l.contains("no validation commands")),
+        "the missing machine verification must be surfaced: {:?}",
+        result.limitations
+    );
+    // The applied change really exists in the tree (nothing rolled back).
+    let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert!(lib.contains("pub fn sub(a: i32, b: i32) -> i32 { a - b }"));
+}
+
+/// Test 2 — existing successful verification still completes normally.
+#[tokio::test]
+async fn test_explicit_verified_change_still_completes() {
+    let dir = coding_workspace();
+    let harness = CodingHarness::new(Arc::new(CodingMockProvider::text(
+        "mock",
+        vec![
+            sub_proposal(),
+            verify_command("cargo check"),
+            final_answer(),
+        ],
+    )));
+
+    let request = CodingRequest::new("add a subtract function", dir.path())
+        .with_planning(Some(make_plan_with_validation()))
+        .with_limits(CodingLimits::default());
+    let (result, _) = run_session(
+        harness,
+        dir.path(),
+        &[PathBuf::from("src/lib.rs")],
+        false,
+        request,
+    )
+    .await;
+
+    assert_eq!(result.termination, CodingTermination::Completed);
+    assert!(result.termination.is_completed());
+    assert_eq!(result.changes.len(), 1);
+    assert!(result.changes[0].verified);
+    assert!(result.all_verified());
+    assert_eq!(result.verification.len(), 1);
+    assert_eq!(result.verification[0].exit_code, 0);
+    assert_eq!(result.verification[0].source, VerificationSource::Explicit);
+}
+
+/// Test 3 — the completion gate with a validation command: change → final
+/// synthesis → gate command exits 0 → Completed, verified, source is the gate.
+#[tokio::test]
+async fn test_completion_gate_with_validation_marks_verified() {
+    let dir = coding_workspace();
+    let harness = CodingHarness::new(Arc::new(CodingMockProvider::text(
+        "mock",
+        vec![sub_proposal(), final_answer()],
+    )));
+
+    let request = CodingRequest::new("add a subtract function", dir.path())
+        .with_planning(Some(make_plan_with_validation()))
+        .with_limits(CodingLimits::default());
+    let (result, _) = run_session(
+        harness,
+        dir.path(),
+        &[PathBuf::from("src/lib.rs")],
+        false,
+        request,
+    )
+    .await;
+
+    assert_eq!(result.termination, CodingTermination::Completed);
+    assert!(result.changes[0].verified);
+    assert!(result.all_verified());
+    assert_eq!(result.verification.len(), 2, "gate ran both plan commands");
+    assert!(
+        result
+            .verification
+            .iter()
+            .all(|r| r.source == VerificationSource::CompletionGate),
+        "verification provenance must be the completion gate"
+    );
+    assert!(result.verification.iter().all(|r| r.success));
+}
+
+/// Test 4 — the completion gate fails: a validation command exits non-zero →
+/// `VerificationFailed` and the session's own changes are rolled back.
+#[tokio::test]
+async fn test_completion_gate_failure_rolls_back_session_changes() {
+    let dir = coding_workspace();
+    let harness = CodingHarness::new(Arc::new(CodingMockProvider::text(
+        "mock",
+        vec![broken_proposal(), final_answer()],
+    )));
+
+    let request = CodingRequest::new("break the crate", dir.path())
+        .with_planning(Some(make_plan_with_validation()))
+        .with_limits(CodingLimits::default());
+    let (result, _) = run_session(
+        harness,
+        dir.path(),
+        &[PathBuf::from("src/lib.rs")],
+        false,
+        request,
+    )
+    .await;
+
+    assert_eq!(result.termination, CodingTermination::VerificationFailed);
+    assert!(!result.termination.is_completed());
+    assert_eq!(result.verification.len(), 1, "gate ran cargo check once");
+    assert!(!result.verification[0].success);
+    assert!(result.changes[0].rolled_back, "session change rolled back");
+    // Rollback restored the pre-session content.
+    let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert!(lib.contains("pub fn add(a: i32, b: i32) -> i32 { a + b }"));
+    assert!(!lib.contains("pub fn sub"));
+}
+
+/// Test 5 — created-file rollback removes the file ONLY when its content still
+/// matches what the session wrote. Here the content matches: the gate fails on
+/// the broken lib.rs, and the created file is removed.
+#[tokio::test]
+async fn test_created_file_rollback_removes_when_content_matches() {
+    let dir = coding_workspace();
+    let create = r#"<invoke name="propose_change">{"path": "src/new.rs", "old": "", "new": "pub fn fresh() {}\n"}</invoke>"#.to_string();
+    let harness = CodingHarness::new(Arc::new(CodingMockProvider::text(
+        "mock",
+        vec![create, broken_proposal(), final_answer()],
+    )));
+
+    let request = CodingRequest::new("break the crate", dir.path())
+        .with_planning(Some(make_plan_with_validation()))
+        .with_limits(CodingLimits::default());
+    let (result, _) = run_session(
+        harness,
+        dir.path(),
+        &[PathBuf::from("src/lib.rs")],
+        false,
+        request,
+    )
+    .await;
+
+    assert_eq!(result.termination, CodingTermination::VerificationFailed);
+    assert_eq!(result.changes.len(), 2);
+    let created = &result.changes[0];
+    assert!(created.created);
+    assert!(
+        created.rolled_back,
+        "a session-created file whose content still matches is removed on rollback"
+    );
+    assert!(
+        !dir.path().join("src/new.rs").exists(),
+        "the created file must be gone after content-matched rollback"
+    );
+    // The pre-existing lib.rs was restored to its original content.
+    let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert!(lib.contains("pub fn add(a: i32, b: i32) -> i32 { a + b }"));
+}
+
+/// Test 5 — created-file rollback must NOT remove a file another actor
+/// modified after the session wrote it. The mock's side effect overwrites the
+/// created file right before rollback; the file is left untouched.
+#[tokio::test]
+async fn test_created_file_rollback_keeps_foreign_content() {
+    let dir = coding_workspace();
+    let create = r#"<invoke name="propose_change">{"path": "src/new.rs", "old": "", "new": "pub fn fresh() {}\n"}</invoke>"#.to_string();
+    let new_path = dir.path().join("src/new.rs");
+    let provider =
+        CodingMockProvider::text("mock", vec![create, broken_proposal(), final_answer()])
+            .with_side_effect(move || {
+                // Another actor overwrites the file the session created.
+                std::fs::write(&new_path, "someone else's file\n").unwrap();
+            });
+    let harness = CodingHarness::new(Arc::new(provider));
+
+    let request = CodingRequest::new("break the crate", dir.path())
+        .with_planning(Some(make_plan_with_validation()))
+        .with_limits(CodingLimits::default());
+    let (result, _) = run_session(
+        harness,
+        dir.path(),
+        &[PathBuf::from("src/lib.rs")],
+        false,
+        request,
+    )
+    .await;
+
+    assert_eq!(result.termination, CodingTermination::VerificationFailed);
+    assert_eq!(result.changes.len(), 2);
+    let created = &result.changes[0];
+    assert!(created.created);
+    assert!(
+        !created.rolled_back,
+        "a created file whose content no longer matches the session's write is left untouched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/new.rs")).unwrap(),
+        "someone else's file\n",
+        "the foreign content must be preserved exactly"
+    );
+    assert!(
+        result
+            .limitations
+            .iter()
+            .any(|l| l.contains("left untouched")),
+        "the rollback log must record the untouched file: {:?}",
+        result.limitations
+    );
 }

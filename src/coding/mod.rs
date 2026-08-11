@@ -21,13 +21,14 @@
 //!      ↓
 //! observation
 //!      ↓
-//! propose_change (mutation via ChangePlan behind a permission boundary)
+//! propose_change (mutation via ChangeEngine behind a permission boundary)
 //!      ↓
 //! verify (runtime-intercepted policy-checked command, authoritative exit code)
 //!      ↓
 //! bounded revision on explicit verify failure
 //!      ↓
 //! reserved final synthesis → completion gate auto-verifies unverified changes
+//!      (no plan validation commands → VerificationUnavailable, never faked)
 //!      ↓
 //! CodingResult
 //!      ↓
@@ -37,10 +38,12 @@
 //! Coding is the FIRST mutating subagent, which is why it carries the strictest
 //! boundaries:
 //!
-//! - **No raw filesystem writes.** All mutation goes through
-//!   [`ChangePlan`](crate::tools::ChangePlan)/[`PatchEngine`](crate::tools::PatchEngine)
-//!   behind an explicit permission boundary ([`permissions`]). The model surface
-//!   is `propose_change` + `verify`, both runtime-intercepted.
+//! - **No raw filesystem writes.** All mutation goes through the
+//!   [`ChangeEngine`] behind an explicit permission boundary ([`permissions`]):
+//!   existing-file writes ride [`ChangePlan`](crate::tools::ChangePlan) /
+//!   [`PatchEngine`](crate::tools::PatchEngine), and file creation is the
+//!   engine's documented controlled creation seam. The model surface is
+//!   `propose_change` + `verify`, both runtime-intercepted.
 //! - **Plan-driven.** Coding consumes the REAL `PlanningResult`, not rendered
 //!   prose, and enforces plan adherence: changes outside the plan are recorded
 //!   as unplanned (never silently added), and a strict mode denies them.
@@ -50,6 +53,11 @@
 //! - **Reversible.** A terminal failure (verification-failed or error) rolls
 //!   back only the session's own changes, in reverse order; created files are
 //!   removed only when their content still matches what the session wrote.
+//! - **Honest verification.** `AppliedChange.verified` (and therefore
+//!   [`CodingResult::all_verified`]) is true ONLY after an authoritative
+//!   machine verification succeeded. A session that applied changes but had no
+//!   validation commands terminates as `VerificationUnavailable` — never
+//!   fabricated as verified.
 //! - **Bounded.** Independent iteration/tool/model/timeout budgets plus a
 //!   bounded revision budget ([`limits::MAX_REVISION_ATTEMPTS`]).
 //! - **No `run_command`.** Coding has NO arbitrary execution surface;

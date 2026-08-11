@@ -7,9 +7,12 @@
 //!   (`propose_change` and `verify`). Raw filesystem mutation tools
 //!   (`create_file`, `edit_file`), arbitrary execution (`run_command`) and git
 //!   mutations are neither registered nor permitted.
-//! - ALL mutation goes through [`ChangeEngine`], which routes every write
-//!   through [`ChangePlan`](crate::tools::ChangePlan) /
-//!   [`PatchEngine`](crate::tools::PatchEngine). The engine enforces:
+//! - ALL mutation goes through [`ChangeEngine`], the single mutation seam.
+//!   Existing-file changes ride [`ChangePlan`](crate::tools::ChangePlan) /
+//!   [`PatchEngine`](crate::tools::PatchEngine); file creation — which
+//!   PatchEngine cannot reconstruct from a non-existent on-disk base — goes
+//!   through the engine's documented controlled creation seam
+//!   ([`ChangeEngine::create_file`]). The engine enforces:
 //!   - the workspace-root path boundary (traversal is denied),
 //!   - plan adherence (out-of-plan changes are flagged — and denied outright
 //!     in strict mode),
@@ -190,10 +193,12 @@ pub struct PreparedChange {
 
 /// The workspace-bound mutation engine behind `propose_change`.
 ///
-/// Every write ultimately routes through a
+/// Existing-file writes route through a
 /// [`ChangePlan`](crate::tools::ChangePlan) built by
-/// [`crate::tools::PatchEngine`] — the engine never calls `fs::write` on
-/// source files directly.
+/// [`crate::tools::PatchEngine`]; created files go through the engine's
+/// controlled creation seam ([`ChangeEngine::create_file`]). The engine never
+/// calls `fs::write` on source files outside these two seams — it is the ONLY
+/// mutation path Coding uses.
 pub struct ChangeEngine {
     workspace_root: PathBuf,
     planned_files: Vec<PathBuf>,
@@ -314,9 +319,13 @@ impl ChangeEngine {
     /// preparation and application is never clobbered.
     ///
     /// This is the prepare/apply seam: preparation stays read-only and
-    /// reversible, the mutation itself is a single
+    /// reversible. Existing-file changes are a single
     /// [`ChangePlan::apply`](crate::tools::ChangePlan::apply) routed through
-    /// [`PatchEngine`](crate::tools::PatchEngine).
+    /// [`PatchEngine`](crate::tools::PatchEngine); created files use the
+    /// engine's controlled creation seam
+    /// ([`ChangeEngine::create_file`]) because PatchEngine reconstructs the
+    /// new content from a file's on-disk base, which cannot exist for a file
+    /// being created.
     pub fn apply(&self, prepared: &PreparedChange) -> crate::error::Result<String> {
         let current = if prepared.created {
             if prepared.path.exists() {
@@ -341,23 +350,7 @@ impl ChangeEngine {
             )));
         }
         if prepared.created {
-            // PatchEngine reconstructs from the on-disk base, which cannot
-            // exist for a file being created. The mutation stays a single
-            // write through the change seam after the staleness check above.
-            if let Some(parent) = prepared.path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        crate::error::CodeBroError::Patch(format!(
-                            "Cannot create parent dirs for {}: {e}",
-                            prepared.path.display()
-                        ))
-                    })?;
-                }
-            }
-            std::fs::write(&prepared.path, &prepared.full_new).map_err(|e| {
-                crate::error::CodeBroError::Patch(format!("Failed to write file: {e}"))
-            })?;
-            return Ok(format!("Patch applied to {}", prepared.path.display()));
+            return self.create_file(prepared);
         }
         let mut plan = crate::tools::ChangePlan::propose_between(
             &prepared.path,
@@ -365,6 +358,33 @@ impl ChangeEngine {
             &prepared.full_new,
         )?;
         plan.apply()
+    }
+
+    /// The CONTROLLED creation path of the engine — the sole filesystem write
+    /// that does not ride a [`ChangePlan`](crate::tools::ChangePlan).
+    ///
+    /// File creation cannot go through [`PatchEngine`](crate::tools::PatchEngine):
+    /// [`PatchEngine::apply`](crate::tools::PatchEngine::apply) reconstructs
+    /// the new content from the file's on-disk base, which does not exist for
+    /// a file being created. Creation therefore stays INSIDE the engine as a
+    /// single, explicitly documented write, still protected by the
+    /// prepare/apply staleness check that ran in
+    /// [`ChangeEngine::apply`] (a file created by someone else between prepare
+    /// and apply is never clobbered). Nothing else in Coding writes files.
+    fn create_file(&self, prepared: &PreparedChange) -> crate::error::Result<String> {
+        if let Some(parent) = prepared.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    crate::error::CodeBroError::Patch(format!(
+                        "Cannot create parent dirs for {}: {e}",
+                        prepared.path.display()
+                    ))
+                })?;
+            }
+        }
+        std::fs::write(&prepared.path, &prepared.full_new)
+            .map_err(|e| crate::error::CodeBroError::Patch(format!("Failed to write file: {e}")))?;
+        Ok(format!("Patch applied to {}", prepared.path.display()))
     }
 }
 
@@ -858,6 +878,30 @@ mod tests {
             std::fs::read_to_string(dir.path().join("src/new.rs")).unwrap(),
             "someone else's file\n"
         );
+    }
+
+    #[test]
+    fn test_engine_denies_create_outside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ChangeEngine::new(dir.path(), &[], false);
+        // Traversal escape is denied.
+        let traversal = engine
+            .prepare("../outside.rs", "", "content")
+            .expect_err("a traversal create must be denied");
+        assert!(
+            traversal.to_string().contains("path boundary"),
+            "got: {traversal}"
+        );
+        // An absolute path outside the root is denied.
+        let outside = dir.path().parent().unwrap().join("outside-create.rs");
+        let outside_err = engine
+            .prepare(&outside.to_string_lossy(), "", "content")
+            .expect_err("a create outside the workspace root must be denied");
+        assert!(
+            outside_err.to_string().contains("path boundary"),
+            "got: {outside_err}"
+        );
+        assert!(!outside.exists(), "no file may be written outside the root");
     }
 
     #[test]
