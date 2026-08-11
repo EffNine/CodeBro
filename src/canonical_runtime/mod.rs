@@ -161,6 +161,13 @@ pub struct TaskOptions {
     /// Testing evidence when those ran, and injects its evidence-backed
     /// implementation plan into the main LLM context. Defaults to false.
     pub planning_enabled: bool,
+    /// When true, the coordinator runs the autonomous Coding subagent
+    /// (Sprint 30F) after Planning, consumes the REAL PlanningResult, applies
+    /// plan-driven reversible changes to the repository, verifies them through
+    /// the policy-checked Testing surface, and injects the auditable
+    /// [`crate::coding::CodingResult`] into the main LLM context. Defaults to
+    /// false.
+    pub coding_enabled: bool,
 }
 
 /// The outcome of a directly-invoked streaming tool run (shell commands,
@@ -585,7 +592,9 @@ impl CanonicalRuntime {
         // Research and Testing evidence produced above and turns it into an
         // evidence-backed implementation plan injected into the context that
         // reaches the main LLM. Failure is isolated: a planning error never
-        // crashes the main task.
+        // crashes the main task. The result is kept so the Coding phase
+        // (Sprint 30F) can consume it.
+        let mut planning_result: Option<crate::planning::PlanningResult> = None;
         if opts.planning_enabled {
             let planning = self
                 .run_autonomous_planning(
@@ -600,8 +609,11 @@ impl CanonicalRuntime {
                 Ok(result) => {
                     let render = result.render();
                     diag.planning = Some(
-                        crate::canonical_runtime::diagnostics::PlanningDiagnostics::from(result),
+                        crate::canonical_runtime::diagnostics::PlanningDiagnostics::from(
+                            result.clone(),
+                        ),
                     );
+                    planning_result = Some(result);
                     context = extend_context(
                         context,
                         vec![ContextFragment {
@@ -624,6 +636,51 @@ impl CanonicalRuntime {
             }
         }
 
+        // Autonomous Coding (Sprint 30F): when enabled, run the plan-driven
+        // Coding subagent AFTER Planning. Coding consumes the REAL
+        // PlanningResult, applies reversible changes through the change engine
+        // (ChangePlan/PatchEngine behind a permission boundary), verifies them
+        // through the Testing command policy (authoritative exit codes), and
+        // injects the auditable result into the context that reaches the main
+        // LLM. Failure is isolated: a coding error never crashes the main task.
+        if opts.coding_enabled {
+            let coding = self
+                .run_autonomous_coding(
+                    req,
+                    &memory_entries,
+                    &opts,
+                    planning_result.clone(),
+                    research_result.clone(),
+                    testing_result.clone(),
+                )
+                .await;
+            match coding {
+                Ok(result) => {
+                    let render = result.render();
+                    diag.coding = Some(
+                        crate::canonical_runtime::diagnostics::CodingDiagnostics::from(result),
+                    );
+                    context = extend_context(
+                        context,
+                        vec![ContextFragment {
+                            source: "coding".to_string(),
+                            content: render,
+                            relevance_score: 0.85,
+                        }],
+                    );
+                    diag.context_fragments = context.fragment_count();
+                }
+                Err(e) => {
+                    // Failure isolation: the main task continues with the
+                    // existing context. The failure is observable but not
+                    // fatal.
+                    (req.emit)(AgentEvent::Log {
+                        level: "pipeline".to_string(),
+                        message: format!("Coding subagent failed (continuing without it): {e}"),
+                    });
+                }
+            }
+        }
         // Canonical prompt compilation.
         let t = Instant::now();
         let compiled = self.prompt_builder.compile_context(&context);
@@ -1030,6 +1087,150 @@ impl CanonicalRuntime {
         let compiled = self.prompt_builder.compile_context(&context);
         Ok((context, compiled))
     }
+
+    /// Compile-only mode that runs the RESEARCH, TESTING, PLANNING and CODING
+    /// subagents in phase order (Sprint 30F) and injects all four results
+    /// into the compiled prompt. Planning consumes the Research/Testing
+    /// evidence; Coding consumes the REAL PlanningResult and applies
+    /// reversible changes. Used by the Sprint 30F parent-integration test:
+    /// proves CodingResult → ContextFragment → compiled main prompt.
+    pub async fn compile_for_task_with_coding(
+        &mut self,
+        task: &str,
+        conversation: Vec<ConversationMessage>,
+    ) -> std::result::Result<(EngineeringContext, CompiledPrompt), String> {
+        let noop_emit = |_: AgentEvent| {};
+        let noop_chunk = |_: &str| {};
+        let req = TaskRequest {
+            task,
+            conversation,
+            emit: &noop_emit,
+            on_chunk: &noop_chunk,
+        };
+
+        let identity = if self.identity.is_loaded() {
+            self.identity.snapshot()
+        } else {
+            ProjectIdentity::new("unknown", "unknown")
+        };
+        let keywords = extract_keywords(task);
+        let memory_ctx = self.resolve_memory(&keywords, &[]);
+        let memory_entries: Vec<String> = memory_ctx
+            .entries
+            .iter()
+            .map(|e| format!("{}: {}", e.key, e.value))
+            .collect();
+        let (assembly, report) = self.observe(&req, &memory_entries).await?;
+        let mut context = self.build_context(&req, &identity, memory_ctx, assembly, report)?;
+
+        // Assemble grounding once, then run the phases in order.
+        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
+            .assemble_with_extras(task, &[], &memory_entries);
+        let research = match self
+            .run_research_task(task, grounded.clone(), &noop_emit, None)
+            .await
+        {
+            Ok(result) => {
+                let render = result.render();
+                context = extend_context(
+                    context,
+                    vec![ContextFragment {
+                        source: "research".to_string(),
+                        content: render,
+                        relevance_score: 0.85,
+                    }],
+                );
+                Some(result)
+            }
+            Err(e) => {
+                return Err(format!("Autonomous research failed: {e}"));
+            }
+        };
+        let testing = match self
+            .run_testing_task(task, grounded.clone(), &noop_emit, None)
+            .await
+        {
+            Ok(result) => {
+                let render = result.render();
+                context = extend_context(
+                    context,
+                    vec![ContextFragment {
+                        source: "testing".to_string(),
+                        content: render,
+                        relevance_score: 0.85,
+                    }],
+                );
+                Some(result)
+            }
+            Err(e) => {
+                return Err(format!("Autonomous testing failed: {e}"));
+            }
+        };
+        let planning = match self
+            .run_planning_task(
+                task,
+                grounded.clone(),
+                research.clone(),
+                testing.clone(),
+                &noop_emit,
+                None,
+            )
+            .await
+        {
+            Ok(result) => {
+                let render = result.render();
+                context = extend_context(
+                    context,
+                    vec![ContextFragment {
+                        source: "planning".to_string(),
+                        content: render,
+                        relevance_score: 0.85,
+                    }],
+                );
+                Some(result)
+            }
+            Err(e) => {
+                return Err(format!("Autonomous planning failed: {e}"));
+            }
+        };
+
+        // Sprint 30F: the task may leave the planning phase with NO plan (an
+        // empty engine result). Encoding that absence as an Option keeps the
+        // downstream phase decision honest: a PlanningResult with an empty
+        // plan list is a REAL plan-shaped empty result — not evidence
+        // supporting execution.
+        match self
+            .run_coding_task(
+                task,
+                grounded,
+                planning.clone(),
+                research.clone(),
+                testing,
+                &noop_emit,
+                None,
+            )
+            .await
+        {
+            Ok(result) => {
+                let render = result.render();
+                context = extend_context(
+                    context,
+                    vec![ContextFragment {
+                        source: "coding".to_string(),
+                        content: render,
+                        relevance_score: 0.85,
+                    }],
+                );
+            }
+            Err(e) => {
+                return Err(format!("Autonomous coding failed: {e}"));
+            }
+        }
+
+        let compiled = self.prompt_builder.compile_context(&context);
+        Ok((context, compiled))
+    }
+
     /// Run the autonomous Research subagent over a grounded context using the
     /// runtime's shared provider state and a restricted read-only tool
     /// registry. Returns the structured, evidence-backed [`ResearchResult`].
@@ -1209,6 +1410,100 @@ impl CanonicalRuntime {
         let cancel = opts.cancel.clone();
         self.run_planning_task(req.task, grounded, research, testing, req.emit, cancel)
             .await
+    }
+
+    // =====================================================================
+    // Autonomous Coding (Sprint 30F)
+    // =====================================================================
+
+    /// Run the autonomous Coding subagent over a grounded context using the
+    /// runtime's shared provider state and the engine-bound mutation tooling.
+    /// Coding consumes the REAL PlanningResult and the Research/Testing
+    /// evidence, applies plane-driven reversible changes, and returns the
+    /// structured, auditable [`CodingResult`].
+    pub async fn run_coding_task(
+        &self,
+        task: &str,
+        grounding: GroundedContext,
+        planning: Option<crate::planning::PlanningResult>,
+        research: Option<crate::research::ResearchResult>,
+        testing: Option<crate::testing::TestingResult>,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        cancel: Option<crate::cancellation::CancellationToken>,
+    ) -> std::result::Result<crate::coding::CodingResult, String> {
+        self.run_coding_task_with_limits(
+            task,
+            grounding,
+            planning,
+            research,
+            testing,
+            crate::coding::CodingLimits::default(),
+            emit,
+            cancel,
+        )
+        .await
+    }
+
+    /// Run the autonomous Coding subagent with explicit session limits (the
+    /// real-provider smoke uses a larger budget than the conservative default).
+    pub async fn run_coding_task_with_limits(
+        &self,
+        task: &str,
+        grounding: GroundedContext,
+        planning: Option<crate::planning::PlanningResult>,
+        research: Option<crate::research::ResearchResult>,
+        testing: Option<crate::testing::TestingResult>,
+        limits: crate::coding::CodingLimits,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        cancel: Option<crate::cancellation::CancellationToken>,
+    ) -> std::result::Result<crate::coding::CodingResult, String> {
+        let planned_files: Vec<std::path::PathBuf> = planning
+            .as_ref()
+            .map(|p| p.affected_files.clone())
+            .unwrap_or_default();
+        let strict = limits.strict_plan_adherence;
+        let tooling = crate::coding::CodingTooling::new(
+            &self.workspace_root,
+            &planned_files,
+            strict,
+            limits.command_timeout_secs,
+        );
+        let mut subagent = crate::coding::CodingSubagent::new(
+            self.provider_runtime.clone(),
+            self.router.clone(),
+            self.io_providers.clone(),
+            tooling,
+        );
+        let request = crate::coding::CodingRequest::new(task, self.workspace_root.clone())
+            .with_grounding(grounding)
+            .with_research(research)
+            .with_testing(testing)
+            .with_planning(planning)
+            .with_limits(limits);
+        Ok(subagent.run(request, emit, cancel).await)
+    }
+
+    /// Run the autonomous coding subagent inside the canonical task pipeline
+    /// (used by `run_task_with_options`). Bounded by the task deadline and the
+    /// coding limits; failure is isolated and reported as an error result.
+    /// The Planning result from earlier in the same task becomes the coding
+    /// execution mandate.
+    async fn run_autonomous_coding(
+        &self,
+        req: &TaskRequest<'_>,
+        memory_entries: &[String],
+        opts: &TaskOptions,
+        planning: Option<crate::planning::PlanningResult>,
+        research: Option<crate::research::ResearchResult>,
+        testing: Option<crate::testing::TestingResult>,
+    ) -> std::result::Result<crate::coding::CodingResult, String> {
+        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
+            .assemble_with_extras(req.task, &[], memory_entries);
+        let cancel = opts.cancel.clone();
+        self.run_coding_task(
+            req.task, grounded, planning, research, testing, req.emit, cancel,
+        )
+        .await
     }
 
     // =====================================================================

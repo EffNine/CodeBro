@@ -89,6 +89,8 @@ pub struct TaskDiagnostics {
     pub testing: Option<TestingDiagnostics>,
     /// Autonomous planning diagnostics (Sprint 30E), when planning ran.
     pub planning: Option<PlanningDiagnostics>,
+    /// Autonomous coding diagnostics (Sprint 30F), when coding ran.
+    pub coding: Option<CodingDiagnostics>,
 }
 
 impl TaskDiagnostics {
@@ -238,6 +240,68 @@ impl From<crate::planning::PlanningResult> for PlanningDiagnostics {
             plan_steps: result.plan.len(),
             affected_files: result.affected_files.len(),
             risks: result.risks.len(),
+            duration_ms: result.duration_ms,
+            provider: result.provider,
+            error: result.limitations.first().cloned(),
+        }
+    }
+}
+
+/// Observational diagnostics for one autonomous Coding session (Sprint 30F).
+#[derive(Debug, Clone, Default)]
+pub struct CodingDiagnostics {
+    /// Whether coding reached a terminal state (any non-error termination).
+    pub completed: bool,
+    /// Whether the final implementation summary was produced.
+    pub synthesis_complete: bool,
+    /// Why coding terminated (completed / iteration_limit / tool_limit /
+    /// model_limit / timeout / cancelled / error).
+    pub termination: String,
+    /// Number of reasoning iterations.
+    pub iterations: usize,
+    /// Number of tool calls executed (including verification commands).
+    pub tool_calls: usize,
+    /// Number of model (provider) calls.
+    pub model_calls: usize,
+    /// Number of changes applied and kept (not rolled back).
+    pub changes_applied: usize,
+    /// Number of changes created then rolled back.
+    pub changes_rolled_back: usize,
+    /// Number of changes that were outside the plan's file list.
+    pub unplanned_changes: usize,
+    /// Number of policy-checked verification commands executed.
+    pub verifications_run: usize,
+    /// Number of verification commands that failed.
+    pub verifications_failed: usize,
+    /// Number of revision attempts after failed verification.
+    pub revisions: usize,
+    /// Coding duration in milliseconds.
+    pub duration_ms: u64,
+    /// Provider that executed the coding.
+    pub provider: String,
+    /// Error message when coding failed.
+    pub error: Option<String>,
+}
+
+impl From<crate::coding::CodingResult> for CodingDiagnostics {
+    fn from(result: crate::coding::CodingResult) -> Self {
+        CodingDiagnostics {
+            completed: result.termination.is_completed(),
+            synthesis_complete: result.synthesis_complete,
+            termination: result.termination.to_string(),
+            iterations: result.iterations,
+            tool_calls: result.tool_calls,
+            model_calls: result.model_calls,
+            changes_applied: result.changes.len(),
+            changes_rolled_back: result.changes.iter().filter(|c| c.rolled_back).count(),
+            unplanned_changes: result.unplanned_changes.len(),
+            verifications_run: result.verification.len(),
+            verifications_failed: result
+                .verification
+                .iter()
+                .filter(|r| !r.success && !r.denied)
+                .count(),
+            revisions: result.revisions,
             duration_ms: result.duration_ms,
             provider: result.provider,
             error: result.limitations.first().cloned(),

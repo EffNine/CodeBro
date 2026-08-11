@@ -5140,3 +5140,338 @@ async fn real_provider_planning_smoke() {
         "a real planning session must produce concrete plan steps"
     );
 }
+
+// =========================================================================
+// Sprint 30F — Autonomous Coding Subagent (parent integration)
+// =========================================================================
+
+/// The fixed final-report text the scripted "model" produces for the coding
+/// phase (a plain synthesis answer with no tool calls).
+fn coding_final_answer() -> String {
+    "## Changed files\nsrc/lib.rs: added subtract() next to add().\n\n## Verification\ncargo check: exit 0, success\n\n## Deviation from plan\nnone\n".to_string()
+}
+
+/// The real mutation the scripted coding phase applies: replace `add` with
+/// `sub` in the fixture crate, then verify with a REAL `cargo check`.
+fn coding_sub_proposal() -> String {
+    r#"<invoke name="propose_change">{"path": "src/lib.rs", "old": "pub fn add(a: i32, b: i32) -> i32 { a + b }", "new": "pub fn sub(a: i32, b: i32) -> i32 { a - b }"}</invoke>"#.to_string()
+}
+
+fn coding_verify(command: &str) -> String {
+    format!(
+        r#"<invoke name="verify">{}</invoke>"#,
+        serde_json::json!({ "command": command })
+    )
+}
+
+/// Full Sprint 30C/30D/30E/30F chain → CodingResult → ContextFragment →
+/// compiled main prompt. Research, Testing and Planning run first; Coding
+/// consumes the REAL PlanningResult, applies a reversible change through the
+/// change engine, verifies it with a real command, and its rendering must
+/// reach the final compiled prompt alongside the earlier fragments.
+#[tokio::test]
+async fn test_coding_result_reaches_compiled_prompt() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            // Research iteration 1: read the library source.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Research final report.
+            "add() is defined in src/lib.rs and returns a + b.".to_string(),
+            // Testing iteration 1: run a REAL cargo check.
+            r#"<invoke name="run_command">{"command": "cargo check"}</invoke>"#.to_string(),
+            // Testing final report.
+            "cargo check passed with exit code 0.".to_string(),
+            // Planning iteration 1: a single targeted read-only verify.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Planning final implementation plan.
+            planning_final_answer(),
+            // Coding iteration 1: apply the plan's step (real mutation).
+            coding_sub_proposal(),
+            // Coding iteration 2: explicit verification (REAL cargo check).
+            coding_verify("cargo check"),
+            // Coding final synthesis report (no tool calls); the completion
+            // gate has nothing left to verify.
+            coding_final_answer(),
+        ],
+    )));
+
+    let (context, compiled) = runtime
+        .compile_for_task_with_coding("add a subtract function", no_conversation())
+        .await
+        .expect("compile with coding");
+
+    // CodingResult became a `coding` ContextFragment.
+    let fragment = context
+        .context_fragments
+        .iter()
+        .find(|f| f.source == "coding")
+        .map(|f| f.content.clone())
+        .unwrap_or_default();
+    assert!(
+        fragment.contains("## Autonomous Coding"),
+        "coding fragment must carry the rendered result:\n{}",
+        fragment
+    );
+    assert!(
+        fragment.contains("src/lib.rs"),
+        "coding fragment must carry the changed file:\n{}",
+        fragment
+    );
+    // The authoritative machine fact: the change was verified by a real
+    // command with exit code 0.
+    assert!(
+        fragment.contains("exit_code: 0"),
+        "coding fragment must carry the authoritative verification fact:\n{}",
+        fragment
+    );
+
+    // The compiled main prompt contains the coding fragment AND the earlier
+    // fragments, in phase order.
+    assert!(
+        compiled.prompt.contains("--- coding () ---"),
+        "prompt must render the coding fragment:\n{}",
+        compiled.prompt
+    );
+    assert!(
+        compiled.prompt.contains("## Autonomous Coding"),
+        "prompt must contain the coding rendering"
+    );
+    let research_at = compiled.prompt.find("--- research () ---");
+    let testing_at = compiled.prompt.find("--- testing () ---");
+    let planning_at = compiled.prompt.find("--- planning () ---");
+    let coding_at = compiled.prompt.find("--- coding () ---");
+    assert!(
+        research_at.is_some()
+            && testing_at.is_some()
+            && planning_at.is_some()
+            && coding_at.is_some(),
+        "all phase fragments must be present in the compiled prompt"
+    );
+    assert!(
+        research_at.unwrap() < testing_at.unwrap()
+            && testing_at.unwrap() < planning_at.unwrap()
+            && planning_at.unwrap() < coding_at.unwrap(),
+        "phase order must be research → testing → planning → coding"
+    );
+
+    // The mutation really happened and was verified.
+    let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert!(lib.contains("pub fn sub(a: i32, b: i32) -> i32 { a - b }"));
+}
+
+/// Full chain: ResearchResult + TestingResult + PlanningResult → CodingSubagent
+/// → ContextFragment → PromptBuilder → main provider. The main provider's
+/// prompt must contain the coding fragment and all earlier evidence, in the
+/// correct phase order.
+#[tokio::test]
+async fn test_coding_consumes_planning_evidence() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec![
+            // Research iteration 1: read the library source.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Research final report.
+            "add() is defined in src/lib.rs and returns a + b.".to_string(),
+            // Testing iteration 1: run a REAL cargo check.
+            r#"<invoke name="run_command">{"command": "cargo check"}</invoke>"#.to_string(),
+            // Testing final report.
+            "cargo check passed with exit code 0.".to_string(),
+            // Planning iteration 1: a single targeted read-only verify.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Planning final implementation plan.
+            planning_final_answer(),
+            // Coding iteration 1: apply the plan's step (real mutation).
+            coding_sub_proposal(),
+            // Coding iteration 2: explicit verification (REAL cargo check).
+            coding_verify("cargo check"),
+            // Coding final synthesis report.
+            coding_final_answer(),
+            // Main loop answer.
+            "main task complete.".to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        research_enabled: true,
+        testing_enabled: true,
+        planning_enabled: true,
+        coding_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a subtract function to the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "main task must succeed with coding enabled: {:?}",
+        result.error
+    );
+    assert!(result.response.contains("main task complete"));
+
+    // The main provider's prompt (the LAST recorded prompt) contains the
+    // coding fragment AND the earlier evidence, in phase order.
+    let prompts = provider.all_prompts();
+    assert_eq!(
+        prompts.len(),
+        10,
+        "2 research + 2 testing + 2 planning + 3 coding + 1 main call"
+    );
+    let main_prompt = prompts.last().expect("main prompt present");
+    assert!(
+        main_prompt.contains("--- coding () ---"),
+        "main prompt must contain the coding fragment:\n{}",
+        main_prompt
+    );
+    assert!(
+        main_prompt.contains("## Autonomous Coding"),
+        "main prompt must contain the coding rendering"
+    );
+    let research_at = main_prompt.find("--- research () ---");
+    let testing_at = main_prompt.find("--- testing () ---");
+    let planning_at = main_prompt.find("--- planning () ---");
+    let coding_at = main_prompt.find("--- coding () ---");
+    assert!(
+        research_at.is_some()
+            && testing_at.is_some()
+            && planning_at.is_some()
+            && coding_at.is_some(),
+        "all phase fragments must be present in the main prompt"
+    );
+    assert!(
+        research_at.unwrap() < testing_at.unwrap()
+            && testing_at.unwrap() < planning_at.unwrap()
+            && planning_at.unwrap() < coding_at.unwrap(),
+        "phase order in the main prompt must be research → testing → planning → coding"
+    );
+
+    // Research and Testing produced usable evidence first.
+    let research = result
+        .diagnostics
+        .research
+        .expect("research diagnostics recorded");
+    assert!(research.completed);
+    let testing = result
+        .diagnostics
+        .testing
+        .expect("testing diagnostics recorded");
+    assert!(testing.completed);
+    let planning = result
+        .diagnostics
+        .planning
+        .expect("planning diagnostics recorded");
+    assert!(planning.completed);
+    assert_eq!(planning.plan_steps, 1);
+
+    // Coding diagnostics were captured with the applied, verified change.
+    let coding = result
+        .diagnostics
+        .coding
+        .expect("coding diagnostics recorded");
+    assert!(coding.completed);
+    assert!(coding.synthesis_complete);
+    assert_eq!(coding.termination, "completed");
+    assert_eq!(coding.iterations, 3);
+    assert_eq!(coding.tool_calls, 2);
+    assert_eq!(coding.model_calls, 3);
+    assert_eq!(coding.changes_applied, 1);
+    assert_eq!(coding.verifications_run, 1);
+    assert_eq!(coding.verifications_failed, 0);
+    assert_eq!(coding.unplanned_changes, 0);
+}
+
+/// CodingResult → ContextFragment → PromptBuilder → main provider. The main
+/// provider's last prompt must carry the structured coding fragment (applied
+/// change + authoritative exit code).
+#[tokio::test]
+async fn test_coding_result_reaches_main_provider_prompt() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec![
+            // Coding iteration 1: apply the plan's step (real mutation).
+            coding_sub_proposal(),
+            // Coding iteration 2: explicit verification (REAL cargo check).
+            coding_verify("cargo check"),
+            // Coding final synthesis report.
+            coding_final_answer(),
+            // Main loop answer.
+            "main task complete.".to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        coding_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a subtract function",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "main task must succeed with coding enabled: {:?}",
+        result.error
+    );
+    assert!(result.response.contains("main task complete"));
+
+    // The main provider's prompt (the LAST recorded prompt) contains the
+    // coding fragment with the applied change and its authoritative exit code.
+    let prompts = provider.all_prompts();
+    assert_eq!(prompts.len(), 4, "3 coding calls + 1 main call");
+    let main_prompt = prompts.last().expect("main prompt present");
+    assert!(
+        main_prompt.contains("--- coding () ---"),
+        "main prompt must contain the coding fragment:\n{}",
+        main_prompt
+    );
+    assert!(
+        main_prompt.contains("## Autonomous Coding"),
+        "main prompt must contain the coding rendering"
+    );
+    assert!(
+        main_prompt.contains("src/lib.rs"),
+        "main prompt must carry the changed file"
+    );
+    assert!(
+        main_prompt.contains("exit_code: 0"),
+        "main prompt must carry the authoritative command evidence"
+    );
+
+    // Coding diagnostics were captured.
+    let coding = result
+        .diagnostics
+        .coding
+        .expect("coding diagnostics recorded");
+    assert!(coding.completed);
+    assert!(coding.synthesis_complete);
+    assert_eq!(coding.changes_applied, 1);
+    assert_eq!(coding.verifications_run, 1);
+    assert_eq!(coding.verifications_failed, 0);
+}

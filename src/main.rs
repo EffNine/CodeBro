@@ -7,6 +7,7 @@ mod cancellation;
 mod canonical_runtime;
 mod capability_discovery;
 mod cli;
+mod coding;
 mod config;
 mod credentials;
 mod dispatcher;

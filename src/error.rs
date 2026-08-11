@@ -18,6 +18,9 @@ pub enum CodeBroError {
     #[error("Tool error: {0}")]
     Tool(String),
 
+    #[error("Permission error: {0}")]
+    Permission(String),
+
     #[error("Patch error: {0}")]
     Patch(String),
 
