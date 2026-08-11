@@ -563,5 +563,107 @@ Done.
             unwrap_tool_arguments(r#"{"input": 42}"#),
             r#"{"input": 42}"#
         );
+        // JSON object with a non-string single value is NOT an envelope.
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"input": {"nested": true}}"#),
+            r#"{"input": {"nested": true}}"#
+        );
+    }
+
+    #[test]
+    fn test_unwrap_tool_arguments_nested_json() {
+        // Unwrapping the envelope reveals a nested raw argument string; the
+        // nested JSON is preserved verbatim (the tool receives it as the raw
+        // argument).
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"input": "{\"path\": \"src/main.rs\"}"}"#),
+            r#"{"path": "src/main.rs"}"#
+        );
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"input": "{\"command\": \"cargo build\"}"}"#),
+            r#"{"command": "cargo build"}"#
+        );
+        // A nested envelope inside the outer envelope unwraps one level only,
+        // matching the tool's single-`input` declaration.
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"input": "{\"input\": \"x\"}"}"#),
+            r#"{"input": "x"}"#
+        );
+    }
+
+    #[test]
+    fn test_unwrap_tool_arguments_escaped() {
+        // Escaped backslashes, spaces and quotes survive the envelope unwrap.
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"input": "C:\\dir\\file.rs"}"#),
+            "C:\\dir\\file.rs"
+        );
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"path": "src with spaces/main.rs"}"#),
+            "src with spaces/main.rs"
+        );
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"command": "echo \"hello world\""}"#),
+            "echo \"hello world\""
+        );
+        assert_eq!(unwrap_tool_arguments(r#"{"file_path": "a\tb"}"#), "a\tb");
+    }
+
+    #[test]
+    fn test_unwrap_normalized_tool_call_identical_across_envelopes() {
+        // All real-world envelope variants normalize to the SAME internal
+        // `ToolCall.arguments` so the downstream registry receives an
+        // identical raw argument string.
+        let variants = [
+            r#"{"input": "src/main.rs"}"#,
+            r#"{"path": "src/main.rs"}"#,
+            r#"{"file_path": "src/main.rs"}"#,
+        ];
+        let normalized: Vec<String> = variants
+            .iter()
+            .map(|args| unwrap_tool_arguments(args))
+            .collect();
+        assert_eq!(normalized[0], "src/main.rs");
+        assert_eq!(normalized[0], normalized[1]);
+        assert_eq!(normalized[1], normalized[2]);
+
+        // Applying the same normalization to an equivalent structured
+        // ToolCall produces identical internal arguments.
+        let make = |args: &str| ToolCall {
+            id: "c1".to_string(),
+            name: "read_file".to_string(),
+            arguments: unwrap_tool_arguments(args),
+        };
+        let a = make(r#"{"input": "src/main.rs"}"#);
+        let b = make(r#"{"path": "src/main.rs"}"#);
+        let c = make(r#"{"file_path": "src/main.rs"}"#);
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.name, c.name);
+        assert_eq!(a.arguments, b.arguments);
+        assert_eq!(b.arguments, c.arguments);
+        assert_eq!(a.arguments, "src/main.rs");
+    }
+
+    #[test]
+    fn test_unwrap_tool_arguments_structured_calling_pipeline() {
+        // The full normalization a structured provider response goes through:
+        // parse → unwrap envelope → raw args identical to a text-encoded call.
+        let structured = r#"[{"id": "c1", "function": {"name": "read_file", "arguments": "{\"input\": \"src/parser.rs\"}"}}]"#;
+        let mut calls = parse_structured_tool_calls(structured).unwrap();
+        assert_eq!(calls.len(), 1);
+        for call in calls.iter_mut() {
+            call.arguments = unwrap_tool_arguments(&call.arguments);
+        }
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, "src/parser.rs");
+
+        // The text-encoded equivalent (`{"path": ...}` envelope) normalizes to
+        // the exact same internal `ToolCall`.
+        let text = r#"<invoke name="read_file">{"path": "src/parser.rs"}</invoke>"#;
+        let mut text_calls = parse_tool_calls(text).unwrap();
+        assert_eq!(text_calls.len(), 1);
+        text_calls[0].arguments = unwrap_tool_arguments(&text_calls[0].arguments);
+        assert_eq!(text_calls[0].name, calls[0].name);
+        assert_eq!(text_calls[0].arguments, calls[0].arguments);
     }
 }

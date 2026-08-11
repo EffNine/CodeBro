@@ -115,8 +115,22 @@ impl ResearchSubagent {
                 return self.finish(state, ResearchTermination::IterationLimit, started, emit);
             }
 
-            // 5. Compile the research prompt with the current evidence trail.
-            let prompt = state.build_prompt();
+            // 5. Determine the phase: evidence gathering vs final synthesis.
+            //    The loop reserves one model call for synthesis so a model that
+            //    keeps exploring can never starve the final report. When the
+            //    evidence budget is spent (and real evidence was gathered), the
+            //    next call is forced to synthesize the findings.
+            if !state.synthesis_attempted
+                && state.model_calls >= state.limits.evidence_model_budget()
+                && state.has_evidence()
+            {
+                state.synthesis_attempted = true;
+            }
+            let prompt = if state.synthesis_attempted {
+                state.build_synthesis_prompt()
+            } else {
+                state.build_prompt()
+            };
 
             // 6. Authoritative provider selection (identical to main agent).
             let route_request = RouteRequest::new()
@@ -195,13 +209,24 @@ impl ResearchSubagent {
                             .collect()
                     };
 
-                    // No tool call → the model produced its final report.
+                    // No tool call → the model produced its final report. This
+                    // is the synthesis-complete signal: the model stopped
+                    // gathering evidence and wrote a prose summary.
                     if calls.is_empty() {
                         state.final_answer = Some(full);
+                        state.synthesis_complete = true;
                         let model = provider_model;
                         return self
                             .finish(state, ResearchTermination::Completed, started, emit)
                             .with_provider(provider_id.as_str().to_string(), model);
+                    }
+
+                    // The reserved synthesis call must not keep gathering
+                    // evidence: the model-call budget reserved for it is spent.
+                    // Terminate honestly — the structured evidence gathered so
+                    // far is preserved and no summary is fabricated.
+                    if state.synthesis_attempted {
+                        return self.finish(state, ResearchTermination::ModelLimit, started, emit);
                     }
 
                     // 9. Tool-call budget.
@@ -312,6 +337,11 @@ struct ResearchState {
     iterations: usize,
     tool_calls: usize,
     model_calls: usize,
+    /// Whether the loop has switched from evidence gathering to the reserved
+    /// final synthesis call.
+    synthesis_attempted: bool,
+    /// Whether the final prose synthesis was produced.
+    synthesis_complete: bool,
     observations: Vec<ToolObservation>,
     files_inspected: Vec<PathBuf>,
     symbols_found: Vec<String>,
@@ -327,6 +357,8 @@ impl ResearchState {
             iterations: 0,
             tool_calls: 0,
             model_calls: 0,
+            synthesis_attempted: false,
+            synthesis_complete: false,
             observations: Vec::new(),
             files_inspected: Vec::new(),
             symbols_found: Vec::new(),
@@ -384,6 +416,14 @@ impl ResearchState {
         }
         // Keep the overall evidence trail bounded.
         self.symbols_found.truncate(MAX_SYMBOLS_TOTAL);
+    }
+
+    /// Whether the session has gathered any real tool evidence worth
+    /// synthesizing. Every executed tool call pushes an observation, so a
+    /// single successful tool call is sufficient to trigger the final
+    /// synthesis when the evidence budget is exhausted.
+    fn has_evidence(&self) -> bool {
+        self.tool_calls > 0
     }
 
     /// Make an absolute inspected path relative to the workspace root so the
@@ -459,9 +499,65 @@ impl ResearchState {
         }
 
         prompt.push_str(&format!(
-            "\nINSTRUCTIONS:\n1. Use the available tools to inspect the repository and gather evidence. Prefer a small number of targeted reads over exhaustive listing.\n2. You MUST call at least one tool before producing the final report unless the grounded context already answers the objective.\n3. When you have inspected the key files, STOP calling tools and produce the final research report. The report must be evidence-backed and cite the exact file paths and function names you inspected.\n4. Produce the final report on your next turn once you have inspected the relevant files — do not keep exploring.\n\nRESEARCH STEP {}:\n",
+            "\nINSTRUCTIONS:\n1. Use the available tools to inspect the repository and gather evidence. Prefer a small number of targeted reads over exhaustive listing.\n2. You MUST call at least one tool before producing the final report unless the grounded context already answers the objective.\n3. You have a bounded evidence budget: only {} evidence-gathering call(s) remain before the final synthesis. Gather only the evidence you actually need.\n4. Once you have inspected the relevant files, STOP calling tools and produce the final research report. The report must be evidence-backed and cite the exact file paths and function names you inspected.\n5. Produce the final report on your next turn once you have inspected the relevant files — do not keep exploring.\n\nRESEARCH STEP {}:\n",
+            self.limits.evidence_model_budget().saturating_sub(self.model_calls).max(1),
             self.iterations + 1
         ));
+        prompt
+    }
+
+    /// Compile the reserved final-synthesis prompt. The model sees the full
+    /// evidence trail gathered so far and must produce the final research
+    /// report WITHOUT any further tool calls. This is the bounded completion
+    /// step of the research loop.
+    fn build_synthesis_prompt(&self) -> String {
+        let grounding = &self.request.grounding;
+        let mut prompt = String::new();
+        prompt.push_str("You are CodeBro's autonomous Research subagent final synthesis step.\n\n");
+        prompt.push_str(&format!("OBJECTIVE:\n{}\n\n", self.request.task));
+
+        prompt.push_str("GROUNDED CONTEXT (initial knowledge):\n");
+        prompt.push_str(&format!(
+            "Project: {} ({})\n",
+            grounding.project_name, grounding.project_language
+        ));
+        if !grounding.relevant_files.is_empty() {
+            prompt.push_str(&format!(
+                "Relevant files: {}\n",
+                grounding.relevant_files.join(", ")
+            ));
+        }
+        if !grounding.related_symbols.is_empty() {
+            prompt.push_str(&format!(
+                "Related symbols: {}\n",
+                grounding.related_symbols.join(", ")
+            ));
+        }
+        if !grounding.dependencies.is_empty() {
+            prompt.push_str(&format!(
+                "Dependencies: {}\n",
+                grounding.dependencies.join(", ")
+            ));
+        }
+
+        prompt.push_str("\nEVIDENCE GATHERED (tool observations):\n");
+        if self.observations.is_empty() {
+            prompt.push_str("(no tool observations — synthesize from grounded context only)\n");
+        } else {
+            for (i, observation) in self.observations.iter().enumerate() {
+                prompt.push_str(&format!(
+                    "  {}. {} {} → {}\n",
+                    i + 1,
+                    observation.name,
+                    observation.arguments,
+                    observation.result
+                ));
+            }
+        }
+
+        prompt.push_str(
+            "\nINSTRUCTIONS:\n1. Synthesize the evidence above into a concise final research report that answers the OBJECTIVE.\n2. Do NOT call any tools. This is the final synthesis step; the evidence budget is exhausted.\n3. Base every claim ONLY on the evidence above or the grounded context. If the evidence does not answer the objective, say so explicitly rather than inventing details.\n4. Cite the exact file paths and function names from the evidence.\n\nFINAL RESEARCH REPORT:\n",
+        );
         prompt
     }
 
@@ -484,6 +580,7 @@ impl ResearchState {
             iterations: self.iterations,
             model_calls: self.model_calls,
             termination,
+            synthesis_complete: self.synthesis_complete,
             tool_observations: self.observations.clone(),
             limitations,
             duration_ms,

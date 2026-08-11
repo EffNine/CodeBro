@@ -13,6 +13,10 @@
 pub struct ResearchDiagnostics {
     /// Whether research produced a usable result.
     pub completed: bool,
+    /// Whether the final prose synthesis was produced. `false` means the
+    /// session ended before a final report could be written; the structured
+    /// evidence trail is still preserved.
+    pub synthesis_complete: bool,
     /// Why research terminated (completed / iteration_limit / tool_limit /
     /// model_limit / timeout / cancelled / error).
     pub termination: String,
@@ -121,6 +125,7 @@ impl From<crate::research::ResearchResult> for ResearchDiagnostics {
     fn from(result: crate::research::ResearchResult) -> Self {
         ResearchDiagnostics {
             completed: result.termination.is_completed(),
+            synthesis_complete: result.synthesis_complete,
             termination: result.termination.to_string(),
             iterations: result.iterations,
             tool_calls: result.tool_calls,

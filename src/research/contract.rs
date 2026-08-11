@@ -138,6 +138,11 @@ pub struct ResearchResult {
     pub model_calls: usize,
     /// Why the session terminated.
     pub termination: ResearchTermination,
+    /// Whether the final prose synthesis was actually produced. `false` means
+    /// the session ended (e.g. `ModelLimit`) before a final report could be
+    /// written; the structured evidence trail is still preserved and a summary
+    /// is never fabricated.
+    pub synthesis_complete: bool,
     /// Ordered tool observations (evidence trail).
     pub tool_observations: Vec<ToolObservation>,
     /// Explicit limitations of this research pass.
@@ -164,6 +169,7 @@ impl ResearchResult {
             iterations: 0,
             model_calls: 0,
             termination,
+            synthesis_complete: false,
             tool_observations: Vec::new(),
             limitations: vec![error.to_string()],
             duration_ms: 0,
@@ -182,8 +188,8 @@ impl ResearchResult {
             self.termination
         ));
         out.push_str(&format!(
-            "Iterations: {} | tool calls: {} | model calls: {}\n",
-            self.iterations, self.tool_calls, self.model_calls
+            "Iterations: {} | tool calls: {} | model calls: {} | synthesis complete: {}\n",
+            self.iterations, self.tool_calls, self.model_calls, self.synthesis_complete
         ));
         if !self.provider.is_empty() {
             out.push_str(&format!("Provider: {}\n", self.provider));
@@ -235,7 +241,7 @@ impl ResearchResult {
     /// Compact one-line summary for observability.
     pub fn summary_line(&self) -> String {
         format!(
-            "[research] provider={} model={} iterations={} tool_calls={} model_calls={} files={} symbols={} termination={} duration={}ms output={}B",
+            "[research] provider={} model={} iterations={} tool_calls={} model_calls={} files={} symbols={} termination={} synthesis={} duration={}ms output={}B",
             if self.provider.is_empty() { "-" } else { &self.provider },
             if self.model.is_empty() { "-" } else { &self.model },
             self.iterations,
@@ -244,6 +250,7 @@ impl ResearchResult {
             self.files_inspected.len(),
             self.symbols_found.len(),
             self.termination,
+            self.synthesis_complete,
             self.duration_ms,
             self.output_size,
         )
@@ -279,6 +286,8 @@ mod tests {
         assert!(result.summary.contains("provider unavailable"));
         assert!(result.findings.is_empty());
         assert_eq!(result.tool_calls, 0);
+        // A failed session never claims a synthesis was produced.
+        assert!(!result.synthesis_complete);
     }
 
     #[test]
@@ -292,5 +301,6 @@ mod tests {
         assert!(rendered.contains("Autonomous Research Findings"));
         assert!(rendered.contains("Termination:"));
         assert!(rendered.contains("cancelled"));
+        assert!(rendered.contains("synthesis complete: false"));
     }
 }

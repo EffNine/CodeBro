@@ -559,13 +559,18 @@ impl CanonicalRuntime {
                         let verify_result = self.verify_task(req, &opts, &mut diag, started).await;
                         match verify_result {
                             Some((summary, verify_response)) => {
-                                diag.verification = Some(summary);
+                                diag.verification = Some(summary.clone());
                                 if !verify_response.trim().is_empty() {
                                     response.push_str("\n\n");
                                     response.push_str(&verify_response);
                                 }
-                                // Verification passed → complete.
-                                if verify_response.contains("passed") {
+                                // Verification passed → complete. The decision is
+                                // made from the authoritative per-step exit
+                                // codes, NOT by searching the command output
+                                // text: a failing `cargo test` still prints
+                                // "2619 passed; 1 failed", so a text `passed`
+                                // match would wrongly mask a genuine failure.
+                                if summary.steps.iter().all(|s| s.success) {
                                     break;
                                 }
                                 // Verification failed → bounded revision.

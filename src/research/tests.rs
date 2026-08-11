@@ -367,6 +367,7 @@ async fn test_research_multi_step_tool_results_feed_next_iteration() {
     assert_eq!(result.termination, ResearchTermination::Completed);
     assert_eq!(result.iterations, 3);
     assert_eq!(result.tool_calls, 2);
+    assert!(result.synthesis_complete);
 
     // The evidence trail flowed into the next model calls: iteration 2's
     // prompt contains the list_files result; iteration 3's prompt contains
@@ -469,6 +470,170 @@ async fn test_research_structured_input_envelope_is_unwrapped() {
         "files_inspected must record the real resolved path, got: {:?}",
         result.files_inspected
     );
+}
+
+// =========================================================================
+// Synthesis: reserved final model call (Sprint 30C.0.1)
+// =========================================================================
+
+/// A model that keeps exploring must be forced into a final synthesis call
+/// when the evidence budget is exhausted, and that call must produce the
+/// structured result.
+#[tokio::test]
+async fn test_research_reserves_final_synthesis_call() {
+    let dir = fixture_workspace();
+    let provider = Arc::new(ResearchMockProvider::text(
+        "research-mock",
+        vec![
+            r#"<invoke name="list_files">{"path": "src"}</invoke>"#.to_string(),
+            r#"<invoke name="list_files">{"path": "src"}</invoke>"#.to_string(),
+            "Synthesis: parser.rs defines parse_tool_calls.".to_string(),
+        ],
+    ));
+    let harness = ResearchHarness::new(provider.clone());
+    let limits = ResearchLimits {
+        max_model_calls: 3,
+        reserved_synthesis_calls: 1,
+        ..ResearchLimits::default()
+    };
+    let result = run_research(harness, "trace the parser", dir.path(), Some(limits)).await;
+
+    assert_eq!(result.termination, ResearchTermination::Completed);
+    assert!(
+        result.synthesis_complete,
+        "the reserved synthesis call must produce the final report"
+    );
+    assert_eq!(result.model_calls, 3, "3 calls: 2 evidence + 1 synthesis");
+    assert_eq!(
+        result.tool_calls, 2,
+        "evidence gathering must stop at the budget"
+    );
+    assert!(
+        result.summary.contains("parse_tool_calls"),
+        "the synthesis must be the final answer, got: {}",
+        result.summary
+    );
+
+    // The final call is the distinct synthesis prompt, not the evidence prompt.
+    let prompts = provider.prompt_log();
+    assert_eq!(prompts.len(), 3);
+    assert!(
+        prompts[2].contains("FINAL RESEARCH REPORT"),
+        "the last call must be the synthesis prompt:\n{}",
+        prompts[2]
+    );
+    assert!(
+        !prompts[2].contains("RESEARCH STEP 3"),
+        "synthesis prompt must not use the evidence step format"
+    );
+}
+
+/// If the model uses the reserved synthesis call to request MORE evidence, the
+/// loop must terminate honestly: `ModelLimit`, `synthesis_complete = false`,
+/// with the evidence trail preserved and no fabricated summary.
+#[tokio::test]
+async fn test_research_synthesis_cannot_extend_evidence_gathering() {
+    let dir = fixture_workspace();
+    let provider = Arc::new(ResearchMockProvider::text(
+        "research-mock",
+        vec![
+            r#"<invoke name="list_files">{"path": "src"}</invoke>"#.to_string(),
+            r#"<invoke name="read_file">{"path": "src/parser.rs"}</invoke>"#.to_string(),
+            // During the synthesis call the model asks for one more read.
+            r#"<invoke name="read_file">{"path": "src/main.rs"}</invoke>"#.to_string(),
+        ],
+    ));
+    let harness = ResearchHarness::new(provider.clone());
+    let limits = ResearchLimits {
+        max_model_calls: 3,
+        reserved_synthesis_calls: 1,
+        ..ResearchLimits::default()
+    };
+    let result = run_research(harness, "trace the parser", dir.path(), Some(limits)).await;
+
+    assert_eq!(result.termination, ResearchTermination::ModelLimit);
+    assert!(!result.synthesis_complete);
+    // The structured evidence gathered before the synthesis attempt is kept.
+    assert_eq!(result.tool_calls, 2);
+    assert!(
+        result
+            .tool_observations
+            .iter()
+            .any(|o| o.name == "read_file"),
+        "the evidence trail must be preserved, got: {:?}",
+        result.tool_observations
+    );
+    assert!(
+        result
+            .files_inspected
+            .iter()
+            .any(|f| f.to_string_lossy().contains("parser")),
+        "inspected files must be preserved, got: {:?}",
+        result.files_inspected
+    );
+    // No summary is fabricated: the summary is the honest default.
+    assert!(
+        result.summary.contains("model_limit"),
+        "summary must state the real termination, got: {}",
+        result.summary
+    );
+    assert!(
+        result.limitations.iter().any(|l| l.contains("model-call")),
+        "limitations must record the model-call limit"
+    );
+    // The synthesis prompt was the final call.
+    let prompts = provider.prompt_log();
+    assert_eq!(prompts.len(), 3);
+    assert!(
+        prompts[2].contains("FINAL RESEARCH REPORT"),
+        "the last call must be the synthesis prompt:\n{}",
+        prompts[2]
+    );
+}
+
+/// A model that voluntarily stops exploring (no tool call) completes with the
+/// final answer and a full synthesis — no forced call is needed.
+#[tokio::test]
+async fn test_research_voluntary_completion_is_full_synthesis() {
+    let dir = fixture_workspace();
+    let harness = ResearchHarness::new(Arc::new(ResearchMockProvider::text(
+        "research-mock",
+        vec![
+            r#"<invoke name="read_file">{"path": "src/parser.rs"}</invoke>"#.to_string(),
+            "Final report: parse_tool_calls lives in src/parser.rs.".to_string(),
+        ],
+    )));
+    let result = run_research(harness, "trace the parser", dir.path(), None).await;
+
+    assert_eq!(result.termination, ResearchTermination::Completed);
+    assert!(result.synthesis_complete);
+    assert_eq!(result.model_calls, 2);
+}
+
+/// A budget too small to gather evidence must not fabricate a synthesis: it
+/// terminates at `ModelLimit` with `synthesis_complete = false`.
+#[tokio::test]
+async fn test_research_no_evidence_no_synthesis_is_honest() {
+    let dir = fixture_workspace();
+    let harness = ResearchHarness::new(Arc::new(ResearchMockProvider::text(
+        "research-mock",
+        vec![
+            r#"<invoke name="list_files">{"path": "src"}</invoke>"#.to_string(),
+            r#"<invoke name="list_files">{"path": "src"}</invoke>"#.to_string(),
+        ],
+    )));
+    // max_model_calls = 1: the single call is used for evidence; there is no
+    // budget left to attempt synthesis, so the result is an honest ModelLimit.
+    let limits = ResearchLimits {
+        max_model_calls: 1,
+        reserved_synthesis_calls: 1,
+        ..ResearchLimits::default()
+    };
+    let result = run_research(harness, "trace the parser", dir.path(), Some(limits)).await;
+
+    assert_eq!(result.termination, ResearchTermination::ModelLimit);
+    assert!(!result.synthesis_complete);
+    assert!(result.tool_calls <= 1);
 }
 
 // =========================================================================

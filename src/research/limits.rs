@@ -25,6 +25,15 @@ pub const MAX_RESEARCH_TOOL_CALLS: usize = 20;
 /// explore then synthesize.
 pub const MAX_RESEARCH_MODEL_CALLS: usize = 6;
 
+/// Model calls reserved for the final synthesis step.
+///
+/// The research loop divides its model budget into an evidence-gathering phase
+/// (up to `max_model_calls - reserved_synthesis_calls`) and a guaranteed final
+/// synthesis call. This makes the "gather evidence → synthesize" pipeline
+/// deterministic: a real model that keeps exploring cannot starve the final
+/// report, and the overall budget stays strictly bounded.
+pub const RESERVED_SYNTHESIS_CALLS: usize = 1;
+
 /// Hard wall-clock timeout for a research session, in milliseconds.
 ///
 /// Matches the main task default (`DEFAULT_TASK_TIMEOUT_MS` = 30s). Research
@@ -49,6 +58,9 @@ pub struct ResearchLimits {
     pub max_iterations: usize,
     pub max_tool_calls: usize,
     pub max_model_calls: usize,
+    /// Model calls reserved for the final synthesis step (see
+    /// [`RESERVED_SYNTHESIS_CALLS`]).
+    pub reserved_synthesis_calls: usize,
     pub timeout_ms: u64,
     pub max_output_bytes: usize,
     pub max_tool_result_chars: usize,
@@ -60,6 +72,7 @@ impl Default for ResearchLimits {
             max_iterations: MAX_RESEARCH_ITERATIONS,
             max_tool_calls: MAX_RESEARCH_TOOL_CALLS,
             max_model_calls: MAX_RESEARCH_MODEL_CALLS,
+            reserved_synthesis_calls: RESERVED_SYNTHESIS_CALLS,
             timeout_ms: RESEARCH_TIMEOUT_MS,
             max_output_bytes: MAX_RESEARCH_OUTPUT_BYTES,
             max_tool_result_chars: MAX_TOOL_RESULT_CHARS,
@@ -74,10 +87,19 @@ impl ResearchLimits {
             max_iterations: 1,
             max_tool_calls: 1,
             max_model_calls: 1,
+            reserved_synthesis_calls: RESERVED_SYNTHESIS_CALLS,
             timeout_ms: 500,
             max_output_bytes: 256,
             max_tool_result_chars: 64,
         }
+    }
+
+    /// The number of model calls available for evidence gathering before the
+    /// loop is forced to switch to the final synthesis call. Never exceeds
+    /// `max_model_calls`.
+    pub fn evidence_model_budget(&self) -> usize {
+        self.max_model_calls
+            .saturating_sub(self.reserved_synthesis_calls)
     }
 
     /// Human-readable description of the tools available to research.
@@ -112,6 +134,30 @@ mod tests {
         assert!(limits.max_tool_calls < 100);
         assert!(limits.max_model_calls < 15);
         assert!(limits.timeout_ms <= 30_000);
+        // The synthesis reservation always leaves at least one evidence call
+        // available and never exceeds the model budget.
+        assert!(limits.reserved_synthesis_calls >= 1);
+        assert!(limits.reserved_synthesis_calls <= limits.max_model_calls);
+        assert!(limits.evidence_model_budget() < limits.max_model_calls);
+        assert!(
+            limits.evidence_model_budget() + limits.reserved_synthesis_calls
+                == limits.max_model_calls
+        );
+    }
+
+    #[test]
+    fn test_evidence_budget_is_bounded() {
+        let limits = ResearchLimits {
+            max_model_calls: 1,
+            ..ResearchLimits::default()
+        };
+        assert_eq!(limits.evidence_model_budget(), 0);
+        let limits = ResearchLimits {
+            max_model_calls: 6,
+            reserved_synthesis_calls: 1,
+            ..ResearchLimits::default()
+        };
+        assert_eq!(limits.evidence_model_budget(), 5);
     }
 
     #[test]

@@ -3846,3 +3846,234 @@ async fn test_text_encoded_input_envelope_is_unwrapped_for_real_tools() {
         "text-encoded read_file must actually succeed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 11. Full flow (Sprint 30C.0.1): ResearchSubagent → main agent → explicit
+//     verification (cargo build + cargo test). Reproduces the real-provider
+//     smoke run: research gathers real evidence first, the main loop runs, and
+//     verification executes REAL build/test commands. The verification must
+//     pass for a genuinely valid crate even after research has run.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_research_then_main_then_verification_full_flow_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"vt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src").join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[cfg(test)]\nmod tests { #[test] fn ok() {} }\n",
+    )
+    .unwrap();
+
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            // Research iteration 1: read the library source.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Research final report.
+            "add() is defined in src/lib.rs and returns a + b.".to_string(),
+            // Main agent final answer (execution intent → verification runs).
+            "I added the function to the project.".to_string(),
+        ],
+    )));
+
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        research_enabled: true,
+        max_verification_revisions: Some(1),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a function to the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "full flow must succeed for a valid crate: {:?}",
+        result.error
+    );
+    let verification = result
+        .diagnostics
+        .verification
+        .expect("verification must run for an execution task");
+    assert!(
+        verification.steps.iter().all(|s| s.success),
+        "build and test must pass even after research ran: {:?}",
+        verification
+    );
+    // Research diagnostics were recorded and completed with a synthesis.
+    let research = result
+        .diagnostics
+        .research
+        .expect("research diagnostics recorded");
+    assert!(research.completed);
+    assert!(research.synthesis_complete);
+    let evs = events.lock().unwrap();
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, AgentEvent::AgentCompleted { .. })),
+        "main agent must complete the task"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. Verification decision is driven by the authoritative per-step exit
+//     codes, NOT by searching the command output text. A failing `cargo test`
+//     still prints "0 passed; 1 failed", so the old `contains("passed")`
+//     heuristic wrongly masked real failures. Regression test: a failing test
+//     must fail the task even though its output contains "passed".
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_verification_failure_with_passed_substring_is_not_masked() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"vf\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    // Compiles fine, but the single test always FAILS. The surfaced failure
+    // output deliberately contains the substring "passed" (the panic message),
+    // exactly like a real `cargo test` whose tail shows "0 passed; 1 failed".
+    std::fs::write(
+        dir.path().join("src").join("lib.rs"),
+        "pub fn f() -> i32 { 1 }\n#[cfg(test)]\nmod tests { #[test] fn always_fails() { panic!(\"passed and still failed\") } }\n",
+    )
+    .unwrap();
+
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Initial answer + one revision answer. The mock provider cannot fix the
+    // failing test, so verification keeps failing.
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec!["Done.".to_string(), "Tried to fix.".to_string()],
+    )));
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        max_verification_revisions: Some(1),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a function to the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        !result.success,
+        "a failing test must not be masked even though the output contains 'passed': {:?}",
+        result.error
+    );
+    let error = result.error.clone().unwrap_or_default();
+    assert!(
+        error.contains("Verification failed"),
+        "the task must report the verification failure, got: {}",
+        error
+    );
+    let verification = result
+        .diagnostics
+        .verification
+        .expect("verification must run");
+    assert!(
+        verification.steps.iter().any(|s| !s.success),
+        "the verification summary must record the real failure: {:?}",
+        verification
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13. Real-provider research smoke (Sprint 30C.0.1). Runs ONE short research
+//     task against the configured provider (AGNES), proving the full
+//     evidence-gathering → bounded synthesis → structured ResearchResult
+//     pipeline against a real LLM. Ignored by default because it makes a real
+//     network call with a real credential; run with:
+//     `cargo test --bin codebro real_provider_research_smoke -- --ignored --nocapture`
+//     The credential is read from the environment and never persisted.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn real_provider_research_smoke() {
+    let api_key = std::env::var("AGNES_API_KEY")
+        .ok()
+        .or_else(|| std::env::var("CODEBRO_API_KEY").ok());
+    let Some(api_key) = api_key else {
+        eprintln!("REAL PROVIDER: BLOCKED (no AGNES_API_KEY in environment)");
+        return;
+    };
+    let base_url = std::env::var("CODEBRO_BASE_URL")
+        .unwrap_or_else(|_| "https://apihub.agnes-ai.com/v1".to_string());
+    let model = std::env::var("CODEBRO_MODEL").unwrap_or_else(|_| "agnes-2.5-flash".to_string());
+
+    let config = Config {
+        provider: "openai".to_string(),
+        base_url,
+        model,
+        api_key: Some(api_key),
+    };
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let provider = Arc::new(crate::providers::OpenAiProvider::new(config.clone()));
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(config, &root).expect("runtime");
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(provider);
+
+    let task = "Research how src/canonical_runtime/mod.rs executes a tool call. Identify the relevant functions and inspect the minimum files necessary. Do not modify anything.";
+    let grounding = crate::agent::grounding::GroundingAssembler::new(&root).assemble_with_extras(
+        task,
+        &[],
+        &[],
+    );
+    let (_events, emit) = event_sink();
+    let result = runtime
+        .run_research_task(task, grounding, &emit, None)
+        .await
+        .expect("real-provider research must return a structured result");
+
+    println!("[real-provider] {}", result.summary_line());
+    println!(
+        "[real-provider] termination={} synthesis_complete={}",
+        result.termination, result.synthesis_complete
+    );
+    println!(
+        "[real-provider] files_inspected={:?}",
+        result.files_inspected
+    );
+    println!("[real-provider] symbols={:?}", result.symbols_found);
+    println!("[real-provider] render:\n{}", result.render());
+
+    // The acceptance contract: the session terminates bounded and, with the
+    // reserved synthesis call, the final report is actually produced.
+    assert!(
+        result.model_calls <= 6,
+        "model calls must stay bounded, got {}",
+        result.model_calls
+    );
+    assert!(
+        result.tool_calls <= 20,
+        "tool calls must stay bounded, got {}",
+        result.tool_calls
+    );
+    assert!(
+        result.synthesis_complete,
+        "synthesis must complete for a real provider"
+    );
+    assert!(result.termination.is_completed());
+}
