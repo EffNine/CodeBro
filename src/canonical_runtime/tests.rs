@@ -190,6 +190,114 @@ async fn test_project_identity_reaches_engineering_context() {
 }
 
 #[tokio::test]
+async fn test_coordinator_analysis_is_grounded_in_workspace() {
+    // CanonicalRuntime → observe → Coordinator → SubAgentContext → grounded
+    // report. The report must reference actual files/dependencies from the
+    // temp workspace (no index required: workspace-scan fallback).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\n[dependencies]\ntokio = \"1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/parser.rs"),
+        "pub fn parse_tool_calls() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/parser_tests.rs"),
+        "#[cfg(test)] mod tests { #[test] fn it_works() {} }\n",
+    )
+    .unwrap();
+
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    let (context, _compiled) = runtime
+        .compile_for_task("trace the parser module execution", no_conversation())
+        .await
+        .expect("compile");
+
+    let report = context
+        .context_fragments
+        .iter()
+        .find(|f| f.source == "agent_analysis")
+        .map(|f| f.content.clone())
+        .unwrap_or_default();
+
+    assert!(
+        !report.is_empty(),
+        "agent analysis report should be present"
+    );
+    assert!(
+        report.contains("src/parser.rs"),
+        "grounded report should reference the real parser file:\n{}",
+        report
+    );
+    assert!(
+        report.contains("tokio"),
+        "grounded report should reference a real manifest dependency:\n{}",
+        report
+    );
+    assert!(
+        report.contains("src/parser_tests.rs"),
+        "grounded report should reference the real test file:\n{}",
+        report
+    );
+}
+
+#[tokio::test]
+async fn test_coordinator_memory_entries_flow_into_subagent_context() {
+    // Engineering memory resolved by the runtime must reach the subagent
+    // context (memory_entries) and surface in the grounded report.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.register_provider(Arc::new(MockProvider::new("mock", Vec::new())));
+
+    {
+        let entry = crate::engineering_memory::EngineeringMemoryEntry::new(
+            "m1",
+            "ci",
+            "uses github actions",
+        )
+        .with_metadata(
+            crate::engineering_memory::types::EngineeringMemoryMetadata {
+                importance: 0.9,
+                confidence: 0.9,
+                tags: vec!["ci".to_string()],
+                source: Some("test".to_string()),
+            },
+        );
+        let mem = runtime.memory.as_mut().unwrap();
+        mem.record(entry).unwrap();
+        mem.persist().unwrap();
+    }
+
+    let (context, _compiled) = runtime
+        .compile_for_task("ci", no_conversation())
+        .await
+        .expect("compile");
+
+    let report = context
+        .context_fragments
+        .iter()
+        .find(|f| f.source == "agent_analysis")
+        .map(|f| f.content.clone())
+        .unwrap_or_default();
+
+    assert!(
+        report.contains("ci: uses github actions"),
+        "memory entry should reach the subagent report:\n{}",
+        report
+    );
+}
+
+#[tokio::test]
 async fn test_engineering_memory_reaches_engineering_context() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =

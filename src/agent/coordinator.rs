@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 
 use crate::agent::communication::MessageType;
 use crate::agent::events::AgentEvent;
+use crate::agent::grounding::{GroundedContext, GroundingAssembler};
 use crate::agent::recovery::RecoveryEngine;
 use crate::agent::router::TaskRouter;
 use crate::agent::status::AgentStatus;
@@ -210,6 +211,9 @@ impl AgentCoordinator {
     /// Orchestrates a full task through the router and subagents, emitting
     /// lifecycle events, populating a TaskGraph, and routing failures through
     /// the RecoveryEngine. Returns the aggregated subagent report.
+    ///
+    /// Grounded context is assembled from the workspace at `project_root`
+    /// (once) and shared by every subagent.
     pub async fn run_task(
         &mut self,
         task: &str,
@@ -227,6 +231,35 @@ impl AgentCoordinator {
         &mut self,
         task: &str,
         project_root: Option<&str>,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        agent_factory: &(dyn Fn(&str) -> Option<Box<dyn SubAgent>> + Send + Sync),
+    ) -> String {
+        let root = project_root.unwrap_or(".");
+        let grounded = GroundingAssembler::new(root).assemble(task);
+        self.run_task_grounded_with(task, grounded, emit, agent_factory)
+            .await
+    }
+
+    /// Orchestrates a task using a pre-assembled [`GroundedContext`] (the
+    /// canonical-runtime path, which assembles repository context once and
+    /// reuses it across every subagent).
+    pub async fn run_task_grounded(
+        &mut self,
+        task: &str,
+        grounded: GroundedContext,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) -> String {
+        let router = self.router.clone();
+        let factory = move |name: &str| router.get_agent(name);
+        self.run_task_grounded_with(task, grounded, emit, &factory)
+            .await
+    }
+
+    /// Core orchestration over a shared [`GroundedContext`].
+    async fn run_task_grounded_with(
+        &mut self,
+        task: &str,
+        grounded: GroundedContext,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
         agent_factory: &(dyn Fn(&str) -> Option<Box<dyn SubAgent>> + Send + Sync),
     ) -> String {
@@ -272,15 +305,7 @@ impl AgentCoordinator {
             let _ = self.spawn_agent(name, AgentRole::Main).await;
             let _ = self.assign_task(name, task, None).await;
 
-            let context = SubAgentContext {
-                task_description: task.to_string(),
-                project_root: project_root.unwrap_or(".").to_string(),
-                relevant_files: Vec::new(),
-                related_symbols: Vec::new(),
-                dependencies: Vec::new(),
-                previous_results: previous_results.clone(),
-                memory_entries: Vec::new(),
-            };
+            let context = grounded.to_subagent_context(previous_results.clone());
 
             emit(AgentEvent::AgentProgress {
                 agent: name.clone(),

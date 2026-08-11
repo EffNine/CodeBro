@@ -8,6 +8,40 @@ impl PlanningAgent {
         PlanningAgent
     }
 
+    /// Steps that reference actual repository entities from the grounded
+    /// context. Empty when the context carries no repository data.
+    fn grounded_steps(&self, context: &SubAgentContext) -> Vec<String> {
+        let mut steps = Vec::new();
+
+        for file in context.relevant_files.iter().take(4) {
+            steps.push(format!("Inspect {}", file));
+        }
+
+        for symbol in context.related_symbols.iter().take(4) {
+            steps.push(format!(
+                "Analyze {} to understand current behaviour",
+                symbol
+            ));
+        }
+
+        for test in context.test_files.iter().take(2) {
+            steps.push(format!("Add or extend regression coverage near {}", test));
+        }
+
+        if !context.dependencies.is_empty() {
+            steps.push(format!(
+                "Review dependency impact: {}",
+                context.dependencies.join(", ")
+            ));
+        }
+
+        if !context.build_info.is_empty() {
+            steps.push(format!("Validate with: {}", context.build_info));
+        }
+
+        steps
+    }
+
     fn breakdown_task(&self, context: &SubAgentContext) -> Vec<String> {
         let mut steps = Vec::new();
         let task = &context.task_description;
@@ -139,10 +173,17 @@ impl SubAgent for PlanningAgent {
         output.push(context.task_description.clone());
         output.push(String::new());
 
-        let steps = self.breakdown_task(context);
-        output.push("Execution Plan:".to_string());
-        for (i, step) in steps.iter().enumerate() {
-            output.push(format!("  {}. {}", i + 1, step));
+        let grounded = self.grounded_steps(context);
+        if grounded.is_empty() {
+            output.push("Execution Plan:".to_string());
+            for (i, step) in self.breakdown_task(context).iter().enumerate() {
+                output.push(format!("  {}. {}", i + 1, step));
+            }
+        } else {
+            output.push("Execution Plan (grounded in repository context):".to_string());
+            for (i, step) in grounded.iter().enumerate() {
+                output.push(format!("  {}. {}", i + 1, step));
+            }
         }
 
         output.push(String::new());
@@ -153,6 +194,17 @@ impl SubAgent for PlanningAgent {
         ));
         output.push(format!("  Dependencies: {}", context.dependencies.len()));
         output.push(format!("  Symbols: {}", context.related_symbols.len()));
+        for file in context.relevant_files.iter().take(6) {
+            output.push(format!("    - {}", file));
+        }
+
+        if !context.context_fragments.is_empty() {
+            output.push(String::new());
+            output.push("Context:".to_string());
+            for fragment in context.context_fragments.iter().take(6) {
+                output.push(format!("  - {}", fragment));
+            }
+        }
 
         let risks = self.identify_risks(context);
         if !risks.is_empty() {

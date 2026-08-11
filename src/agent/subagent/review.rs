@@ -27,6 +27,67 @@ impl ReviewAgent {
 
         checks
     }
+
+    /// Grounded review findings referencing actual repository entities.
+    fn grounded_review(&self, context: &SubAgentContext) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        lines.push("Review Findings".to_string());
+        lines.push("File:".to_string());
+        for file in context.relevant_files.iter().take(6) {
+            lines.push(format!("  - {}", file));
+        }
+        if context.relevant_files.is_empty() {
+            lines.push("  - (no repository files resolved)".to_string());
+        }
+
+        lines.push(String::new());
+        lines.push("Relevant symbol:".to_string());
+        for symbol in context.related_symbols.iter().take(6) {
+            lines.push(format!("  - {}", symbol));
+        }
+        if context.related_symbols.is_empty() {
+            lines.push("  - (none resolved from the index)".to_string());
+        }
+
+        lines.push(String::new());
+        lines.push("Dependency concerns:".to_string());
+        for dep in context.dependencies.iter().take(6) {
+            lines.push(format!("  - {}", dep));
+        }
+        if context.dependencies.is_empty() {
+            lines.push("  - (no manifest dependencies resolved)".to_string());
+        }
+
+        lines.push(String::new());
+        lines.push("Coupling and regression points:".to_string());
+        for file in context.relevant_files.iter().take(4) {
+            lines.push(format!(
+                "  - changes touching {} may affect its dependents",
+                file
+            ));
+        }
+        for symbol in context.related_symbols.iter().take(4) {
+            lines.push(format!(
+                "  - {} is likely exercised by existing callers",
+                symbol
+            ));
+        }
+        if context.relevant_files.is_empty() && context.related_symbols.is_empty() {
+            lines.push("  - (no coupling evidence in the current context)".to_string());
+        }
+
+        lines.push(String::new());
+        lines.push("Existing tests:".to_string());
+        for test in context.test_files.iter().take(4) {
+            lines.push(format!("  - {}", test));
+        }
+        if context.test_files.is_empty() {
+            lines.push("  - (no existing test files identified)".to_string());
+        }
+
+        lines
+    }
 }
 
 impl SubAgent for ReviewAgent {
@@ -108,6 +169,9 @@ impl SubAgent for ReviewAgent {
             output.push(format!("  - {}", file));
             tools_used.push("read_file".to_string());
         }
+
+        output.push(String::new());
+        output.extend(self.grounded_review(context));
 
         let issues = self.analyze_code_quality(context);
         output.push(String::new());

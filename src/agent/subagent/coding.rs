@@ -37,6 +37,70 @@ impl CodingAgent {
 
         concerns
     }
+
+    /// A grounded implementation strategy referencing actual target files and
+    /// symbols. The coding subagent remains analysis-only (Sprint 30B).
+    fn grounded_strategy(&self, context: &SubAgentContext) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        lines.push("Target:".to_string());
+        for file in context.relevant_files.iter().take(6) {
+            lines.push(format!("  - {}", file));
+        }
+        if context.relevant_files.is_empty() {
+            lines.push("  - (no repository files resolved)".to_string());
+        }
+
+        lines.push(String::new());
+        lines.push("Existing implementation:".to_string());
+        for symbol in context.related_symbols.iter().take(6) {
+            lines.push(format!("  - {}", symbol));
+        }
+        if context.related_symbols.is_empty() {
+            lines.push(
+                "  - (no symbols resolved from the index; inspect the target files directly)"
+                    .to_string(),
+            );
+        }
+
+        lines.push(String::new());
+        lines.push("Required change:".to_string());
+        lines.push(format!(
+            "  Apply a {} to the task.",
+            self.determine_edit_strategy(context)
+        ));
+
+        lines.push(String::new());
+        lines.push("Potential affected symbols:".to_string());
+        for symbol in context.related_symbols.iter().take(6) {
+            lines.push(format!("  - {}", symbol));
+        }
+        if context.related_symbols.is_empty() {
+            lines.push("  - (none resolved)".to_string());
+        }
+
+        lines.push(String::new());
+        lines.push("Relevant tests:".to_string());
+        for test in context.test_files.iter().take(4) {
+            lines.push(format!("  - {}", test));
+        }
+        if context.test_files.is_empty() {
+            lines.push("  - (no existing test files identified)".to_string());
+        }
+
+        let concerns = self.validate_edit_safety(context);
+        lines.push(String::new());
+        lines.push("Risk:".to_string());
+        if concerns.is_empty() {
+            lines.push("  - (no safety concerns flagged)".to_string());
+        } else {
+            for concern in &concerns {
+                lines.push(format!("  - {}", concern));
+            }
+        }
+
+        lines
+    }
 }
 
 impl SubAgent for CodingAgent {
@@ -113,7 +177,6 @@ impl SubAgent for CodingAgent {
         let mut recommendations = Vec::new();
 
         let strategy = self.determine_edit_strategy(context);
-        let concerns = self.validate_edit_safety(context);
 
         output.push("Coding Phase".to_string());
         output.push(format!("Strategy: {}", strategy));
@@ -123,21 +186,18 @@ impl SubAgent for CodingAgent {
         output.push(context.task_description.clone());
         output.push(String::new());
 
-        if !concerns.is_empty() {
-            output.push("Safety Concerns:".to_string());
-            for concern in &concerns {
-                output.push(format!("  - {}", concern));
-            }
-            output.push(String::new());
-        }
+        output.push("Implementation Strategy:".to_string());
+        output.extend(self.grounded_strategy(context));
 
+        output.push(String::new());
         output.push("Target Files:".to_string());
         for file in &context.relevant_files {
             output.push(format!("  - {}", file));
             files_modified.push(file.clone());
+            tools_used.push("read_file".to_string());
         }
-        output.push(String::new());
 
+        output.push(String::new());
         output.push("Implementation Approach:".to_string());
         match strategy.as_str() {
             "incremental_refactor" => {

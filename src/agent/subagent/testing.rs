@@ -25,6 +25,44 @@ impl TestingAgent {
     fn identify_test_targets(&self, context: &SubAgentContext) -> Vec<String> {
         context.related_symbols.clone()
     }
+
+    /// A grounded testing strategy referencing actual test files and the
+    /// project's validation command.
+    fn grounded_test_plan(&self, context: &SubAgentContext) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        lines.push("Existing tests:".to_string());
+        for test in context.test_files.iter().take(6) {
+            lines.push(format!("  - {}", test));
+        }
+        if context.test_files.is_empty() {
+            lines.push("  - (no existing test files identified)".to_string());
+        }
+
+        lines.push(String::new());
+        lines.push("Recommended tests:".to_string());
+        for symbol in context.related_symbols.iter().take(5) {
+            lines.push(format!("  - add a unit test exercising {}", symbol));
+        }
+        if context.related_symbols.is_empty() {
+            lines.push("  - add a new test module alongside the target source files".to_string());
+        }
+        if !context.test_files.is_empty() {
+            lines.push(
+                "  - add regression coverage to the existing test modules listed above".to_string(),
+            );
+        }
+
+        lines.push(String::new());
+        lines.push("Validation:".to_string());
+        if context.build_info.is_empty() {
+            lines.push("  - cargo test".to_string());
+        } else {
+            lines.push(format!("  - {}", context.build_info));
+        }
+
+        lines
+    }
 }
 
 impl SubAgent for TestingAgent {
@@ -110,6 +148,9 @@ impl SubAgent for TestingAgent {
         for target in &targets {
             output.push(format!("  - {}", target));
         }
+
+        output.push(String::new());
+        output.extend(self.grounded_test_plan(context));
 
         output.push(String::new());
         output.push("Test Plan:".to_string());

@@ -18,6 +18,16 @@ pub struct SubAgentContext {
     pub dependencies: Vec<String>,
     pub previous_results: Vec<SubAgentResult>,
     pub memory_entries: Vec<String>,
+    // Grounded context (Sprint 30B): populated from real workspace / index
+    // / memory data so subagents reason about actual repository entities.
+    pub project_name: String,
+    pub project_language: String,
+    pub workspace_summary: String,
+    pub git_state: String,
+    pub build_info: String,
+    pub test_files: Vec<String>,
+    pub tool_observations: Vec<String>,
+    pub context_fragments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

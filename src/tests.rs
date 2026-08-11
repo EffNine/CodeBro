@@ -2749,6 +2749,67 @@ async fn test_coordinator_report_contains_all_phases() {
     }
 }
 
+#[tokio::test]
+async fn test_coordinator_report_is_grounded_in_repository() {
+    let mut coordinator = crate::agent::AgentCoordinator::new(6);
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ev = events.clone();
+    let emit = move |e: crate::agent::AgentEvent| ev.lock().unwrap().push(e);
+
+    // Task deliberately targets the canonical runtime so the workspace scan
+    // must surface the real file in the research findings.
+    let report = coordinator
+        .run_task("trace the canonical runtime execution", None, &emit)
+        .await;
+
+    assert!(
+        report.contains("src/canonical_runtime/mod.rs"),
+        "grounded report must reference the real runtime file:\n{}",
+        report
+    );
+    assert!(
+        report.contains("Cargo.toml") || report.contains("cargo"),
+        "grounded report must reference real build/project info:\n{}",
+        report
+    );
+}
+
+#[tokio::test]
+async fn test_coordinator_grounded_context_reaches_every_subagent() {
+    use crate::agent::grounding::GroundingAssembler;
+
+    let mut coordinator = crate::agent::AgentCoordinator::new(6);
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ev = events.clone();
+    let emit = move |e: crate::agent::AgentEvent| ev.lock().unwrap().push(e);
+
+    let grounded = GroundingAssembler::new(".").assemble("trace the canonical runtime execution");
+    assert!(
+        grounded
+            .relevant_files
+            .iter()
+            .any(|f| f.contains("canonical_runtime")),
+        "grounded context should contain the runtime file: {:?}",
+        grounded.relevant_files
+    );
+
+    let report = coordinator
+        .run_task_grounded("trace the canonical runtime execution", grounded, &emit)
+        .await;
+
+    // The same grounded context flows into research, planning and coding.
+    assert!(
+        report.contains("src/canonical_runtime/mod.rs"),
+        "research should surface the grounded file:\n{}",
+        report
+    );
+    assert!(
+        report.contains("Execution Plan (grounded"),
+        "planning should use the grounded plan:\n{}",
+        report
+    );
+}
+
 // ===== Model Picker Tests =====
 
 #[test]

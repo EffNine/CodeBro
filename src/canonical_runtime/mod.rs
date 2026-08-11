@@ -464,7 +464,12 @@ impl CanonicalRuntime {
 
         // Context assembly + observe + reason.
         let t = Instant::now();
-        let (assembly, report) = match self.observe(req).await {
+        let memory_entries: Vec<String> = memory_ctx
+            .entries
+            .iter()
+            .map(|e| format!("{}: {}", e.key, e.value))
+            .collect();
+        let (assembly, report) = match self.observe(req, &memory_entries).await {
             Ok(assembled) => assembled,
             Err(e) => return self.fail(req, Some(&mut graph), &root_id, e, diag, started),
         };
@@ -647,7 +652,12 @@ impl CanonicalRuntime {
         };
         let keywords = extract_keywords(task);
         let memory_ctx = self.resolve_memory(&keywords, &[]);
-        let (assembly, report) = self.observe(&req).await?;
+        let memory_entries: Vec<String> = memory_ctx
+            .entries
+            .iter()
+            .map(|e| format!("{}: {}", e.key, e.value))
+            .collect();
+        let (assembly, report) = self.observe(&req, &memory_entries).await?;
         let context = self.build_context(&req, &identity, memory_ctx, assembly, report)?;
         let compiled = self.prompt_builder.compile_context(&context);
         Ok((context, compiled))
@@ -662,6 +672,7 @@ impl CanonicalRuntime {
     async fn observe(
         &self,
         req: &TaskRequest<'_>,
+        memory_entries: &[String],
     ) -> std::result::Result<(ContextAssemblyResult, String), String> {
         // Observe: ground truth via the existing tool pipeline.
         let mut tool_frags = Vec::new();
@@ -711,6 +722,7 @@ impl CanonicalRuntime {
         // Canonical context assembly. The request is scoped and dropped before
         // the coordinator await so non-`Send` runtime handles (e.g. the
         // rusqlite-backed indexer) never live across a suspension point.
+        let tool_observations: Vec<String> = tool_frags.iter().map(|f| f.content.clone()).collect();
         let assembly = {
             let mut request = ContextAssemblyRequest::new(req.task.to_string());
 
@@ -738,14 +750,15 @@ impl CanonicalRuntime {
                 .map_err(|e| format!("Context assembly failed: {e}"))?
         };
 
-        // Reason: existing coordinator produces a plan/analysis report.
+        // Reason: existing coordinator produces a grounded plan/analysis report.
+        // Grounding is assembled once from the workspace/index and shared by
+        // every subagent.
         (req.emit)(AgentEvent::AgentStatusChanged {
             agent: "main".to_string(),
             status: AgentStatus::Planning,
         });
         let report = {
             let mut coordinator = AgentCoordinator::new(6);
-            let root_str = self.workspace_root.to_string_lossy().to_string();
             let coord_emit = |e: AgentEvent| {
                 // The runtime owns the task lifecycle graph; suppress the
                 // coordinator's internal sub-agent graph updates.
@@ -753,8 +766,10 @@ impl CanonicalRuntime {
                     (req.emit)(e);
                 }
             };
+            let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
+                .assemble_with_extras(req.task, &tool_observations, memory_entries);
             coordinator
-                .run_task(req.task, Some(&root_str), &coord_emit)
+                .run_task_grounded(req.task, grounded, &coord_emit)
                 .await
         };
 

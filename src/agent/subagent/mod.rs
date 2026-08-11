@@ -6,6 +6,9 @@ pub mod review;
 pub mod testing;
 pub mod trait_agent;
 
+#[cfg(test)]
+mod tests;
+
 pub use coding::CodingAgent;
 pub use planning::PlanningAgent;
 pub use research::ResearchAgent;

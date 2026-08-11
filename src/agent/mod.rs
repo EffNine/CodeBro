@@ -5,6 +5,7 @@ pub mod coordinator;
 pub mod decision;
 pub mod events;
 pub mod experience;
+pub mod grounding;
 pub mod memory;
 pub mod memory_manager;
 pub mod performance;
@@ -39,6 +40,8 @@ pub use events::{AgentEvent, AgentEventBus, EventHistory, EventSubscriber};
 pub use experience::{
     Experience, ExperienceContext, ExperienceReplay, ExperienceResult, ExperienceStatistics,
 };
+#[allow(unused_imports)]
+pub use grounding::{GroundedContext, GroundingAssembler};
 pub use memory::Memory;
 #[allow(unused_imports)]
 pub use memory_manager::MemoryConsolidationEngine;

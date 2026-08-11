@@ -1,4 +1,5 @@
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
+use crate::agent::grounding::truncate_for_summary;
 use crate::agent::subagent::{SubAgent, SubAgentCapability, SubAgentContext, SubAgentResult};
 
 pub struct ResearchAgent;
@@ -88,12 +89,21 @@ impl SubAgent for ResearchAgent {
         let errors = Vec::new();
         let mut recommendations = Vec::new();
 
-        findings.push("Research Phase".to_string());
+        findings.push("Research Findings".to_string());
         findings.push("Task:".to_string());
         findings.push(context.task_description.clone());
         findings.push(String::new());
 
-        findings.push("Files Inspected:".to_string());
+        if !context.project_name.is_empty() {
+            findings.push("Project:".to_string());
+            findings.push(format!("  {}", context.project_name));
+            if !context.project_language.is_empty() {
+                findings.push(format!("  Language: {}", context.project_language));
+            }
+            findings.push(String::new());
+        }
+
+        findings.push("Relevant files:".to_string());
         for file in self.file_inspection(context) {
             findings.push(format!("  - {}", file));
             files_inspected.push(file);
@@ -101,32 +111,60 @@ impl SubAgent for ResearchAgent {
         }
 
         findings.push(String::new());
-        findings.push("Symbols Found:".to_string());
+        findings.push("Relevant symbols:".to_string());
         for symbol in self.semantic_search(context) {
             findings.push(format!("  - {}", symbol));
         }
 
         findings.push(String::new());
-        findings.push("Dependencies:".to_string());
+        findings.push("Relevant dependencies:".to_string());
         for dep in self.dependency_analysis(context) {
             findings.push(format!("  - {}", dep));
         }
 
-        findings.push(String::new());
-        findings.push("Analysis:".to_string());
-        findings.push(format!(
-            "Found {} relevant files and {} symbols related to the task.",
-            files_inspected.len(),
-            context.related_symbols.len()
-        ));
-
-        if files_inspected.len() > 5 {
-            recommendations.push("Consider narrowing the search scope".to_string());
+        if !context.test_files.is_empty() {
+            findings.push(String::new());
+            findings.push("Related tests:".to_string());
+            for test in &context.test_files {
+                findings.push(format!("  - {}", test));
+            }
         }
 
-        if context.related_symbols.is_empty() {
-            recommendations
-                .push("No related symbols found. Consider expanding search terms".to_string());
+        if !context.tool_observations.is_empty() {
+            findings.push(String::new());
+            findings.push("Tool observations:".to_string());
+            for obs in &context.tool_observations {
+                findings.push(format!("  - {}", truncate_for_summary(obs, 300)));
+            }
+        }
+
+        if !context.memory_entries.is_empty() {
+            findings.push(String::new());
+            findings.push("Engineering memory:".to_string());
+            for entry in &context.memory_entries {
+                findings.push(format!("  - {}", truncate_for_summary(entry, 300)));
+            }
+        }
+
+        findings.push(String::new());
+        findings.push("Analysis:".to_string());
+        if files_inspected.is_empty() {
+            findings.push(
+                "No repository files matched the task terms; inspect the workspace directly."
+                    .to_string(),
+            );
+            recommendations.push("Inspect the workspace to identify relevant modules".to_string());
+        } else {
+            findings.push(format!(
+                "Found {} relevant files, {} symbols and {} dependencies related to the task.",
+                files_inspected.len(),
+                context.related_symbols.len(),
+                context.dependencies.len()
+            ));
+            findings.push("Useful existing implementations:".to_string());
+            for (i, file) in files_inspected.iter().take(5).enumerate() {
+                findings.push(format!("  {}. {}", i + 1, file));
+            }
         }
 
         if !context.dependencies.is_empty() {
@@ -134,6 +172,17 @@ impl SubAgent for ResearchAgent {
                 "Found {} dependencies. Consider reviewing them for potential impacts.",
                 context.dependencies.len()
             ));
+        }
+
+        if files_inspected.len() > 5 {
+            recommendations.push("Consider narrowing the search scope".to_string());
+        }
+
+        if context.related_symbols.is_empty() {
+            recommendations.push(
+                "No related symbols resolved from the index. Consider building .codebro/index.db"
+                    .to_string(),
+            );
         }
 
         let duration = start.elapsed();
