@@ -151,6 +151,11 @@ pub struct TaskOptions {
     /// (Sprint 30C) before the main execution loop and injects the
     /// evidence-backed result into the main LLM context. Defaults to false.
     pub research_enabled: bool,
+    /// When true, the coordinator runs the autonomous Testing subagent
+    /// (Sprint 30D) before the main execution loop and injects its
+    /// authoritative command evidence (exit codes) into the main LLM context.
+    /// Defaults to false.
+    pub testing_enabled: bool,
 }
 
 /// The outcome of a directly-invoked streaming tool run (shell commands,
@@ -523,6 +528,43 @@ impl CanonicalRuntime {
             }
         }
 
+        // Autonomous Testing (Sprint 30D): when enabled, run the policy-checked
+        // Testing subagent over the grounded context and inject its
+        // authoritative command evidence (real exit codes) into the context
+        // that reaches the main LLM. Failure is isolated: a testing error
+        // never crashes the main task.
+        if opts.testing_enabled {
+            let testing = self
+                .run_autonomous_testing(req, &memory_entries, &opts)
+                .await;
+            match testing {
+                Ok(result) => {
+                    let render = result.render();
+                    diag.testing = Some(
+                        crate::canonical_runtime::diagnostics::TestingDiagnostics::from(result),
+                    );
+                    context = extend_context(
+                        context,
+                        vec![ContextFragment {
+                            source: "testing".to_string(),
+                            content: render,
+                            relevance_score: 0.85,
+                        }],
+                    );
+                    diag.context_fragments = context.fragment_count();
+                }
+                Err(e) => {
+                    // Failure isolation: the main task continues with the
+                    // existing context. The failure is observable but not
+                    // fatal.
+                    (req.emit)(AgentEvent::Log {
+                        level: "pipeline".to_string(),
+                        message: format!("Testing subagent failed (continuing without it): {e}"),
+                    });
+                }
+            }
+        }
+
         // Canonical prompt compilation.
         let t = Instant::now();
         let compiled = self.prompt_builder.compile_context(&context);
@@ -769,10 +811,69 @@ impl CanonicalRuntime {
         Ok((context, compiled))
     }
 
+    /// Compile-only mode that also runs the autonomous Testing subagent and
+    /// injects its result into the compiled prompt. Used by the Sprint 30D
+    /// parent-integration test: proves TestingResult → ContextFragment →
+    /// compiled main prompt.
+    pub async fn compile_for_task_with_testing(
+        &mut self,
+        task: &str,
+        conversation: Vec<ConversationMessage>,
+    ) -> std::result::Result<(EngineeringContext, CompiledPrompt), String> {
+        let noop_emit = |_: AgentEvent| {};
+        let noop_chunk = |_: &str| {};
+        let req = TaskRequest {
+            task,
+            conversation,
+            emit: &noop_emit,
+            on_chunk: &noop_chunk,
+        };
+
+        let identity = if self.identity.is_loaded() {
+            self.identity.snapshot()
+        } else {
+            ProjectIdentity::new("unknown", "unknown")
+        };
+        let keywords = extract_keywords(task);
+        let memory_ctx = self.resolve_memory(&keywords, &[]);
+        let memory_entries: Vec<String> = memory_ctx
+            .entries
+            .iter()
+            .map(|e| format!("{}: {}", e.key, e.value))
+            .collect();
+        let (assembly, report) = self.observe(&req, &memory_entries).await?;
+        let mut context = self.build_context(&req, &identity, memory_ctx, assembly, report)?;
+
+        // Assemble grounding once and run the autonomous testing subagent.
+        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
+            .assemble_with_extras(task, &[], &memory_entries);
+        match self
+            .run_testing_task(task, grounded, &noop_emit, None)
+            .await
+        {
+            Ok(result) => {
+                let render = result.render();
+                context = extend_context(
+                    context,
+                    vec![ContextFragment {
+                        source: "testing".to_string(),
+                        content: render,
+                        relevance_score: 0.85,
+                    }],
+                );
+            }
+            Err(e) => {
+                return Err(format!("Autonomous testing failed: {e}"));
+            }
+        }
+
+        let compiled = self.prompt_builder.compile_context(&context);
+        Ok((context, compiled))
+    }
+
     // =====================================================================
     // Autonomous Research (Sprint 30C)
     // =====================================================================
-
     /// Run the autonomous Research subagent over a grounded context using the
     /// runtime's shared provider state and a restricted read-only tool
     /// registry. Returns the structured, evidence-backed [`ResearchResult`].
@@ -808,6 +909,70 @@ impl CanonicalRuntime {
             .assemble_with_extras(req.task, &[], memory_entries);
         let cancel = opts.cancel.clone();
         self.run_research_task(req.task, grounded, req.emit, cancel)
+            .await
+    }
+
+    // =====================================================================
+    // Autonomous Testing (Sprint 30D)
+    // =====================================================================
+
+    /// Run the autonomous Testing subagent over a grounded context using the
+    /// runtime's shared provider state and a restricted, policy-checked tool
+    /// registry. Returns the structured, machine-fact `TestingResult`.
+    pub async fn run_testing_task(
+        &self,
+        task: &str,
+        grounding: GroundedContext,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        cancel: Option<crate::cancellation::CancellationToken>,
+    ) -> std::result::Result<crate::testing::TestingResult, String> {
+        self.run_testing_task_with_limits(
+            task,
+            grounding,
+            crate::testing::TestingLimits::default(),
+            emit,
+            cancel,
+        )
+        .await
+    }
+
+    /// Run the autonomous Testing subagent with explicit session limits (the
+    /// real-provider smoke uses a larger budget than the conservative default).
+    pub async fn run_testing_task_with_limits(
+        &self,
+        task: &str,
+        grounding: GroundedContext,
+        limits: crate::testing::TestingLimits,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        cancel: Option<crate::cancellation::CancellationToken>,
+    ) -> std::result::Result<crate::testing::TestingResult, String> {
+        let tooling =
+            crate::testing::TestingTooling::new(&self.workspace_root, limits.command_timeout_secs);
+        let mut subagent = crate::testing::TestingSubagent::new(
+            self.provider_runtime.clone(),
+            self.router.clone(),
+            self.io_providers.clone(),
+            tooling,
+        );
+        let request = crate::testing::TestingRequest::new(task, self.workspace_root.clone())
+            .with_grounding(grounding)
+            .with_limits(limits);
+        Ok(subagent.run(request, emit, cancel).await)
+    }
+
+    /// Run the autonomous testing subagent inside the canonical task pipeline
+    /// (used by `run_task_with_options`). Bounded by the task deadline and the
+    /// testing limits; failure is isolated and reported as an error result.
+    async fn run_autonomous_testing(
+        &self,
+        req: &TaskRequest<'_>,
+        memory_entries: &[String],
+        opts: &TaskOptions,
+    ) -> std::result::Result<crate::testing::TestingResult, String> {
+        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
+            .assemble_with_extras(req.task, &[], memory_entries);
+        let cancel = opts.cancel.clone();
+        self.run_testing_task(req.task, grounded, req.emit, cancel)
             .await
     }
 

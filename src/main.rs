@@ -38,6 +38,7 @@ mod scanner;
 mod service_registry;
 mod session;
 mod settings;
+mod testing;
 mod tests;
 mod tools;
 mod tui;

@@ -85,6 +85,8 @@ pub struct TaskDiagnostics {
     pub verification: Option<super::VerificationSummary>,
     /// Autonomous research diagnostics (Sprint 30C), when research ran.
     pub research: Option<ResearchDiagnostics>,
+    /// Autonomous testing diagnostics (Sprint 30D), when testing ran.
+    pub testing: Option<TestingDiagnostics>,
 }
 
 impl TaskDiagnostics {
@@ -134,6 +136,59 @@ impl From<crate::research::ResearchResult> for ResearchDiagnostics {
             symbols_found: result.symbols_found.len(),
             duration_ms: result.duration_ms,
             provider: result.provider,
+            error: result.limitations.first().cloned(),
+        }
+    }
+}
+
+/// Observational diagnostics for one autonomous Testing session (Sprint 30D).
+#[derive(Debug, Clone, Default)]
+pub struct TestingDiagnostics {
+    /// Whether testing produced a usable result.
+    pub completed: bool,
+    /// Whether the final prose synthesis was produced.
+    pub synthesis_complete: bool,
+    /// Why testing terminated (completed / iteration_limit / tool_limit /
+    /// model_limit / timeout / cancelled / error).
+    pub termination: String,
+    /// Number of reasoning iterations.
+    pub iterations: usize,
+    /// Number of real tool calls executed.
+    pub tool_calls: usize,
+    /// Number of model (provider) calls.
+    pub model_calls: usize,
+    /// Number of validation commands executed.
+    pub commands_run: usize,
+    /// Number of validation failures.
+    pub failures: usize,
+    /// Number of files inspected.
+    pub files_inspected: usize,
+    /// Testing duration in milliseconds.
+    pub duration_ms: u64,
+    /// Provider that executed the testing.
+    pub provider: String,
+    /// Whether the git tracked tree was left unchanged after testing.
+    pub git_tree_unchanged: bool,
+    /// Error message when testing failed.
+    pub error: Option<String>,
+}
+
+impl From<crate::testing::TestingResult> for TestingDiagnostics {
+    fn from(result: crate::testing::TestingResult) -> Self {
+        let git_tree_unchanged = result.git_tree_unchanged();
+        TestingDiagnostics {
+            completed: result.termination.is_completed(),
+            synthesis_complete: result.synthesis_complete,
+            termination: result.termination.to_string(),
+            iterations: result.iterations,
+            tool_calls: result.tool_calls,
+            model_calls: result.model_calls,
+            commands_run: result.commands_run.len(),
+            failures: result.failures.len(),
+            files_inspected: result.files_inspected.len(),
+            duration_ms: result.duration_ms,
+            provider: result.provider,
+            git_tree_unchanged,
             error: result.limitations.first().cloned(),
         }
     }

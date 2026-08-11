@@ -4077,3 +4077,366 @@ async fn real_provider_research_smoke() {
     );
     assert!(result.termination.is_completed());
 }
+
+// =========================================================================
+// Sprint 30D — Autonomous Testing Subagent (parent integration)
+// =========================================================================
+
+/// A fixture crate that COMPILES so the Testing subagent can run real
+/// validation commands against it. `target/` and `Cargo.lock` are gitignored
+/// so normal build artifacts never surface in the git state.
+fn testing_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"vt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "target/\nCargo.lock\n").unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[cfg(test)]\nmod tests { #[test] fn ok() {} }\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// TestingResult → ContextFragment → compiled main prompt.
+#[tokio::test]
+async fn test_testing_result_reaches_compiled_prompt() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            r#"<invoke name="run_command">{"command": "cargo check"}</invoke>"#.to_string(),
+            "cargo check passed with exit code 0.".to_string(),
+        ],
+    )));
+
+    let (context, compiled) = runtime
+        .compile_for_task_with_testing("validate the crate", no_conversation())
+        .await
+        .expect("compile with testing");
+
+    // TestingResult became a `testing` ContextFragment.
+    let fragment = context
+        .context_fragments
+        .iter()
+        .find(|f| f.source == "testing")
+        .map(|f| f.content.clone())
+        .unwrap_or_default();
+    assert!(
+        fragment.contains("Autonomous Testing Findings"),
+        "testing fragment must carry the rendered result:\n{}",
+        fragment
+    );
+    // The fragment carried authoritative machine facts from a REAL cargo check.
+    assert!(
+        fragment.contains("exit_code: 0"),
+        "testing fragment must carry the authoritative exit code:\n{}",
+        fragment
+    );
+
+    // The compiled main prompt contains the testing fragment.
+    assert!(
+        compiled.prompt.contains("--- testing () ---"),
+        "prompt must render the testing fragment:\n{}",
+        compiled.prompt
+    );
+    assert!(
+        compiled.prompt.contains("Autonomous Testing Findings"),
+        "prompt must contain the testing rendering"
+    );
+    assert!(
+        compiled.prompt.contains("exit_code: 0"),
+        "prompt must contain the authoritative command evidence"
+    );
+}
+
+/// Full chain: TestingResult → ContextFragment → PromptBuilder → main
+/// provider. The main provider's prompt must contain the authoritative command
+/// evidence (real exit codes).
+#[tokio::test]
+async fn test_testing_result_reaches_main_provider_prompt() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec![
+            // Testing iteration 1: run cargo check.
+            r#"<invoke name="run_command">{"command": "cargo check"}</invoke>"#.to_string(),
+            // Testing final answer.
+            "cargo check passed with exit code 0.".to_string(),
+            // Main loop answer.
+            "main task complete.".to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        testing_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "validate the crate",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "main task must succeed with testing enabled: {:?}",
+        result.error
+    );
+    assert!(result.response.contains("main task complete"));
+
+    // The main provider's prompt (the LAST recorded prompt) contains the
+    // testing fragment with the authoritative command evidence.
+    let prompts = provider.all_prompts();
+    assert_eq!(prompts.len(), 3, "2 testing calls + 1 main call");
+    let main_prompt = prompts.last().expect("main prompt present");
+    assert!(
+        main_prompt.contains("--- testing () ---"),
+        "main prompt must contain the testing fragment:\n{}",
+        main_prompt
+    );
+    assert!(
+        main_prompt.contains("Autonomous Testing Findings"),
+        "main prompt must contain the testing rendering"
+    );
+    assert!(
+        main_prompt.contains("exit_code: 0"),
+        "main prompt must contain the authoritative exit code evidence"
+    );
+
+    // Testing diagnostics were captured.
+    let testing = result
+        .diagnostics
+        .testing
+        .expect("testing diagnostics recorded");
+    assert!(testing.completed);
+    assert_eq!(testing.commands_run, 1);
+    assert_eq!(testing.failures, 0);
+    assert!(testing.git_tree_unchanged);
+}
+
+/// A testing session that terminates abnormally (budget exhausted) must NOT
+/// crash or block the main task: the main agent continues and completes.
+#[tokio::test]
+async fn test_testing_failure_is_isolated_from_main_task() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Testing keeps requesting commands until its model-call budget (6) is
+    // exhausted (the reserved synthesis call also asks for a command); the
+    // final response is the main agent's answer.
+    let mut responses: Vec<String> = (0..6)
+        .map(|_| r#"<invoke name="run_command">{"command": "true"}</invoke>"#.to_string())
+        .collect();
+    responses.push("main answer after failed testing".to_string());
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new("mock", responses)));
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        testing_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "validate the crate",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    // The main task still succeeds despite testing exhausting its budget.
+    assert!(
+        result.success,
+        "main task must survive testing failure: {:?}",
+        result.error
+    );
+    assert!(result.response.contains("main answer after failed testing"));
+    let testing = result
+        .diagnostics
+        .testing
+        .expect("testing diagnostics recorded");
+    assert_eq!(
+        testing.termination, "model_limit",
+        "testing must terminate abnormally (bounded error result)"
+    );
+    assert!(!testing.completed);
+}
+
+/// Full flow (Sprint 30D): TestingSubagent → main agent → explicit
+/// verification. Testing runs a REAL cargo check first, then the main loop
+/// runs, and the task-level verification (cargo build + cargo test) must still
+/// pass for a genuinely valid crate. This mirrors the research-then-verification
+/// full-flow test.
+#[tokio::test]
+async fn test_testing_then_main_then_verification_full_flow_passes() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            // Testing iteration 1: run cargo check.
+            r#"<invoke name="run_command">{"command": "cargo check"}</invoke>"#.to_string(),
+            // Testing final report.
+            "cargo check passes for the crate.".to_string(),
+            // Main agent final answer (execution intent → verification runs).
+            "I added the function to the project.".to_string(),
+        ],
+    )));
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        testing_enabled: true,
+        max_verification_revisions: Some(1),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a function to the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "full flow must succeed for a valid crate: {:?}",
+        result.error
+    );
+    let verification = result
+        .diagnostics
+        .verification
+        .expect("verification must run for an execution task");
+    assert!(
+        verification.steps.iter().all(|s| s.success),
+        "build and test must pass even after testing ran: {:?}",
+        verification
+    );
+    let testing = result
+        .diagnostics
+        .testing
+        .expect("testing diagnostics recorded");
+    assert!(testing.completed);
+    assert!(testing.synthesis_complete);
+    assert!(testing.git_tree_unchanged);
+}
+
+// ---------------------------------------------------------------------------
+// Real-provider testing smoke (Sprint 30D). Runs ONE bounded validation task
+// against the configured provider (AGNES), proving the full
+// decide → execute → authoritative exit code → observe → synthesize →
+// TestingResult pipeline against a real LLM. Ignored by default because it
+// makes a real network call with a real credential; run with:
+// `cargo test --bin codebro real_provider_testing_smoke -- --ignored --nocapture`
+// The credential is read from the environment and never persisted.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn real_provider_testing_smoke() {
+    let api_key = std::env::var("AGNES_API_KEY")
+        .ok()
+        .or_else(|| std::env::var("CODEBRO_API_KEY").ok());
+    let Some(api_key) = api_key else {
+        eprintln!("REAL PROVIDER: BLOCKED (no AGNES_API_KEY in environment)");
+        return;
+    };
+    let base_url = std::env::var("CODEBRO_BASE_URL")
+        .unwrap_or_else(|_| "https://apihub.agnes-ai.com/v1".to_string());
+    let model = std::env::var("CODEBRO_MODEL").unwrap_or_else(|_| "agnes-2.5-flash".to_string());
+
+    let config = Config {
+        provider: "openai".to_string(),
+        base_url,
+        model,
+        api_key: Some(api_key),
+    };
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let provider = Arc::new(crate::providers::OpenAiProvider::new(config.clone()));
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(config, &root).expect("runtime");
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(provider);
+
+    let task = "Run a safe validation of this Rust repository. First determine the appropriate validation command. Run only read-only validation/build/test commands. Do not modify source files or git state. Report exact exit codes and failures.";
+    let grounding = crate::agent::grounding::GroundingAssembler::new(&root).assemble_with_extras(
+        task,
+        &[],
+        &[],
+    );
+    let (_events, emit) = event_sink();
+    // A generous budget for a real heavy validation task (warm cargo target):
+    // the default 30s session is too tight for compiling and testing the full
+    // repository. This is explicit configuration for one real run, not a
+    // change to the conservative default.
+    let limits = crate::testing::TestingLimits {
+        timeout_ms: 180_000,
+        command_timeout_secs: 120,
+        ..crate::testing::TestingLimits::default()
+    };
+    let result = runtime
+        .run_testing_task_with_limits(task, grounding, limits, &emit, None)
+        .await
+        .expect("real-provider testing must return a structured result");
+
+    println!("[real-provider] {}", result.summary_line());
+    println!(
+        "[real-provider] termination={} synthesis_complete={}",
+        result.termination, result.synthesis_complete
+    );
+    for command in &result.commands_run {
+        println!(
+            "[real-provider] command={} exit_code={} success={} denied={} timeout={}",
+            command.command, command.exit_code, command.success, command.denied, command.timeout
+        );
+    }
+    for failure in &result.failures {
+        println!(
+            "[real-provider] failure kind={} command={} exit_code={}",
+            failure.kind.as_str(),
+            failure.command,
+            failure.exit_code
+        );
+    }
+    println!("[real-provider] render:\n{}", result.render());
+
+    // The acceptance contract: the session terminates bounded, commands were
+    // actually executed, and the git tree was left untouched.
+    assert!(
+        result.model_calls <= 6,
+        "model calls must stay bounded, got {}",
+        result.model_calls
+    );
+    assert!(
+        result.tool_calls <= 12,
+        "tool calls must stay bounded, got {}",
+        result.tool_calls
+    );
+    assert!(
+        result.synthesis_complete,
+        "synthesis must complete for a real provider"
+    );
+    assert!(result.termination.is_completed());
+    assert!(
+        result.git_tree_unchanged(),
+        "real-provider testing must not mutate the tracked tree"
+    );
+}
