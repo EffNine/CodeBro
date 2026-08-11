@@ -261,6 +261,33 @@ pub fn extract_tool_calls(response: &str, structured_json: Option<&str>) -> Resu
     parse_tool_calls(response)
 }
 
+/// Unwrap the structured function-calling argument envelope.
+///
+/// CodeBro's tool definitions declare a single `input` string parameter (see
+/// `ToolRegistry::tool_definitions`), so OpenAI-compatible providers wrap tool
+/// arguments as `{"input": "<the raw argument string>"}`. In practice real
+/// models also emit other single-key envelopes such as `{"file_path": ...}` or
+/// `{"path": ...}` for file tools. Tools themselves expect the raw argument
+/// string (a path, `path|content`, a command, ...).
+///
+/// The unwrap rule: when the argument parses as a JSON object with exactly
+/// one key whose value is a string, that string is the raw argument. This is a
+/// no-op for raw strings, multi-key JSON (which tools consume verbatim), and
+/// non-string values.
+pub fn unwrap_tool_arguments(arguments: &str) -> String {
+    let trimmed = arguments.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(object) = value.as_object() {
+            if object.len() == 1 {
+                if let Some(raw) = object.values().next().and_then(|v| v.as_str()) {
+                    return raw.to_string();
+                }
+            }
+        }
+    }
+    arguments.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +522,46 @@ Done.
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "run_command");
         assert!(calls[0].arguments.contains("echo"));
+    }
+
+    #[test]
+    fn test_unwrap_tool_arguments_envelope() {
+        // The canonical structured-calling envelope: `{"input": "<args>"}`.
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"input": "src/main.rs"}"#),
+            "src/main.rs"
+        );
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"input": "/abs/path/to/file.rs"}"#),
+            "/abs/path/to/file.rs"
+        );
+        // Real models also emit other single-key envelopes.
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"file_path": "src/main.rs"}"#),
+            "src/main.rs"
+        );
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"path": "src/main.rs"}"#),
+            "src/main.rs"
+        );
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"command": "cargo build"}"#),
+            "cargo build"
+        );
+    }
+
+    #[test]
+    fn test_unwrap_tool_arguments_passthrough() {
+        // Raw arguments, multi-key JSON and non-string values pass through.
+        assert_eq!(unwrap_tool_arguments("src/main.rs"), "src/main.rs");
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"path": "a", "content": "b"}"#),
+            r#"{"path": "a", "content": "b"}"#
+        );
+        assert_eq!(unwrap_tool_arguments(""), "");
+        assert_eq!(
+            unwrap_tool_arguments(r#"{"input": 42}"#),
+            r#"{"input": 42}"#
+        );
     }
 }

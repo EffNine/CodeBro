@@ -6,9 +6,12 @@
 
 /// Maximum number of research reasoning iterations before giving up.
 ///
-/// The main loop uses `MAX_REACT_ITERATIONS = 5`; research is capped lower
-/// so a runaway research session stops quickly.
-pub const MAX_RESEARCH_ITERATIONS: usize = 4;
+/// Real-provider validation (Sprint 30C.0) showed a 4-call budget prevents a
+/// real LLM from completing exploration AND a final synthesis for a multi-part
+/// task (it terminated at `model_limit` without producing findings). 6 allows
+/// targeted exploration plus one synthesis pass while remaining bounded and
+/// close to the main loop's `MAX_REACT_ITERATIONS = 5`.
+pub const MAX_RESEARCH_ITERATIONS: usize = 6;
 
 /// Maximum total tool calls across the entire research session.
 ///
@@ -17,14 +20,17 @@ pub const MAX_RESEARCH_TOOL_CALLS: usize = 20;
 
 /// Maximum total model (provider) calls across the research session.
 ///
-/// Each iteration performs at most one model call; the bound is therefore
-/// slightly above `MAX_RESEARCH_ITERATIONS` to permit one final-answer call.
-pub const MAX_RESEARCH_MODEL_CALLS: usize = 4;
+/// Each iteration performs at most one model call. 6 is strictly smaller than
+/// the main loop's `MAX_MODEL_CALLS = 15` while giving a real LLM room to
+/// explore then synthesize.
+pub const MAX_RESEARCH_MODEL_CALLS: usize = 6;
 
 /// Hard wall-clock timeout for a research session, in milliseconds.
 ///
-/// The main task default is 30s; research is bounded to half of that.
-pub const RESEARCH_TIMEOUT_MS: u64 = 15_000;
+/// Matches the main task default (`DEFAULT_TASK_TIMEOUT_MS` = 30s). Research
+/// is otherwise strictly smaller than the main loop's budget; a real provider
+/// needs this much wall time to complete a multi-step research session.
+pub const RESEARCH_TIMEOUT_MS: u64 = 30_000;
 
 /// Maximum accumulated tool-result output retained for the next iteration
 /// (in bytes). Research must stay cheap; oversized tool output is truncated.
@@ -96,11 +102,16 @@ mod tests {
     #[test]
     fn test_default_limits_are_smaller_than_main_loop() {
         let limits = ResearchLimits::default();
-        // Research must be strictly bounded relative to the canonical runtime.
-        assert!(limits.max_iterations < 5);
+        // Research must be strictly bounded relative to the canonical runtime:
+        // tool calls (20 < 100) and model calls (6 < 15) are strictly smaller,
+        // and the timeout matches the main task default so a real provider can
+        // complete a multi-step session. Iterations (6) sit just above the main
+        // loop's 5 to let a real LLM explore then synthesize — this was tuned
+        // after real-provider validation (Sprint 30C.0).
+        assert!(limits.max_iterations <= 6);
         assert!(limits.max_tool_calls < 100);
         assert!(limits.max_model_calls < 15);
-        assert!(limits.timeout_ms < 30_000);
+        assert!(limits.timeout_ms <= 30_000);
     }
 
     #[test]

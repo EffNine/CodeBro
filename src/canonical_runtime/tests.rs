@@ -3695,9 +3695,9 @@ async fn test_research_failure_is_isolated_from_main_task() {
     let mut runtime =
         CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
     runtime.with_retry_policy(RetryPolicy::immediate(0));
-    // Research keeps calling tools until its model-call budget is exhausted;
-    // the final response is the main agent's answer.
-    let mut responses: Vec<String> = (0..4)
+    // Research keeps calling tools until its model-call budget (6) is
+    // exhausted; the final response is the main agent's answer.
+    let mut responses: Vec<String> = (0..6)
         .map(|_| r#"<invoke name="list_files">{"path": "src"}</invoke>"#.to_string())
         .collect();
     responses.push("main answer after failed research".to_string());
@@ -3735,4 +3735,114 @@ async fn test_research_failure_is_isolated_from_main_task() {
         "research must terminate abnormally (bounded error result)"
     );
     assert!(!research.completed);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Structured `{"input": ...}` envelope is unwrapped so real tools execute.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_structured_input_envelope_unwrapped_for_real_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("greeting.txt"), "hello from the real file").unwrap();
+    let abs = dir
+        .path()
+        .join("greeting.txt")
+        .to_string_lossy()
+        .to_string();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(FunctionCallingMockProvider::new(
+        "fc-mock",
+        vec![
+            // Canonical structured-calling envelope: `{"input": "<args>"}`.
+            format!(
+                r#"[{{"id": "call_1", "function": {{"name": "read_file", "arguments": "{{\"input\": \"{}\"}}"}}}}]"#,
+                abs
+            ),
+            "[]".to_string(),
+        ],
+    )));
+
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "read the greeting file",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    assert!(
+        result.success,
+        "envelope-unwrapped structured read must complete: {:?}",
+        result.error
+    );
+    let evs = events.lock().unwrap();
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCompleted { tool, success: true, .. } if tool == "read_file"
+        )),
+        "read_file must actually succeed (envelope unwrapped), events: {:?}",
+        evs.iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolCompleted { tool, success, .. } => {
+                    Some(format!("{tool}:{success}"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Text-encoded tool calls carrying the `{"input": ...}` envelope are also
+//     unwrapped before execution.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_text_encoded_input_envelope_is_unwrapped_for_real_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("greeting.txt"), "hello from the real file").unwrap();
+    let abs = dir
+        .path()
+        .join("greeting.txt")
+        .to_string_lossy()
+        .to_string();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "text-mock",
+        vec![
+            // Text-encoded call with the canonical envelope.
+            format!(
+                r#"<invoke name="read_file">{{"input": "{}"}}</invoke>"#,
+                abs
+            ),
+            "Done reading.".to_string(),
+        ],
+    )));
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "read the greeting file",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    assert!(
+        result.success,
+        "text-encoded envelope-unwrapped read must complete: {:?}",
+        result.error
+    );
+    let evs = events.lock().unwrap();
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCompleted { tool, success: true, .. } if tool == "read_file"
+        )),
+        "text-encoded read_file must actually succeed"
+    );
 }

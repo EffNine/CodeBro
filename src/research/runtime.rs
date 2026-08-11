@@ -169,17 +169,30 @@ impl ResearchSubagent {
                     state.model_calls += 1;
                     state.iterations += 1;
 
-                    let calls: Vec<ToolCall> = if !structured.is_empty() {
-                        structured
+                    let calls: Vec<ToolCall> = {
+                        let parsed = if !structured.is_empty() {
+                            structured
+                                .into_iter()
+                                .map(|c: StructuredToolCall| ToolCall {
+                                    id: c.id,
+                                    name: c.name,
+                                    arguments: c.arguments,
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            tool_parser::parse_tool_calls(&full).unwrap_or_default()
+                        };
+                        // Structured calls arrive wrapped in the `{"input":
+                        // ...}` envelope; text-encoded calls may carry the same
+                        // envelope. Unwrap so the restricted registry receives
+                        // the raw argument string. A no-op for raw strings.
+                        parsed
                             .into_iter()
-                            .map(|c: StructuredToolCall| ToolCall {
-                                id: c.id,
-                                name: c.name,
-                                arguments: c.arguments,
+                            .map(|mut c| {
+                                c.arguments = tool_parser::unwrap_tool_arguments(&c.arguments);
+                                c
                             })
                             .collect()
-                    } else {
-                        tool_parser::parse_tool_calls(&full).unwrap_or_default()
                     };
 
                     // No tool call → the model produced its final report.
@@ -344,9 +357,11 @@ impl ResearchState {
             }
             _ => {}
         }
-        // Extract symbols from file contents that were actually read.
+        // Extract symbols from file contents that were actually read. The cap
+        // is per-file; large files (e.g. the canonical runtime) define many
+        // functions and the key entry points appear deep in the file.
         if observation.name == "read_file" {
-            self.add_symbols(&extract_symbols(full_result, 12));
+            self.add_symbols(&extract_symbols(full_result, MAX_SYMBOLS_PER_FILE));
         }
         self.observations.push(observation);
     }
@@ -367,6 +382,8 @@ impl ResearchState {
                 self.symbols_found.push(symbol.clone());
             }
         }
+        // Keep the overall evidence trail bounded.
+        self.symbols_found.truncate(MAX_SYMBOLS_TOTAL);
     }
 
     /// Make an absolute inspected path relative to the workspace root so the
@@ -442,7 +459,7 @@ impl ResearchState {
         }
 
         prompt.push_str(&format!(
-            "\nINSTRUCTIONS:\n1. Use the available tools to inspect the repository and gather evidence.\n2. You MUST call at least one tool before producing the final report unless the grounded context already answers the objective.\n3. Decide your next action and call a tool, or produce the final research report.\n\nRESEARCH STEP {}:\n",
+            "\nINSTRUCTIONS:\n1. Use the available tools to inspect the repository and gather evidence. Prefer a small number of targeted reads over exhaustive listing.\n2. You MUST call at least one tool before producing the final report unless the grounded context already answers the objective.\n3. When you have inspected the key files, STOP calling tools and produce the final research report. The report must be evidence-backed and cite the exact file paths and function names you inspected.\n4. Produce the final report on your next turn once you have inspected the relevant files — do not keep exploring.\n\nRESEARCH STEP {}:\n",
             self.iterations + 1
         ));
         prompt
@@ -594,6 +611,12 @@ fn list_output_paths(output: &str) -> Vec<PathBuf> {
 }
 
 /// Deterministically extract likely symbol names from source text (bounded).
+/// Key entry points (e.g. the canonical runtime's `run_execution_loop`,
+/// `execute_tool`) are defined deep in large files, so the per-file cap is set
+/// high enough to surface them while the overall result stays bounded.
+const MAX_SYMBOLS_PER_FILE: usize = 40;
+const MAX_SYMBOLS_TOTAL: usize = 80;
+
 fn extract_symbols(content: &str, max: usize) -> Vec<String> {
     let mut symbols = Vec::new();
     let mut lines = content.lines();

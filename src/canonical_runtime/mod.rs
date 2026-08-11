@@ -1145,17 +1145,32 @@ impl CanonicalRuntime {
                     model_calls += 1;
                     // Normalize structured and text-parsed tool calls into the
                     // same internal `ToolCall` representation.
-                    let calls: Vec<ToolCall> = if !structured.is_empty() {
-                        structured
+                    let calls: Vec<ToolCall> = {
+                        let parsed = if !structured.is_empty() {
+                            structured
+                                .into_iter()
+                                .map(|c| ToolCall {
+                                    id: c.id,
+                                    name: c.name,
+                                    arguments: c.arguments,
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            tool_parser::parse_tool_calls(&full).unwrap_or_default()
+                        };
+                        // Normalize structured and text-parsed tool calls into
+                        // the same internal representation. Structured calls
+                        // arrive wrapped in the `{"input": ...}` envelope;
+                        // text-encoded calls may carry the same envelope. The
+                        // unwrap is a no-op for raw argument strings, so it is
+                        // safe to apply to every tool call.
+                        parsed
                             .into_iter()
-                            .map(|c| ToolCall {
-                                id: c.id,
-                                name: c.name,
-                                arguments: c.arguments,
+                            .map(|mut c| {
+                                c.arguments = tool_parser::unwrap_tool_arguments(&c.arguments);
+                                c
                             })
                             .collect()
-                    } else {
-                        tool_parser::parse_tool_calls(&full).unwrap_or_default()
                     };
                     if !calls.is_empty() {
                         // Enforce per-iteration tool call limit.

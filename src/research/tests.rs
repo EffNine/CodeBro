@@ -422,6 +422,55 @@ async fn test_research_structured_tool_calling_reaches_restricted_registry() {
     );
 }
 
+#[tokio::test]
+async fn test_research_structured_input_envelope_is_unwrapped() {
+    // Real OpenAI-compatible providers wrap tool arguments in the canonical
+    // `{"input": "<args>"}` envelope (the tool definitions declare a single
+    // `input` parameter). Research must unwrap it before executing tools.
+    let dir = fixture_workspace();
+    let abs = dir
+        .path()
+        .join("src/parser.rs")
+        .to_string_lossy()
+        .to_string();
+    let harness = ResearchHarness::new(Arc::new(ResearchMockProvider::structured(
+        "research-fc",
+        vec![
+            format!(
+                r#"[{{"id": "c1", "function": {{"name": "read_file", "arguments": "{{\"input\": \"{}\"}}"}}}}]"#,
+                abs
+            ),
+            "[]".to_string(),
+        ],
+    )));
+    let result = run_research(harness, "inspect the parser", dir.path(), None).await;
+
+    assert_eq!(result.termination, ResearchTermination::Completed);
+    let read = result
+        .tool_observations
+        .iter()
+        .find(|o| o.name == "read_file")
+        .expect("read_file observation present");
+    assert!(
+        read.success,
+        "read_file must succeed once the input envelope is unwrapped, got: {}",
+        read.result
+    );
+    assert!(
+        read.result.contains("parse_tool_calls"),
+        "read_file must return real file contents, got: {}",
+        read.result
+    );
+    assert!(
+        result
+            .files_inspected
+            .iter()
+            .any(|f| f.to_string_lossy().contains("parser")),
+        "files_inspected must record the real resolved path, got: {:?}",
+        result.files_inspected
+    );
+}
+
 // =========================================================================
 // Permission: mutating tools are blocked
 // =========================================================================
