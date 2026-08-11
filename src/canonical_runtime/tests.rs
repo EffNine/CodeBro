@@ -4678,6 +4678,207 @@ async fn test_planning_consumes_research_and_testing_evidence() {
     assert_eq!(planning.risks, 1);
 }
 
+/// Full chain: PlanningResult → ContextFragment → PromptBuilder → main
+/// provider. The main provider's last prompt must carry the structured
+/// planning fragment (concrete step + its own read-only observation of a real
+/// repository file).
+#[tokio::test]
+async fn test_planning_result_reaches_main_provider_prompt() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec![
+            // Planning iteration 1: a single targeted read-only verify.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Planning final implementation plan (no tool calls).
+            planning_final_answer(),
+            // Main loop answer.
+            "main task complete.".to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        planning_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a subtract function",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "main task must succeed with planning enabled: {:?}",
+        result.error
+    );
+    assert!(result.response.contains("main task complete"));
+
+    // The main provider's prompt (the LAST recorded prompt) contains the
+    // planning fragment and the planner's real repository observation.
+    let prompts = provider.all_prompts();
+    assert_eq!(prompts.len(), 3, "2 planning calls + 1 main call");
+    let main_prompt = prompts.last().expect("main prompt present");
+    assert!(
+        main_prompt.contains("--- planning () ---"),
+        "main prompt must contain the planning fragment:\n{}",
+        main_prompt
+    );
+    assert!(
+        main_prompt.contains("## Autonomous Planning"),
+        "main prompt must contain the planning rendering"
+    );
+    assert!(
+        main_prompt.contains("1. Modify add in src/lib.rs"),
+        "main prompt must contain the concrete planned step"
+    );
+    assert!(
+        main_prompt.contains("planning_read"),
+        "main prompt must carry the planner's own read-only observation provenance"
+    );
+
+    // Planning diagnostics were captured with the structured plan.
+    let planning = result
+        .diagnostics
+        .planning
+        .expect("planning diagnostics recorded");
+    assert!(planning.completed);
+    assert!(planning.synthesis_complete);
+    assert_eq!(planning.termination, "completed");
+    assert_eq!(planning.tool_calls, 1);
+    assert_eq!(planning.model_calls, 2);
+    assert_eq!(planning.plan_steps, 1);
+    assert_eq!(planning.affected_files, 1);
+}
+
+/// Sprint 30E section 21: the deterministic full chain where the three
+/// specialist outputs converge. ResearchResult → TestingResult → PlanningSubagent
+/// → targeted read → PlanningResult → EngineeringContext → main provider
+/// prompt. The main prompt must contain the three distinguishable specialist
+/// renderings (Research Findings, Testing Findings, Planning) AND actual
+/// repository evidence surfaced by the planner's own targeted read.
+#[tokio::test]
+async fn test_research_testing_planning_context_chain() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec![
+            // Research iteration 1: read the library source.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Research final report.
+            "add() is defined in src/lib.rs and returns a + b.".to_string(),
+            // Testing iteration 1: run a REAL cargo check.
+            r#"<invoke name="run_command">{"command": "cargo check"}</invoke>"#.to_string(),
+            // Testing final report.
+            "cargo check passed with exit code 0.".to_string(),
+            // Planning iteration 1: targeted read-only verify of the research
+            // claim (the exact file research named).
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Planning final implementation plan (no tool calls).
+            planning_final_answer(),
+            // Main loop answer.
+            "main task complete.".to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        research_enabled: true,
+        testing_enabled: true,
+        planning_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a subtract function to the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "full chain must succeed: {:?}",
+        result.error
+    );
+    assert!(result.response.contains("main task complete"));
+
+    // The main provider's prompt (the LAST recorded prompt) contains all three
+    // specialist renderings, each distinguishable, plus real repository
+    // evidence and the authoritative testing fact.
+    let prompts = provider.all_prompts();
+    assert_eq!(
+        prompts.len(),
+        7,
+        "2 research + 2 testing + 2 planning + 1 main call"
+    );
+    let main_prompt = prompts.last().expect("main prompt present");
+    assert!(
+        main_prompt.contains("Autonomous Research Findings"),
+        "main prompt must contain the research specialist rendering:\n{}",
+        main_prompt
+    );
+    assert!(
+        main_prompt.contains("Autonomous Testing Findings"),
+        "main prompt must contain the testing specialist rendering"
+    );
+    assert!(
+        main_prompt.contains("Autonomous Planning"),
+        "main prompt must contain the planning specialist rendering"
+    );
+    // Actual repository evidence: planning's own targeted read surfaced the
+    // real lib.rs content into the main prompt.
+    assert!(
+        main_prompt.contains("pub fn add(a: i32, b: i32)"),
+        "main prompt must contain actual repository evidence from the planner's read:\n{}",
+        main_prompt
+    );
+    // Authoritative machine fact from the real cargo check run by Testing.
+    assert!(
+        main_prompt.contains("exit_code: 0") || main_prompt.contains("exit_code 0"),
+        "main prompt must carry the authoritative testing fact"
+    );
+    // The concrete plan step reached the main prompt.
+    assert!(
+        main_prompt.contains("1. Modify add in src/lib.rs"),
+        "main prompt must contain the concrete planned step"
+    );
+
+    // All three phases recorded diagnostics with completed synthesis.
+    let research = result
+        .diagnostics
+        .research
+        .expect("research diagnostics recorded");
+    assert!(research.completed && research.synthesis_complete);
+    let testing = result
+        .diagnostics
+        .testing
+        .expect("testing diagnostics recorded");
+    assert!(testing.completed && testing.synthesis_complete);
+    let planning = result
+        .diagnostics
+        .planning
+        .expect("planning diagnostics recorded");
+    assert!(planning.completed && planning.synthesis_complete);
+    assert_eq!(planning.tool_calls, 1, "planning used one targeted read");
+    assert_eq!(planning.iterations, 2);
+    assert_eq!(planning.model_calls, 2);
+    assert_eq!(planning.plan_steps, 1);
+}
+
 /// A planning session that terminates abnormally (model budget exhausted) must
 /// NOT crash or block the main task: the main agent continues and completes,
 /// with its context still carrying the earlier research/testing evidence.

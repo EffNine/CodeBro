@@ -885,17 +885,23 @@ impl PlanningState {
         dependencies
     }
 
-    /// Plan-level risks: standalone `Risk:` lines and the optional trailing
+    /// Plan-level risks: standalone `Risk:` lines, a `Risk` section heading
+    /// (e.g. `## Risk` followed by bullet lines) and the optional trailing
     /// `(severity: x) [mitigation: y]` refinement. Step-level `Risk:` fields
     /// stay with their steps and never become plan-level risks.
     fn extract_risks(&self, answer: &str, plan: &[PlanStep]) -> Vec<PlanningRisk> {
         let mut risks: Vec<PlanningRisk> = Vec::new();
+        let mut in_section = false;
         for raw in answer.lines() {
-            let line = raw.trim();
+            let line = decorate_line(raw);
             if line.is_empty() {
                 continue;
             }
-            if let Some(rest) = strip_field(line, "Risk:") {
+            let lower = line.to_lowercase();
+            if lower.starts_with("risk:") {
+                let Some(rest) = strip_field(line, "Risk:") else {
+                    continue;
+                };
                 let mut severity = "unknown".to_string();
                 let mut mitigation = String::new();
                 let mut description = rest.to_string();
@@ -917,7 +923,52 @@ impl PlanningState {
                     description = description[..idx].trim().to_string();
                 }
                 // Step-level risks are not plan-level risks.
-                if !plan.iter().any(|s| s.risk == description) {
+                if !plan.iter().any(|s| s.risk == description)
+                    && !risks.iter().any(|r| r.description == description)
+                {
+                    risks.push(PlanningRisk {
+                        description,
+                        severity,
+                        mitigation,
+                    });
+                }
+                continue;
+            }
+            if lower == "risk" {
+                in_section = true;
+                continue;
+            }
+            if in_section {
+                if is_section_boundary(&lower) {
+                    in_section = false;
+                    continue;
+                }
+                let mut severity = "unknown".to_string();
+                let mut mitigation = String::new();
+                let description = line.trim_start_matches(['-', '*', '>']).trim().to_string();
+                if description.is_empty() {
+                    continue;
+                }
+                // A trailing " (severity: x) [mitigation: y]" refinement.
+                let description = if let Some(idx) = description.find(" (severity:") {
+                    let tail = &description[idx..];
+                    if let Some(s) = tail
+                        .split_once("severity:")
+                        .and_then(|(_, s)| s.split([')', ']']).next().map(|s| s.trim().to_string()))
+                    {
+                        severity = s;
+                    }
+                    if let Some(m) = tail
+                        .split_once("mitigation:")
+                        .and_then(|(_, m)| m.split(']').next().map(|m| m.trim().to_string()))
+                    {
+                        mitigation = m;
+                    }
+                    description[..idx].trim().to_string()
+                } else {
+                    description
+                };
+                if !risks.iter().any(|r| r.description == description) {
                     risks.push(PlanningRisk {
                         description,
                         severity,
@@ -929,14 +980,37 @@ impl PlanningState {
         risks
     }
 
-    /// Assumptions: every `Assumption:` line. The planner must never silently
-    /// turn an assumption into a fact.
+    /// Assumptions: every `Assumption:` line plus bullets inside an
+    /// `Assumption` section heading. The planner must never silently turn an
+    /// assumption into a fact.
     fn extract_assumptions(&self, answer: &str) -> Vec<String> {
         let mut assumptions = Vec::new();
-        for line in answer.lines() {
-            let line = line.trim();
-            if let Some(rest) = strip_field(line, "Assumption:") {
-                assumptions.push(rest.to_string());
+        let mut in_section = false;
+        for raw in answer.lines() {
+            let line = decorate_line(raw);
+            if line.is_empty() {
+                continue;
+            }
+            let lower = line.to_lowercase();
+            if lower.starts_with("assumption:") {
+                if let Some(rest) = strip_field(line, "Assumption:") {
+                    assumptions.push(rest.to_string());
+                }
+                continue;
+            }
+            if lower == "assumption" {
+                in_section = true;
+                continue;
+            }
+            if in_section {
+                if is_section_boundary(&lower) {
+                    in_section = false;
+                    continue;
+                }
+                let text = line.trim_start_matches(['-', '*', '>']).trim();
+                if !text.is_empty() {
+                    assumptions.push(text.to_string());
+                }
             }
         }
         assumptions
@@ -1108,10 +1182,12 @@ impl PlanningResult {
 // Deterministic parsing helpers
 // =============================================================================
 
-/// Parse a `Step N: <action>` header. Matching is case-insensitive but the
+/// Parse a `Step N: <action>` header. Matching is case-insensitive and
+/// tolerates common markdown decoration (`## Step N:`, `### Step 3:`,
+/// `- Step 2:`) so real-provider synthesis text extracts reliably. The
 /// extracted action preserves the model's original casing.
 fn parse_step_header(line: &str) -> Option<(usize, String)> {
-    let trimmed = line.trim();
+    let trimmed = strip_markdown_prefix(line);
     let lower = trimmed.to_lowercase();
     let (num_part, _) = lower.strip_prefix("step ")?.split_once(':')?;
     let order: usize = num_part.trim().parse().ok()?;
@@ -1128,18 +1204,62 @@ fn parse_step_header(line: &str) -> Option<(usize, String)> {
     Some((order, action))
 }
 
-/// Strip a `Field:` prefix when the line starts with it (case-insensitive).
+/// Strip a `Field:` prefix when the line starts with it (case-insensitive),
+/// tolerating leading markdown decoration (`**Files:**`, `> **Reason:**`).
 fn strip_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
-    let lower = line.to_lowercase();
+    let stripped = strip_markdown_prefix(line);
+    let lower = stripped.to_lowercase();
     if lower.starts_with(&field.to_lowercase()) {
-        let rest = &line[field.len()..];
-        let rest = rest.trim_start_matches([':', ' ', '\t']).trim();
+        let rest = &stripped[field.len()..];
+        let rest = rest
+            .trim_start_matches([':', ' ', '\t', '*', '`'])
+            .trim_end_matches(['*', '`'])
+            .trim();
         if rest.is_empty() {
             return None;
         }
         return Some(rest);
     }
     None
+}
+
+/// Strip leading markdown decoration from a line: heading `#` markers, bold
+/// `*` markers, list bullets, blockquote `>` and inline-code backticks.
+fn strip_markdown_prefix(mut line: &str) -> &str {
+    loop {
+        let before = line;
+        line = line
+            .trim_start()
+            .trim_start_matches(['#', '-', '*', '>', '`'])
+            .trim_start();
+        if line.len() == before.len() {
+            return line;
+        }
+    }
+}
+
+/// Normalize a line's leading/trailing markdown decoration so deterministic
+/// parsing sees the raw semantic content: `#` headings, `**bold**` markers,
+/// list bullets, blockquotes and inline-code backticks.
+fn decorate_line(line: &str) -> &str {
+    strip_markdown_prefix(line)
+        .trim_start_matches(['*', '-', '>', '`'])
+        .trim_end_matches(['*', '`'])
+        .trim()
+}
+
+/// Whether a line terminates a `Risk`/`Assumption` section capture: a section
+/// heading, a step, or another known plan section header.
+fn is_section_boundary(lower: &str) -> bool {
+    lower.starts_with('#')
+        || lower.starts_with("step ")
+        || lower == "existing implementation"
+        || lower == "required change"
+        || lower == "dependencies"
+        || lower == "tests"
+        || lower == "summary"
+        || lower == "final implementation plan"
+        || lower == "limitations"
 }
 
 /// Parse file paths from a comma/whitespace separated field.
@@ -1155,7 +1275,7 @@ fn parse_paths(input: &str) -> Vec<PathBuf> {
 fn parse_commands(input: &str) -> Vec<String> {
     input
         .split(';')
-        .map(|c| c.trim().to_string())
+        .map(|c| c.trim().trim_matches('`').trim().to_string())
         .filter(|c| !c.is_empty())
         .collect()
 }
@@ -1166,7 +1286,7 @@ fn parse_tokens(input: &str) -> Vec<String> {
         .split(|c: char| c == ',' || c.is_whitespace())
         .map(|token| {
             token
-                .trim_matches(['(', ')', '[', ']', ';', ':', ',', '\''])
+                .trim_matches(['(', ')', '[', ']', ';', ':', ',', '\'', '`', '*'])
                 .trim()
                 .to_string()
         })
@@ -1292,6 +1412,110 @@ mod tests {
         );
         assert_eq!(parse_step_header("Step: no number"), None);
         assert_eq!(parse_step_header("Step 3"), None);
+    }
+
+    #[test]
+    fn test_parse_step_header_tolerates_markdown_decoration() {
+        // Real providers wrap steps in markdown headings/bullets; the
+        // deterministic parser must still extract them.
+        assert_eq!(
+            parse_step_header("## Step 3: Refactor the executor"),
+            Some((3, "Refactor the executor".to_string()))
+        );
+        assert_eq!(
+            parse_step_header("### Step 1: Fix the check"),
+            Some((1, "Fix the check".to_string()))
+        );
+        assert_eq!(
+            parse_step_header("- Step 2: Add coverage"),
+            Some((2, "Add coverage".to_string()))
+        );
+        assert_eq!(parse_step_header("## Existing implementation"), None);
+        assert_eq!(parse_step_header("### Risk"), None);
+    }
+
+    #[test]
+    fn test_strip_field_tolerates_bold_markdown_and_backticks() {
+        // The leading `**` decoration is stripped and the value is trimmed of
+        // edge backticks; interior backticks (per-token) survive to the token
+        // parsers which strip them.
+        assert_eq!(
+            strip_field("**Files:** `src/a.rs`, `src/b.rs`", "Files:"),
+            Some("src/a.rs`, `src/b.rs")
+        );
+        assert_eq!(strip_field("**Risk:** high", "Risk:"), Some("high"));
+        assert_eq!(strip_field("> **Reason:** why", "Reason:"), Some("why"));
+        assert_eq!(strip_field("Symbols:** x", "Symbols:"), Some("x"));
+    }
+
+    #[test]
+    fn test_extract_plan_from_real_provider_shaped_markdown() {
+        // The exact shape a real LLM produced in Sprint 30E real-provider
+        // validation: `## Step N:` headers and `**Field:**` lines.
+        let state = PlanningState::new(
+            PlanningRequest::new("plan a retry policy", "."),
+            crate::planning::PlanningLimits::default(),
+        );
+        let answer = "## Existing implementation\n\
+             core.rs owns scheduling.\n\
+             \n\
+             ## Required change\n\
+             Add a retry policy.\n\
+             \n\
+             ## Step 1: Add retry config field to the executor\n\
+             **Files:** `src/core.rs`\n\
+             **Symbols:** `run_execution_loop`\n\
+             **Reason:** the executor owns the loop\n\
+             **Depends:** provider retry layer\n\
+             **Validate:** `cargo test`; `cargo check`\n\
+             **Tests:** `src/tests.rs`\n\
+             **Risk:** callers may break\n\
+             \n\
+             ## Dependencies\n\
+             - src/core.rs\n\
+             \n\
+             ## Assumption\n\
+             - the retry symbols exist\n\
+             \n\
+             ## Risk\n\
+             - retroactive changes (severity: low) [mitigation: run full suite]\n";
+        let plan = state.extract_plan(answer);
+        assert_eq!(plan.len(), 1, "one step extracted");
+        let step = &plan[0];
+        assert_eq!(step.action, "Add retry config field to the executor");
+        assert!(step.target_files.contains(&PathBuf::from("src/core.rs")));
+        assert_eq!(step.target_symbols, vec!["run_execution_loop".to_string()]);
+        assert_eq!(step.validation, vec!["cargo test", "cargo check"]);
+        assert_eq!(step.risk, "callers may break");
+        assert!(step.target_files.contains(&PathBuf::from("src/tests.rs")));
+
+        let risks = state.extract_risks(answer, &plan);
+        assert!(
+            risks.iter().any(|r| r.description == "retroactive changes"),
+            "section risk must be captured: {:?}",
+            risks
+        );
+        assert!(
+            !risks.iter().any(|r| r.description == "callers may break"),
+            "step risk must not double as a plan-level risk: {:?}",
+            risks
+        );
+
+        let assumptions = state.extract_assumptions(answer);
+        assert!(
+            assumptions
+                .iter()
+                .any(|a| a.contains("retry symbols exist")),
+            "section assumption must be captured: {:?}",
+            assumptions
+        );
+
+        let dependencies = state.extract_dependencies(answer, &plan);
+        assert!(
+            dependencies.iter().any(|d| d == "retry"),
+            "step dependency must be captured: {:?}",
+            dependencies
+        );
     }
 
     #[test]
