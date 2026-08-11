@@ -5,7 +5,8 @@ use std::sync::Arc;
 use crate::agent::events::AgentEvent;
 use crate::canonical_runtime::CanonicalRuntime;
 use crate::config::Config;
-use crate::engineering_context::{ContextFragment, ConversationMessage};
+use crate::engineering_context::{ContextFragment, ConversationMessage, EngineeringContextBuilder};
+use crate::prompt_builder::PromptBuilder;
 use crate::provider_runtime::{Priority, RetryPolicy};
 use crate::providers::Provider;
 
@@ -22,6 +23,8 @@ struct MockProvider {
     responses: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// When true, `stream_response` fails immediately.
     fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The last compiled prompt the provider was asked to generate from.
+    last_prompt: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl MockProvider {
@@ -31,6 +34,7 @@ impl MockProvider {
             model: format!("{}-model", name),
             responses: std::sync::Arc::new(std::sync::Mutex::new(responses)),
             fail: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_prompt: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -38,6 +42,11 @@ impl MockProvider {
         let p = MockProvider::new(name, Vec::new());
         p.fail.store(true, std::sync::atomic::Ordering::SeqCst);
         p
+    }
+
+    /// The exact prompt text the provider received on its last call.
+    fn last_prompt_text(&self) -> Option<String> {
+        self.last_prompt.lock().unwrap().clone()
     }
 }
 
@@ -75,7 +84,7 @@ impl Provider for MockProvider {
 
     fn stream_response(
         &self,
-        _message: &str,
+        message: &str,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -84,6 +93,7 @@ impl Provider for MockProvider {
                 + '_,
         >,
     > {
+        *self.last_prompt.lock().unwrap() = Some(message.to_string());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
             let result = Err(anyhow::anyhow!("mock provider offline"));
@@ -294,6 +304,275 @@ async fn test_coordinator_memory_entries_flow_into_subagent_context() {
         report.contains("ci: uses github actions"),
         "memory entry should reach the subagent report:\n{}",
         report
+    );
+}
+
+// =========================================================================
+// Sprint 30B.5 — Grounded context integration into the main LLM prompt
+// =========================================================================
+
+/// A small workspace whose files/symbols match the task terms, with a real
+/// `.codebro/index.db` so the coordinator resolves actual symbols.
+fn grounded_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src/canonical_runtime")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src/agent")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\n[dependencies]\ntokio = \"1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/canonical_runtime/mod.rs"),
+        "pub struct CanonicalRuntime {}\nimpl CanonicalRuntime {\n    pub fn run_execution_loop() {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/agent/tool_parser.rs"),
+        "pub fn parse_tool_calls() {}\npub fn trace_runtime_parsing() {}\n",
+    )
+    .unwrap();
+
+    let codebro_dir = dir.path().join(".codebro");
+    std::fs::create_dir_all(&codebro_dir).unwrap();
+    {
+        let mut indexer =
+            crate::intelligence::CodeIndexer::new(codebro_dir.join("index.db")).unwrap();
+        let src = std::fs::read_to_string(dir.path().join("src/canonical_runtime/mod.rs")).unwrap();
+        indexer
+            .index_file(&dir.path().join("src/canonical_runtime/mod.rs"), &src)
+            .unwrap();
+        let src = std::fs::read_to_string(dir.path().join("src/agent/tool_parser.rs")).unwrap();
+        indexer
+            .index_file(&dir.path().join("src/agent/tool_parser.rs"), &src)
+            .unwrap();
+    }
+    dir
+}
+
+/// The coordinator's aggregated report fragment (source = "agent_analysis").
+fn agent_analysis_report(context: &crate::engineering_context::EngineeringContext) -> String {
+    context
+        .context_fragments
+        .iter()
+        .find(|f| f.source == "agent_analysis")
+        .map(|f| f.content.clone())
+        .unwrap_or_default()
+}
+
+/// Rebuild a context with one fragment source removed (used to build the
+/// "baseline" prompt that lacks the grounded coordinator report).
+fn context_without_fragment_source(
+    ctx: &crate::engineering_context::EngineeringContext,
+    source: &str,
+) -> crate::engineering_context::EngineeringContext {
+    let fragments: Vec<ContextFragment> = ctx
+        .context_fragments
+        .iter()
+        .filter(|f| f.source != source)
+        .cloned()
+        .collect();
+    EngineeringContextBuilder::new()
+        .with_skip_validation()
+        .project(ctx.project.clone())
+        .task(ctx.task.clone().expect("task plan present"))
+        .objective(ctx.objective.clone())
+        .goal_alignment(ctx.goal_alignment.clone())
+        .workspace(ctx.workspace.clone())
+        .context_fragments(fragments)
+        .memory(ctx.memory.clone())
+        .constraints(ctx.constraints.clone())
+        .runtime(ctx.runtime.clone())
+        .active_files(ctx.active_files.clone())
+        .user_request(ctx.user_request.clone())
+        .conversation(ctx.conversation.clone())
+        .system_prompt(ctx.system_prompt.clone())
+        .build()
+        .expect("rebuild baseline context")
+}
+
+#[tokio::test]
+async fn test_grounded_report_fragment_reaches_compiled_prompt() {
+    // Task → grounding → coordinator report → EngineeringContext →
+    // PromptBuilder. The compiled prompt must contain the grounded report
+    // (identifiable by the `agent_analysis` marker and the research output)
+    // including actual repository facts.
+    let dir = grounded_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+
+    let (context, compiled) = runtime
+        .compile_for_task("trace canonical runtime execution", no_conversation())
+        .await
+        .expect("compile");
+
+    // The coordinator report fragment is present in the EngineeringContext.
+    let report = agent_analysis_report(&context);
+    assert!(
+        report.contains("src/canonical_runtime/mod.rs"),
+        "grounded report must reference the runtime file:\n{}",
+        report
+    );
+    assert!(
+        report.contains("run_execution_loop"),
+        "grounded report must reference the runtime symbol:\n{}",
+        report
+    );
+
+    // The report is compiled into the final prompt as a labelled fragment.
+    assert!(
+        compiled.prompt.contains("--- agent_analysis () ---"),
+        "prompt must render the agent_analysis fragment:\n{}",
+        compiled.prompt
+    );
+    assert!(
+        compiled.prompt.contains("Research Findings"),
+        "prompt must contain the grounded research analysis:\n{}",
+        compiled.prompt
+    );
+    assert!(
+        compiled.prompt.contains("src/canonical_runtime/mod.rs"),
+        "prompt must contain the grounded file fact"
+    );
+    assert!(
+        compiled.prompt.contains("run_execution_loop"),
+        "prompt must contain the grounded symbol fact"
+    );
+}
+
+#[tokio::test]
+async fn test_grounded_facts_reach_mock_provider_prompt() {
+    // Full chain: task → grounding → coordinator → EngineeringContext →
+    // PromptBuilder → provider. The MockProvider records the exact prompt it
+    // is asked to generate from; it must contain the grounded repository facts.
+    let dir = grounded_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    let provider = Arc::new(MockProvider::new("mock", vec!["final answer".to_string()]));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "trace canonical runtime execution",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task(&req).await;
+    assert!(result.success, "task should succeed: {:?}", result.error);
+    assert!(result.response.contains("final answer"));
+
+    let prompt = provider
+        .last_prompt_text()
+        .expect("mock provider must have received a prompt");
+    assert!(
+        prompt.contains("--- agent_analysis () ---"),
+        "grounded report fragment must be in the prompt sent to the provider"
+    );
+    assert!(
+        prompt.contains("src/canonical_runtime/mod.rs"),
+        "provider prompt must contain the grounded file fact:\n{}",
+        prompt
+    );
+    assert!(
+        prompt.contains("run_execution_loop"),
+        "provider prompt must contain the grounded symbol fact:\n{}",
+        prompt
+    );
+}
+
+#[tokio::test]
+async fn test_grounded_vs_baseline_prompt_delta() {
+    // The grounded facts must come from the coordinator report, not from some
+    // other fragment. Removing the agent_analysis fragment must remove the
+    // facts from the compiled prompt (the fixture has no other source carrying
+    // them, so this deterministically attributes the facts to the report).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src/canonical_runtime")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\n[dependencies]\ntokio = \"1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/canonical_runtime/mod.rs"),
+        "pub fn run_execution_loop() {}\n",
+    )
+    .unwrap();
+
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    let (context, compiled_grounded) = runtime
+        .compile_for_task("trace canonical runtime execution", no_conversation())
+        .await
+        .expect("compile");
+
+    assert!(
+        compiled_grounded
+            .prompt
+            .contains("src/canonical_runtime/mod.rs"),
+        "grounded prompt contains the file fact"
+    );
+
+    // Baseline: same context without the coordinator report.
+    let baseline_ctx = context_without_fragment_source(&context, "agent_analysis");
+    let baseline_prompt = PromptBuilder::new().compile_context(&baseline_ctx).prompt;
+    assert!(
+        !baseline_prompt.contains("src/canonical_runtime/mod.rs"),
+        "baseline prompt must NOT contain the grounded file fact (it originates in the report)"
+    );
+    assert!(
+        !baseline_prompt.contains("Research Findings"),
+        "baseline prompt must not contain the coordinator report"
+    );
+}
+
+#[tokio::test]
+async fn test_grounded_context_cost_is_bounded() {
+    // The grounded report must be present exactly once and stay small; adding
+    // it must not balloon the prompt.
+    let dir = grounded_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+
+    let (context, compiled) = runtime
+        .compile_for_task("trace canonical runtime execution", no_conversation())
+        .await
+        .expect("compile");
+
+    // Exactly one agent_analysis fragment (no duplication).
+    let report_frags: Vec<&ContextFragment> = context
+        .context_fragments
+        .iter()
+        .filter(|f| f.source == "agent_analysis")
+        .collect();
+    assert_eq!(report_frags.len(), 1, "report fragment must appear once");
+
+    // The report is a single bounded fragment.
+    let report = agent_analysis_report(&context);
+    assert!(
+        report.len() < 4096,
+        "grounded report must stay small, got {} bytes",
+        report.len()
+    );
+    let report_tokens = report.len() / 4;
+
+    // The prompt cost attributable to grounding is bounded by the report size
+    // plus a small rendering overhead.
+    let baseline_ctx = context_without_fragment_source(&context, "agent_analysis");
+    let baseline_tokens = PromptBuilder::new()
+        .compile_context(&baseline_ctx)
+        .statistics
+        .estimated_tokens;
+    let grounded_tokens = compiled.statistics.estimated_tokens;
+    let delta = grounded_tokens.saturating_sub(baseline_tokens);
+    assert!(
+        delta <= report_tokens + 256,
+        "grounding must not add uncontrolled prompt growth: delta {} vs report {} tokens",
+        delta,
+        report_tokens
     );
 }
 
