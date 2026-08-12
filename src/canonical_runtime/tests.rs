@@ -5684,3 +5684,380 @@ async fn test_review_result_reaches_main_provider_prompt() {
     assert!(review.completed);
     assert!(review.synthesis_complete);
 }
+
+// ---------------------------------------------------------------------------
+// Real-provider FULL PIPELINE smoke (Sprint 30G.2). Runs the complete
+// Research → Testing → Planning → Coding → Review → Main LLM chain against
+// the configured provider (AGNES) on a DISPOSABLE fixture crate. Ignored by
+// default because it makes real network calls with a real credential; run
+// with:
+// `cargo test --bin codebro real_provider_full_pipeline_smoke -- --ignored --nocapture`
+// The credential is read from the environment and never persisted.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn real_provider_full_pipeline_smoke() {
+    let api_key = std::env::var("AGNES_API_KEY")
+        .ok()
+        .or_else(|| std::env::var("CODEBRO_API_KEY").ok());
+    let Some(api_key) = api_key else {
+        eprintln!("REAL PROVIDER: BLOCKED (no AGNES_API_KEY in environment)");
+        return;
+    };
+    let base_url = std::env::var("CODEBRO_BASE_URL")
+        .unwrap_or_else(|_| "https://apihub.agnes-ai.com/v1".to_string());
+    let model = std::env::var("CODEBRO_MODEL").unwrap_or_else(|_| "agnes-2.5-flash".to_string());
+    let config = Config {
+        provider: "openai".to_string(),
+        base_url,
+        model,
+        api_key: Some(api_key),
+    };
+
+    // Disposable fixture crate: CodeBro itself is never touched.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "target/\nCargo.lock\n").unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[cfg(test)]\nmod tests { #[test] fn ok() {} }\n",
+    )
+    .unwrap();
+
+    let provider = Arc::new(crate::providers::OpenAiProvider::new(config.clone()));
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(config, dir.path()).expect("runtime");
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(provider);
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        research_enabled: true,
+        testing_enabled: true,
+        planning_enabled: true,
+        coding_enabled: true,
+        review_enabled: true,
+        task_timeout_ms: Some(600_000),
+        max_verification_revisions: Some(0),
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "Add a subtract function named subtract(a: i32, b: i32) -> i32 to src/lib.rs next to add, with the same signature style. Keep the existing test module. Do not touch anything else.",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    println!(
+        "[real-provider] main success={} cancelled={} error={:?}",
+        result.success, result.cancelled, result.error
+    );
+    macro_rules! print_diag {
+        ($name:literal, $opt:expr) => {
+            match $opt {
+                Some(d) => println!(
+                    "[real-provider] {}: completed={} synthesis={} termination={} iterations={} tool_calls={} model_calls={}",
+                    $name,
+                    d.completed,
+                    d.synthesis_complete,
+                    d.termination,
+                    d.iterations,
+                    d.tool_calls,
+                    d.model_calls
+                ),
+                None => println!("[real-provider] {}: (not run)", $name),
+            }
+        };
+    }
+    print_diag!("research", result.diagnostics.research.as_ref());
+    print_diag!("testing", result.diagnostics.testing.as_ref());
+    print_diag!("planning", result.diagnostics.planning.as_ref());
+    print_diag!("coding", result.diagnostics.coding.as_ref());
+    print_diag!("review", result.diagnostics.review.as_ref());
+
+    // The full chain must have actually executed every phase.
+    let research = result.diagnostics.research.expect("research ran");
+    let testing = result.diagnostics.testing.expect("testing ran");
+    let planning = result.diagnostics.planning.expect("planning ran");
+    let coding = result.diagnostics.coding.expect("coding ran");
+    let review = result.diagnostics.review.expect("review ran");
+    assert!(
+        research.completed && research.synthesis_complete,
+        "research must complete with synthesis for a real provider"
+    );
+    assert!(
+        testing.completed && testing.synthesis_complete,
+        "testing must complete with synthesis"
+    );
+    assert!(
+        planning.completed && planning.synthesis_complete,
+        "planning must complete with synthesis"
+    );
+    // Coding honesty: with a real model the session may legitimately terminate
+    // Completed (all changes machine-verified) OR VerificationUnavailable (the
+    // real plan carried no validation commands — changes stay, honestly
+    // unverified). It must never claim a fabricated verification and must
+    // never be a raw error/cancellation.
+    assert!(
+        matches!(
+            coding.termination.as_str(),
+            "completed" | "verification_unavailable"
+        ),
+        "coding must terminate honestly (completed or verification_unavailable), got: {}",
+        coding.termination
+    );
+    assert!(coding.synthesis_complete, "coding synthesis must complete");
+    assert!(
+        review.completed && review.synthesis_complete,
+        "review must complete with synthesis"
+    );
+
+    // The main LLM actually executed and the task reached a bounded terminal
+    // outcome (success, or a bounded error message — never a crash). A real
+    // model may legitimately exhaust the main loop's repeated-action guard.
+    assert!(
+        !result.cancelled,
+        "the pipeline must not be left in a cancelled state"
+    );
+    if !result.success {
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            !error.is_empty(),
+            "a failed task must carry a bounded error message"
+        );
+        println!("[real-provider] main task ended bounded with error: {error}");
+    } else {
+        assert!(
+            !result.response.is_empty(),
+            "a successful task must carry a main response"
+        );
+        println!("[real-provider] main response:\n{}", result.response);
+    }
+    println!(
+        "[real-provider] fixture src/lib.rs now:\n{}",
+        std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap_or_default()
+    );
+}
+
+// =========================================================================
+// Sprint 30G.2 — Whole-pipeline audit regressions
+// =========================================================================
+
+/// Disabled phases must not execute, must not fabricate successful-looking
+/// results, and must not leak stale fragments into the compiled main prompt.
+#[tokio::test]
+async fn test_disabled_phases_produce_no_fragments_and_no_fake_results() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec!["main answer without specialists".to_string()],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions::default();
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "explain the project",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "a task with every phase disabled must still succeed: {:?}",
+        result.error
+    );
+
+    // No diagnostics may be recorded for any disabled phase (nothing ran).
+    assert!(
+        result.diagnostics.research.is_none(),
+        "research must not run"
+    );
+    assert!(result.diagnostics.testing.is_none(), "testing must not run");
+    assert!(
+        result.diagnostics.planning.is_none(),
+        "planning must not run"
+    );
+    assert!(result.diagnostics.coding.is_none(), "coding must not run");
+    assert!(result.diagnostics.review.is_none(), "review must not run");
+
+    // Exactly one provider call: the main agent. No specialist consumed a
+    // scripted response, so no fake successful phase result was created.
+    let prompts = provider.all_prompts();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "only the main agent may call the provider"
+    );
+    for marker in [
+        "Autonomous Research Findings",
+        "Autonomous Testing Findings",
+        "Autonomous Planning",
+        "Autonomous Coding",
+        "Autonomous Review",
+    ] {
+        assert!(
+            !prompts[0].contains(marker),
+            "disabled phases must not leak a fragment into the main prompt: {marker}"
+        );
+    }
+}
+
+/// Audit invariant: a failing validation command (real exit code 101) must
+/// remain visible in the main provider's prompt even when the model's prose
+/// claims everything "passed". The machine fact travels through
+/// TestingResult → ContextFragment → compiled prompt → MockProvider.
+#[tokio::test]
+async fn test_exit_code_survives_main_prompt_despite_misleading_prose() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"ef\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec![
+            // Testing iteration 1: a REAL command that fails with exit 101
+            // (`cargo test` on a crate with a failing test).
+            r#"<invoke name="run_command">{"command": "cargo test"}</invoke>"#.to_string(),
+            // Testing final report — deliberately MISLEADING prose.
+            "All validation commands passed successfully.".to_string(),
+            // Main loop answer.
+            "main task complete.".to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        testing_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "validate the crate",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "main task must survive a failing testing phase: {:?}",
+        result.error
+    );
+
+    // The testing phase recorded the AUTHORITATIVE machine fact.
+    let testing = result
+        .diagnostics
+        .testing
+        .expect("testing diagnostics recorded");
+    assert_eq!(testing.failures, 1, "the failing command must be a failure");
+
+    // The main prompt carries the machine fact even though the model prose
+    // claimed success — the prose cannot override the exit code.
+    let prompts = provider.all_prompts();
+    let main_prompt = prompts.last().expect("main prompt present");
+    assert!(
+        main_prompt.contains("exit_code: 101"),
+        "exit_code: 101 must remain visible in the main prompt:\n{main_prompt}"
+    );
+    assert!(
+        main_prompt.contains("success: false"),
+        "success: false must remain visible in the main prompt:\n{main_prompt}"
+    );
+    assert!(
+        main_prompt.contains("All validation commands passed successfully."),
+        "the misleading prose is present (it is advisory only) — but it must never replace the exit code"
+    );
+}
+
+/// Audit invariant: an unverified coding session (VerificationUnavailable)
+/// must be visible as such in the main provider's prompt — the unverified
+/// state must not render as machine-verified.
+#[tokio::test]
+async fn test_unverified_coding_state_remains_visible_in_main_prompt() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec![
+            // Coding iteration 1: apply a real change.
+            coding_sub_proposal(),
+            // Coding final synthesis (no tool calls). No plan exists
+            // (planning_enabled=false), so the completion gate has no
+            // validation commands → VerificationUnavailable.
+            coding_final_answer(),
+            // Main loop answer.
+            "main task complete.".to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        coding_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a subtract function",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "main task must survive an unverified coding session: {:?}",
+        result.error
+    );
+
+    let coding = result
+        .diagnostics
+        .coding
+        .expect("coding diagnostics recorded");
+    assert_eq!(
+        coding.termination, "verification_unavailable",
+        "a coding session with no validation surface must never claim completion-as-verified"
+    );
+
+    // The main prompt honestly reports the unverified state: the termination,
+    // the absence of verification records and the change WITHOUT a verified
+    // marker — despite the model's final report claiming success.
+    let prompts = provider.all_prompts();
+    let main_prompt = prompts.last().expect("main prompt present");
+    assert!(
+        main_prompt.contains("verification_unavailable"),
+        "the unverified termination must remain visible in the main prompt:\n{main_prompt}"
+    );
+    assert!(
+        main_prompt.contains("(no verification commands executed)"),
+        "the absence of machine verification must remain visible:\n{main_prompt}"
+    );
+    assert!(
+        !main_prompt.contains("[verified]"),
+        "the unverified change must not render as verified:\n{main_prompt}"
+    );
+}

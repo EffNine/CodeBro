@@ -536,7 +536,7 @@ impl PlanningState {
             out.push_str("Command results (AUTHORITATIVE machine facts — trust the exit codes, not prose):\n");
             for command in &testing.commands_run {
                 out.push_str(&format!(
-                    "- {} → exit_code: {}, success: {}{}{}\n",
+                    "- {} → exit_code: {}, success: {}{}{}{}\n",
                     command.command,
                     command.exit_code,
                     command.success,
@@ -550,6 +550,11 @@ impl PlanningState {
                     },
                     if command.timeout {
                         ", timed_out: true"
+                    } else {
+                        ""
+                    },
+                    if command.cancelled {
+                        ", cancelled: true"
                     } else {
                         ""
                     }
@@ -1551,5 +1556,60 @@ mod tests {
         assert!(looks_like_identifier("CanonicalRuntime::stream_once"));
         assert!(!looks_like_identifier("cargo test"));
         assert!(!looks_like_identifier(""));
+    }
+
+    #[test]
+    fn test_render_testing_preserves_cancelled_machine_fact() {
+        // A cancelled testing command must keep its machine fact visible to
+        // the planner: exit code -1, success false AND the cancelled marker.
+        let mut state = PlanningState::new(
+            PlanningRequest::new("plan the fix", "."),
+            crate::planning::PlanningLimits::default(),
+        );
+        let cancelled = crate::testing::TestCommandResult {
+            command: "cargo test".to_string(),
+            working_directory: "/r".to_string(),
+            exit_code: -1,
+            success: false,
+            duration_ms: 100,
+            output: String::new(),
+            timeout: false,
+            cancelled: true,
+            denied: false,
+            denied_reason: None,
+        };
+        state.request.testing = Some(crate::testing::TestingResult {
+            summary: String::new(),
+            findings: Vec::new(),
+            commands_run: vec![cancelled],
+            files_inspected: Vec::new(),
+            failures: Vec::new(),
+            tool_calls: 1,
+            iterations: 1,
+            model_calls: 1,
+            termination: crate::testing::TestingTermination::Cancelled,
+            synthesis_complete: false,
+            observations: Vec::new(),
+            limitations: Vec::new(),
+            duration_ms: 0,
+            output_size: 0,
+            provider: String::new(),
+            model: String::new(),
+            git_before: None,
+            git_after: None,
+        });
+        let rendered = state.render_testing();
+        assert!(
+            rendered.contains("exit_code: -1"),
+            "exit code must stay visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("success: false"),
+            "success must stay visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("cancelled: true"),
+            "the cancelled machine fact must not be dropped: {rendered}"
+        );
     }
 }

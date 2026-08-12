@@ -26,6 +26,7 @@ struct ReviewMockProvider {
     model: String,
     responses: Arc<Mutex<Vec<String>>>,
     fail: Arc<AtomicBool>,
+    last_prompt: Arc<Mutex<Option<String>>>,
 }
 
 impl ReviewMockProvider {
@@ -35,7 +36,13 @@ impl ReviewMockProvider {
             model: format!("{}-model", name),
             responses: Arc::new(Mutex::new(responses)),
             fail: Arc::new(AtomicBool::new(false)),
+            last_prompt: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The exact prompt text the provider received on its last call.
+    fn last_prompt_text(&self) -> Option<String> {
+        self.last_prompt.lock().unwrap().clone()
     }
 
     fn failing(name: &str) -> Self {
@@ -83,7 +90,7 @@ impl Provider for ReviewMockProvider {
     }
     fn stream_response(
         &self,
-        _message: &str,
+        message: &str,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -97,6 +104,7 @@ impl Provider for ReviewMockProvider {
             let result = Err(anyhow::anyhow!("review mock provider offline"));
             Box::pin(async move { result })
         } else {
+            *self.last_prompt.lock().unwrap() = Some(message.to_string());
             let response = self.next();
             let _ = tx.send(response);
             Box::pin(async move { Ok(rx) })
@@ -858,5 +866,107 @@ PASS
     assert!(
         result.findings.is_empty(),
         "findings without evidence must not be emitted"
+    );
+}
+
+#[tokio::test]
+async fn test_review_independently_detects_coding_claim_mismatch() {
+    // Audit scenario: CodingResult claims "changed src/ghost.rs" but the real
+    // repository does not contain that change (the file does not even exist).
+    // Review must be fed the REAL repository state — its own read_file
+    // observation of the actual fixture — alongside the coding claim, so the
+    // mismatch is detectable. Uses a real repository fixture, not strings.
+    let dir = review_workspace();
+    // The real fixture: src/lib.rs holds the actual content; src/ghost.rs does
+    // not exist anywhere in the workspace.
+    let provider = Arc::new(ReviewMockProvider::text(
+        "mock",
+        vec![
+            // Review iteration 1: independently inspect the file Coding claims
+            // to have changed.
+            r#"<invoke name="read_file">{"path": "src/ghost.rs"}</invoke>"#.to_string(),
+            // Review iteration 2: inspect the actual repository file.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Review final synthesis.
+            final_review(),
+        ],
+    ));
+    let harness = ReviewHarness::new(provider.clone());
+    let coding = crate::coding::CodingResult {
+        summary: "changed ghost file".to_string(),
+        changes: vec![crate::coding::AppliedChange {
+            path: PathBuf::from("src/ghost.rs"),
+            created: false,
+            unplanned: false,
+            preview: "+pub fn ghost() {}".to_string(),
+            backup: "old".to_string(),
+            full_new: "pub fn ghost() {}".to_string(),
+            verified: true,
+            rolled_back: false,
+        }],
+        unplanned_changes: Vec::new(),
+        verification: vec![crate::coding::VerificationRecord {
+            command: "cargo check".to_string(),
+            working_directory: dir.path().to_string_lossy().to_string(),
+            exit_code: 0,
+            success: true,
+            duration_ms: 10,
+            output: String::new(),
+            timeout: false,
+            cancelled: false,
+            denied: false,
+            denied_reason: None,
+            source: crate::coding::VerificationSource::CompletionGate,
+        }],
+        files_inspected: Vec::new(),
+        tool_calls: 0,
+        iterations: 0,
+        model_calls: 0,
+        revisions: 0,
+        termination: crate::coding::CodingTermination::Completed,
+        synthesis_complete: true,
+        observations: Vec::new(),
+        limitations: Vec::new(),
+        duration_ms: 0,
+        output_size: 0,
+        provider: String::new(),
+        model: String::new(),
+        git_before: None,
+        git_after: None,
+    };
+    let request = ReviewRequest::new("review the change", dir.path())
+        .with_coding(Some(coding))
+        .with_limits(ReviewLimits::default());
+    let (result, _) = run_review_session(harness, dir.path(), request).await;
+
+    assert_eq!(result.termination, ReviewTermination::Completed);
+    assert!(result.synthesis_complete);
+
+    // The model's final prompt carries BOTH the coding claim and the review's
+    // own real observation that contradicts it.
+    let prompt = provider
+        .last_prompt_text()
+        .expect("review must have sent a prompt to the provider");
+    assert!(
+        prompt.contains("src/ghost.rs"),
+        "the coding claim must be visible to the reviewer:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("CURRENT OBSERVATIONS"),
+        "the review's own observations must be rendered into its prompt:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("Error") && prompt.contains("ghost"),
+        "the review's REAL read_file observation of the missing file must be visible (not the coding claim):\n{prompt}"
+    );
+    assert!(
+        prompt.contains("pub fn add(a: i32, b: i32)"),
+        "the review must independently observe the REAL repository file content:\n{prompt}"
+    );
+
+    // The review never creates the claimed file (read-only boundary).
+    assert!(
+        !dir.path().join("src/ghost.rs").exists(),
+        "review must never materialize a file that Coding claimed"
     );
 }

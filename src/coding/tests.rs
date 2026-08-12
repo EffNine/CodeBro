@@ -273,6 +273,42 @@ fn final_answer() -> String {
     "implemented the subtract change in src/lib.rs.".to_string()
 }
 
+#[tokio::test]
+async fn test_coding_cancellation_is_honored_without_mutation() {
+    // Cancellation before the loop starts must produce a bounded Cancelled
+    // result: no provider call, no mutation, no fake Completed status.
+    let dir = coding_workspace();
+    let cancel = crate::cancellation::CancellationToken::new();
+    cancel.cancel();
+
+    let harness = CodingHarness::new(Arc::new(CodingMockProvider::text(
+        "mock",
+        vec![sub_proposal(), final_answer()],
+    )));
+    let request = CodingRequest::new("add a subtract function", dir.path())
+        .with_planning(Some(make_plan_with_validation()))
+        .with_limits(CodingLimits::default());
+    let (_, emit) = event_sink();
+    let mut subagent = harness.subagent(
+        dir.path(),
+        &[PathBuf::from("src/lib.rs")],
+        false,
+        &request.limits,
+    );
+    let result = subagent.run(request, &emit, Some(cancel)).await;
+
+    assert_eq!(result.termination, CodingTermination::Cancelled);
+    assert!(!result.synthesis_complete);
+    assert!(
+        result.changes.is_empty(),
+        "no changes may be applied under immediate cancellation"
+    );
+    // The repository is untouched: no partial untracked mutation.
+    let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert!(lib.contains("pub fn add"));
+    assert!(!lib.contains("pub fn sub"));
+}
+
 async fn run_session(
     harness: CodingHarness,
     tooling_root: &Path,

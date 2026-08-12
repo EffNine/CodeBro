@@ -314,16 +314,23 @@ impl ReviewSubagent {
 
     /// Assemble the final result for a terminating session.
     fn finish(
-        &mut self,
+        &self,
         state: ReviewState,
         termination: ReviewTermination,
         started: Instant,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> ReviewResult {
-        emit(AgentEvent::AgentCompleted {
-            agent: "review".to_string(),
-            duration_ms: started.elapsed().as_millis() as u64,
-        });
+        if termination.is_completed() {
+            emit(AgentEvent::AgentCompleted {
+                agent: "review".to_string(),
+                duration_ms: started.elapsed().as_millis() as u64,
+            });
+        } else {
+            emit(AgentEvent::Log {
+                level: "review".to_string(),
+                message: format!("Review terminated: {}", termination),
+            });
+        }
         state.build_result(termination, started.elapsed().as_millis() as u64)
     }
 
@@ -605,7 +612,7 @@ impl ReviewState {
             out.push_str("Command results (AUTHORITATIVE machine facts):\n");
             for command in &testing.commands_run {
                 out.push_str(&format!(
-                    "- {} → exit_code: {}, success: {}{}{}\n",
+                    "- {} → exit_code: {}, success: {}{}{}{}\n",
                     command.command,
                     command.exit_code,
                     command.success,
@@ -619,6 +626,11 @@ impl ReviewState {
                     },
                     if command.timeout {
                         ", timed_out: true"
+                    } else {
+                        ""
+                    },
+                    if command.cancelled {
+                        ", cancelled: true"
                     } else {
                         ""
                     }
@@ -844,12 +856,13 @@ impl ReviewState {
             })
             .unwrap_or_default();
 
+        let findings = parse_findings(&self.final_answer.as_deref().unwrap_or(""));
         let verdict = parse_verdict(
             &self.final_answer.as_deref().unwrap_or(""),
+            &findings,
             &unverified,
             &deviations,
         );
-        let findings = parse_findings(&self.final_answer.as_deref().unwrap_or(""));
         let security_concerns =
             parse_security_concerns(&self.final_answer.as_deref().unwrap_or(""));
         let regression_risks = parse_regression_risks(&self.final_answer.as_deref().unwrap_or(""));
@@ -974,12 +987,21 @@ fn list_output_paths(output: &str) -> Vec<PathBuf> {
 /// `PASS`, `PASS_WITH_RISKS`, or `FAIL`. This parser does a case-insensitive
 /// scan for those exact tokens. When none are found, or when authoritative
 /// machine facts contradict a `PASS`, the verdict is downgraded conservatively.
-fn parse_verdict(text: &str, unverified: &[PathBuf], deviations: &[PathBuf]) -> ReviewVerdict {
+///
+/// Authoritative downgrade invariants (model prose must never override them):
+/// - unverified changes, plan deviations or a Critical finding make `PASS`
+///   impossible (downgraded to at most `PassWithRisks`; an explicit `FAIL`
+///   stays `Fail`);
+/// - a missing verdict falls back to `PassWithRisks` (never `Pass`).
+fn parse_verdict(
+    text: &str,
+    findings: &[ReviewFinding],
+    unverified: &[PathBuf],
+    deviations: &[PathBuf],
+) -> ReviewVerdict {
     let lower = text.to_lowercase();
 
-    // Authoritative downgrade invariants: unverified changes or plan deviations
-    // must never be hidden behind a PASS verdict.
-    if !unverified.is_empty() || !deviations.is_empty() {
+    if !unverified.is_empty() || !deviations.is_empty() || has_critical_finding(findings) {
         // Even if the model said PASS, machine facts force a lower verdict.
         if lower.contains("fail") {
             return ReviewVerdict::Fail;
@@ -998,6 +1020,14 @@ fn parse_verdict(text: &str, unverified: &[PathBuf], deviations: &[PathBuf]) -> 
     }
     // No explicit verdict found — default conservatively to PassWithRisks.
     ReviewVerdict::PassWithRisks
+}
+
+/// Whether any finding is severity Critical. A Critical finding is a machine-
+/// surfaced contradiction: `PASS` is never acceptable alongside one.
+fn has_critical_finding(findings: &[ReviewFinding]) -> bool {
+    findings
+        .iter()
+        .any(|f| f.severity == ReviewSeverity::Critical)
 }
 
 /// Parse structured findings from synthesis prose.
@@ -1176,19 +1206,22 @@ mod tests {
     #[test]
     fn test_parse_verdict_from_pass_synthesis() {
         let text = "## Verdict\nPASS\n";
-        assert_eq!(parse_verdict(text, &[], &[]), ReviewVerdict::Pass);
+        assert_eq!(parse_verdict(text, &[], &[], &[]), ReviewVerdict::Pass);
     }
 
     #[test]
     fn test_parse_verdict_from_fail_synthesis() {
         let text = "## Verdict\nFAIL\n";
-        assert_eq!(parse_verdict(text, &[], &[]), ReviewVerdict::Fail);
+        assert_eq!(parse_verdict(text, &[], &[], &[]), ReviewVerdict::Fail);
     }
 
     #[test]
     fn test_parse_verdict_from_pass_with_risks_synthesis() {
         let text = "## Verdict\nPASS_WITH_RISKS\n";
-        assert_eq!(parse_verdict(text, &[], &[]), ReviewVerdict::PassWithRisks);
+        assert_eq!(
+            parse_verdict(text, &[], &[], &[]),
+            ReviewVerdict::PassWithRisks
+        );
     }
 
     #[test]
@@ -1196,7 +1229,7 @@ mod tests {
         let text = "## Verdict\nPASS\n";
         let unverified = vec![PathBuf::from("src/lib.rs")];
         assert_eq!(
-            parse_verdict(text, &unverified, &[]),
+            parse_verdict(text, &[], &unverified, &[]),
             ReviewVerdict::PassWithRisks
         );
     }
@@ -1206,22 +1239,71 @@ mod tests {
         let text = "## Verdict\nPASS\n";
         let deviations = vec![PathBuf::from("src/extra.rs")];
         assert_eq!(
-            parse_verdict(text, &[], &deviations),
+            parse_verdict(text, &[], &[], &deviations),
             ReviewVerdict::PassWithRisks
         );
+    }
+
+    #[test]
+    fn test_parse_verdict_downgrades_pass_when_critical_finding_exists() {
+        // A Critical finding must never be hidden behind a PASS verdict, even
+        // when the model's prose explicitly claims PASS (audit invariant).
+        let text = "## Verdict\nPASS\n";
+        let critical = vec![ReviewFinding {
+            severity: ReviewSeverity::Critical,
+            category: ReviewCategory::Security,
+            title: "hardcoded secret".to_string(),
+            file: Some(PathBuf::from("src/config.rs")),
+            symbol: None,
+            statement: "credential is hardcoded".to_string(),
+            evidence: "read_file showed plaintext".to_string(),
+            recommendation: String::new(),
+        }];
+        assert_eq!(
+            parse_verdict(text, &critical, &[], &[]),
+            ReviewVerdict::PassWithRisks
+        );
+        // An explicit FAIL alongside a critical finding stays FAIL.
+        assert_eq!(
+            parse_verdict("## Verdict\nFAIL\n", &critical, &[], &[]),
+            ReviewVerdict::Fail
+        );
+    }
+
+    #[test]
+    fn test_parse_verdict_ignores_non_critical_findings_for_pass() {
+        // A low-severity or informational finding does not block a PASS.
+        let text = "## Verdict\nPASS\n";
+        let low = vec![ReviewFinding {
+            severity: ReviewSeverity::Low,
+            category: ReviewCategory::Maintainability,
+            title: "style nit".to_string(),
+            file: None,
+            symbol: None,
+            statement: "minor".to_string(),
+            evidence: "observed".to_string(),
+            recommendation: String::new(),
+        }];
+        assert_eq!(parse_verdict(text, &low, &[], &[]), ReviewVerdict::Pass);
     }
 
     #[test]
     fn test_parse_verdict_allows_fail_even_with_unverified() {
         let text = "## Verdict\nFAIL\n";
         let unverified = vec![PathBuf::from("src/lib.rs")];
-        assert_eq!(parse_verdict(text, &unverified, &[]), ReviewVerdict::Fail);
+        assert_eq!(
+            parse_verdict(text, &[], &unverified, &[]),
+            ReviewVerdict::Fail
+        );
     }
 
     #[test]
     fn test_parse_verdict_falls_back_to_pass_with_risks_when_missing() {
         let text = "No verdict section present.\n";
-        assert_eq!(parse_verdict(text, &[], &[]), ReviewVerdict::PassWithRisks);
+        assert_eq!(
+            parse_verdict(text, &[], &[], &[]),
+            ReviewVerdict::PassWithRisks
+        );
     }
 
     #[test]
@@ -1304,5 +1386,60 @@ none"#;
     fn test_list_output_paths() {
         let paths = list_output_paths("a.rs\nb.rs\n");
         assert_eq!(paths, vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")]);
+    }
+
+    #[test]
+    fn test_render_testing_preserves_cancelled_machine_fact() {
+        // A cancelled testing command must keep its machine fact visible to
+        // the reviewer: exit code -1, success false AND the cancelled marker.
+        let mut state = ReviewState::new(
+            ReviewRequest::new("review the work", "."),
+            ReviewLimits::default(),
+        );
+        let cancelled = crate::testing::TestCommandResult {
+            command: "cargo test".to_string(),
+            working_directory: "/r".to_string(),
+            exit_code: -1,
+            success: false,
+            duration_ms: 100,
+            output: String::new(),
+            timeout: false,
+            cancelled: true,
+            denied: false,
+            denied_reason: None,
+        };
+        state.request.testing = Some(crate::testing::TestingResult {
+            summary: String::new(),
+            findings: Vec::new(),
+            commands_run: vec![cancelled],
+            files_inspected: Vec::new(),
+            failures: Vec::new(),
+            tool_calls: 1,
+            iterations: 1,
+            model_calls: 1,
+            termination: crate::testing::TestingTermination::Cancelled,
+            synthesis_complete: false,
+            observations: Vec::new(),
+            limitations: Vec::new(),
+            duration_ms: 0,
+            output_size: 0,
+            provider: String::new(),
+            model: String::new(),
+            git_before: None,
+            git_after: None,
+        });
+        let rendered = state.render_testing();
+        assert!(
+            rendered.contains("exit_code: -1"),
+            "exit code must stay visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("success: false"),
+            "success must stay visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("cancelled: true"),
+            "the cancelled machine fact must not be dropped: {rendered}"
+        );
     }
 }
