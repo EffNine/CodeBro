@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::agent::events::AgentEvent;
-use crate::canonical_runtime::CanonicalRuntime;
+use crate::canonical_runtime::{CanonicalRuntime, TaskMode, TaskOptions};
 use crate::config::Config;
 use crate::engineering_context::{ContextFragment, ConversationMessage, EngineeringContextBuilder};
 use crate::prompt_builder::PromptBuilder;
@@ -4470,6 +4470,27 @@ fn planning_final_answer() -> String {
         .to_string()
 }
 
+/// A final-plan text whose step carries NO `Validate:` field, so the plan
+/// has no validation commands (used to prove the completion gate never
+/// fabricates verification).
+fn planning_final_answer_without_validation() -> String {
+    "## Existing implementation\n\
+     add() currently returns a + b in src/lib.rs.\n\
+     \n\
+     ## Required change\n\
+     Add a subtract() sibling with the same signature.\n\
+     \n\
+     Step 1: Modify add in src/lib.rs\n\
+     Files: src/lib.rs\n\
+     Symbols: add\n\
+     Reason: the task needs arithmetic helpers in one place\n\
+     Risk: callers of add may break\n\
+     \n\
+     Dependencies: src/lib.rs\n\
+     Assumption: no external callers\n"
+        .to_string()
+}
+
 /// PlanningResult → ContextFragment → compiled main prompt. The full Sprint
 /// 30C/30D/30E chain runs: Research first, then Testing (REAL cargo check),
 /// then Planning consumes both evidence streams, performs one targeted
@@ -5409,6 +5430,10 @@ async fn test_coding_result_reaches_main_provider_prompt() {
     let provider = Arc::new(RecordingScriptedProvider::new(
         "mock",
         vec![
+            // Planning iteration 1: a single targeted read-only verify.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Planning final implementation plan.
+            planning_final_answer(),
             // Coding iteration 1: apply the plan's step (real mutation).
             coding_sub_proposal(),
             // Coding iteration 2: explicit verification (REAL cargo check).
@@ -5424,6 +5449,7 @@ async fn test_coding_result_reaches_main_provider_prompt() {
     let (_, emit) = event_sink();
     let on_chunk = |_c: &str| {};
     let options = crate::canonical_runtime::TaskOptions {
+        planning_enabled: true,
         coding_enabled: true,
         ..Default::default()
     };
@@ -5445,7 +5471,7 @@ async fn test_coding_result_reaches_main_provider_prompt() {
     // The main provider's prompt (the LAST recorded prompt) contains the
     // coding fragment with the applied change and its authoritative exit code.
     let prompts = provider.all_prompts();
-    assert_eq!(prompts.len(), 4, "3 coding calls + 1 main call");
+    assert_eq!(prompts.len(), 6, "2 planning + 3 coding + 1 main call");
     let main_prompt = prompts.last().expect("main prompt present");
     assert!(
         main_prompt.contains("--- coding () ---"),
@@ -5993,8 +6019,14 @@ async fn test_exit_code_survives_main_prompt_despite_misleading_prose() {
 /// Audit invariant: an unverified coding session (VerificationUnavailable)
 /// must be visible as such in the main provider's prompt — the unverified
 /// state must not render as machine-verified.
+///
+/// Sprint 31A production policy — HARD STOP: applied-but-unverified changes
+/// must never become a normal successful task. With a plan that carries NO
+/// validation commands, coding applies a real change and terminates
+/// `verification_unavailable`; the task MUST fail with an explicit error and
+/// the change stays in the working tree for the user to inspect.
 #[tokio::test]
-async fn test_unverified_coding_state_remains_visible_in_main_prompt() {
+async fn test_verification_unavailable_blocks_success() {
     let dir = testing_workspace();
     let mut runtime =
         CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
@@ -6002,19 +6034,304 @@ async fn test_unverified_coding_state_remains_visible_in_main_prompt() {
     let provider = Arc::new(RecordingScriptedProvider::new(
         "mock",
         vec![
+            // Planning iteration 1: a single targeted read-only verify.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Planning final implementation plan WITHOUT any Validate field:
+            // the plan carries no validation surface.
+            planning_final_answer_without_validation(),
             // Coding iteration 1: apply a real change.
             coding_sub_proposal(),
-            // Coding final synthesis (no tool calls). No plan exists
-            // (planning_enabled=false), so the completion gate has no
-            // validation commands → VerificationUnavailable.
+            // Coding final synthesis (no tool calls). The completion gate has
+            // no validation commands → VerificationUnavailable.
             coding_final_answer(),
-            // Main loop answer.
-            "main task complete.".to_string(),
         ],
     ));
     runtime.register_provider(provider.clone());
 
     let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        planning_enabled: true,
+        coding_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a subtract function",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        !result.success,
+        "unverified mutations must hard-stop the task, not succeed: {:?}",
+        result.error
+    );
+
+    let error = result.error.expect("explicit failure message");
+    assert!(
+        error.contains("verification_unavailable"),
+        "the failure must name the termination: {error}"
+    );
+    assert!(
+        error.contains("could not be machine-verified"),
+        "the failure must state the unverified condition: {error}"
+    );
+    assert!(
+        error.contains("src/lib.rs"),
+        "the failure must name the unverified file: {error}"
+    );
+
+    // The coding phase DID run and its honest unverified state was recorded.
+    let coding = result
+        .diagnostics
+        .coding
+        .expect("coding diagnostics recorded");
+    assert_eq!(
+        coding.termination, "verification_unavailable",
+        "a coding session with no validation surface must never claim completion-as-verified"
+    );
+    assert_eq!(coding.changes_applied, 1);
+
+    // The change remains in the working tree, inspectable (never silently
+    // removed, never silently claimed verified).
+    let content = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert!(
+        content.contains("pub fn sub"),
+        "the unverified change must remain in the tree for inspection: {content}"
+    );
+
+    // No main-loop provider call happened: the task stopped at the gate.
+    assert_eq!(
+        provider.all_prompts().len(),
+        4,
+        "planning (2) + coding (2) only — the main loop must not run after the gate"
+    );
+}
+
+// =========================================================================
+// Sprint 31A — Productionization audit policy tests
+// =========================================================================
+
+/// A review final report that FAILs with a Critical finding (used to prove
+/// the hard-stop review gate).
+fn review_final_answer_fail() -> String {
+    "FINAL CODE REVIEW:\n\
+     ## Summary\n\
+     The replacement is not equivalent.\n\
+     ## Findings\n\
+     - [critical] correctness — subtract is wrong\n\
+       file: src/lib.rs\n\
+       statement: the replacement breaks the public contract\n\
+       evidence: git diff\n\
+       recommendation: revert\n\
+     ## Verification Status\n\
+     - src/lib.rs [unverified]\n\
+     ## Verdict\n\
+     FAIL\n"
+        .to_string()
+}
+
+/// A review final report that passes WITH RISKS (High finding, no Critical).
+fn review_final_answer_pass_with_risks() -> String {
+    "FINAL CODE REVIEW:\n\
+     ## Summary\n\
+     Mostly fine, one regression risk.\n\
+     ## Findings\n\
+     - [high] regression — callers may break\n\
+       file: src/lib.rs\n\
+       statement: the signature differs from add\n\
+       evidence: git diff\n\
+       recommendation: check callers\n\
+     ## Verification Status\n\
+     - src/lib.rs [verified]\n\
+     ## Verdict\n\
+     PASS_WITH_RISKS\n"
+        .to_string()
+}
+
+/// Sprint 31A invariant: the DEFAULT task must never enable autonomous
+/// mutation or any specialist phase.
+#[test]
+fn test_default_task_does_not_enable_autonomous_coding() {
+    let opts = crate::canonical_runtime::TaskOptions::default();
+    assert!(!opts.coding_enabled, "coding must be off by default");
+    assert!(!opts.review_enabled, "review must be off by default");
+    assert!(!opts.planning_enabled, "planning must be off by default");
+    assert!(!opts.testing_enabled, "testing must be off by default");
+    assert!(!opts.research_enabled, "research must be off by default");
+}
+
+/// Sprint 31A invariant: coding (mutation) is enabled ONLY by the explicit
+/// Autonomous mode — Assist / Validate / Plan never enable it.
+#[test]
+fn test_autonomous_mode_is_explicit() {
+    let assist = crate::canonical_runtime::TaskOptions::for_mode(TaskMode::Assist);
+    assert!(assist.research_enabled);
+    assert!(!assist.testing_enabled);
+    assert!(!assist.coding_enabled);
+    assert!(!assist.review_enabled);
+
+    let validate = crate::canonical_runtime::TaskOptions::for_mode(TaskMode::Validate);
+    assert!(validate.testing_enabled);
+    assert!(!validate.planning_enabled);
+    assert!(!validate.coding_enabled);
+    assert!(!validate.review_enabled);
+
+    let plan = crate::canonical_runtime::TaskOptions::for_mode(TaskMode::Plan);
+    assert!(plan.planning_enabled);
+    assert!(!plan.coding_enabled);
+    assert!(!plan.review_enabled);
+
+    let autonomous = crate::canonical_runtime::TaskOptions::for_mode(TaskMode::Autonomous);
+    assert!(autonomous.research_enabled);
+    assert!(autonomous.testing_enabled);
+    assert!(autonomous.planning_enabled);
+    assert!(autonomous.coding_enabled);
+    assert!(autonomous.review_enabled);
+}
+
+/// Sprint 31A invariant: enablement state is per-options value; a fresh
+/// default never inherits a previous task's flags.
+#[test]
+fn test_disabled_flags_do_not_leak_between_tasks() {
+    let autonomous = crate::canonical_runtime::TaskOptions::for_mode(TaskMode::Autonomous);
+    assert!(autonomous.coding_enabled);
+
+    let fresh = crate::canonical_runtime::TaskOptions::default();
+    assert!(!fresh.coding_enabled);
+    assert!(!fresh.review_enabled);
+    assert!(!fresh.planning_enabled);
+
+    let assist_again = crate::canonical_runtime::TaskOptions::for_mode(TaskMode::Assist);
+    assert!(!assist_again.coding_enabled);
+}
+
+/// Sprint 31A invariant: the whole-pipeline deadline budgets the main loop
+/// plus every enabled specialist's own session timeout, so enabling phases
+/// can never starve the main loop's budget.
+#[test]
+fn test_deadline_budget_includes_enabled_specialists() {
+    use super::task_deadline_budget;
+    assert_eq!(task_deadline_budget(&TaskOptions::default()), 0);
+
+    let mut autonomous = TaskOptions::for_mode(TaskMode::Autonomous);
+    autonomous.task_timeout_ms = Some(30_000);
+    assert_eq!(
+        task_deadline_budget(&autonomous),
+        30_000 + 5 * 30_000,
+        "task timeout + 5 specialist timeouts"
+    );
+
+    let mut plan = TaskOptions::for_mode(TaskMode::Plan);
+    plan.task_timeout_ms = Some(10_000);
+    assert_eq!(
+        task_deadline_budget(&plan),
+        10_000 + 3 * 30_000,
+        "task timeout + research/testing/planning timeouts"
+    );
+}
+
+/// Sprint 31A invariant: the main loop's iteration budget stays at the
+/// default `MAX_REACT_ITERATIONS` with no specialists and grows by one per
+/// enabled phase, so a specialist-augmented main loop cannot exhaust its
+/// budget before synthesizing the injected evidence.
+#[test]
+fn test_main_loop_budget_scales_with_enabled_specialists() {
+    use super::{main_loop_iteration_budget, MAX_REACT_ITERATIONS};
+    assert_eq!(
+        main_loop_iteration_budget(&TaskOptions::default()),
+        MAX_REACT_ITERATIONS,
+        "the default budget must stay unchanged"
+    );
+    assert_eq!(
+        main_loop_iteration_budget(&TaskOptions::for_mode(TaskMode::Assist)),
+        MAX_REACT_ITERATIONS + 1
+    );
+    assert_eq!(
+        main_loop_iteration_budget(&TaskOptions::for_mode(TaskMode::Validate)),
+        MAX_REACT_ITERATIONS + 2
+    );
+    assert_eq!(
+        main_loop_iteration_budget(&TaskOptions::for_mode(TaskMode::Plan)),
+        MAX_REACT_ITERATIONS + 3
+    );
+    assert_eq!(
+        main_loop_iteration_budget(&TaskOptions::for_mode(TaskMode::Autonomous)),
+        MAX_REACT_ITERATIONS + 5
+    );
+}
+
+/// Sprint 31A integration: with all five specialists enabled, the main ReAct
+/// loop must survive past the base `MAX_REACT_ITERATIONS` — it must get the
+/// scaled `5 + 5 = 10` iterations even when the provider never stops calling
+/// tools. Each specialist consumes its own bounded budget (6 calls), so the
+/// expected total provider call count is 5 × 6 + 10 = 40.
+#[tokio::test]
+async fn test_main_loop_runs_beyond_base_iterations_with_specialists() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    // Distinct tool calls (varying argument) so the repeated-action guard
+    // never fires and only the iteration budget can stop the loops.
+    let responses: Vec<String> = (0..60)
+        .map(|i| format!(r#"<invoke name="list_files">{{"path": ".", "x": {i}}}</invoke>"#))
+        .collect();
+    let provider = Arc::new(RecordingScriptedProvider::new("mock", responses));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = TaskOptions::for_mode(TaskMode::Autonomous);
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "list files repeatedly",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        !result.success,
+        "the main loop must exhaust its (scaled) iteration budget: {:?}",
+        result.error
+    );
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("maximum number of reasoning iterations"),
+        "the failure must be the iteration-cap message: {:?}",
+        result.error
+    );
+
+    // 5 specialists × 6 model calls + main loop × 10 (scaled) = 40.
+    assert_eq!(
+        provider.all_prompts().len(),
+        40,
+        "each specialist must stay bounded (6 calls) and the main loop must get the scaled 10-iteration budget"
+    );
+}
+
+/// Sprint 31A policy: coding without a Planning result is DENIED — no
+/// mutation, no fake result, no fragment, and the task continues with an
+/// explicit policy log.
+#[tokio::test]
+async fn test_coding_requires_planning_result() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec!["main answer without coding".to_string()],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (events, emit) = event_sink();
     let on_chunk = |_c: &str| {};
     let options = crate::canonical_runtime::TaskOptions {
         coding_enabled: true,
@@ -6030,34 +6347,160 @@ async fn test_unverified_coding_state_remains_visible_in_main_prompt() {
     let result = runtime.run_task_with_options(&req, options).await;
     assert!(
         result.success,
-        "main task must survive an unverified coding session: {:?}",
+        "denied coding must not crash the task: {:?}",
         result.error
     );
 
-    let coding = result
-        .diagnostics
-        .coding
-        .expect("coding diagnostics recorded");
-    assert_eq!(
-        coding.termination, "verification_unavailable",
-        "a coding session with no validation surface must never claim completion-as-verified"
+    // No coding diagnostics, no coding fragment, no mutation.
+    assert!(
+        result.diagnostics.coding.is_none(),
+        "the denied coding phase must not record diagnostics"
+    );
+    let prompts = provider.all_prompts();
+    let main_prompt = prompts.last().expect("main prompt");
+    assert!(
+        !main_prompt.contains("Autonomous Coding"),
+        "the denied phase must not leak a fragment: {main_prompt}"
+    );
+    let content = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert!(
+        content.contains("pub fn add") && !content.contains("pub fn sub"),
+        "no mutation may occur without a plan: {content}"
     );
 
-    // The main prompt honestly reports the unverified state: the termination,
-    // the absence of verification records and the change WITHOUT a verified
-    // marker — despite the model's final report claiming success.
-    let prompts = provider.all_prompts();
-    let main_prompt = prompts.last().expect("main prompt present");
+    // The denial is explicit and observable.
+    let logs: Vec<String> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Log { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .collect();
     assert!(
-        main_prompt.contains("verification_unavailable"),
-        "the unverified termination must remain visible in the main prompt:\n{main_prompt}"
+        logs.iter()
+            .any(|m| m.contains("requires a Planning result") && m.contains("denied")),
+        "the policy denial must be logged: {logs:?}"
+    );
+}
+
+/// Sprint 31A hard stop: a review FAIL verdict (with a Critical finding)
+/// must block task success — the user must never see a normal successful
+/// task for a failing review.
+#[tokio::test]
+async fn test_critical_review_blocks_success() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec![
+            // Review final synthesis: FAIL with a Critical finding.
+            review_final_answer_fail(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        review_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "review the change",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        !result.success,
+        "a FAIL review must block success: {:?}",
+        result.error
+    );
+    let error = result.error.expect("failure message");
+    assert!(
+        error.contains("Autonomous review verdict: FAIL"),
+        "the failure must surface the verdict: {error}"
     );
     assert!(
-        main_prompt.contains("(no verification commands executed)"),
-        "the absence of machine verification must remain visible:\n{main_prompt}"
+        error.contains("1 critical"),
+        "the failure must surface the critical count: {error}"
+    );
+
+    // The verdict is recorded in diagnostics.
+    let review = result
+        .diagnostics
+        .review
+        .expect("review diagnostics recorded");
+    assert_eq!(review.verdict, "FAIL");
+
+    // The main loop never ran after the gate.
+    assert_eq!(
+        provider.all_prompts().len(),
+        1,
+        "only the review phase ran — the main loop must not run after the gate"
+    );
+}
+
+/// Sprint 31A policy: PASS_WITH_RISKS is not a silent success — the risk is
+/// clearly surfaced in the final answer the user reads. Review may also run
+/// WITHOUT Coding (standalone review of the existing working tree).
+#[tokio::test]
+async fn test_review_pass_with_risks_surfaces_risk() {
+    let dir = testing_workspace();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec![
+            // Review final synthesis: PASS_WITH_RISKS with a High finding.
+            review_final_answer_pass_with_risks(),
+            // Main loop answer.
+            "main task complete.".to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        review_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "review the change",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "PASS_WITH_RISKS may continue, but the risk must surface: {:?}",
+        result.error
     );
     assert!(
-        !main_prompt.contains("[verified]"),
-        "the unverified change must not render as verified:\n{main_prompt}"
+        result.response.contains("PASS_WITH_RISKS"),
+        "the risk must be surfaced in the final answer: {}",
+        result.response
     );
+    assert!(
+        result.response.contains("finding"),
+        "the surfaced risk must be concrete: {}",
+        result.response
+    );
+
+    let review = result
+        .diagnostics
+        .review
+        .expect("review diagnostics recorded");
+    assert_eq!(review.verdict, "PASS_WITH_RISKS");
+    assert!(review.findings >= 1);
 }

@@ -984,9 +984,12 @@ fn list_output_paths(output: &str) -> Vec<PathBuf> {
 /// Extract the verdict from synthesis prose.
 ///
 /// The synthesis prompt instructs the model to emit `## Verdict` followed by
-/// `PASS`, `PASS_WITH_RISKS`, or `FAIL`. This parser does a case-insensitive
-/// scan for those exact tokens. When none are found, or when authoritative
-/// machine facts contradict a `PASS`, the verdict is downgraded conservatively.
+/// `PASS`, `PASS_WITH_RISKS`, or `FAIL`. The verdict is parsed ONLY from that
+/// `## Verdict` section, using standalone-token matching — body prose such as
+/// "no failures found" or "fails at runtime" must never be misread as a FAIL
+/// verdict (real-provider smoke exposed exactly this false positive). When
+/// the section is missing, or when authoritative machine facts contradict a
+/// `PASS`, the verdict is downgraded conservatively.
 ///
 /// Authoritative downgrade invariants (model prose must never override them):
 /// - unverified changes, plan deviations or a Critical finding make `PASS`
@@ -999,27 +1002,70 @@ fn parse_verdict(
     unverified: &[PathBuf],
     deviations: &[PathBuf],
 ) -> ReviewVerdict {
-    let lower = text.to_lowercase();
+    let explicit = extract_verdict_section(text)
+        .as_deref()
+        .and_then(verdict_token);
 
+    // Machine facts always win: unverified changes, plan deviations and
+    // Critical findings make PASS impossible. Only an explicit FAIL token in
+    // the Verdict section keeps the verdict at Fail.
     if !unverified.is_empty() || !deviations.is_empty() || has_critical_finding(findings) {
-        // Even if the model said PASS, machine facts force a lower verdict.
-        if lower.contains("fail") {
+        if explicit == Some(ReviewVerdict::Fail) {
             return ReviewVerdict::Fail;
         }
         return ReviewVerdict::PassWithRisks;
     }
 
+    // No authoritative contradiction: the explicit token wins; a missing
+    // verdict defaults conservatively to PassWithRisks (never Pass).
+    explicit.unwrap_or(ReviewVerdict::PassWithRisks)
+}
+
+/// Extract the `## Verdict` section: the lines after the `## Verdict` header
+/// until the next `## ` header (or the end of the text). Returns `None` when
+/// the section is absent.
+fn extract_verdict_section(text: &str) -> Option<String> {
+    let mut in_section = false;
+    let mut section = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if in_section {
+            if trimmed.starts_with("## ") {
+                break;
+            }
+            section.push_str(line);
+            section.push('\n');
+        } else if trimmed.to_lowercase().starts_with("## verdict") {
+            in_section = true;
+        }
+    }
+    if in_section {
+        Some(section)
+    } else {
+        None
+    }
+}
+
+/// The verdict token explicitly written in the `## Verdict` section, if any.
+/// Standalone-token matching: "No failures found" is NOT a FAIL verdict.
+fn verdict_token(section: &str) -> Option<ReviewVerdict> {
+    let lower = section.to_lowercase();
     if lower.contains("pass_with_risks") || lower.contains("pass with risks") {
-        return ReviewVerdict::PassWithRisks;
+        return Some(ReviewVerdict::PassWithRisks);
     }
-    if lower.contains("fail") {
-        return ReviewVerdict::Fail;
+    if contains_standalone_token(section, "fail") {
+        return Some(ReviewVerdict::Fail);
     }
-    if lower.contains("pass") {
-        return ReviewVerdict::Pass;
+    if contains_standalone_token(section, "pass") {
+        return Some(ReviewVerdict::Pass);
     }
-    // No explicit verdict found — default conservatively to PassWithRisks.
-    ReviewVerdict::PassWithRisks
+    None
+}
+
+/// Whether `token` appears in `text` as a standalone word (case-insensitive).
+fn contains_standalone_token(text: &str, token: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|word| word.eq_ignore_ascii_case(token))
 }
 
 /// Whether any finding is severity Critical. A Critical finding is a machine-
@@ -1302,6 +1348,55 @@ mod tests {
         let text = "No verdict section present.\n";
         assert_eq!(
             parse_verdict(text, &[], &[], &[]),
+            ReviewVerdict::PassWithRisks
+        );
+    }
+
+    #[test]
+    fn test_parse_verdict_ignores_body_prose_fail_words() {
+        // Real-provider smoke (Sprint 31A): body prose like "no failures
+        // found" must never be misread as a FAIL verdict. The verdict comes
+        // exclusively from the ## Verdict section.
+        let text = "## Summary\nNo failures found; the change is correct.\n\
+                    ## Verdict\nPASS\n";
+        assert_eq!(parse_verdict(text, &[], &[], &[]), ReviewVerdict::Pass);
+
+        // Even "fails at runtime" in the body must not flip the verdict.
+        let text = "## Summary\nNothing fails at runtime.\n## Verdict\nPASS\n";
+        assert_eq!(parse_verdict(text, &[], &[], &[]), ReviewVerdict::Pass);
+    }
+
+    #[test]
+    fn test_parse_verdict_uses_only_the_verdict_section() {
+        // A FAIL token inside the Verdict section is authoritative...
+        let text = "## Summary\nThe change compiles.\n## Verdict\nFAIL\n";
+        assert_eq!(parse_verdict(text, &[], &[], &[]), ReviewVerdict::Fail);
+
+        // ...while an early section boundary cuts off later prose.
+        let text = "## Verdict\nPASS\n## Findings\n- [high] regression — callers may break\n";
+        assert_eq!(parse_verdict(text, &[], &[], &[]), ReviewVerdict::Pass);
+
+        // Standalone-token matching: "No failures found" inside the Verdict
+        // section is not a FAIL token either.
+        let text = "## Verdict\nNo failures found\n";
+        assert_eq!(
+            parse_verdict(text, &[], &[], &[]),
+            ReviewVerdict::PassWithRisks
+        );
+    }
+
+    #[test]
+    fn test_parse_verdict_case_insensitive_tokens() {
+        assert_eq!(
+            parse_verdict("## Verdict\nfail\n", &[], &[], &[]),
+            ReviewVerdict::Fail
+        );
+        assert_eq!(
+            parse_verdict("## Verdict\npass\n", &[], &[], &[]),
+            ReviewVerdict::Pass
+        );
+        assert_eq!(
+            parse_verdict("## Verdict\npass_with_risks\n", &[], &[], &[]),
             ReviewVerdict::PassWithRisks
         );
     }

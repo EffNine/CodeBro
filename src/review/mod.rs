@@ -16,7 +16,9 @@ pub mod runtime;
 #[cfg(test)]
 mod tests;
 
-pub use contract::{ReviewFinding, ReviewRequest, ReviewResult, ReviewTermination};
+pub use contract::{
+    ReviewFinding, ReviewRequest, ReviewResult, ReviewSeverity, ReviewTermination, ReviewVerdict,
+};
 pub use limits::ReviewLimits;
 pub use permissions::{build_review_tool_registry, ReviewPermissionHook, ReviewTooling};
 pub use runtime::ReviewSubagent;

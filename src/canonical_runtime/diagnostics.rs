@@ -317,6 +317,8 @@ pub struct ReviewDiagnostics {
     pub completed: bool,
     pub synthesis_complete: bool,
     pub termination: String,
+    /// The review verdict: PASS / PASS_WITH_RISKS / FAIL.
+    pub verdict: String,
     pub iterations: usize,
     pub tool_calls: usize,
     pub model_calls: usize,
@@ -336,6 +338,7 @@ impl From<crate::review::ReviewResult> for ReviewDiagnostics {
             completed: result.termination.is_completed(),
             synthesis_complete: result.synthesis_complete,
             termination: result.termination.to_string(),
+            verdict: result.verdict.to_string(),
             iterations: result.iterations,
             tool_calls: result.tool_calls,
             model_calls: result.model_calls,

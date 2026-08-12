@@ -104,12 +104,60 @@ const MAX_REPEATED_ACTIONS: usize = 3;
 const DEFAULT_TASK_TIMEOUT_MS: u64 = 30_000;
 
 /// Maximum total model calls (provider invocations) across the entire task,
-/// including verification revisions. Each revision re-enters the ReAct loop
-/// (up to `MAX_REACT_ITERATIONS` per entry). Total bound:
+/// including verification revisions, for the DEFAULT task (no autonomous
+/// specialists). Each revision re-enters the ReAct loop (up to
+/// `MAX_REACT_ITERATIONS` per entry). Total bound:
 ///   MAX_MODEL_CALLS = MAX_REACT_ITERATIONS * (1 + MAX_VERIFICATION_REVISIONS)
 ///   = 5 * (1 + 2) = 15 provider calls worst-case.
+///
+/// Sprint 31A: when autonomous phases are enabled, the effective bound scales
+/// with the iteration budget (`max_iterations * (1 + 2)`); see
+/// [`CanonicalRuntime::run_execution_loop`].
 const MAX_MODEL_CALLS: usize =
     MAX_REACT_ITERATIONS * (1 + 2/* default max_verification_revisions */);
+
+/// The whole-pipeline deadline budget in milliseconds (Sprint 31A policy).
+///
+/// `task_timeout_ms` budgets the MAIN ReAct loop. Each enabled autonomous
+/// specialist runs under its own session timeout, so the full pipeline is
+/// bounded by `task_timeout + Σ(enabled specialist timeouts)`. A zero or
+/// missing task timeout means no deadline (the per-phase limits still bound
+/// every specialist).
+fn task_deadline_budget(opts: &TaskOptions) -> u64 {
+    let mut budget = opts.task_timeout_ms.unwrap_or(0);
+    if opts.research_enabled {
+        budget = budget.saturating_add(crate::research::ResearchLimits::default().timeout_ms);
+    }
+    if opts.testing_enabled {
+        budget = budget.saturating_add(crate::testing::TestingLimits::default().timeout_ms);
+    }
+    if opts.planning_enabled {
+        budget = budget.saturating_add(crate::planning::PlanningLimits::default().timeout_ms);
+    }
+    if opts.coding_enabled {
+        budget = budget.saturating_add(crate::coding::CodingLimits::default().timeout_ms);
+    }
+    if opts.review_enabled {
+        budget = budget.saturating_add(crate::review::ReviewLimits::default().timeout_ms);
+    }
+    budget
+}
+
+/// The main ReAct loop's effective iteration budget (Sprint 31A policy).
+///
+/// `MAX_REACT_ITERATIONS` (5) is the DEFAULT-task budget. When autonomous
+/// phases are enabled, the loop gets one extra iteration per enabled phase —
+/// real-provider smoke showed the full pipeline can exhaust 5 iterations
+/// while synthesizing the injected specialist evidence. The default is never
+/// lowered.
+fn main_loop_iteration_budget(opts: &TaskOptions) -> usize {
+    MAX_REACT_ITERATIONS
+        + usize::from(opts.research_enabled)
+        + usize::from(opts.testing_enabled)
+        + usize::from(opts.planning_enabled)
+        + usize::from(opts.coding_enabled)
+        + usize::from(opts.review_enabled)
+}
 
 /// A request to execute one engineering task.
 pub struct TaskRequest<'a> {
@@ -175,6 +223,62 @@ pub struct TaskOptions {
     /// [`crate::review::ReviewResult`] into the main LLM context. Failure is
     /// isolated: a review error never crashes the main task. Defaults to false.
     pub review_enabled: bool,
+}
+
+impl TaskOptions {
+    /// Build the canonical option set for a production task mode
+    /// (Sprint 31A productionization policy). Every mode is expressed over
+    /// the existing per-phase flags — no new execution machinery.
+    pub fn for_mode(mode: TaskMode) -> Self {
+        let (research, testing, planning, coding, review) = mode.phase_flags();
+        TaskOptions {
+            research_enabled: research,
+            testing_enabled: testing,
+            planning_enabled: planning,
+            coding_enabled: coding,
+            review_enabled: review,
+            ..TaskOptions::default()
+        }
+    }
+}
+
+/// Canonical production task modes (Sprint 31A).
+///
+/// The autonomous phases are NEVER enabled implicitly: the production default
+/// is [`TaskMode::Assist`], and every more capable mode is an explicit opt-in
+/// by the caller. Mutation is possible only in [`TaskMode::Autonomous`].
+///
+/// ```text
+/// Assist      = Grounding + Research + Main LLM             (no mutation)
+/// Validate    = + Testing                                    (no mutation)
+/// Plan        = + Planning                                   (no mutation)
+/// Autonomous  = + Coding + Review                            (mutation allowed)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskMode {
+    /// Grounding + Research + Main LLM. No autonomous mutation.
+    Assist,
+    /// Grounding + Research + Testing + Main LLM. No autonomous mutation.
+    Validate,
+    /// Grounding + Research + Testing + Planning + Main LLM. No mutation.
+    Plan,
+    /// The full pipeline: Grounding + Research + Testing + Planning + Coding
+    /// + Review + Main LLM. The ONLY mode in which Coding may mutate the
+    /// repository.
+    Autonomous,
+}
+
+impl TaskMode {
+    /// The exact enable flags for this mode, as
+    /// `(research, testing, planning, coding, review)`.
+    pub fn phase_flags(&self) -> (bool, bool, bool, bool, bool) {
+        match self {
+            TaskMode::Assist => (true, false, false, false, false),
+            TaskMode::Validate => (true, true, false, false, false),
+            TaskMode::Plan => (true, true, true, false, false),
+            TaskMode::Autonomous => (true, true, true, true, true),
+        }
+    }
 }
 
 /// The outcome of a directly-invoked streaming tool run (shell commands,
@@ -432,13 +536,24 @@ impl CanonicalRuntime {
         let mut diag = TaskDiagnostics::new(req.task);
 
         // Establish a hard task-level deadline. This deadline is shared across
-        // all phases (planning, model reasoning, tool execution, verification,
-        // revision) and is propagated into `stream_once` so that provider
-        // streaming is interruptible via `tokio::select!`.
-        let deadline = opts
-            .task_timeout_ms
-            .filter(|t| *t > 0)
-            .map(|t| TokioInstant::now() + std::time::Duration::from_millis(t));
+        // the main execution phases (model reasoning, tool execution,
+        // verification, revision) and is propagated into `stream_once` so that
+        // provider streaming is interruptible via `tokio::select!`.
+        //
+        // Sprint 31A production policy: the configured task timeout budgets
+        // the MAIN ReAct loop; each enabled autonomous specialist is
+        // additionally budgeted by its own session timeout, so the whole
+        // pipeline remains bounded by `task_timeout + Σ(specialist timeouts)`.
+        // Without this, enabling specialists under a finite task timeout would
+        // let them consume the main loop's entire budget before it starts.
+        let deadline = {
+            let budget = task_deadline_budget(&opts);
+            if budget > 0 {
+                Some(TokioInstant::now() + std::time::Duration::from_millis(budget))
+            } else {
+                None
+            }
+        };
 
         let opts = TaskOptions {
             deadline,
@@ -652,49 +767,102 @@ impl CanonicalRuntime {
         // injects the auditable result into the context that reaches the main
         // LLM. Failure is isolated: a coding error never crashes the main task.
         if opts.coding_enabled {
-            let coding = self
-                .run_autonomous_coding(
-                    req,
-                    &memory_entries,
-                    &opts,
-                    planning_result.clone(),
-                    research_result.clone(),
-                    testing_result.clone(),
-                )
-                .await;
-            match coding {
-                Ok(result) => {
-                    let render = result.render();
-                    diag.coding = Some(
-                        crate::canonical_runtime::diagnostics::CodingDiagnostics::from(
-                            result.clone(),
-                        ),
-                    );
-                    coding_result = Some(result);
-                    context = extend_context(
-                        context,
-                        vec![ContextFragment {
-                            source: "coding".to_string(),
-                            content: render,
-                            relevance_score: 0.85,
-                        }],
-                    );
-                    diag.context_fragments = context.fragment_count();
-                }
-                Err(e) => {
-                    // Failure isolation: the main task continues with the
-                    // existing context. The failure is observable but not
-                    // fatal.
-                    (req.emit)(AgentEvent::Log {
-                        level: "pipeline".to_string(),
-                        message: format!("Coding subagent failed (continuing without it): {e}"),
-                    });
+            // Sprint 31A production policy: autonomous Coding REQUIRES a real
+            // PlanningResult (Sprint 30F treats it as the execution contract).
+            // Without one there is no plan-adherence boundary and no planned
+            // validation surface. The phase is DENIED, never silently replaced
+            // by a fallback plan; no mutation can occur.
+            if planning_result.is_none() {
+                (req.emit)(AgentEvent::Log {
+                    level: "pipeline".to_string(),
+                    message:
+                        "policy: autonomous coding requires a Planning result — coding phase denied"
+                            .to_string(),
+                });
+            } else {
+                let coding = self
+                    .run_autonomous_coding(
+                        req,
+                        &memory_entries,
+                        &opts,
+                        planning_result.clone(),
+                        research_result.clone(),
+                        testing_result.clone(),
+                    )
+                    .await;
+                match coding {
+                    Ok(result) => {
+                        let render = result.render();
+                        diag.coding = Some(
+                            crate::canonical_runtime::diagnostics::CodingDiagnostics::from(
+                                result.clone(),
+                            ),
+                        );
+                        coding_result = Some(result.clone());
+                        context = extend_context(
+                            context,
+                            vec![ContextFragment {
+                                source: "coding".to_string(),
+                                content: render,
+                                relevance_score: 0.85,
+                            }],
+                        );
+                        diag.context_fragments = context.fragment_count();
+
+                        // Sprint 31A production policy — hard stop condition:
+                        // applied-but-unverified mutations must never silently
+                        // become a normal successful task. If any applied
+                        // change was never covered by an authoritative
+                        // exit-code-0 verification (and was not rolled back),
+                        // the task fails with an explicit message. The changes
+                        // remain in the working tree, honestly marked
+                        // unverified, for the user to inspect.
+                        let unverified: Vec<String> = result
+                            .changes
+                            .iter()
+                            .filter(|c| !c.rolled_back && !c.verified)
+                            .map(|c| c.path.display().to_string())
+                            .collect();
+                        if !unverified.is_empty() {
+                            let cancelled = opts
+                                .cancel
+                                .as_ref()
+                                .map(|c| c.is_cancelled())
+                                .unwrap_or(false);
+                            if cancelled {
+                                return self.cancel(req, Some(&mut graph), &root_id, diag, started);
+                            }
+                            return self.fail(
+                                req,
+                                Some(&mut graph),
+                                &root_id,
+                                format!(
+                                    "Autonomous coding applied changes that could not be machine-verified (termination: {}). Unverified: {}. The changes remain in the working tree — inspect them before proceeding.",
+                                    result.termination,
+                                    unverified.join(", ")
+                                ),
+                                diag,
+                                started,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Failure isolation: the main task continues with the
+                        // existing context. The failure is observable but not
+                        // fatal.
+                        (req.emit)(AgentEvent::Log {
+                            level: "pipeline".to_string(),
+                            message: format!("Coding subagent failed (continuing without it): {e}"),
+                        });
+                    }
                 }
             }
         }
 
         // Autonomous Review (Sprint 30G): when enabled, run the read-only
-        // Review subagent AFTER Coding.
+        // Review subagent AFTER Coding. Review may also run WITHOUT Coding
+        // (reviewing the existing working tree); it never mutates anything.
+        let mut review_risks: Option<String> = None;
         if opts.review_enabled {
             let review = self
                 .run_autonomous_review(
@@ -724,6 +892,46 @@ impl CanonicalRuntime {
                         }],
                     );
                     diag.context_fragments = context.fragment_count();
+
+                    // Sprint 31A production policy — the review verdict is
+                    // always surfaced as a pipeline event.
+                    (req.emit)(AgentEvent::Log {
+                        level: "pipeline".to_string(),
+                        message: format!("Autonomous review verdict: {}", result.verdict),
+                    });
+
+                    // Hard stop conditions: a FAIL verdict or any Critical
+                    // finding must never silently become a normal successful
+                    // task.
+                    let critical = result
+                        .findings
+                        .iter()
+                        .filter(|f| f.severity == crate::review::ReviewSeverity::Critical)
+                        .count();
+                    if result.verdict == crate::review::ReviewVerdict::Fail || critical > 0 {
+                        return self.fail(
+                            req,
+                            Some(&mut graph),
+                            &root_id,
+                            format!(
+                                "Autonomous review verdict: {} — {} finding(s), {} critical. The changes must not be treated as successful; inspect the review before proceeding.",
+                                result.verdict,
+                                result.findings.len(),
+                                critical
+                            ),
+                            diag,
+                            started,
+                        );
+                    }
+
+                    // PASS_WITH_RISKS: the task may continue, but the risks
+                    // must be clearly surfaced in the final answer.
+                    if result.verdict == crate::review::ReviewVerdict::PassWithRisks {
+                        review_risks = Some(format!(
+                            "Autonomous review verdict: PASS_WITH_RISKS — {} finding(s) surfaced. Review the findings before relying on this result.",
+                            result.findings.len()
+                        ));
+                    }
                 }
                 Err(e) => {
                     (req.emit)(AgentEvent::Log {
@@ -850,6 +1058,14 @@ impl CanonicalRuntime {
                             }
                         }
                     }
+                }
+
+                // Sprint 31A production policy: a PASS_WITH_RISKS review is
+                // not a silent success — the risk is surfaced in the final
+                // answer the user actually reads.
+                if let Some(warning) = &review_risks {
+                    response.push_str("\n\n---\n");
+                    response.push_str(warning);
                 }
 
                 graph.update_status(&root_id, TaskStatus::Completed);
@@ -1931,7 +2147,15 @@ impl CanonicalRuntime {
         let started = Instant::now();
         let mut trace = RouteTrace::default();
         let mut context = initial_context;
-        let max_iterations = MAX_REACT_ITERATIONS;
+        // Sprint 31A production policy (budget): the main loop's reasoning
+        // budget scales with the number of enabled autonomous phases
+        // (`5 + n`, capped in practice at 10). Real-provider smoke showed a
+        // full specialist pipeline can exhaust the base 5 iterations while
+        // synthesizing the injected evidence; the default (no specialists)
+        // stays at exactly `MAX_REACT_ITERATIONS`. The model-call budget
+        // scales with it (each revision re-enters the loop).
+        let max_iterations = main_loop_iteration_budget(opts);
+        let max_model_calls = max_iterations * (MAX_MODEL_CALLS / MAX_REACT_ITERATIONS);
         let max_tool_calls_per_iter = opts
             .max_tool_calls_per_iteration
             .unwrap_or(MAX_TOOL_CALLS_PER_ITERATION);
@@ -1957,11 +2181,11 @@ impl CanonicalRuntime {
             }
 
             // 3. Model-call budget check.
-            if model_calls >= MAX_MODEL_CALLS {
+            if model_calls >= max_model_calls {
                 return (
                     Err(format!(
                         "Maximum model calls ({}) exceeded",
-                        MAX_MODEL_CALLS
+                        max_model_calls
                     )),
                     trace,
                 );
