@@ -4,6 +4,7 @@
 //! single section key. The builder orchestrates their assembly.
 
 use super::template::SectionKey;
+use crate::engineering_context::context::StructuredFacts;
 
 /// Build the System Identity section.
 ///
@@ -37,6 +38,8 @@ Your constraints:
 - Never run destructive commands without explicit user confirmation
 - Request confirmation for destructive, irreversible, externally consequential, or high-impact actions
 - Ask only when genuinely blocked by missing information
+
+STRUCTURED MACHINE FACTS are authoritative runtime observations. Do not contradict them using model-generated prose. Exit codes determine command success. Verification flags are machine-derived. Review verdicts come from structured review state. If prose conflicts with structured machine facts, trust structured facts.
 
 Your output format:
 - Use clear, structured responses
@@ -279,6 +282,70 @@ pub fn build_active_files(active_paths: &[String]) -> String {
 /// Build the User Request section.
 pub fn build_user_request(request: &str) -> String {
     request.trim().to_string()
+}
+
+/// Build the Structured Machine Facts section from structured facts payloads.
+///
+/// Renders facts in a fixed specialist order (research → testing → planning →
+/// coding → review) so that identical inputs always produce byte-identical
+/// output. Empty payloads are skipped.
+pub fn build_structured_machine_facts(facts: &[StructuredFacts]) -> String {
+    // Fixed ordering ensures deterministic rendering regardless of insertion
+    // order in the context. Specialists absent from the facts list are skipped.
+    let order: &[&str] = &["research", "testing", "planning", "coding", "review"];
+    let mut lines: Vec<String> = Vec::new();
+
+    for source in order {
+        let Some(sf) = facts.iter().find(|f| f.source == *source) else {
+            continue;
+        };
+        if sf.payload.is_empty() {
+            continue;
+        }
+        lines.push(format!("[{}]", source));
+        // Sort keys for deterministic output.
+        let mut keys: Vec<&String> = sf.payload.keys().collect();
+        keys.sort();
+        for key in keys {
+            let value = &sf.payload[key];
+            match value {
+                serde_json::Value::Null => continue,
+                serde_json::Value::Bool(b) => {
+                    lines.push(format!("  {}: {}", key, b));
+                }
+                serde_json::Value::Number(n) => {
+                    lines.push(format!("  {}: {}", key, n));
+                }
+                serde_json::Value::String(s) => {
+                    lines.push(format!("  {}: {}", key, s));
+                }
+                serde_json::Value::Array(arr) => {
+                    // Render arrays compactly.
+                    let items: Vec<String> = arr
+                        .iter()
+                        .filter_map(|v| match v {
+                            serde_json::Value::String(s) => Some(s.clone()),
+                            serde_json::Value::Number(n) => Some(n.to_string()),
+                            serde_json::Value::Bool(b) => Some(b.to_string()),
+                            _ => None,
+                        })
+                        .collect();
+                    if items.is_empty() {
+                        lines.push(format!("  {}: []", key));
+                    } else {
+                        lines.push(format!("  {}: {}", key, items.join(", ")));
+                    }
+                }
+                _ => {
+                    // Fallback: serialize the value as-is (covers nested objects).
+                    lines.push(format!("  {}: {}", key, value));
+                }
+            }
+        }
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
 }
 
 /// Build the Response Instructions section based on template and intent.
@@ -623,5 +690,140 @@ mod tests {
             ..ObjectiveLike::default()
         };
         assert!(!filled.is_empty());
+    }
+
+    #[test]
+    fn test_build_structured_machine_facts_empty() {
+        let result = build_structured_machine_facts(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_structured_machine_facts_research() {
+        use crate::engineering_context::context::StructuredFacts;
+        let facts = vec![StructuredFacts::new("research")
+            .with_field("files_inspected", 3usize)
+            .with_field("symbols_found", 5usize)
+            .with_field("findings_count", 2usize)
+            .with_field("termination", "completed")
+            .with_field("synthesis_complete", true)];
+        let result = build_structured_machine_facts(&facts);
+        assert!(result.contains("[research]"));
+        assert!(result.contains("files_inspected: 3"));
+        assert!(result.contains("symbols_found: 5"));
+        assert!(result.contains("findings_count: 2"));
+        assert!(result.contains("termination: completed"));
+        assert!(result.contains("synthesis_complete: true"));
+    }
+
+    #[test]
+    fn test_build_structured_machine_facts_testing_preserves_exit_code() {
+        use crate::engineering_context::context::StructuredFacts;
+        let facts = vec![StructuredFacts::new("testing")
+            .with_field("commands_run_count", 2usize)
+            .with_field("failures_count", 1usize)
+            .with_field("exit_codes", vec![101i32, 0])
+            .with_field("git_tree_unchanged", true)
+            .with_field("synthesis_complete", true)];
+        let result = build_structured_machine_facts(&facts);
+        assert!(result.contains("[testing]"));
+        assert!(result.contains("exit_codes: 101, 0"));
+        assert!(result.contains("failures_count: 1"));
+        assert!(result.contains("git_tree_unchanged: true"));
+    }
+
+    #[test]
+    fn test_build_structured_machine_facts_deterministic_order() {
+        use crate::engineering_context::context::StructuredFacts;
+        // Create facts in non-alphabetical source order to verify deterministic output.
+        let facts = vec![
+            StructuredFacts::new("review")
+                .with_field("verdict", "PASS_WITH_RISKS")
+                .with_field("findings_count", 1usize),
+            StructuredFacts::new("coding")
+                .with_field("all_verified", false)
+                .with_field("changes_count", 2usize),
+            StructuredFacts::new("testing").with_field("exit_codes", vec![0i32]),
+        ];
+        let r1 = build_structured_machine_facts(&facts);
+        let r2 = build_structured_machine_facts(&facts);
+        assert_eq!(r1, r2, "same input must produce identical output");
+        // Verify fixed ordering: testing before coding before review.
+        let testing_pos = r1.find("[testing]").unwrap();
+        let coding_pos = r1.find("[coding]").unwrap();
+        let review_pos = r1.find("[review]").unwrap();
+        assert!(testing_pos < coding_pos && coding_pos < review_pos);
+    }
+
+    #[test]
+    fn test_build_structured_machine_facts_sorted_keys() {
+        use crate::engineering_context::context::StructuredFacts;
+        // Insert keys in reverse alphabetical order; output must be sorted.
+        let mut facts = StructuredFacts::new("planning").with_field("zzz_last", 1usize);
+        facts = facts.with_field("aaa_first", 2usize);
+        facts = facts.with_field("mmm_middle", 3usize);
+        let result = build_structured_machine_facts(&[facts]);
+        let aaa_pos = result.find("aaa_first").unwrap();
+        let mmm_pos = result.find("mmm_middle").unwrap();
+        let zzz_pos = result.find("zzz_last").unwrap();
+        assert!(aaa_pos < mmm_pos && mmm_pos < zzz_pos);
+    }
+
+    #[test]
+    fn test_build_structured_machine_facts_skips_empty() {
+        use crate::engineering_context::context::StructuredFacts;
+        let facts = vec![
+            StructuredFacts::new("research"), // empty payload
+            StructuredFacts::new("testing"),  // empty payload
+        ];
+        let result = build_structured_machine_facts(&facts);
+        // Both have empty payloads, so nothing should be rendered.
+        assert!(result.is_empty(), "empty facts should produce no output");
+    }
+
+    #[test]
+    fn test_build_structured_machine_facts_all_five_specialists() {
+        use crate::engineering_context::context::StructuredFacts;
+        let facts = vec![
+            StructuredFacts::new("research")
+                .with_field("files_inspected", 10usize)
+                .with_field("synthesis_complete", true),
+            StructuredFacts::new("testing")
+                .with_field("exit_codes", vec![0i32])
+                .with_field("success", true),
+            StructuredFacts::new("planning").with_field("steps_count", 3usize),
+            StructuredFacts::new("coding")
+                .with_field("all_verified", true)
+                .with_field("changes_count", 1usize),
+            StructuredFacts::new("review")
+                .with_field("verdict", "PASS")
+                .with_field("findings_count", 0usize),
+        ];
+        let result = build_structured_machine_facts(&facts);
+        assert!(result.contains("[research]"));
+        assert!(result.contains("[testing]"));
+        assert!(result.contains("[planning]"));
+        assert!(result.contains("[coding]"));
+        assert!(result.contains("[review]"));
+        // Fixed order: research → testing → planning → coding → review
+        let positions: Vec<usize> = vec![
+            result.find("[research]").unwrap(),
+            result.find("[testing]").unwrap(),
+            result.find("[planning]").unwrap(),
+            result.find("[coding]").unwrap(),
+            result.find("[review]").unwrap(),
+        ];
+        for i in 1..positions.len() {
+            assert!(positions[i - 1] < positions[i]);
+        }
+    }
+
+    #[test]
+    fn test_default_system_identity_contains_machine_authority_instruction() {
+        let result = default_system_identity();
+        assert!(result.contains("STRUCTURED MACHINE FACTS are authoritative"));
+        assert!(result.contains("Exit codes determine command success"));
+        assert!(result
+            .contains("If prose conflicts with structured machine facts, trust structured facts"));
     }
 }

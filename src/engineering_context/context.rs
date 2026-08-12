@@ -1,6 +1,7 @@
 //! The core `EngineeringContext` type — the universal runtime contract.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use super::constraints::ConstraintContext;
 use super::diagnostics::EngineeringContextDiagnostics;
@@ -21,12 +22,51 @@ pub struct IntentPlan {
     pub ambiguity_reason: Option<String>,
 }
 
+/// Machine-authoritative structured facts from a specialist result.
+/// This carries the structured data (not rendered prose) so downstream
+/// consumers can access machine facts without parsing prose.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct StructuredFacts {
+    /// The source specialist that produced these facts.
+    pub source: String,
+    /// Key-value structured payload. The exact keys depend on the source.
+    /// For research: files_inspected, symbols_found, findings_count, termination
+    /// For testing: commands_run_count, failures_count, exit_codes, git_tree_unchanged
+    /// For planning: steps_count, affected_files_count, affected_symbols_count, risks_count
+    /// For coding: changes_count, verified_changes_count, unplanned_changes_count, verification_count, all_verified
+    /// For review: findings_count, verdict, verified_changes_count, unverified_changes_count, plan_deviations_count
+    pub payload: HashMap<String, serde_json::Value>,
+}
+
+impl StructuredFacts {
+    /// Create empty structured facts for a source.
+    pub fn new(source: impl Into<String>) -> Self {
+        StructuredFacts {
+            source: source.into(),
+            payload: HashMap::new(),
+        }
+    }
+
+    /// Insert a typed value into the payload.
+    pub fn with_field(mut self, key: impl Into<String>, value: impl Serialize) -> Self {
+        if let Ok(json) = serde_json::to_value(value) {
+            self.payload.insert(key.into(), json);
+        }
+        self
+    }
+}
+
 /// A single context fragment from the assembly result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextFragment {
     pub source: String,
     pub content: String,
     pub relevance_score: f64,
+    /// Optional machine-authoritative structured facts from the specialist.
+    /// When present, these facts originate directly from structured result
+    /// fields, never from parsing rendered prose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_facts: Option<StructuredFacts>,
 }
 
 /// A single conversation message.
@@ -321,5 +361,84 @@ mod tests {
 
         // Different objectives must not compare equal.
         assert!(!with_objective.equals(&without_objective));
+    }
+
+    #[test]
+    fn test_structured_facts_survive_builder_insertion() {
+        use crate::engineering_context::context::StructuredFacts;
+
+        let facts = StructuredFacts::new("testing")
+            .with_field("exit_code", 101i32)
+            .with_field("success", false);
+
+        let ctx = EngineeringContextBuilder::new()
+            .project(ProjectIdentity::new("proj", "rust"))
+            .task(IntentPlan {
+                detected_goal: "test".to_string(),
+                intent_type: "Execution".to_string(),
+                confidence: 0.9,
+                ambiguity: false,
+                ambiguity_reason: None,
+            })
+            .context_fragment(ContextFragment {
+                source: "testing".to_string(),
+                content: "tests failed".to_string(),
+                relevance_score: 0.85,
+                structured_facts: Some(facts.clone()),
+            })
+            .user_request("test")
+            .system_prompt("sys")
+            .build()
+            .expect("build should succeed");
+
+        assert_eq!(ctx.fragment_count(), 1);
+        let frag = &ctx.context_fragments[0];
+        assert_eq!(frag.source, "testing");
+        let sf = frag
+            .structured_facts
+            .as_ref()
+            .expect("facts must be present");
+        assert_eq!(sf.source, "testing");
+        assert_eq!(sf.payload.get("exit_code").unwrap().as_i64().unwrap(), 101);
+        assert_eq!(sf.payload.get("success").unwrap().as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn test_structured_facts_survive_serialization_roundtrip() {
+        use crate::engineering_context::context::StructuredFacts;
+
+        let facts = StructuredFacts::new("coding")
+            .with_field("all_verified", false)
+            .with_field("changes_count", 2usize);
+
+        let mut ctx = sample_context();
+        ctx.context_fragments.push(ContextFragment {
+            source: "coding".to_string(),
+            content: "applied 2 changes".to_string(),
+            relevance_score: 0.9,
+            structured_facts: Some(facts.clone()),
+        });
+
+        let json = serde_json::to_string(&ctx).expect("serialize");
+        let decoded: EngineeringContext = serde_json::from_str(&json).expect("deserialize");
+
+        let frag = decoded
+            .context_fragments
+            .iter()
+            .find(|f| f.source == "coding")
+            .expect("coding fragment must exist");
+        let sf = frag
+            .structured_facts
+            .as_ref()
+            .expect("facts must survive roundtrip");
+        assert_eq!(sf.source, "coding");
+        assert_eq!(
+            sf.payload.get("all_verified").unwrap().as_bool().unwrap(),
+            false
+        );
+        assert_eq!(
+            sf.payload.get("changes_count").unwrap().as_u64().unwrap(),
+            2
+        );
     }
 }

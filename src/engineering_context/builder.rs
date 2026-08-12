@@ -416,11 +416,13 @@ mod tests {
                 source: "test".to_string(),
                 content: "abc".to_string(),
                 relevance_score: 0.9,
+                structured_facts: None,
             })
             .context_fragment(ContextFragment {
                 source: "test".to_string(),
                 content: "abc".to_string(),
                 relevance_score: 0.8,
+                structured_facts: None,
             })
             .build();
         match result {
@@ -448,11 +450,13 @@ mod tests {
                 source: "tool_result".to_string(),
                 content: "abcdefghij".to_string(),
                 relevance_score: 0.9,
+                structured_facts: None,
             })
             .context_fragment(ContextFragment {
                 source: "tool_result".to_string(),
                 content: "klmnopqrst".to_string(),
                 relevance_score: 0.9,
+                structured_facts: None,
             })
             .build()
             .expect("distinct equal-length fragments must be accepted");
@@ -486,6 +490,7 @@ mod tests {
                 source: format!("src_{}", i),
                 content: format!("content for fragment {}", i),
                 relevance_score: 0.5 + (i as f64 * 0.001),
+                structured_facts: None,
             });
         }
         let ctx = builder.build().expect("build should succeed");

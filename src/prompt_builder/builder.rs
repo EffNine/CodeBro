@@ -162,6 +162,7 @@ mod tests {
                 source: file.path.clone(),
                 content: file.content.clone(),
                 relevance_score: 0.9,
+                structured_facts: None,
             });
         }
         for diag in diagnostics {
@@ -169,6 +170,7 @@ mod tests {
                 source: "diagnostic".to_string(),
                 content: diag.message.clone(),
                 relevance_score: 0.0,
+                structured_facts: None,
             });
         }
 

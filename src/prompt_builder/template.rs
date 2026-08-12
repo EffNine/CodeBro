@@ -85,6 +85,7 @@ impl PromptTemplate {
                 SectionKey::EngineeringObjective,
                 SectionKey::EngineeringConstraints,
                 SectionKey::RelevantContext,
+                SectionKey::StructuredMachineFacts,
                 SectionKey::EngineeringMemory,
                 SectionKey::WorkspaceFacts,
                 SectionKey::UserRequest,
@@ -98,6 +99,7 @@ impl PromptTemplate {
                 SectionKey::EngineeringConstraints,
                 SectionKey::ActiveFiles,
                 SectionKey::RelevantContext,
+                SectionKey::StructuredMachineFacts,
                 SectionKey::EngineeringMemory,
                 SectionKey::UserRequest,
                 SectionKey::ResponseInstructions,
@@ -109,6 +111,7 @@ impl PromptTemplate {
                 SectionKey::EngineeringObjective,
                 SectionKey::ArchitectureDecisions,
                 SectionKey::RelevantContext,
+                SectionKey::StructuredMachineFacts,
                 SectionKey::EngineeringMemory,
                 SectionKey::ActiveFiles,
                 SectionKey::UserRequest,
@@ -121,6 +124,7 @@ impl PromptTemplate {
                 SectionKey::EngineeringObjective,
                 SectionKey::EngineeringConstraints,
                 SectionKey::RelevantContext,
+                SectionKey::StructuredMachineFacts,
                 SectionKey::EngineeringMemory,
                 SectionKey::UserRequest,
                 SectionKey::ResponseInstructions,
@@ -132,6 +136,7 @@ impl PromptTemplate {
                 SectionKey::EngineeringObjective,
                 SectionKey::ArchitectureDecisions,
                 SectionKey::RelevantContext,
+                SectionKey::StructuredMachineFacts,
                 SectionKey::EngineeringMemory,
                 SectionKey::ActiveFiles,
                 SectionKey::UserRequest,
@@ -144,6 +149,7 @@ impl PromptTemplate {
                 SectionKey::EngineeringObjective,
                 SectionKey::EngineeringConstraints,
                 SectionKey::RelevantContext,
+                SectionKey::StructuredMachineFacts,
                 SectionKey::EngineeringMemory,
                 SectionKey::ActiveFiles,
                 SectionKey::UserRequest,
@@ -155,6 +161,7 @@ impl PromptTemplate {
                 SectionKey::CurrentTask,
                 SectionKey::EngineeringObjective,
                 SectionKey::RelevantContext,
+                SectionKey::StructuredMachineFacts,
                 SectionKey::EngineeringMemory,
                 SectionKey::UserRequest,
                 SectionKey::ResponseInstructions,
@@ -180,6 +187,7 @@ pub enum SectionKey {
     ActiveFiles,
     UserRequest,
     ResponseInstructions,
+    StructuredMachineFacts,
 }
 
 impl SectionKey {
@@ -197,6 +205,7 @@ impl SectionKey {
             SectionKey::ActiveFiles => "active_files",
             SectionKey::UserRequest => "user_request",
             SectionKey::ResponseInstructions => "response_instructions",
+            SectionKey::StructuredMachineFacts => "structured_machine_facts",
         }
     }
 }
@@ -281,6 +290,10 @@ mod tests {
     fn test_section_key_str() {
         assert_eq!(SectionKey::SystemIdentity.as_str(), "system_identity");
         assert_eq!(SectionKey::UserRequest.as_str(), "user_request");
+        assert_eq!(
+            SectionKey::StructuredMachineFacts.as_str(),
+            "structured_machine_facts"
+        );
     }
 
     #[test]

@@ -166,6 +166,22 @@ impl PromptCompiler {
 
         let fact_count = context.workspace_file_count() + context.fragment_count();
 
+        // Extract structured machine facts from fragments in fixed order.
+        let ordered_sources: &[&str] = &["research", "testing", "planning", "coding", "review"];
+        let mut structured_facts_list: Vec<crate::engineering_context::context::StructuredFacts> =
+            Vec::new();
+        for source in ordered_sources {
+            if let Some(frag) = context
+                .context_fragments
+                .iter()
+                .find(|f| f.source == *source)
+            {
+                if let Some(ref sf) = frag.structured_facts {
+                    structured_facts_list.push(sf.clone());
+                }
+            }
+        }
+
         let context_budget_remaining = context.runtime.budget_tokens.saturating_sub(
             context
                 .estimated_tokens()
@@ -202,6 +218,7 @@ impl PromptCompiler {
                 &context.user_request,
                 context_budget_remaining,
                 &template_selection,
+                &structured_facts_list,
             );
 
             if section.is_empty() {
@@ -258,6 +275,7 @@ impl PromptCompiler {
         user_request: &str,
         context_budget_remaining: usize,
         template_selection: &TemplateSelection,
+        structured_facts: &[crate::engineering_context::context::StructuredFacts],
     ) -> PromptSection {
         match key {
             SectionKey::SystemIdentity => {
@@ -285,25 +303,29 @@ impl PromptCompiler {
                 let content = build_relevant_context(relevant_files, conversation);
                 PromptSection::new(4, "Relevant Context", &content)
             }
+            SectionKey::StructuredMachineFacts => {
+                let content = build_structured_machine_facts(structured_facts);
+                PromptSection::new(5, "Structured Machine Facts", &content)
+            }
             SectionKey::EngineeringMemory => {
                 let content = build_engineering_memory(memories, context_budget_remaining);
-                PromptSection::new(5, "Engineering Memory", &content)
+                PromptSection::new(6, "Engineering Memory", &content)
             }
             SectionKey::ArchitectureDecisions => {
                 let content = build_architecture_decisions(arch_rules);
-                PromptSection::new(6, "Architecture Decisions", &content)
+                PromptSection::new(7, "Architecture Decisions", &content)
             }
             SectionKey::WorkspaceFacts => {
                 let content = build_workspace_facts(fact_count, diagnostics);
-                PromptSection::new(7, "Workspace Facts", &content)
+                PromptSection::new(8, "Workspace Facts", &content)
             }
             SectionKey::ActiveFiles => {
                 let content = build_active_files(active_files);
-                PromptSection::new(8, "Active Files", &content)
+                PromptSection::new(9, "Active Files", &content)
             }
             SectionKey::UserRequest => {
                 let content = build_user_request(user_request);
-                PromptSection::new(9, "User Request", &content)
+                PromptSection::new(10, "User Request", &content)
             }
             SectionKey::ResponseInstructions => {
                 let content = build_response_instructions(
@@ -312,7 +334,7 @@ impl PromptCompiler {
                         .map(|p| p.intent_type.as_str())
                         .unwrap_or("default"),
                 );
-                PromptSection::new(10, "Response Instructions", &content)
+                PromptSection::new(11, "Response Instructions", &content)
             }
         }
     }
@@ -506,6 +528,7 @@ mod tests {
                 source: file.path.clone(),
                 content: file.content.clone(),
                 relevance_score: 0.9,
+                structured_facts: None,
             });
         }
         for diag in diagnostics {
@@ -513,6 +536,7 @@ mod tests {
                 source: "diagnostic".to_string(),
                 content: diag.message.clone(),
                 relevance_score: 0.0,
+                structured_facts: None,
             });
         }
 
@@ -1186,6 +1210,7 @@ mod tests {
                 source: "src/main.rs".to_string(),
                 content: "fn main() {}".to_string(),
                 relevance_score: 0.9,
+                structured_facts: None,
             })
             .active_file("src/main.rs".to_string())
             .user_request("Fix the auth bug")
@@ -1336,5 +1361,176 @@ mod tests {
         let result = compiler.compile_context(&context);
 
         assert!(!result.prompt.contains("Engineering Objective"));
+    }
+
+    #[test]
+    fn test_structured_facts_section_appears_in_prompt() {
+        use crate::engineering_context::{
+            builder::EngineeringContextBuilder, context::StructuredFacts,
+            identity::ProjectIdentity, ContextFragment, IntentPlan,
+        };
+
+        let context = EngineeringContextBuilder::new()
+            .project(ProjectIdentity::new("proj", "rust"))
+            .task(IntentPlan {
+                detected_goal: "fix bug".to_string(),
+                intent_type: "Execution".to_string(),
+                confidence: 0.9,
+                ambiguity: false,
+                ambiguity_reason: None,
+            })
+            .context_fragment(ContextFragment {
+                source: "research".to_string(),
+                content: "## Research findings".to_string(),
+                relevance_score: 0.85,
+                structured_facts: Some(
+                    StructuredFacts::new("research")
+                        .with_field("files_inspected", 3usize)
+                        .with_field("synthesis_complete", true),
+                ),
+            })
+            .user_request("fix the bug")
+            .system_prompt("sys")
+            .build()
+            .expect("build should succeed");
+
+        let compiler = PromptCompiler::new();
+        let result = compiler.compile_context(&context);
+
+        assert!(result.prompt.contains("=== Structured Machine Facts ==="));
+        assert!(result.prompt.contains("[research]"));
+        assert!(result.prompt.contains("files_inspected: 3"));
+        assert!(result.prompt.contains("synthesis_complete: true"));
+    }
+
+    #[test]
+    fn test_structured_facts_section_appears_once() {
+        use crate::engineering_context::{
+            builder::EngineeringContextBuilder, context::StructuredFacts,
+            identity::ProjectIdentity, ContextFragment, IntentPlan,
+        };
+
+        let context = EngineeringContextBuilder::new()
+            .project(ProjectIdentity::new("proj", "rust"))
+            .task(IntentPlan {
+                detected_goal: "fix bug".to_string(),
+                intent_type: "Execution".to_string(),
+                confidence: 0.9,
+                ambiguity: false,
+                ambiguity_reason: None,
+            })
+            .context_fragment(ContextFragment {
+                source: "research".to_string(),
+                content: "research prose".to_string(),
+                relevance_score: 0.85,
+                structured_facts: Some(StructuredFacts::new("research").with_field("x", 1usize)),
+            })
+            .context_fragment(ContextFragment {
+                source: "testing".to_string(),
+                content: "testing prose".to_string(),
+                relevance_score: 0.85,
+                structured_facts: Some(StructuredFacts::new("testing").with_field("y", 2usize)),
+            })
+            .user_request("fix the bug")
+            .system_prompt("sys")
+            .build()
+            .expect("build should succeed");
+
+        let compiler = PromptCompiler::new();
+        let result = compiler.compile_context(&context);
+
+        let count = result
+            .prompt
+            .matches("=== Structured Machine Facts ===")
+            .count();
+        assert_eq!(
+            count, 1,
+            "structured facts section must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn test_structured_facts_are_deterministic() {
+        use crate::engineering_context::{
+            builder::EngineeringContextBuilder, context::StructuredFacts,
+            identity::ProjectIdentity, ContextFragment, IntentPlan,
+        };
+
+        let context = EngineeringContextBuilder::new()
+            .project(ProjectIdentity::new("proj", "rust"))
+            .task(IntentPlan {
+                detected_goal: "fix bug".to_string(),
+                intent_type: "Execution".to_string(),
+                confidence: 0.9,
+                ambiguity: false,
+                ambiguity_reason: None,
+            })
+            .context_fragment(ContextFragment {
+                source: "review".to_string(),
+                content: "review prose".to_string(),
+                relevance_score: 0.85,
+                structured_facts: Some(
+                    StructuredFacts::new("review")
+                        .with_field("verdict", "PASS_WITH_RISKS")
+                        .with_field("findings_count", 1usize),
+                ),
+            })
+            .context_fragment(ContextFragment {
+                source: "coding".to_string(),
+                content: "coding prose".to_string(),
+                relevance_score: 0.85,
+                structured_facts: Some(
+                    StructuredFacts::new("coding")
+                        .with_field("all_verified", false)
+                        .with_field("changes_count", 2usize),
+                ),
+            })
+            .user_request("fix the bug")
+            .system_prompt("sys")
+            .build()
+            .expect("build should succeed");
+
+        let compiler = PromptCompiler::new();
+        let r1 = compiler.compile_context(&context);
+        let r2 = compiler.compile_context(&context);
+
+        assert_eq!(
+            r1.prompt, r2.prompt,
+            "same context must produce byte-identical prompt"
+        );
+    }
+
+    #[test]
+    fn test_machine_authority_instructions_in_default_system_prompt() {
+        use crate::engineering_context::{
+            builder::EngineeringContextBuilder, identity::ProjectIdentity, IntentPlan,
+        };
+
+        let context = EngineeringContextBuilder::new()
+            .project(ProjectIdentity::new("proj", "rust"))
+            .task(IntentPlan {
+                detected_goal: "fix bug".to_string(),
+                intent_type: "Execution".to_string(),
+                confidence: 0.9,
+                ambiguity: false,
+                ambiguity_reason: None,
+            })
+            .user_request("fix the bug")
+            .system_prompt("") // empty → uses default
+            .build()
+            .expect("build should succeed");
+
+        let compiler = PromptCompiler::new();
+        let result = compiler.compile_context(&context);
+
+        assert!(result
+            .prompt
+            .contains("STRUCTURED MACHINE FACTS are authoritative"));
+        assert!(result
+            .prompt
+            .contains("Exit codes determine command success"));
+        assert!(result
+            .prompt
+            .contains("If prose conflicts with structured machine facts, trust structured facts"));
     }
 }

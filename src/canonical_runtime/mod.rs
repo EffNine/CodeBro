@@ -610,13 +610,19 @@ impl CanonicalRuntime {
         diag.memory_resolution_ms = t.elapsed().as_millis() as u64;
         diag.memory_entries = memory_ctx.entry_count();
 
-        // Context assembly + observe + reason.
-        let t = Instant::now();
+        // Assemble grounded context ONCE per task (Sprint 30I.1).
+        // This is the single baseline repository context shared by all specialists.
         let memory_entries: Vec<String> = memory_ctx
             .entries
             .iter()
             .map(|e| format!("{}: {}", e.key, e.value))
             .collect();
+        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
+            .assemble_with_extras(req.task, &[], &memory_entries);
+        let grounded = std::sync::Arc::new(grounded);
+
+        // Context assembly + observe + reason.
+        let t = Instant::now();
         let (assembly, report) = match self.observe(req, &memory_entries).await {
             Ok(assembled) => assembled,
             Err(e) => return self.fail(req, Some(&mut graph), &root_id, e, diag, started),
@@ -639,7 +645,7 @@ impl CanonicalRuntime {
         let mut research_result: Option<crate::research::ResearchResult> = None;
         if opts.research_enabled {
             let research = self
-                .run_autonomous_research(req, &memory_entries, &opts)
+                .run_autonomous_research(req, grounded.clone(), &opts)
                 .await;
             match research {
                 Ok(result) => {
@@ -649,13 +655,23 @@ impl CanonicalRuntime {
                             result.clone(),
                         ),
                     );
-                    research_result = Some(result);
+                    research_result = Some(result.clone());
                     context = extend_context(
                         context,
                         vec![ContextFragment {
                             source: "research".to_string(),
                             content: render,
                             relevance_score: 0.85,
+                            structured_facts: Some(
+                                crate::engineering_context::context::StructuredFacts::new(
+                                    "research",
+                                )
+                                .with_field("files_inspected", result.files_inspected.len())
+                                .with_field("symbols_found", result.symbols_found.len())
+                                .with_field("findings_count", result.findings.len())
+                                .with_field("termination", result.termination.to_string())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                            ),
                         }],
                     );
                     diag.context_fragments = context.fragment_count();
@@ -681,7 +697,7 @@ impl CanonicalRuntime {
         let mut testing_result: Option<crate::testing::TestingResult> = None;
         if opts.testing_enabled {
             let testing = self
-                .run_autonomous_testing(req, &memory_entries, &opts)
+                .run_autonomous_testing(req, grounded.clone(), &opts)
                 .await;
             match testing {
                 Ok(result) => {
@@ -691,13 +707,30 @@ impl CanonicalRuntime {
                             result.clone(),
                         ),
                     );
-                    testing_result = Some(result);
+                    testing_result = Some(result.clone());
                     context = extend_context(
                         context,
                         vec![ContextFragment {
                             source: "testing".to_string(),
                             content: render,
                             relevance_score: 0.85,
+                            structured_facts: Some(
+                                crate::engineering_context::context::StructuredFacts::new(
+                                    "testing",
+                                )
+                                .with_field("commands_run_count", result.commands_run.len())
+                                .with_field("failures_count", result.failures.len())
+                                .with_field(
+                                    "exit_codes",
+                                    result
+                                        .commands_run
+                                        .iter()
+                                        .map(|c| c.exit_code)
+                                        .collect::<Vec<_>>(),
+                                )
+                                .with_field("git_tree_unchanged", result.git_tree_unchanged())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                            ),
                         }],
                     );
                     diag.context_fragments = context.fragment_count();
@@ -726,7 +759,7 @@ impl CanonicalRuntime {
             let planning = self
                 .run_autonomous_planning(
                     req,
-                    &memory_entries,
+                    grounded.clone(),
                     &opts,
                     research_result.clone(),
                     testing_result.clone(),
@@ -740,13 +773,24 @@ impl CanonicalRuntime {
                             result.clone(),
                         ),
                     );
-                    planning_result = Some(result);
+                    planning_result = Some(result.clone());
                     context = extend_context(
                         context,
                         vec![ContextFragment {
                             source: "planning".to_string(),
                             content: render,
                             relevance_score: 0.85,
+                            structured_facts: Some(
+                                crate::engineering_context::context::StructuredFacts::new(
+                                    "planning",
+                                )
+                                .with_field("steps_count", result.plan.len())
+                                .with_field("affected_files_count", result.affected_files.len())
+                                .with_field("affected_symbols_count", result.affected_symbols.len())
+                                .with_field("risks_count", result.risks.len())
+                                .with_field("tests_to_update_count", result.tests_to_update.len())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                            ),
                         }],
                     );
                     diag.context_fragments = context.fragment_count();
@@ -788,7 +832,7 @@ impl CanonicalRuntime {
                 let coding = self
                     .run_autonomous_coding(
                         req,
-                        &memory_entries,
+                        grounded.clone(),
                         &opts,
                         planning_result.clone(),
                         research_result.clone(),
@@ -810,6 +854,23 @@ impl CanonicalRuntime {
                                 source: "coding".to_string(),
                                 content: render,
                                 relevance_score: 0.85,
+                                structured_facts: Some(
+                                    crate::engineering_context::context::StructuredFacts::new(
+                                        "coding",
+                                    )
+                                    .with_field("changes_count", result.changes.len())
+                                    .with_field(
+                                        "verified_changes_count",
+                                        result.changes.iter().filter(|c| c.verified).count(),
+                                    )
+                                    .with_field(
+                                        "unplanned_changes_count",
+                                        result.unplanned_changes.len(),
+                                    )
+                                    .with_field("verification_count", result.verification.len())
+                                    .with_field("all_verified", result.all_verified())
+                                    .with_field("synthesis_complete", result.synthesis_complete),
+                                ),
                             }],
                         );
                         diag.context_fragments = context.fragment_count();
@@ -872,7 +933,7 @@ impl CanonicalRuntime {
             let review = self
                 .run_autonomous_review(
                     req,
-                    &memory_entries,
+                    grounded.clone(),
                     &opts,
                     research_result.clone(),
                     testing_result.clone(),
@@ -894,6 +955,24 @@ impl CanonicalRuntime {
                             source: "review".to_string(),
                             content: render,
                             relevance_score: 0.85,
+                            structured_facts: Some(
+                                crate::engineering_context::context::StructuredFacts::new("review")
+                                    .with_field("findings_count", result.findings.len())
+                                    .with_field("verdict", result.verdict.to_string())
+                                    .with_field(
+                                        "verified_changes_count",
+                                        result.verified_changes.len(),
+                                    )
+                                    .with_field(
+                                        "unverified_changes_count",
+                                        result.unverified_changes.len(),
+                                    )
+                                    .with_field(
+                                        "plan_deviations_count",
+                                        result.plan_deviations.len(),
+                                    )
+                                    .with_field("synthesis_complete", result.synthesis_complete),
+                            ),
                         }],
                     );
                     diag.context_fragments = context.fragment_count();
@@ -1042,6 +1121,7 @@ impl CanonicalRuntime {
                                                     revision, rev_response
                                                 ),
                                                 relevance_score: 0.7,
+                                                structured_facts: None,
                                             }],
                                         );
                                     }
@@ -1188,6 +1268,14 @@ impl CanonicalRuntime {
                         source: "research".to_string(),
                         content: render,
                         relevance_score: 0.85,
+                        structured_facts: Some(
+                            crate::engineering_context::context::StructuredFacts::new("research")
+                                .with_field("files_inspected", result.files_inspected.len())
+                                .with_field("symbols_found", result.symbols_found.len())
+                                .with_field("findings_count", result.findings.len())
+                                .with_field("termination", result.termination.to_string())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                        ),
                     }],
                 );
             }
@@ -1248,6 +1336,21 @@ impl CanonicalRuntime {
                         source: "testing".to_string(),
                         content: render,
                         relevance_score: 0.85,
+                        structured_facts: Some(
+                            crate::engineering_context::context::StructuredFacts::new("testing")
+                                .with_field("commands_run_count", result.commands_run.len())
+                                .with_field("failures_count", result.failures.len())
+                                .with_field(
+                                    "exit_codes",
+                                    result
+                                        .commands_run
+                                        .iter()
+                                        .map(|c| c.exit_code)
+                                        .collect::<Vec<_>>(),
+                                )
+                                .with_field("git_tree_unchanged", result.git_tree_unchanged())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                        ),
                     }],
                 );
             }
@@ -1309,6 +1412,14 @@ impl CanonicalRuntime {
                         source: "research".to_string(),
                         content: render,
                         relevance_score: 0.85,
+                        structured_facts: Some(
+                            crate::engineering_context::context::StructuredFacts::new("research")
+                                .with_field("files_inspected", result.files_inspected.len())
+                                .with_field("symbols_found", result.symbols_found.len())
+                                .with_field("findings_count", result.findings.len())
+                                .with_field("termination", result.termination.to_string())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                        ),
                     }],
                 );
                 Some(result)
@@ -1329,6 +1440,21 @@ impl CanonicalRuntime {
                         source: "testing".to_string(),
                         content: render,
                         relevance_score: 0.85,
+                        structured_facts: Some(
+                            crate::engineering_context::context::StructuredFacts::new("testing")
+                                .with_field("commands_run_count", result.commands_run.len())
+                                .with_field("failures_count", result.failures.len())
+                                .with_field(
+                                    "exit_codes",
+                                    result
+                                        .commands_run
+                                        .iter()
+                                        .map(|c| c.exit_code)
+                                        .collect::<Vec<_>>(),
+                                )
+                                .with_field("git_tree_unchanged", result.git_tree_unchanged())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                        ),
                     }],
                 );
                 Some(result)
@@ -1349,6 +1475,15 @@ impl CanonicalRuntime {
                         source: "planning".to_string(),
                         content: render,
                         relevance_score: 0.85,
+                        structured_facts: Some(
+                            crate::engineering_context::context::StructuredFacts::new("planning")
+                                .with_field("steps_count", result.plan.len())
+                                .with_field("affected_files_count", result.affected_files.len())
+                                .with_field("affected_symbols_count", result.affected_symbols.len())
+                                .with_field("risks_count", result.risks.len())
+                                .with_field("tests_to_update_count", result.tests_to_update.len())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                        ),
                     }],
                 );
             }
@@ -1413,6 +1548,14 @@ impl CanonicalRuntime {
                         source: "research".to_string(),
                         content: render,
                         relevance_score: 0.85,
+                        structured_facts: Some(
+                            crate::engineering_context::context::StructuredFacts::new("research")
+                                .with_field("files_inspected", result.files_inspected.len())
+                                .with_field("symbols_found", result.symbols_found.len())
+                                .with_field("findings_count", result.findings.len())
+                                .with_field("termination", result.termination.to_string())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                        ),
                     }],
                 );
                 Some(result)
@@ -1433,6 +1576,21 @@ impl CanonicalRuntime {
                         source: "testing".to_string(),
                         content: render,
                         relevance_score: 0.85,
+                        structured_facts: Some(
+                            crate::engineering_context::context::StructuredFacts::new("testing")
+                                .with_field("commands_run_count", result.commands_run.len())
+                                .with_field("failures_count", result.failures.len())
+                                .with_field(
+                                    "exit_codes",
+                                    result
+                                        .commands_run
+                                        .iter()
+                                        .map(|c| c.exit_code)
+                                        .collect::<Vec<_>>(),
+                                )
+                                .with_field("git_tree_unchanged", result.git_tree_unchanged())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                        ),
                     }],
                 );
                 Some(result)
@@ -1460,6 +1618,15 @@ impl CanonicalRuntime {
                         source: "planning".to_string(),
                         content: render,
                         relevance_score: 0.85,
+                        structured_facts: Some(
+                            crate::engineering_context::context::StructuredFacts::new("planning")
+                                .with_field("steps_count", result.plan.len())
+                                .with_field("affected_files_count", result.affected_files.len())
+                                .with_field("affected_symbols_count", result.affected_symbols.len())
+                                .with_field("risks_count", result.risks.len())
+                                .with_field("tests_to_update_count", result.tests_to_update.len())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                        ),
                     }],
                 );
                 Some(result)
@@ -1494,6 +1661,21 @@ impl CanonicalRuntime {
                         source: "coding".to_string(),
                         content: render,
                         relevance_score: 0.85,
+                        structured_facts: Some(
+                            crate::engineering_context::context::StructuredFacts::new("coding")
+                                .with_field("changes_count", result.changes.len())
+                                .with_field(
+                                    "verified_changes_count",
+                                    result.changes.iter().filter(|c| c.verified).count(),
+                                )
+                                .with_field(
+                                    "unplanned_changes_count",
+                                    result.unplanned_changes.len(),
+                                )
+                                .with_field("verification_count", result.verification.len())
+                                .with_field("all_verified", result.all_verified())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                        ),
                     }],
                 );
                 result
@@ -1525,6 +1707,18 @@ impl CanonicalRuntime {
                         source: "review".to_string(),
                         content: render,
                         relevance_score: 0.85,
+                        structured_facts: Some(
+                            crate::engineering_context::context::StructuredFacts::new("review")
+                                .with_field("findings_count", result.findings.len())
+                                .with_field("verdict", result.verdict.to_string())
+                                .with_field("verified_changes_count", result.verified_changes.len())
+                                .with_field(
+                                    "unverified_changes_count",
+                                    result.unverified_changes.len(),
+                                )
+                                .with_field("plan_deviations_count", result.plan_deviations.len())
+                                .with_field("synthesis_complete", result.synthesis_complete),
+                        ),
                     }],
                 );
             }
@@ -1565,13 +1759,11 @@ impl CanonicalRuntime {
     async fn run_autonomous_research(
         &self,
         req: &TaskRequest<'_>,
-        memory_entries: &[String],
+        grounded: std::sync::Arc<crate::agent::grounding::GroundedContext>,
         opts: &TaskOptions,
     ) -> std::result::Result<crate::research::ResearchResult, String> {
-        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
-            .assemble_with_extras(req.task, &[], memory_entries);
         let cancel = opts.cancel.clone();
-        self.run_research_task(req.task, grounded, req.emit, cancel)
+        self.run_research_task(req.task, (*grounded).clone(), req.emit, cancel)
             .await
     }
 
@@ -1629,13 +1821,11 @@ impl CanonicalRuntime {
     async fn run_autonomous_testing(
         &self,
         req: &TaskRequest<'_>,
-        memory_entries: &[String],
+        grounded: std::sync::Arc<crate::agent::grounding::GroundedContext>,
         opts: &TaskOptions,
     ) -> std::result::Result<crate::testing::TestingResult, String> {
-        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
-            .assemble_with_extras(req.task, &[], memory_entries);
         let cancel = opts.cancel.clone();
-        self.run_testing_task(req.task, grounded, req.emit, cancel)
+        self.run_testing_task(req.task, (*grounded).clone(), req.emit, cancel)
             .await
     }
 
@@ -1706,16 +1896,21 @@ impl CanonicalRuntime {
     async fn run_autonomous_planning(
         &self,
         req: &TaskRequest<'_>,
-        memory_entries: &[String],
+        grounded: std::sync::Arc<crate::agent::grounding::GroundedContext>,
         opts: &TaskOptions,
         research: Option<crate::research::ResearchResult>,
         testing: Option<crate::testing::TestingResult>,
     ) -> std::result::Result<crate::planning::PlanningResult, String> {
-        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
-            .assemble_with_extras(req.task, &[], memory_entries);
         let cancel = opts.cancel.clone();
-        self.run_planning_task(req.task, grounded, research, testing, req.emit, cancel)
-            .await
+        self.run_planning_task(
+            req.task,
+            (*grounded).clone(),
+            research,
+            testing,
+            req.emit,
+            cancel,
+        )
+        .await
     }
 
     // =====================================================================
@@ -1797,17 +1992,21 @@ impl CanonicalRuntime {
     async fn run_autonomous_coding(
         &self,
         req: &TaskRequest<'_>,
-        memory_entries: &[String],
+        grounded: std::sync::Arc<crate::agent::grounding::GroundedContext>,
         opts: &TaskOptions,
         planning: Option<crate::planning::PlanningResult>,
         research: Option<crate::research::ResearchResult>,
         testing: Option<crate::testing::TestingResult>,
     ) -> std::result::Result<crate::coding::CodingResult, String> {
-        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
-            .assemble_with_extras(req.task, &[], memory_entries);
         let cancel = opts.cancel.clone();
         self.run_coding_task(
-            req.task, grounded, planning, research, testing, req.emit, cancel,
+            req.task,
+            (*grounded).clone(),
+            planning,
+            research,
+            testing,
+            req.emit,
+            cancel,
         )
         .await
     }
@@ -1881,18 +2080,23 @@ impl CanonicalRuntime {
     async fn run_autonomous_review(
         &self,
         req: &TaskRequest<'_>,
-        memory_entries: &[String],
+        grounded: std::sync::Arc<crate::agent::grounding::GroundedContext>,
         opts: &TaskOptions,
         research: Option<crate::research::ResearchResult>,
         testing: Option<crate::testing::TestingResult>,
         planning: Option<crate::planning::PlanningResult>,
         coding: Option<crate::coding::CodingResult>,
     ) -> std::result::Result<crate::review::ReviewResult, String> {
-        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
-            .assemble_with_extras(req.task, &[], memory_entries);
         let cancel = opts.cancel.clone();
         self.run_review_task(
-            req.task, grounded, research, testing, planning, coding, req.emit, cancel,
+            req.task,
+            (*grounded).clone(),
+            research,
+            testing,
+            planning,
+            coding,
+            req.emit,
+            cancel,
         )
         .await
     }
@@ -2071,6 +2275,7 @@ impl CanonicalRuntime {
                 source: f.source.to_string(),
                 content: f.content.clone(),
                 relevance_score: f.relevance_score,
+                structured_facts: None,
             })
             .collect();
         if !report.trim().is_empty() {
@@ -2078,6 +2283,7 @@ impl CanonicalRuntime {
                 source: "agent_analysis".to_string(),
                 content: report,
                 relevance_score: 0.8,
+                structured_facts: None,
             });
         }
         dedup_fragments(&mut fragments);
@@ -2340,6 +2546,7 @@ impl CanonicalRuntime {
                                 source: "tool_result".to_string(),
                                 content: format!("Tool result for {}: {}", call.name, result),
                                 relevance_score: 0.9,
+                                structured_facts: None,
                             });
                             total_tool_calls += 1;
                         }
