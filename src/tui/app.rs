@@ -1,11 +1,13 @@
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 use crate::config::Config;
+use crate::tui::actions::ActionStream;
 use crate::tui::console::{ConsoleStatus, PtyConsole};
 use crate::tui::dashboard::Dashboard;
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::mpsc;
+use std::time::Instant;
 
 use crate::agent::events::AgentEvent;
 use crate::cancellation::CancellationToken;
@@ -89,6 +91,21 @@ pub struct TuiApp {
     /// Active masked API-key input (set by `//apikey <provider>`). While set,
     /// typed characters go to the masked buffer instead of the main input.
     pub secure_input: Option<SecureInputState>,
+    /// Semantic action history shown inside the chat (bounded, event-derived).
+    pub action_stream: ActionStream,
+    /// Whether the right intelligence rail is visible. Default: expanded.
+    pub rail_visible: bool,
+    /// Whether the live PTY console overlay is open (Ctrl+K / `//console`).
+    pub show_console: bool,
+    /// When the app session started (real wall clock for the session panel).
+    pub session_started_at: Instant,
+    /// When the current task started (for the session duration).
+    pub task_started_at: Option<Instant>,
+    /// Workspace identity resolved ONCE at startup and cached. The renderer
+    /// must never spawn subprocesses (`git rev-parse` et al.) per frame, so
+    /// this is resolved here, outside the render path.
+    pub workspace_root: std::path::PathBuf,
+    pub workspace_name: String,
 }
 
 /// UI state for the provider management panel
@@ -170,6 +187,16 @@ impl TuiApp {
 
         let settings = crate::settings::SettingsManager::new(config.clone(), config_dir.clone());
 
+        // Workspace identity is resolved once at startup (this may spawn a
+        // `git rev-parse --show-toplevel` subprocess ONCE) and cached so the
+        // render path stays pure with respect to subprocess/filesystem work.
+        let workspace_root = crate::tools::detect_workspace_root();
+        let workspace_name = workspace_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| ".".to_string());
+
         Ok(TuiApp {
             messages: VecDeque::new(),
             input: String::new(),
@@ -198,12 +225,26 @@ impl TuiApp {
             cancel_token: None,
             pending_confirmation: None,
             secure_input: None,
+            action_stream: ActionStream::new(),
+            rail_visible: true,
+            show_console: false,
+            session_started_at: Instant::now(),
+            task_started_at: None,
+            workspace_root,
+            workspace_name,
         })
     }
 
     pub fn add_message(&mut self, role: MessageRole, content: String) {
+        // Only auto-follow when the user was already at the bottom. A user who
+        // scrolled upward must never have their viewport yanked by a new
+        // message; the "new activity" indicator (driven by scroll_from_bottom)
+        // signals new content instead.
+        let was_at_bottom = self.scroll_from_bottom == 0;
         self.messages.push_back(Message { role, content });
-        self.scroll_to_bottom();
+        if was_at_bottom {
+            self.scroll_to_bottom();
+        }
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -221,6 +262,25 @@ impl TuiApp {
     pub fn clear_screen(&mut self) {
         self.messages.clear();
         self.scroll_from_bottom = 0;
+        self.action_stream.clear();
+    }
+
+    pub fn toggle_rail(&mut self) {
+        self.rail_visible = !self.rail_visible;
+    }
+
+    pub fn toggle_console(&mut self) {
+        self.show_console = !self.show_console;
+    }
+
+    /// Real session duration in seconds (app start → now).
+    pub fn session_duration_secs(&self) -> u64 {
+        self.session_started_at.elapsed().as_secs()
+    }
+
+    /// Real task duration in seconds when a task is in flight.
+    pub fn task_duration_secs(&self) -> Option<u64> {
+        self.task_started_at.map(|t| t.elapsed().as_secs())
     }
 
     // ---- Input cursor handling ----
@@ -424,6 +484,7 @@ impl TuiApp {
             registry.begin_task(task);
         }
         self.dashboard.metrics = Some(crate::metrics::TaskMetrics::new("current task"));
+        self.task_started_at = Some(Instant::now());
     }
 
     pub fn end_task(&mut self) {
@@ -434,9 +495,19 @@ impl TuiApp {
             registry.end_task(&self.config.model);
         }
         self.dashboard.metrics = None;
+        self.task_started_at = None;
     }
 
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
+        self.action_stream.handle_event(&event);
+        // Tool-only tasks (e.g. `!cargo test`) never emit agent status events;
+        // keep the animation driving while the action stream is live so the
+        // chat spinner and live action tails tick.
+        if self.action_stream.has_running() && !self.dashboard.animation.is_active() {
+            self.dashboard
+                .animation
+                .start_activity(crate::tui::animation::ActivityType::Thinking);
+        }
         self.dashboard.handle_event(event.clone());
 
         if let Some(tracker) = self.session_tracker.as_mut() {
@@ -556,6 +627,7 @@ impl TuiApp {
         if let Some(token) = &self.cancel_token {
             token.cancel();
         }
+        self.action_stream.cancel_active();
         self.dashboard
             .log("info", "Task cancelled by user".to_string());
         self.is_loading = false;
@@ -916,5 +988,103 @@ impl TuiApp {
                 wd.proposals[index].approved = wd.proposals[index].enabled;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_app() -> TuiApp {
+        TuiApp::new().expect("app creation")
+    }
+
+    // ─── F4: add_message must not yank a detached viewport ────────────
+
+    #[test]
+    fn test_add_message_follows_bottom_when_at_bottom() {
+        let mut app = make_app();
+        for i in 0..20 {
+            app.add_message(MessageRole::Assistant, format!("line {}", i));
+        }
+        assert_eq!(app.scroll_from_bottom, 0, "already at bottom");
+        app.add_message(MessageRole::Assistant, "new at bottom".to_string());
+        assert_eq!(
+            app.scroll_from_bottom, 0,
+            "at bottom + new message must stay following bottom"
+        );
+    }
+
+    #[test]
+    fn test_add_message_preserves_detached_viewport() {
+        let mut app = make_app();
+        for i in 0..20 {
+            app.add_message(MessageRole::Assistant, format!("line {}", i));
+        }
+        app.scroll_up();
+        app.scroll_up();
+        app.scroll_up();
+        let detached = app.scroll_from_bottom;
+        assert!(detached > 0, "viewport detached");
+        app.add_message(MessageRole::Assistant, "new while detached".to_string());
+        assert_eq!(
+            app.scroll_from_bottom, detached,
+            "scrolled-up viewport must not be yanked by a new message"
+        );
+    }
+
+    #[test]
+    fn test_add_message_detached_indicator_survives_activity() {
+        let mut app = make_app();
+        for i in 0..20 {
+            app.add_message(MessageRole::Assistant, format!("line {}", i));
+        }
+        app.scroll_up();
+        let detached = app.scroll_from_bottom;
+        app.action_stream.handle_event(&AgentEvent::ToolStarted {
+            tool: "read_file".to_string(),
+            args: "a.rs".to_string(),
+        });
+        assert!(
+            app.scroll_from_bottom > 0,
+            "detached viewport remains detached under new activity"
+        );
+        assert!(app.action_stream.has_live_activity());
+        let _ = detached;
+    }
+
+    #[test]
+    fn test_end_returns_to_live_view() {
+        let mut app = make_app();
+        for i in 0..20 {
+            app.add_message(MessageRole::Assistant, format!("line {}", i));
+        }
+        app.scroll_up();
+        assert!(app.scroll_from_bottom > 0);
+        app.scroll_to_bottom();
+        assert_eq!(app.scroll_from_bottom, 0, "End returns to live view");
+    }
+
+    // ─── F5: workspace identity is cached outside the render path ─────
+
+    #[test]
+    fn test_workspace_identity_cached_at_startup() {
+        let app = make_app();
+        assert!(
+            !app.workspace_name.is_empty(),
+            "workspace name resolved at startup"
+        );
+        // The cached root exists and the name matches its file name.
+        assert!(app.workspace_root.exists());
+        let expected = app
+            .workspace_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(".");
+        assert_eq!(app.workspace_name, expected);
+        // Stable across reads (no per-render resolution).
+        let name_a = app.workspace_name.clone();
+        let name_b = app.workspace_name.clone();
+        assert_eq!(name_a, name_b);
     }
 }

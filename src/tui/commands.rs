@@ -196,6 +196,18 @@ pub const RUNTIME_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         namespace: CommandNamespace::Runtime,
+        command: "//rail",
+        usage: "//rail",
+        description: "Toggle the right intelligence rail",
+    },
+    CommandSpec {
+        namespace: CommandNamespace::Runtime,
+        command: "//console",
+        usage: "//console",
+        description: "Open the live PTY console overlay",
+    },
+    CommandSpec {
+        namespace: CommandNamespace::Runtime,
         command: "//memory",
         usage: "//memory",
         description: "View or clear project memory",

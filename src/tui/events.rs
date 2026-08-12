@@ -18,6 +18,12 @@ pub enum AppEvent {
     /// A bracketed-paste block from the terminal (may contain newlines).
     Paste(String),
     Mouse(MouseEvent),
+    /// The runtime finished the current task with a real success flag. Sent
+    /// immediately before `Response` so the UI can finalize action groups
+    /// honestly (completed vs failed).
+    TaskFinished {
+        success: bool,
+    },
     /// P5: Provider health check results
     ProviderHealthResults(Vec<(String, crate::provider_manager::HealthStatus, Option<u64>)>),
     /// P5: Workspace discovery results
@@ -81,6 +87,9 @@ pub fn check_key_shortcuts(key: &KeyEvent) -> Option<Shortcut> {
         KeyCode::Char('p') => Some(Shortcut::OpenCommandPalette),
         KeyCode::Char('v') => Some(Shortcut::ToggleMetrics),
         KeyCode::Char('o') => Some(Shortcut::ToggleCoordination),
+        KeyCode::Char('u') => Some(Shortcut::ToggleRail),
+        KeyCode::Char('k') => Some(Shortcut::ToggleConsole),
+        KeyCode::Char('d') => Some(Shortcut::ViewDiff),
         _ => None,
     }
 }
@@ -98,6 +107,12 @@ pub enum Shortcut {
     OpenCommandPalette,
     ToggleMetrics,
     ToggleCoordination,
+    /// Collapse/expand the right intelligence rail.
+    ToggleRail,
+    /// Open/close the live PTY console overlay.
+    ToggleConsole,
+    /// Show the staged change preview (the existing `/apply` diff flow).
+    ViewDiff,
 }
 
 impl Shortcut {
@@ -114,6 +129,9 @@ impl Shortcut {
             Shortcut::OpenCommandPalette => "Ctrl+P Commands",
             Shortcut::ToggleMetrics => "Ctrl+V Metrics",
             Shortcut::ToggleCoordination => "Ctrl+O Coordination",
+            Shortcut::ToggleRail => "Ctrl+U Rail",
+            Shortcut::ToggleConsole => "Ctrl+K Console",
+            Shortcut::ViewDiff => "Ctrl+D Diff",
         }
     }
 }
@@ -126,4 +144,81 @@ where
         f.await;
         let _ = sender;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    // ─── F9: Ctrl+D maps to the diff shortcut ─────────────────────────
+
+    #[test]
+    fn test_ctrl_d_maps_to_view_diff() {
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('d'))),
+            Some(Shortcut::ViewDiff)
+        );
+        assert_eq!(Shortcut::ViewDiff.label(), "Ctrl+D Diff");
+    }
+
+    #[test]
+    fn test_all_existing_shortcuts_preserved() {
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('a'))),
+            Some(Shortcut::ToggleAgents)
+        );
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('g'))),
+            Some(Shortcut::ToggleTaskGraph)
+        );
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('m'))),
+            Some(Shortcut::ToggleMemory)
+        );
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('s'))),
+            Some(Shortcut::SaveSession)
+        );
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('t'))),
+            Some(Shortcut::ToggleTrace)
+        );
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('l'))),
+            Some(Shortcut::ClearLogs)
+        );
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('c'))),
+            Some(Shortcut::CancelTask)
+        );
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('q'))),
+            Some(Shortcut::Quit)
+        );
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('p'))),
+            Some(Shortcut::OpenCommandPalette)
+        );
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('v'))),
+            Some(Shortcut::ToggleMetrics)
+        );
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('o'))),
+            Some(Shortcut::ToggleCoordination)
+        );
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('u'))),
+            Some(Shortcut::ToggleRail)
+        );
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('k'))),
+            Some(Shortcut::ToggleConsole)
+        );
+    }
 }

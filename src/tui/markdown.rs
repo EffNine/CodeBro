@@ -6,29 +6,29 @@
 //! Falls back to plain text for inputs without markdown.
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+
+use crate::tui::theme::THEME;
 
 /// The full-width styling for each message pane.
 fn body_style() -> Style {
-    Style::default().fg(Color::Gray)
+    THEME.text()
 }
 
 fn code_style() -> Style {
-    Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::DIM)
+    THEME.yellow().add_modifier(Modifier::DIM)
 }
 
 fn inline_code_style() -> Style {
-    Style::default().fg(Color::Yellow)
+    THEME.yellow()
 }
 
 fn heading_style(level: u32) -> Style {
     let color = match level {
-        1 => Color::Cyan,
-        2 => Color::Blue,
-        _ => Color::Magenta,
+        1 => THEME.purple,
+        2 => THEME.blue,
+        _ => THEME.secondary,
     };
     Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
@@ -119,7 +119,7 @@ pub fn render_markdown(src: &str, width: usize) -> Vec<Line<'static>> {
                 flush!();
                 current.push(Span::styled(
                     list_prefix.clone().unwrap_or_else(|| "- ".into()),
-                    Style::default().fg(Color::Blue),
+                    THEME.blue(),
                 ));
             }
             Event::End(TagEnd::Item) => {
@@ -127,7 +127,7 @@ pub fn render_markdown(src: &str, width: usize) -> Vec<Line<'static>> {
             }
             Event::Start(Tag::BlockQuote) => {
                 maybe_separate!();
-                current.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
+                current.push(Span::styled("│ ", THEME.dim()));
             }
             Event::End(TagEnd::BlockQuote) => {
                 flush!();
@@ -150,7 +150,7 @@ pub fn render_markdown(src: &str, width: usize) -> Vec<Line<'static>> {
                 flush!();
             }
             Event::Start(Tag::TableCell) => {
-                current.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
+                current.push(Span::styled("| ", THEME.dim()));
             }
             Event::End(TagEnd::TableCell) => {}
             Event::TaskListMarker(_) => {}
@@ -176,7 +176,7 @@ pub fn render_markdown(src: &str, width: usize) -> Vec<Line<'static>> {
                 flush!();
                 out.push(Line::from(Span::styled(
                     format!("{}", "-".repeat(width.saturating_sub(4).clamp(4, 60))),
-                    Style::default().fg(Color::DarkGray),
+                    THEME.dim(),
                 )));
             }
             Event::Text(text) => {

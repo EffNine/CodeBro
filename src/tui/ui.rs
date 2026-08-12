@@ -5,7 +5,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui::Terminal;
 use std::io::stdout;
@@ -16,14 +16,25 @@ use crate::agent::events::AgentEvent;
 use crate::agent::status::AgentStatus;
 use crate::agent::task_graph::TaskStatus;
 use crate::config::Config;
-use crate::tui::animation::progress_bar;
+use crate::tui::actions::{UiActionGroup, UiActionKind, UiActionStatus};
+use crate::tui::animation::SPINNER_FRAMES;
 use crate::tui::app::{MessageRole, PendingAction, TuiApp};
 use crate::tui::commands::{self, CommandNamespace};
 use crate::tui::console::PtyConsole;
 use crate::tui::dashboard::Dashboard;
 use crate::tui::events::{self, Shortcut};
+use crate::tui::theme::{Phase, StatusGlyph, THEME};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+const ANIM_FRAME_MS: u128 = 80;
+
+/// Minimum terminal width below which the rail collapses automatically.
+const COMPACT_MIN_WIDTH: u16 = 100;
+/// Minimum terminal height below which the UI sheds chrome automatically.
+const COMPACT_MIN_HEIGHT: u16 = 26;
+/// Rail width is ~22% of the terminal width, at least this many columns and
+/// never more than 25%.
+const RAIL_MIN_WIDTH: u16 = 24;
 
 /// Truncates a string to `width` Unicode characters (never panics on long text).
 pub fn truncate_to(s: &str, width: usize) -> String {
@@ -123,6 +134,10 @@ fn handle_event(msg: events::AppEvent, app: &mut TuiApp) -> bool {
             app.should_quit = true;
             true
         }
+        events::AppEvent::TaskFinished { success } => {
+            app.action_stream.finalize_response(success);
+            true
+        }
         events::AppEvent::Response(content) => {
             app.is_loading = false;
             app.dashboard.dismiss_welcome();
@@ -219,8 +234,14 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
 
             match key.code {
                 KeyCode::Tab => {
-                    // Context-aware completion for `/`, `//`, `!`.
-                    if app.input.starts_with('/') || app.input.starts_with('!') {
+                    // Empty input: cycle the focused action group. Otherwise
+                    // context-aware completion for `/`, `//`, `!`.
+                    if app.input.is_empty() {
+                        if app.action_stream.cycle_focus(true) {
+                            app.dashboard
+                                .log("info", "focused action group".to_string());
+                        }
+                    } else if app.input.starts_with('/') || app.input.starts_with('!') {
                         let candidates = commands::completion_candidates(&app.input, app);
                         let names: Vec<String> =
                             candidates.iter().map(|c| c.command.to_string()).collect();
@@ -248,7 +269,7 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                 KeyCode::Left => app.cursor_left(),
                 KeyCode::Right => app.cursor_right(),
                 KeyCode::Home => app.cursor_home(),
-                KeyCode::End => app.cursor_end(),
+                KeyCode::End => app.scroll_to_bottom(),
                 KeyCode::PageUp => {
                     for _ in 0..10 {
                         app.scroll_up();
@@ -265,6 +286,13 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                         .contains(crossterm::event::KeyModifiers::SHIFT)
                     {
                         app.insert_char('\n');
+                        return;
+                    }
+                    if app.input.is_empty() {
+                        // Expand/collapse the focused action group.
+                        if !app.action_stream.toggle_focused() {
+                            app.scroll_to_bottom();
+                        }
                         return;
                     }
 
@@ -684,6 +712,30 @@ fn handle_runtime_command(input: &str, app: &mut TuiApp) {
     let arg = parts.get(1).copied().unwrap_or("");
 
     match command {
+        "//rail" => {
+            app.toggle_rail();
+            app.add_message(
+                MessageRole::System,
+                format!(
+                    "Intelligence rail: {}",
+                    if app.rail_visible {
+                        "shown"
+                    } else {
+                        "collapsed"
+                    }
+                ),
+            );
+        }
+        "//console" => {
+            app.toggle_console();
+            app.add_message(
+                MessageRole::System,
+                format!(
+                    "PTY console: {}",
+                    if app.show_console { "open" } else { "closed" }
+                ),
+            );
+        }
         "//model" => {
             if arg.is_empty() {
                 app.add_message(
@@ -1070,7 +1122,11 @@ fn help_text(app: &TuiApp) -> String {
     lines.push("    e.g. !git status, !cargo test, !ls".to_string());
     lines.push("".to_string());
     lines.push(
-        "  Shortcuts: Ctrl+P commands · Ctrl+C cancel · Ctrl+L clear · Esc dismiss".to_string(),
+        "  Shortcuts: Ctrl+P commands · Ctrl+C cancel · Ctrl+L clear · Ctrl+U rail · Ctrl+K console · Ctrl+D diff · Esc dismiss".to_string(),
+    );
+    lines.push(
+        "  Chat: Tab focuses an action group · Enter expands/collapses it · End returns to live"
+            .to_string(),
     );
     lines.join("\n")
 }
@@ -1137,6 +1193,7 @@ fn run_command_task(app: &mut TuiApp, label: &str, command: String) {
         let mut runtime = match crate::canonical_runtime::CanonicalRuntime::new(config) {
             Ok(runtime) => runtime,
             Err(e) => {
+                let _ = tx.send(events::AppEvent::TaskFinished { success: false });
                 let _ = tx.send(events::AppEvent::Response(format!(
                     "Runtime initialization failed: {e}"
                 )));
@@ -1151,6 +1208,9 @@ fn run_command_task(app: &mut TuiApp, label: &str, command: String) {
         } else {
             "Failed"
         };
+        let _ = tx.send(events::AppEvent::TaskFinished {
+            success: outcome.success,
+        });
         let _ = tx.send(events::AppEvent::Response(format!(
             "[{}] {}\n{}",
             status,
@@ -1176,6 +1236,7 @@ fn run_playwright_task(app: &mut TuiApp, args: &str) {
         let mut runtime = match crate::canonical_runtime::CanonicalRuntime::new(config) {
             Ok(runtime) => runtime,
             Err(e) => {
+                let _ = tx.send(events::AppEvent::TaskFinished { success: false });
                 let _ = tx.send(events::AppEvent::Response(format!(
                     "Runtime initialization failed: {e}"
                 )));
@@ -1193,6 +1254,9 @@ fn run_playwright_task(app: &mut TuiApp, args: &str) {
         } else {
             "failed"
         };
+        let _ = tx.send(events::AppEvent::TaskFinished {
+            success: outcome.success,
+        });
         let _ = tx.send(events::AppEvent::Response(format!(
             "[playwright {}]\n{}",
             status,
@@ -1269,6 +1333,7 @@ async fn run_chat_pipeline(
     let mut runtime = match crate::canonical_runtime::CanonicalRuntime::new(config.clone()) {
         Ok(runtime) => runtime,
         Err(e) => {
+            let _ = tx.send(events::AppEvent::TaskFinished { success: false });
             let _ = tx.send(events::AppEvent::Response(format!(
                 "Runtime initialization failed: {e}"
             )));
@@ -1294,6 +1359,9 @@ async fn run_chat_pipeline(
 
     let result = runtime.run_task_with_options(&request, options).await;
 
+    let _ = tx.send(events::AppEvent::TaskFinished {
+        success: result.success,
+    });
     if result.success {
         let _ = tx.send(events::AppEvent::Response(result.response));
     } else {
@@ -1305,148 +1373,180 @@ async fn run_chat_pipeline(
     }
 }
 
-// ─── Layout ───────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// Layout
+// ═══════════════════════════════════════════════════════════════════════════
 
-struct PanelLayout {
-    title_h: u16,
-    op_h: u16,
-    output_h: u16,
-    activity_h: u16,
-    agents_h: u16,
-    graph_h: u16,
-    metrics_h: u16,
-    coord_h: u16,
-    input_h: u16,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutMode {
+    /// Chat ~78% + right intelligence rail ~22% (the default).
+    Expanded,
+    /// Full-width chat, rail hidden.
+    Collapsed,
+    /// Narrow/short terminal: rail off, chrome reduced.
+    Compact,
 }
 
-const MIN_OUTPUT: u16 = 4;
+#[derive(Debug, Clone, Copy)]
+struct UiLayout {
+    mode: LayoutMode,
+    header_h: u16,
+    chat_h: u16,
+    input_h: u16,
+    footer_h: u16,
+    rail_w: u16,
+    chat_w: u16,
+}
 
-/// The default view is the task output: title, current operation, output,
-/// a concise live-activity line, and input. Everything else (agents, task
-/// graph, metrics, coordination) is an overlay opened on demand.
-fn compute_layout(app: &TuiApp, total_h: u16) -> PanelLayout {
-    let title_h: u16 = 1;
-    let op_h: u16 = 1;
-    let input_h: u16 = 3;
+impl UiLayout {
+    fn header_area(self, size: Rect) -> Rect {
+        Rect::new(size.x, size.y, size.width, self.header_h)
+    }
 
-    let activity_h: u16 = if app.dashboard.compact {
-        1
-    } else if app.dashboard.verbose {
-        8
+    fn chat_area(self, size: Rect) -> Rect {
+        Rect::new(size.x, size.y + self.header_h, self.chat_w, self.chat_h)
+    }
+
+    fn rail_area(self, size: Rect) -> Rect {
+        Rect::new(
+            size.x + self.chat_w,
+            size.y + self.header_h,
+            self.rail_w,
+            self.chat_h,
+        )
+    }
+
+    fn input_area(self, size: Rect) -> Rect {
+        Rect::new(
+            size.x,
+            size.y + self.header_h + self.chat_h,
+            size.width,
+            self.input_h,
+        )
+    }
+
+    fn footer_area(self, size: Rect) -> Rect {
+        Rect::new(
+            size.x,
+            size.y + size.height.saturating_sub(self.footer_h),
+            size.width,
+            self.footer_h,
+        )
+    }
+}
+
+/// Decide the layout mode from terminal size and user preference. Narrow or
+/// short terminals always collapse to compact so the chat stays usable.
+fn layout_mode(app: &TuiApp, size: Rect) -> LayoutMode {
+    if size.width < COMPACT_MIN_WIDTH || size.height < COMPACT_MIN_HEIGHT {
+        LayoutMode::Compact
+    } else if app.rail_visible {
+        LayoutMode::Expanded
     } else {
-        4
-    };
+        LayoutMode::Collapsed
+    }
+}
 
-    let agents_h = if app.dashboard.show_agents { 5 } else { 0 };
-    let graph_h = if app.dashboard.show_task_graph { 5 } else { 0 };
-    let metrics_h = if app.dashboard.show_metrics { 6 } else { 0 };
-    let coord_h = if app.dashboard.show_coordination {
-        6
+/// The rail is 22% of width, at least `RAIL_MIN_WIDTH` columns (so it stays
+/// readable) and never more than 25%.
+fn rail_width(total: u16) -> u16 {
+    let pct = (total as f32 * 0.22) as u16;
+    let max = (total as f32 * 0.25) as u16;
+    pct.max(RAIL_MIN_WIDTH).min(max).min(total / 2).max(4)
+}
+
+fn compute_ui_layout(app: &TuiApp, size: Rect) -> UiLayout {
+    let mode = layout_mode(app, size);
+    let compact = mode == LayoutMode::Compact || app.dashboard.compact;
+    let header_h: u16 = 1;
+    let footer_h: u16 = if compact { 0 } else { 1 };
+    let input_h: u16 = if compact { 2 } else { 3 };
+    let rail_w = if mode == LayoutMode::Expanded {
+        rail_width(size.width)
     } else {
         0
     };
-
-    let fixed: u16 = title_h + op_h + input_h;
-    let optional: [u16; 5] = [agents_h, graph_h, metrics_h, coord_h, activity_h];
-
-    let mut output_h = total_h.saturating_sub(fixed + optional.iter().sum::<u16>());
-    // Shrink optional panels (largest first) until the output has room.
-    let mut optional = optional;
-    while output_h < MIN_OUTPUT {
-        let mut max_i: Option<usize> = None;
-        let mut max_v: u16 = 0;
-        for (i, &h) in optional.iter().enumerate() {
-            if h > 0 && h > max_v {
-                max_v = h;
-                max_i = Some(i);
-            }
-        }
-        match max_i {
-            Some(i) => optional[i] = optional[i].saturating_sub(1),
-            None => break,
-        }
-        output_h = total_h.saturating_sub(fixed + optional.iter().sum::<u16>());
-    }
-
-    PanelLayout {
-        title_h,
-        op_h,
-        output_h,
-        activity_h: optional[4],
-        agents_h: optional[0],
-        graph_h: optional[1],
-        metrics_h: optional[2],
-        coord_h: optional[3],
+    let chat_w = size.width.saturating_sub(rail_w);
+    let chat_h = size
+        .height
+        .saturating_sub(header_h + input_h + footer_h)
+        .max(1);
+    UiLayout {
+        mode,
+        header_h,
+        chat_h,
         input_h,
+        footer_h,
+        rail_w,
+        chat_w,
     }
 }
 
-fn split_panels(area: Rect, layout: &PanelLayout) -> std::rc::Rc<[Rect]> {
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(layout.title_h),
-            Constraint::Length(layout.op_h),
-            Constraint::Min(MIN_OUTPUT),
-            Constraint::Length(layout.activity_h),
-            Constraint::Length(layout.agents_h),
-            Constraint::Length(layout.graph_h),
-            Constraint::Length(layout.metrics_h),
-            Constraint::Length(layout.coord_h),
-            Constraint::Length(layout.input_h),
-        ])
-        .split(area)
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// Top-level render
+// ═══════════════════════════════════════════════════════════════════════════
 
 fn ui(f: &mut Frame, app: &TuiApp) {
     let size = f.size();
-    let layout = compute_layout(app, size.height);
-    let chunks = split_panels(size, &layout);
+    let layout = compute_ui_layout(app, size);
 
-    render_title(f, app, chunks[0]);
-    render_operation(f, app, chunks[1]);
-    render_output(f, app, chunks[2]);
-
-    if layout.activity_h > 0 {
-        render_activity(f, &app.dashboard, chunks[3], layout.activity_h as usize);
+    render_header(f, app, layout.header_area(size));
+    render_chat(f, app, layout.chat_area(size));
+    if layout.rail_w > 0 {
+        render_rail(f, app, layout.rail_area(size));
     }
-    if layout.agents_h > 0 {
-        render_agents(f, app, chunks[4]);
-    }
-    if layout.graph_h > 0 {
-        render_task_graph(f, app, chunks[5]);
-    }
-    if layout.metrics_h > 0 {
-        render_metrics(f, app, chunks[6]);
-    }
-    if layout.coord_h > 0 {
-        render_coordination(f, app, chunks[7]);
+    render_input(f, app, layout.input_area(size));
+    if layout.footer_h > 0 {
+        render_footer(f, app, layout.footer_area(size));
     }
 
-    render_input(f, app, chunks[8]);
-
-    // Command palette overlay.
+    // Overlays (rendered over the chat when open).
     if app.dashboard.show_command_palette {
-        render_command_palette(f, app, chunks[8]);
+        render_command_palette(f, app, layout.chat_area(size));
     }
-
-    // Autocomplete overlay.
     if !app.dashboard.autocomplete.is_empty() && !app.dashboard.model_picker.is_open() {
-        render_autocomplete(f, app, chunks[8]);
+        render_autocomplete(f, app, layout.input_area(size));
     }
-
     if app.dashboard.model_picker.is_open() {
         render_model_picker(f, app);
     }
-
     if let Some((message, _)) = &app.pending_confirmation {
-        render_confirmation(f, message, chunks[8]);
+        render_confirmation(f, message, layout.input_area(size));
+    }
+    if app.show_console {
+        render_console_popup(f, app, layout.chat_area(size));
+    }
+    if app.dashboard.show_agents {
+        render_agents_popup(f, app, layout.chat_area(size));
+    }
+    if app.dashboard.show_task_graph {
+        render_task_graph_popup(f, app, layout.chat_area(size));
+    }
+    if app.dashboard.show_metrics {
+        render_metrics_popup(f, app, layout.chat_area(size));
+    }
+    if app.dashboard.show_coordination {
+        render_coordination_popup(f, app, layout.chat_area(size));
+    }
+    if app.dashboard.show_memory {
+        render_memory_popup(f, app, layout.chat_area(size));
+    }
+    if app.dashboard.show_trace {
+        render_activity_popup(f, app, layout.chat_area(size));
     }
 }
 
-fn render_title(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let root = crate::tools::detect_workspace_root();
-    let workspace = root.file_name().and_then(|n| n.to_str()).unwrap_or(".");
+// ═══════════════════════════════════════════════════════════════════════════
+// Header
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn render_header(f: &mut Frame, app: &TuiApp, area: Rect) {
+    if area.height < 1 || area.width < 4 {
+        return;
+    }
+    // Workspace identity is cached at app startup; the render path performs
+    // no subprocess/filesystem work (see TuiApp::workspace_name).
+    let workspace = app.workspace_name.clone();
     let model = if app.config.model.trim().is_empty() {
         "auto".to_string()
     } else {
@@ -1455,71 +1555,218 @@ fn render_title(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     let mut spans = vec![
         Span::styled(
-            "codebro",
+            "CodeBro",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(THEME.purple)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" ", Style::default().fg(Color::DarkGray)),
-        Span::styled(workspace, Style::default().fg(Color::Green)),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(model, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(THEME.muted),
+        ),
+        Span::styled("  · ", Style::default().fg(THEME.muted)),
+        Span::styled(workspace, Style::default().fg(THEME.green)),
+        Span::styled("  · ", Style::default().fg(THEME.muted)),
     ];
 
-    // Restrained status indicators: a single spinner while working.
-    if app.dashboard.animation.is_active() {
+    // Real working state: an active task means the autonomous pipeline runs.
+    let working = app.has_active_task() || app.action_stream.has_running();
+    spans.push(Span::styled(
+        if working { "●" } else { "○" },
+        Style::default().fg(if working { THEME.purple } else { THEME.green }),
+    ));
+    spans.push(Span::styled(
+        if working { " Working" } else { " Ready" },
+        Style::default().fg(if working { THEME.purple } else { THEME.green }),
+    ));
+
+    spans.push(Span::styled("  · ", Style::default().fg(THEME.muted)));
+    spans.push(Span::styled(
+        format!("Model: {}", truncate_to(&model, 22)),
+        Style::default().fg(THEME.secondary),
+    ));
+    spans.push(Span::styled(" · ", Style::default().fg(THEME.muted)));
+    spans.push(Span::styled(
+        format!("Provider: {}", truncate_to(&app.config.provider, 14)),
+        Style::default().fg(THEME.secondary),
+    ));
+
+    // Provider health, when a real check ran. Never shows credentials.
+    let active_provider = app
+        .provider_manager
+        .as_ref()
+        .and_then(|pm| pm.active_provider().cloned());
+    if let Some(provider) = active_provider {
+        let health = app
+            .provider_panel
+            .health_results
+            .iter()
+            .find(|(id, _, _)| id == &provider)
+            .map(|(_, h, _)| h);
+        let (glyph, color, label) = match health {
+            Some(crate::provider_manager::HealthStatus::Healthy) => ("●", THEME.green, "Connected"),
+            Some(crate::provider_manager::HealthStatus::Unhealthy { reason: _ }) => {
+                ("⚠", THEME.yellow, "Provider unavailable")
+            }
+            Some(crate::provider_manager::HealthStatus::Unknown) | None => {
+                ("○", THEME.muted, "Provider")
+            }
+        };
+        spans.push(Span::styled("  · ", Style::default().fg(THEME.muted)));
+        spans.push(Span::styled(glyph, Style::default().fg(color)));
         spans.push(Span::styled(
-            format!(" {}", app.dashboard.animation.spinner_char()),
-            Style::default().fg(Color::Cyan),
+            format!(" {}", label),
+            Style::default().fg(color),
         ));
     }
 
-    let title = Paragraph::new(Line::from(spans));
-    f.render_widget(title, area);
+    // Restrained spinner while the agent works.
+    if working {
+        spans.push(Span::styled(
+            format!("  {}", spinner_char_now()),
+            Style::default().fg(THEME.purple),
+        ));
+    }
+
+    let line = Line::from(spans);
+    let paragraph = Paragraph::new(truncate_line_to(&line, area.width as usize))
+        .style(Style::default().bg(THEME.bg));
+    f.render_widget(paragraph, area);
 }
 
-fn render_operation(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let op = app
-        .dashboard
-        .current_operation
-        .as_deref()
-        .unwrap_or("ready");
-    let line = Paragraph::new(Line::from(Span::styled(
-        truncate_to(op, area.width.saturating_sub(2) as usize),
-        Style::default().fg(Color::DarkGray),
-    )));
-    f.render_widget(line, area);
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// Chat
+// ═══════════════════════════════════════════════════════════════════════════
 
-fn render_output(f: &mut Frame, app: &TuiApp, area: Rect) {
-    if area.height < 2 {
+fn render_chat(f: &mut Frame, app: &TuiApp, area: Rect) {
+    if area.height < 2 || area.width < 4 {
         return;
     }
     let inner_w = area.width.saturating_sub(2) as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    if app.dashboard.show_welcome && app.messages.is_empty() && !app.has_console_content() {
-        // A single-line hint, not a full-screen welcome.
+    let has_actions = !app.action_stream.groups.is_empty();
+    let has_console = app.has_console_content();
+
+    if app.dashboard.show_welcome && app.messages.is_empty() && !has_actions && !has_console {
         lines.push(Line::from(Span::styled(
-            "  Type a task, or / for commands · // for runtime · ! for shell · Ctrl+P palette",
-            Style::default().fg(Color::DarkGray),
+            "🧠 Ready.",
+            Style::default().fg(THEME.blue).add_modifier(Modifier::BOLD),
         )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Ask me to inspect, modify, test, or review your project.",
+            Style::default().fg(THEME.secondary),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Type a task, or / for commands · // for runtime · ! for shell · Ctrl+P palette",
+            Style::default().fg(THEME.muted),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Tab focuses an action group · Enter expands/collapses it · Ctrl+U rail · Ctrl+K console",
+            Style::default().fg(THEME.muted),
+        )));
+        lines.push(Line::from(""));
     } else {
         if let Some(ref err) = app.dashboard.last_error {
-            lines.push(Line::from(Span::styled(
-                format!("  ! {}", truncate_to(err, inner_w)),
-                Style::default().fg(Color::Red),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled("❌ ", Style::default().fg(THEME.red)),
+                Span::styled(
+                    truncate_to(err, inner_w.saturating_sub(2)),
+                    Style::default().fg(THEME.red),
+                ),
+            ]));
             lines.push(Line::from(""));
         }
 
+        // Conversation messages. The action timeline belongs to the most
+        // recent user request: it is inserted right after the last User
+        // message, so the chronological flow reads
+        //   user → activity → assistant response
+        // instead of rendering every response above the timeline. Messages
+        // before that point (earlier turns) keep their order.
+        let last_user = app
+            .messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::User);
+        let timeline_at = last_user.map(|i| i + 1).unwrap_or(usize::MAX);
+
+        for (idx, msg) in app.messages.iter().enumerate() {
+            if idx == timeline_at {
+                let action_lines = action_group_lines(app, inner_w);
+                if !action_lines.is_empty() {
+                    lines.push(Line::from(""));
+                    lines.extend(action_lines);
+                }
+            }
+            match msg.role {
+                MessageRole::User => {
+                    lines.push(Line::from(Span::styled(
+                        "You",
+                        Style::default()
+                            .fg(THEME.green)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    for (i, content_line) in msg.content.lines().enumerate() {
+                        let rendered = if i == 0 {
+                            content_line.to_string()
+                        } else {
+                            format!("  {}", content_line)
+                        };
+                        lines.push(Line::from(Span::styled(
+                            truncate_to(&rendered, inner_w),
+                            Style::default().fg(THEME.primary),
+                        )));
+                    }
+                    lines.push(Line::from(""));
+                }
+                MessageRole::Assistant => {
+                    lines.push(Line::from(Span::styled(
+                        "CodeBro",
+                        Style::default().fg(THEME.blue).add_modifier(Modifier::BOLD),
+                    )));
+                    for md_line in crate::tui::markdown::render_markdown(&msg.content, inner_w) {
+                        lines.push(md_line);
+                    }
+                    lines.push(Line::from(""));
+                }
+                MessageRole::System => {
+                    for content_line in msg.content.lines() {
+                        lines.push(Line::from(Span::styled(
+                            truncate_to(content_line, inner_w),
+                            Style::default().fg(THEME.yellow),
+                        )));
+                    }
+                    lines.push(Line::from(""));
+                }
+            }
+        }
+
+        // The last user message is at the end of the conversation (or there is
+        // no user message yet, e.g. `!` command sessions): the timeline still
+        // reads after the conversation and before the streaming response.
+        if timeline_at >= app.messages.len() {
+            let action_lines = action_group_lines(app, inner_w);
+            if !action_lines.is_empty() {
+                lines.push(Line::from(""));
+                lines.extend(action_lines);
+            }
+        }
+
+        // Streaming response.
         if app.dashboard.is_streaming && !app.dashboard.streaming_buffer.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("{} ", app.dashboard.animation.spinner_char()),
-                Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
-            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", spinner_char_now()),
+                    Style::default().fg(THEME.blue).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "CodeBro",
+                    Style::default().fg(THEME.blue).add_modifier(Modifier::BOLD),
+                ),
+            ]));
             for md_line in
                 crate::tui::markdown::render_markdown(&app.dashboard.streaming_buffer, inner_w)
             {
@@ -1528,242 +1775,524 @@ fn render_output(f: &mut Frame, app: &TuiApp, area: Rect) {
             lines.push(Line::from(""));
         }
 
-        for msg in app.messages.iter() {
-            let (label, color): (&str, Color) = match msg.role {
-                MessageRole::User => ("you", Color::Green),
-                MessageRole::Assistant => ("codebro", Color::Blue),
-                MessageRole::System => ("•", Color::Yellow),
-            };
+        // Live task console was moved to the Ctrl+K overlay; a subtle pointer
+        // is kept so users discover it while a command runs.
+        if app.has_active_task() && app.has_console_content() {
             lines.push(Line::from(Span::styled(
-                format!("{}", label),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                "  [PTY output live — Ctrl+K to view]",
+                Style::default().fg(THEME.muted),
             )));
-
-            if msg.role == MessageRole::Assistant {
-                for md_line in crate::tui::markdown::render_markdown(&msg.content, inner_w) {
-                    lines.push(md_line);
-                }
-            } else {
-                for (i, content_line) in msg.content.lines().enumerate() {
-                    let style = match msg.role {
-                        MessageRole::User => Style::default().fg(Color::Green),
-                        MessageRole::System => Style::default().fg(Color::Yellow),
-                        _ => Style::default(),
-                    };
-                    lines.push(Line::from(Span::styled(
-                        if i == 0 {
-                            content_line.to_string()
-                        } else {
-                            format!("  {}", content_line)
-                        },
-                        style,
-                    )));
-                }
-            }
-            lines.push(Line::from(""));
-        }
-
-        // The live task console: appended, never replaced.
-        if let Some(console) = app.active_console_ref() {
-            if !console.is_empty() {
-                lines.push(Line::from(""));
-                lines.extend(console.render_lines(inner_w));
-            }
         }
     }
 
     let total_lines = lines.len() as u16;
-    let view_h = area.height;
+    let view_h = area.height.saturating_sub(1).max(1);
     let max_scroll = total_lines.saturating_sub(view_h);
     let scroll = max_scroll.saturating_sub(app.scroll_from_bottom as u16);
 
-    let output = Paragraph::new(Text::from(lines))
+    let paragraph = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: true })
-        .scroll((scroll, 0));
-    f.render_widget(output, area);
+        .scroll((scroll, 0))
+        .style(Style::default().bg(THEME.bg));
+    f.render_widget(paragraph, area);
+
+    // "New activity" indicator when the user scrolled away from the live view.
+    if app.scroll_from_bottom > 0 && max_scroll > 0 {
+        let hint = "↓ New activity · End to return";
+        let hint_w = hint.len() as u16;
+        let x = area.x + area.width.saturating_sub(hint_w + 1);
+        let y = area.y + area.height.saturating_sub(1);
+        let popup = Rect::new(x, y, hint_w + 1, 1);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default()
+                    .fg(THEME.bg)
+                    .bg(THEME.blue)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            popup,
+        );
+    }
 }
 
-fn render_activity(f: &mut Frame, dashboard: &Dashboard, area: Rect, max_lines: usize) {
-    if area.height < 1 {
+/// Build the chat lines for the phase-grouped action timeline.
+fn action_group_lines(app: &TuiApp, inner_w: usize) -> Vec<Line<'static>> {
+    let stream = &app.action_stream;
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    for (offset, group) in stream.groups.iter().enumerate() {
+        let from_back = stream.groups.len() - 1 - offset;
+        let focused = stream.focused_from_back == Some(from_back);
+        let lines = group_lines(group, inner_w, focused);
+        out.extend(lines);
+    }
+    out
+}
+
+fn group_lines(group: &UiActionGroup, inner_w: usize, focused: bool) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let phase_color = THEME.phase_color(group.phase);
+
+    // Title:  📚 Research  ✓  4.1s
+    let mut title = String::new();
+    if focused {
+        title.push('»');
+        title.push(' ');
+    }
+    title.push_str(group.phase.emoji());
+    title.push(' ');
+    title.push_str(group.phase.label());
+    title.push(' ');
+    title.push_str(group.status.glyph().glyph());
+    if let Some(ms) = group.duration_ms {
+        title.push_str(&format!("  {:>7}", format_duration(ms)));
+    } else {
+        title.push_str(&format!("  {:>7}", format_duration(group.elapsed_ms())));
+    }
+
+    let mut title_spans = vec![Span::styled(
+        truncate_to(&title, inner_w),
+        Style::default().fg(phase_color),
+    )];
+    if group.status.is_terminal() {
+        // Subtle completion timestamp (real).
+        let ts = format_timestamp(group.started_at);
+        let pad = inner_w.saturating_sub(title.chars().count());
+        title_spans.push(Span::styled(
+            format!("{}{}", " ".repeat(pad.min(4)), ts),
+            Style::default().fg(THEME.muted),
+        ));
+    }
+    out.push(Line::from(title_spans));
+
+    let expanded = group.expanded || group.is_running();
+    if expanded {
+        for action in group.actions.iter() {
+            out.push(action_line(action, inner_w));
+        }
+        if let Some(v) = &group.verification {
+            if let Some(s) = v.summary() {
+                out.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", StatusGlyph::Completed.glyph()),
+                        Style::default().fg(THEME.green),
+                    ),
+                    Span::styled(
+                        format!(
+                            "Verification · {}",
+                            truncate_to(&s, inner_w.saturating_sub(6))
+                        ),
+                        Style::default().fg(THEME.green),
+                    ),
+                ]));
+            }
+        }
+    } else {
+        let summary = group.summary_line();
+        out.push(Line::from(Span::styled(
+            format!("  └─ {}", truncate_to(&summary, inner_w.saturating_sub(4))),
+            Style::default().fg(THEME.secondary),
+        )));
+    }
+
+    out.push(Line::from(""));
+    out
+}
+
+fn action_line(action: &crate::tui::actions::UiAction, inner_w: usize) -> Line<'static> {
+    let glyph = action.status.glyph();
+    let color = THEME.status_color(glyph);
+    // Running actions use the spinner instead of a static glyph.
+    let status_mark = if action.status == UiActionStatus::Running {
+        spinner_char_now().to_string()
+    } else {
+        glyph.glyph().to_string()
+    };
+
+    let mut text = format!(
+        "  {} {} {}",
+        status_mark,
+        action.kind.emoji(),
+        action.kind.label()
+    );
+
+    if !action.detail.is_empty() {
+        text.push_str(" · ");
+        text.push_str(&action.detail);
+    }
+
+    // Live PTY tail for running commands: last non-empty line, real output.
+    if action.status == UiActionStatus::Running
+        && matches!(
+            action.kind,
+            UiActionKind::RunningCommand | UiActionKind::Testing
+        )
+        && !action.live_output().is_empty()
+    {
+        let tail = action
+            .live_output()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .unwrap_or(action.live_output())
+            .trim();
+        if !tail.is_empty() {
+            text.push_str(&format!("  {}", truncate_to(tail, 40)));
+        }
+    }
+
+    if let Some(summary) = &action.result_summary {
+        text.push_str("  ");
+        text.push_str(summary);
+    }
+
+    let mut spans = vec![Span::styled(
+        truncate_to(&text, inner_w),
+        Style::default().fg(color),
+    )];
+    // Dim the trailing detail slightly by splitting at the first ' · '.
+    if let Some(idx) = text.find(" · ") {
+        let (head, tail) = text.split_at(idx);
+        if head.len() < text.len() {
+            spans = vec![
+                Span::styled(truncate_to(head, inner_w), Style::default().fg(color)),
+                Span::styled(
+                    truncate_to(
+                        tail,
+                        inner_w.saturating_sub(head.chars().count().min(inner_w)),
+                    ),
+                    Style::default().fg(THEME.muted),
+                ),
+            ];
+        }
+    }
+    Line::from(spans)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Right intelligence rail
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Section heights for [Agents, Progress, Context, Activity, Session], in that
+/// visual order, shrunk (least important first) to fit the available height.
+fn rail_section_heights(total: u16) -> [u16; 5] {
+    let mut heights = [5u16, 5, 4, 5, 4];
+    let drop_order = [1usize, 2, 4, 3, 0];
+    loop {
+        let sum: u16 = heights.iter().sum();
+        if sum <= total {
+            break;
+        }
+        let mut removed = false;
+        for &idx in &drop_order {
+            if heights[idx] > 0 {
+                heights[idx] -= 1;
+                removed = true;
+                break;
+            }
+        }
+        if !removed {
+            break;
+        }
+    }
+    heights
+}
+
+fn render_rail(f: &mut Frame, app: &TuiApp, area: Rect) {
+    if area.width < 12 || area.height < 4 {
         return;
     }
+    let mut heights = rail_section_heights(area.height);
+    // The progress section only makes sense while something is actually
+    // running (or has run); the empty state shows agents only.
+    if app.dashboard.task_graph.is_none() && app.action_stream.groups.is_empty() {
+        heights[1] = 0;
+    }
+    let constraints: Vec<Constraint> = heights.iter().map(|h| Constraint::Length(*h)).collect();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    render_rail_agents(f, app, chunks[0]);
+    if heights[1] > 0 {
+        render_rail_progress(f, app, chunks[1]);
+    }
+    if heights[2] > 0 {
+        render_rail_context(f, app, chunks[2]);
+    }
+    if heights[3] > 0 {
+        render_rail_activity(f, app, chunks[3]);
+    }
+    if heights[4] > 0 {
+        render_rail_session(f, app, chunks[4]);
+    }
+}
+
+fn specialist_status(app: &TuiApp, name: &str) -> (StatusGlyph, String, Option<u64>) {
+    // Real state comes from the agent status monitor; duration from metrics.
+    let status = app
+        .dashboard
+        .status_monitor
+        .get(name)
+        .map(|s| s.status.clone());
+    let duration = app
+        .dashboard
+        .metrics
+        .as_ref()
+        .and_then(|m| m.agent_durations.get(name).copied());
+
+    let (glyph, label) = match status.as_ref() {
+        Some(AgentStatus::Completed) => (StatusGlyph::Completed, "Done"),
+        Some(AgentStatus::Failed) => (StatusGlyph::Failed, "Failed"),
+        Some(AgentStatus::Cancelled) => (StatusGlyph::Cancelled, "Cancelled"),
+        Some(AgentStatus::Idle) => (StatusGlyph::Ready, "Ready"),
+        Some(_) => (StatusGlyph::Running, "Running"),
+        None => (StatusGlyph::Ready, "Ready"),
+    };
+    (glyph, label.to_string(), duration)
+}
+
+fn render_rail_agents(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let rows: [(Phase, &str); 5] = [
+        (Phase::Research, "research"),
+        (Phase::Testing, "testing"),
+        (Phase::Planning, "planning"),
+        (Phase::Coding, "coding"),
+        (Phase::Review, "review"),
+    ];
+    let inner = area.width.saturating_sub(2) as usize;
     let mut lines = Vec::new();
-    let entries: Vec<_> = dashboard.activity_log.iter().take(max_lines).collect();
-    for entry in entries {
-        let color = match entry.level.as_str() {
-            "error" => Color::Red,
-            "tool" => Color::Cyan,
-            "task" => Color::Green,
-            "console" => Color::Blue,
-            _ => Color::DarkGray,
-        };
-        let msg = truncate_to(&entry.message, area.width.saturating_sub(2) as usize);
+    for (phase, name) in rows {
+        let (glyph, label, duration) = specialist_status(app, name);
+        let color = THEME.status_color(glyph);
+        let mut row = format!("  {} {}", glyph.glyph(), phase.label());
+        let pad = 14usize.saturating_sub(row.chars().count());
+        row = format!("{}{}{}", row, " ".repeat(pad), label);
+        if let Some(ms) = duration {
+            row.push_str(&format!("  {}", format_duration(ms)));
+        }
         lines.push(Line::from(Span::styled(
-            format!("  {}", msg),
+            truncate_to(&row, inner),
             Style::default().fg(color),
         )));
     }
-    let paragraph = Paragraph::new(Text::from(lines));
-    f.render_widget(paragraph, area);
+    render_rail_section(f, area, "AGENTS", lines);
 }
 
-fn render_agents(f: &mut Frame, app: &TuiApp, area: Rect) {
-    if area.height < 1 {
-        return;
-    }
-    let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "  agents  (Ctrl+A to close)",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    let entries = app.dashboard.agent_entries();
-    if entries.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no active agents",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        for entry in entries {
-            let (icon, color) = match entry.status {
-                AgentStatus::Completed => ("✓", Color::Green),
-                AgentStatus::Failed => ("✗", Color::Red),
-                AgentStatus::Cancelled => ("⊘", Color::Yellow),
-                AgentStatus::Idle => ("○", Color::DarkGray),
-                _ => ("⟳", Color::Yellow),
+fn render_rail_progress(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let graph = app.dashboard.graph_entries();
+    if !graph.is_empty() {
+        for (desc, agent, status) in graph.iter().take(area.height.saturating_sub(2) as usize) {
+            let (icon, color) = match status {
+                TaskStatus::Completed => ("✓", THEME.green),
+                TaskStatus::Failed => ("✗", THEME.red),
+                TaskStatus::Running => ("●", THEME.purple),
+                TaskStatus::Cancelled => ("⏸", THEME.yellow),
+                _ => ("○", THEME.muted),
             };
-            let bar = progress_bar(entry.progress, 8);
-            let name = truncate_to(&entry.name, 12);
-            let action = entry.action.as_deref().unwrap_or("");
             lines.push(Line::from(vec![
                 Span::styled(format!("  {} ", icon), Style::default().fg(color)),
-                Span::styled(name, Style::default().fg(Color::White)),
+                Span::styled(truncate_to(agent, 10), Style::default().fg(THEME.secondary)),
                 Span::styled(
-                    format!(" [{}] {}", bar, truncate_to(action, 30)),
-                    Style::default().fg(Color::DarkGray),
+                    format!(
+                        " {}",
+                        truncate_to(desc, area.width.saturating_sub(20) as usize)
+                    ),
+                    Style::default().fg(THEME.primary),
+                ),
+            ]));
+        }
+    } else {
+        // No task graph: show the real phase statuses (no fabricated progress).
+        for (phase, name) in [
+            (Phase::Research, "research"),
+            (Phase::Testing, "testing"),
+            (Phase::Planning, "planning"),
+            (Phase::Coding, "coding"),
+            (Phase::Review, "review"),
+        ] {
+            let (glyph, _, _) = specialist_status(app, name);
+            let color = THEME.status_color(glyph);
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {} {}", glyph.glyph(), phase.label()),
+                Style::default().fg(color),
+            )]));
+        }
+    }
+    render_rail_section(f, area, "TASK PROGRESS", lines);
+}
+
+fn render_rail_context(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let s = &app.action_stream;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let files = s.files_inspected.len();
+    if files > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("  📄 Files    ", Style::default().fg(THEME.secondary)),
+            Span::styled(format!("{}", files), Style::default().fg(THEME.primary)),
+        ]));
+    }
+    if !s.tools_used.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  🧰 Tools    ", Style::default().fg(THEME.secondary)),
+            Span::styled(
+                format!("{}", s.tools_used.len()),
+                Style::default().fg(THEME.primary),
+            ),
+        ]));
+    }
+    if s.tests_total > 0 {
+        // Every PTY-backed command exit is counted; label the metric
+        // "Commands" (not "Tests") since plain commands (cargo check, …) are
+        // not tests — see UiActionGroup::test_counts.
+        lines.push(Line::from(vec![
+            Span::styled("  ⚙ Commands ", Style::default().fg(THEME.secondary)),
+            Span::styled(
+                format!("{} / {}", s.tests_passed, s.tests_total),
+                Style::default().fg(if s.tests_passed == s.tests_total {
+                    THEME.green
+                } else {
+                    THEME.yellow
+                }),
+            ),
+        ]));
+    }
+    if s.failures > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("  ⚠ Failures ", Style::default().fg(THEME.secondary)),
+            Span::styled(format!("{}", s.failures), Style::default().fg(THEME.red)),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  —",
+            Style::default().fg(THEME.muted),
+        )));
+    }
+    render_rail_section(f, area, "CONTEXT", lines);
+}
+
+fn render_rail_activity(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match app.action_stream.current_activity() {
+        Some((group, action)) => {
+            let color = THEME.phase_color(group.phase);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} {}", group.phase.emoji(), group.phase.label()),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", action.kind.label()),
+                    Style::default().fg(THEME.secondary),
+                ),
+            ]));
+            if !action.title.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}",
+                        truncate_to(&action.title, area.width.saturating_sub(3) as usize)
+                    ),
+                    Style::default().fg(THEME.primary),
+                )));
+            }
+            if !action.detail.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}",
+                        truncate_to(&action.detail, area.width.saturating_sub(3) as usize)
+                    ),
+                    Style::default().fg(THEME.muted),
+                )));
+            }
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "  ○ Idle",
+                Style::default().fg(THEME.muted),
+            )));
+        }
+    }
+    render_rail_section(f, area, "CURRENT ACTIVITY", lines);
+}
+
+fn render_rail_session(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let status = if app.has_active_task() || app.action_stream.has_running() {
+        ("● Running", THEME.purple)
+    } else {
+        ("○ Idle", THEME.muted)
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  Status    ", Style::default().fg(THEME.secondary)),
+        Span::styled(status.0, Style::default().fg(status.1)),
+    ]));
+    let duration = app
+        .task_duration_secs()
+        .unwrap_or_else(|| app.session_duration_secs());
+    lines.push(Line::from(vec![
+        Span::styled("  Duration  ", Style::default().fg(THEME.secondary)),
+        Span::styled(
+            format_duration(duration as u64 * 1000),
+            Style::default().fg(THEME.primary),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Tool calls", Style::default().fg(THEME.secondary)),
+        Span::styled(
+            format!("  {}", app.action_stream.tool_calls),
+            Style::default().fg(THEME.primary),
+        ),
+    ]));
+    if let Some(metrics) = &app.dashboard.metrics {
+        let tokens = metrics.total_tokens();
+        if tokens > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("  Tokens    ", Style::default().fg(THEME.secondary)),
+                Span::styled(
+                    format!("  {}", crate::metrics::format_token_count(tokens)),
+                    Style::default().fg(THEME.primary),
                 ),
             ]));
         }
     }
-    f.render_widget(Paragraph::new(Text::from(lines)), area);
+    render_rail_section(f, area, "SESSION", lines);
 }
 
-fn render_task_graph(f: &mut Frame, app: &TuiApp, area: Rect) {
-    if area.height < 1 {
+fn render_rail_section(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {
+    if area.height < 2 {
         return;
     }
-    let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "  task graph  (Ctrl+G to close)",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    let entries = app.dashboard.graph_entries();
-    if entries.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no task running",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        for (desc, agent, status) in entries.iter().take(4) {
-            let icon = match status {
-                TaskStatus::Completed => "✓",
-                TaskStatus::Failed => "✗",
-                TaskStatus::Running => "⟳",
-                _ => "○",
-            };
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {} {}: {}",
-                    icon,
-                    truncate_to(agent, 10),
-                    truncate_to(desc, 50)
-                ),
-                Style::default().fg(Color::White),
-            )));
-        }
-    }
-    f.render_widget(Paragraph::new(Text::from(lines)), area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(THEME.border_style())
+        .title(Span::styled(title, THEME.title_style()));
+    let mut visible = lines;
+    visible.truncate(inner_h);
+    let widget = Paragraph::new(Text::from(visible))
+        .block(block)
+        .style(Style::default().bg(THEME.bg));
+    f.render_widget(widget, area);
 }
 
-fn render_metrics(f: &mut Frame, app: &TuiApp, area: Rect) {
-    if area.height < 1 {
-        return;
-    }
-    let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "  metrics  (Ctrl+V to close)",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-
-    let agent_count = app.dashboard.status_monitor.count();
-    let active_count = app.dashboard.status_monitor.active_count();
-    lines.push(Line::from(Span::styled(
-        format!("  agents {} ({} active)", agent_count, active_count),
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    let total_tokens = app
-        .dashboard
-        .metrics
-        .as_ref()
-        .map(|m| m.total_tokens())
-        .unwrap_or(0);
-    let cost = app
-        .dashboard
-        .metrics
-        .as_ref()
-        .map(|m| m.estimated_cost_usd(&app.config.model))
-        .unwrap_or(0.0);
-    lines.push(Line::from(Span::styled(
-        format!(
-            "  tokens {} · cost {}",
-            crate::metrics::format_token_count(total_tokens),
-            crate::metrics::format_cost_usd(cost)
-        ),
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    f.render_widget(Paragraph::new(Text::from(lines)), area);
-}
-
-fn render_coordination(f: &mut Frame, app: &TuiApp, area: Rect) {
-    if area.height < 1 {
-        return;
-    }
-    let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "  coordination  (Ctrl+O to close)",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    for msg in app.dashboard.recent_messages.iter().take(3) {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  {}",
-                truncate_to(msg, area.width.saturating_sub(4) as usize)
-            ),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    f.render_widget(Paragraph::new(Text::from(lines)), area);
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// Input + footer
+// ═══════════════════════════════════════════════════════════════════════════
 
 fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
     let prefix = if let Some(s) = &app.secure_input {
         format!("API key for {}: ", s.provider)
     } else if app.dashboard.animation.is_active() {
-        format!("{}> ", app.dashboard.animation.spinner_char())
+        format!("{}> ", spinner_char_now())
     } else {
         "> ".to_string()
     };
 
-    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(1) as usize;
     let inner_w = area.width.saturating_sub(2) as usize;
     if inner_h == 0 {
         return;
@@ -1791,9 +2320,40 @@ fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
         };
         text_lines.push(Line::from(truncate_to(&full, area.width as usize)));
     }
+    // Dim placeholder when the input is empty and nothing is being typed.
+    if app.input.is_empty() && app.secure_input.is_none() {
+        text_lines[0] = Line::from(Span::styled(
+            format!("{}Ask CodeBro anything...", prefix),
+            Style::default().fg(THEME.muted),
+        ));
+    }
 
-    let paragraph = Paragraph::new(Text::from(text_lines)).style(Style::default().fg(Color::White));
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(THEME.border_style());
+    let paragraph = Paragraph::new(Text::from(text_lines))
+        .block(block)
+        .style(Style::default().fg(THEME.primary));
     f.render_widget(paragraph, area);
+
+    // Right-aligned contextual hint (Enter Send / Ctrl+C cancel).
+    if area.height >= 2 && area.width >= 16 && app.secure_input.is_none() {
+        let hint = if app.has_active_task() {
+            "Ctrl+C cancel"
+        } else {
+            "Enter Send"
+        };
+        let hint_w = hint.len() as u16 + 2;
+        let x = area.x + area.width.saturating_sub(hint_w);
+        let y = area.y;
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {}", hint),
+                Style::default().fg(THEME.muted),
+            ))),
+            Rect::new(x, y, hint_w, 1),
+        );
+    }
 
     if area.width >= 4 && area.height >= 2 {
         let x_off = if cursor_line_rel == 0 {
@@ -1802,9 +2362,384 @@ fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
             cursor_col
         };
         let x = (area.x + x_off as u16).min(area.x + area.width.saturating_sub(2));
-        let y = (area.y + cursor_line_rel as u16).min(area.y + area.height.saturating_sub(2));
+        let y = (area.y + 1 + cursor_line_rel as u16).min(area.y + area.height.saturating_sub(2));
         f.set_cursor(x, y);
     }
+}
+
+fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
+    if area.height < 1 || area.width < 8 {
+        return;
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let entries: [&str; 8] = [
+        "Ctrl+P Palette",
+        "Ctrl+G Graph",
+        "Ctrl+V Metrics",
+        "Ctrl+O Coord",
+        "Ctrl+U Rail",
+        "Ctrl+K Console",
+        "Ctrl+D Diff",
+        "Ctrl+C Cancel",
+    ];
+    for (i, entry) in entries.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", Style::default().fg(THEME.muted)));
+        }
+        let (key, rest) = entry.split_once(' ').unwrap_or((entry, ""));
+        spans.push(Span::styled(
+            format!("{}{}", key, if rest.is_empty() { "" } else { " " }),
+            Style::default().fg(THEME.secondary),
+        ));
+        spans.push(Span::styled(rest, Style::default().fg(THEME.muted)));
+    }
+    let line = truncate_line_to(&Line::from(spans), area.width as usize);
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().bg(THEME.bg)),
+        area,
+    );
+}
+
+/// Truncate a line of spans to `width` columns, dropping trailing spans.
+fn truncate_line_to(line: &Line<'static>, width: usize) -> Line<'static> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for span in &line.spans {
+        let len = span.content.chars().count();
+        if used + len <= width {
+            out.push(span.clone());
+            used += len;
+        } else if used < width {
+            let room = width - used;
+            let s = truncate_to(&span.content, room);
+            out.push(Span::styled(s, span.style));
+            used = width;
+        } else {
+            break;
+        }
+    }
+    Line::from(out)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Overlays
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn centered_popup(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(2));
+    let height = height.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width.max(4), height.max(2))
+}
+
+fn render_console_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let width = area.width.min(area.width / 2 + area.width / 4).max(40);
+    let height = area.height.min(16).max(6);
+    let popup = centered_popup(area, width, height);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(THEME.border_style())
+        .title(Span::styled(
+            format!(
+                "PTY Console (Ctrl+K to close){}",
+                if app.has_console_content() {
+                    " · Esc close"
+                } else {
+                    ""
+                }
+            ),
+            THEME.title_style(),
+        ));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(console) = app.active_console_ref() {
+        let inner_w = popup.width.saturating_sub(2) as usize;
+        let inner_h = popup.height.saturating_sub(2) as usize;
+        let rendered = console.render_lines(inner_w);
+        let status = console.status;
+        let status_line = format!(
+            "  {} {}",
+            status.label(),
+            match status {
+                crate::tui::console::ConsoleStatus::Exited { exit_code } => {
+                    format!("exit {}", exit_code)
+                }
+                _ => String::new(),
+            }
+        );
+        lines.push(Line::from(Span::styled(
+            truncate_to(&status_line, inner_w),
+            Style::default().fg(status.color()),
+        )));
+        let start = rendered.len().saturating_sub(inner_h.saturating_sub(1));
+        for line in rendered.iter().skip(start).take(inner_h.saturating_sub(1)) {
+            lines.push(line.clone());
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  No PTY output yet.",
+            Style::default().fg(THEME.muted),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().bg(THEME.bg)),
+        popup,
+    );
+}
+
+fn render_agents_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let popup = centered_popup(area, 60, 12);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(THEME.border_style())
+        .title(Span::styled(
+            "AGENTS (Ctrl+A to close)",
+            THEME.title_style(),
+        ));
+    let mut lines = Vec::new();
+    let entries = app.dashboard.agent_entries();
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no active agents",
+            Style::default().fg(THEME.muted),
+        )));
+    } else {
+        for entry in entries {
+            let (icon, color) = match entry.status {
+                AgentStatus::Completed => ("✓", THEME.green),
+                AgentStatus::Failed => ("✗", THEME.red),
+                AgentStatus::Cancelled => ("⏸", THEME.yellow),
+                AgentStatus::Idle => ("○", THEME.muted),
+                _ => ("●", THEME.purple),
+            };
+            let name = truncate_to(&entry.name, 14);
+            let action = entry.action.as_deref().unwrap_or("");
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+                Span::styled(name, Style::default().fg(THEME.primary)),
+                Span::styled(
+                    format!("  {}", truncate_to(action, 34)),
+                    Style::default().fg(THEME.muted),
+                ),
+            ]));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().bg(THEME.bg)),
+        popup,
+    );
+}
+
+fn render_task_graph_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let popup = centered_popup(area, 64, 12);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(THEME.border_style())
+        .title(Span::styled(
+            "TASK GRAPH (Ctrl+G to close)",
+            THEME.title_style(),
+        ));
+    let mut lines = Vec::new();
+    let entries = app.dashboard.graph_entries();
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no task running",
+            Style::default().fg(THEME.muted),
+        )));
+    } else {
+        for (desc, agent, status) in entries.iter().take(8) {
+            let (icon, color) = match status {
+                TaskStatus::Completed => ("✓", THEME.green),
+                TaskStatus::Failed => ("✗", THEME.red),
+                TaskStatus::Running => ("●", THEME.purple),
+                TaskStatus::Cancelled => ("⏸", THEME.yellow),
+                _ => ("○", THEME.muted),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+                Span::styled(truncate_to(agent, 10), Style::default().fg(THEME.secondary)),
+                Span::styled(
+                    format!(" {}", truncate_to(desc, 42)),
+                    Style::default().fg(THEME.primary),
+                ),
+            ]));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().bg(THEME.bg)),
+        popup,
+    );
+}
+
+fn render_metrics_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let popup = centered_popup(area, 56, 10);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(THEME.border_style())
+        .title(Span::styled(
+            "METRICS (Ctrl+V to close)",
+            THEME.title_style(),
+        ));
+    let mut lines = Vec::new();
+    let agent_count = app.dashboard.status_monitor.count();
+    let active_count = app.dashboard.status_monitor.active_count();
+    lines.push(Line::from(Span::styled(
+        format!("  agents {} ({} active)", agent_count, active_count),
+        Style::default().fg(THEME.secondary),
+    )));
+    let total_tokens = app
+        .dashboard
+        .metrics
+        .as_ref()
+        .map(|m| m.total_tokens())
+        .unwrap_or(0);
+    let cost = app
+        .dashboard
+        .metrics
+        .as_ref()
+        .map(|m| m.estimated_cost_usd(&app.config.model))
+        .unwrap_or(0.0);
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  tokens {} · cost {}",
+            crate::metrics::format_token_count(total_tokens),
+            crate::metrics::format_cost_usd(cost)
+        ),
+        Style::default().fg(THEME.secondary),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("  tool calls {}", app.action_stream.tool_calls),
+        Style::default().fg(THEME.secondary),
+    )));
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().bg(THEME.bg)),
+        popup,
+    );
+}
+
+fn render_coordination_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let popup = centered_popup(area, 64, 12);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(THEME.border_style())
+        .title(Span::styled(
+            "COORDINATION (Ctrl+O to close)",
+            THEME.title_style(),
+        ));
+    let mut lines = Vec::new();
+    for msg in app.dashboard.recent_messages.iter().take(8) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                truncate_to(msg, popup.width.saturating_sub(4) as usize)
+            ),
+            Style::default().fg(THEME.secondary),
+        )));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no coordination activity",
+            Style::default().fg(THEME.muted),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().bg(THEME.bg)),
+        popup,
+    );
+}
+
+fn render_memory_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let popup = centered_popup(area, 60, 12);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(THEME.border_style())
+        .title(Span::styled(
+            "MEMORY (Ctrl+M to close)",
+            THEME.title_style(),
+        ));
+    let mut lines = Vec::new();
+    for note in app.dashboard.memory_notifications.iter().take(8) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {}  {}",
+                truncate_to(&note.timestamp, 19),
+                truncate_to(&note.message, popup.width.saturating_sub(24) as usize)
+            ),
+            Style::default().fg(THEME.secondary),
+        )));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no memory changes",
+            Style::default().fg(THEME.muted),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().bg(THEME.bg)),
+        popup,
+    );
+}
+
+fn render_activity_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let popup = centered_popup(area, 66, 14);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(THEME.border_style())
+        .title(Span::styled(
+            "ACTIVITY (Ctrl+T to close)",
+            THEME.title_style(),
+        ));
+    let mut lines = Vec::new();
+    for entry in app.dashboard.activity_log.iter().take(12) {
+        let color = match entry.level.as_str() {
+            "error" => THEME.red,
+            "tool" => THEME.purple,
+            "task" => THEME.green,
+            "console" => THEME.blue,
+            _ => THEME.muted,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}  ", truncate_to(&entry.timestamp, 8)),
+                Style::default().fg(THEME.muted),
+            ),
+            Span::styled(
+                truncate_to(&entry.message, popup.width.saturating_sub(16) as usize),
+                Style::default().fg(color),
+            ),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no activity",
+            Style::default().fg(THEME.muted),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().bg(THEME.bg)),
+        popup,
+    );
 }
 
 fn render_confirmation(f: &mut Frame, message: &str, input_area: Rect) {
@@ -1813,15 +2748,15 @@ fn render_confirmation(f: &mut Frame, message: &str, input_area: Rect) {
     let x = input_area.x;
     let y = input_area.y.saturating_sub(height);
     let popup = Rect::new(x, y, width, height);
+    f.render_widget(Clear, popup);
     let lines = vec![
-        Line::from(Span::styled("  ", Style::default().fg(Color::Yellow))),
         Line::from(Span::styled(
-            format!("  {}", truncate_to(message, width as usize)),
-            Style::default().fg(Color::Yellow),
+            format!("  🛡 {}", truncate_to(message, width as usize)),
+            Style::default().fg(THEME.yellow),
         )),
         Line::from(Span::styled(
             "  y/Enter = proceed · n/Esc = cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(THEME.muted),
         )),
     ];
     f.render_widget(Paragraph::new(Text::from(lines)), popup);
@@ -1845,85 +2780,95 @@ fn render_autocomplete(f: &mut Frame, app: &TuiApp, input_area: Rect) {
         let selected = i == app.dashboard.autocomplete_index;
         let spec = commands::all_commands().find(|s| s.command == entry.as_str());
         let desc = spec.map(|s| s.description).unwrap_or("");
+        let (marker_style, entry_style) = if selected {
+            (
+                Style::default()
+                    .fg(THEME.bg)
+                    .bg(THEME.purple)
+                    .add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(THEME.bg)
+                    .bg(THEME.purple)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (
+                Style::default().fg(THEME.muted),
+                Style::default().fg(THEME.primary),
+            )
+        };
         lines.push(Line::from(vec![
-            Span::styled(
-                if selected { "> " } else { "  " },
-                if selected {
-                    Style::default().fg(Color::Black).bg(Color::Cyan)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                },
-            ),
-            Span::styled(
-                entry.clone(),
-                if selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                },
-            ),
+            Span::styled(if selected { "> " } else { "  " }, marker_style),
+            Span::styled(entry.clone(), entry_style),
             Span::styled(
                 format!(
                     "  {}",
                     truncate_to(desc, width.saturating_sub(entry.len() as u16 + 4) as usize)
                 ),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(THEME.muted),
             ),
         ]));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), popup);
 }
 
-fn render_command_palette(f: &mut Frame, app: &TuiApp, input_area: Rect) {
+fn render_command_palette(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
     let query = app.dashboard.palette_query.clone();
     let entries = palette_entries(&query);
-    let width = input_area.width.min(70);
-    let height = (entries.len() as u16 + 2).min(input_area.y.saturating_sub(2));
+    let width = chat_area.width.min(72);
+    let height = (entries.len() as u16 + 2).min(chat_area.height.min(18));
     if height < 3 {
         return;
     }
-    let top = input_area.y.saturating_sub(height);
-    let popup = Rect::new(input_area.x, top, width, height);
+    let popup = centered_popup(chat_area, width, height);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(THEME.border_style())
+        .title(Span::styled("COMMAND PALETTE", THEME.title_style()));
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(
-            "search> ",
+            "  search> ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(THEME.purple)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(query.clone(), Style::default().fg(Color::White)),
+        Span::styled(query.clone(), Style::default().fg(THEME.primary)),
         Span::styled(
             format!("  ({} matches)", entries.len()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(THEME.muted),
         ),
     ]));
 
-    for (i, (cmd, desc)) in entries.iter().enumerate() {
+    let inner_h = height.saturating_sub(3) as usize;
+    for (i, (cmd, desc)) in entries.iter().take(inner_h).enumerate() {
         let selected = i == app.dashboard.palette_index;
         let style = if selected {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(THEME.bg)
+                .bg(THEME.purple)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(THEME.primary)
         };
         lines.push(Line::from(vec![
             Span::styled(if selected { "> " } else { "  " }, style),
             Span::styled(cmd.clone(), style),
             Span::styled(
                 format!("  {}", truncate_to(desc, width as usize)),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(THEME.muted),
             ),
         ]));
     }
 
-    f.render_widget(Paragraph::new(Text::from(lines)), popup);
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().bg(THEME.bg)),
+        popup,
+    );
 }
 
 fn palette_entries(filter: &str) -> Vec<(String, &'static str)> {
@@ -1949,6 +2894,7 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
         return;
     }
     let area = Rect::new(x as u16, y as u16, width as u16, height as u16);
+    f.render_widget(Clear, area);
 
     let picker = &app.dashboard.model_picker;
     let mut lines: Vec<Line> = Vec::new();
@@ -1960,19 +2906,19 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
     lines.push(Line::from(Span::styled(
         header,
         Style::default()
-            .fg(Color::Cyan)
+            .fg(THEME.purple)
             .add_modifier(Modifier::BOLD),
     )));
 
     if picker.loading {
         lines.push(Line::from(Span::styled(
             "  Loading models...",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(THEME.yellow),
         )));
     } else if let Some(ref err) = picker.error {
         lines.push(Line::from(Span::styled(
             format!("  Error: {}", err),
-            Style::default().fg(Color::Red),
+            Style::default().fg(THEME.red),
         )));
     } else {
         let visible = picker.visible_models();
@@ -1993,15 +2939,15 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
             if is_current {
                 spans.push(Span::styled(
                     format!("{}  (current)", model),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(THEME.green),
                 ));
             } else {
                 spans.push(Span::styled(
                     truncate_to(model, width.saturating_sub(6)),
                     Style::default().fg(if selected {
-                        Color::Yellow
+                        THEME.yellow
                     } else {
-                        Color::White
+                        THEME.primary
                     }),
                 ));
             }
@@ -2012,17 +2958,17 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
     if !picker.filter.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("  filter: {}", picker.filter),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(THEME.muted),
         )));
     }
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black))
+        .border_style(THEME.border_style())
         .title("Model");
     let widget = Paragraph::new(Text::from(lines))
         .block(block)
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(THEME.bg));
     f.render_widget(widget, area);
 }
 
@@ -2136,6 +3082,33 @@ fn handle_shortcut(shortcut: Shortcut, app: &mut TuiApp) {
         Shortcut::ToggleCoordination => {
             app.dashboard.toggle_coordination();
         }
+        Shortcut::ToggleRail => {
+            app.toggle_rail();
+        }
+        Shortcut::ToggleConsole => {
+            app.toggle_console();
+        }
+        Shortcut::ViewDiff => {
+            // Reuses the existing staged-change preview flow (`/apply` →
+            // `//approve`); no new diff engine.
+            match &app.pending_change {
+                Some(plan) => {
+                    let path = plan.path().display().to_string();
+                    let preview = plan.preview();
+                    app.add_message(
+                        MessageRole::System,
+                        format!("Diff for {} (not applied):\n{}", path, preview),
+                    );
+                }
+                None => {
+                    app.add_message(
+                        MessageRole::System,
+                        "No pending change to show. Stage one with /apply <file> <new content>."
+                            .to_string(),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -2148,6 +3121,41 @@ fn save_session(app: &TuiApp) -> Result<()> {
     let json = serde_json::to_string_pretty(&app.messages)?;
     std::fs::write(&session_path, json)?;
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Formatting helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Spinner frame derived from wall time; cheap and stateless so it can be used
+/// anywhere without owning animation state.
+fn spinner_char_now() -> &'static str {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let frame = ((millis / ANIM_FRAME_MS) as usize) % SPINNER_FRAMES.len();
+    SPINNER_FRAMES[frame]
+}
+
+fn format_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let secs = ms / 1000;
+        let mins = secs / 60;
+        format!("{}m {:02}s", mins, secs % 60)
+    }
+}
+
+/// Real local timestamp from an `Instant`.
+fn format_timestamp(instant: std::time::Instant) -> String {
+    let elapsed = instant.elapsed();
+    let now = chrono::Local::now();
+    let ts = now - chrono::Duration::from_std(elapsed).unwrap_or_default();
+    ts.format("%H:%M:%S").to_string()
 }
 
 /// Returns the lines of the input buffer that should be rendered and the
@@ -2196,6 +3204,10 @@ mod tests {
         TuiApp::new().expect("app creation")
     }
 
+    fn rect(w: u16, h: u16) -> Rect {
+        Rect::new(0, 0, w, h)
+    }
+
     #[test]
     fn test_input_display_lines_single() {
         let (lines, l, c) = input_display_lines("hello", 3, 3, 50);
@@ -2235,50 +3247,138 @@ mod tests {
         assert_eq!(truncate_to("hello", 0), "");
     }
 
+    // ─── Layout ─────────────────────────────────────────────────────────
+
     #[test]
-    fn test_layout_default_is_task_focused() {
+    fn test_layout_default_expanded_rail() {
         let app = make_app();
-        let layout = compute_layout(&app, 40);
-        // Default: no overlay panels open.
-        assert_eq!(layout.agents_h, 0);
-        assert_eq!(layout.graph_h, 0);
-        assert_eq!(layout.metrics_h, 0);
-        assert_eq!(layout.coord_h, 0);
-        // Output dominates.
-        assert!(layout.output_h >= MIN_OUTPUT);
-        assert!(layout.activity_h >= 1);
-        assert!(layout.input_h >= 3);
+        // 120x40: rail on, ~22% width, chat dominates.
+        let layout = compute_ui_layout(&app, rect(120, 40));
+        assert_eq!(layout.mode, LayoutMode::Expanded);
+        assert!(layout.rail_w > 0);
+        let pct = layout.rail_w as f32 / 120.0;
+        assert!((0.18..=0.26).contains(&pct), "rail is {}%", pct * 100.0);
+        assert!(layout.chat_w >= layout.rail_w * 2);
+        assert!(layout.footer_h == 1);
+        assert!(layout.input_h == 3);
+        assert_eq!(layout.header_h, 1);
+        assert!(layout.chat_h >= 20);
     }
 
     #[test]
-    fn test_layout_overlays_are_optional() {
+    fn test_layout_rail_never_exceeds_quarter() {
+        let app = make_app();
+        for w in [120u16, 140, 160, 200, 240] {
+            let layout = compute_ui_layout(&app, rect(w, 40));
+            assert!(
+                layout.rail_w as f32 <= w as f32 * 0.25 + 0.5,
+                "rail too wide at {}: {}",
+                w,
+                layout.rail_w
+            );
+            assert!(
+                layout.rail_w as f32 >= w as f32 * 0.18,
+                "rail too narrow at {}: {}",
+                w,
+                layout.rail_w
+            );
+        }
+    }
+
+    #[test]
+    fn test_layout_collapsed_rail_full_chat() {
         let mut app = make_app();
-        app.dashboard.show_agents = true;
-        app.dashboard.show_task_graph = true;
-        app.dashboard.show_metrics = true;
-        let layout = compute_layout(&app, 40);
-        assert!(layout.agents_h > 0);
-        assert!(layout.graph_h > 0);
-        assert!(layout.metrics_h > 0);
-        assert!(layout.output_h >= MIN_OUTPUT);
-        let total = layout.title_h
-            + layout.op_h
-            + layout.output_h
-            + layout.activity_h
-            + layout.agents_h
-            + layout.graph_h
-            + layout.metrics_h
-            + layout.coord_h
-            + layout.input_h;
-        assert!(total <= 40);
+        app.rail_visible = false;
+        let layout = compute_ui_layout(&app, rect(120, 40));
+        assert_eq!(layout.mode, LayoutMode::Collapsed);
+        assert_eq!(layout.rail_w, 0);
+        assert_eq!(layout.chat_w, 120);
     }
 
     #[test]
-    fn test_layout_extreme_small() {
+    fn test_layout_compact_narrow_terminal() {
         let app = make_app();
-        let layout = compute_layout(&app, 10);
-        assert!(layout.title_h >= 1);
-        assert!(layout.input_h >= 3);
+        // Narrow: rail forced off, chrome reduced.
+        let layout = compute_ui_layout(&app, rect(80, 30));
+        assert_eq!(layout.mode, LayoutMode::Compact);
+        assert_eq!(layout.rail_w, 0);
+        assert_eq!(layout.chat_w, 80);
+        assert_eq!(layout.footer_h, 0);
+        assert_eq!(layout.input_h, 2);
+    }
+
+    #[test]
+    fn test_layout_compact_short_terminal() {
+        let app = make_app();
+        let layout = compute_ui_layout(&app, rect(140, 18));
+        assert_eq!(layout.mode, LayoutMode::Compact);
+        assert_eq!(layout.rail_w, 0);
+        assert!(layout.chat_h >= 12, "chat too small: {}", layout.chat_h);
+    }
+
+    #[test]
+    fn test_layout_priority_input_and_chat_preserved() {
+        let app = make_app();
+        let layout = compute_ui_layout(&app, rect(120, 22));
+        assert!(layout.input_h >= 2);
+        assert!(layout.chat_h >= 10);
+    }
+
+    #[test]
+    fn test_rail_width_bounds() {
+        assert!(rail_width(120) >= RAIL_MIN_WIDTH);
+        assert!(rail_width(120) <= (120.0 * 0.26) as u16);
+        let w = rail_width(200);
+        let pct = w as f32 / 200.0;
+        assert!((0.18..=0.26).contains(&pct));
+    }
+
+    #[test]
+    fn test_rail_section_heights_fit() {
+        let heights = rail_section_heights(20);
+        assert_eq!(heights.iter().sum::<u16>(), 20);
+        // Agents are the last to be cut.
+        assert!(heights[0] >= 3);
+        // More height than requested: sections stay at their defaults.
+        let heights = rail_section_heights(30);
+        assert_eq!(heights, [5, 5, 4, 5, 4]);
+        assert!(heights.iter().sum::<u16>() <= 30);
+        // Extreme squeeze still keeps at least one row for the rail.
+        let heights = rail_section_heights(3);
+        assert!(heights.iter().sum::<u16>() <= 3);
+    }
+
+    #[test]
+    fn test_layout_area_math() {
+        let app = make_app();
+        let layout = compute_ui_layout(&app, rect(120, 40));
+        let size = rect(120, 40);
+        let header = layout.header_area(size);
+        let chat = layout.chat_area(size);
+        let input = layout.input_area(size);
+        let footer = layout.footer_area(size);
+        assert_eq!(header.height, 1);
+        assert_eq!(footer.y + footer.height, 40);
+        assert_eq!(input.y + input.height, footer.y);
+        assert_eq!(chat.y + chat.height, input.y);
+        assert!(chat.x + chat.width <= 120);
+    }
+
+    // ─── Action rendering helpers ───────────────────────────────────────
+
+    #[test]
+    fn test_format_duration() {
+        assert!(format_duration(500).contains("ms"));
+        assert!(format_duration(3200).contains("s"));
+        assert!(format_duration(120_000).contains("m"));
+    }
+
+    #[test]
+    fn test_spinner_is_stable() {
+        let a = spinner_char_now();
+        let b = spinner_char_now();
+        assert!(SPINNER_FRAMES.contains(&a));
+        assert!(SPINNER_FRAMES.contains(&b));
     }
 
     #[test]
@@ -2288,5 +3388,386 @@ mod tests {
         assert!(!is_dangerous_shell("git status"));
         assert!(!is_dangerous_shell("cargo test"));
         assert!(!is_dangerous_shell("rm file.txt"));
+    }
+
+    #[test]
+    fn test_group_lines_collapsed_shows_summary() {
+        let mut app = make_app();
+        app.action_stream.handle_event(&AgentEvent::ToolStarted {
+            tool: "read_file".to_string(),
+            args: "src/main.rs".to_string(),
+        });
+        app.action_stream.handle_event(&AgentEvent::ToolCompleted {
+            tool: "read_file".to_string(),
+            result: "ok".to_string(),
+            success: true,
+        });
+        if let Some(group) = app.action_stream.groups.back_mut() {
+            group.status = UiActionStatus::Completed;
+            group.expanded = false;
+        }
+        let lines = action_group_lines(&app, 80);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.to_string())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(joined.contains("└─"), "collapsed summary: {}", joined);
+        assert!(joined.contains("read"), "keeps real counts");
+    }
+
+    #[test]
+    fn test_group_lines_running_expanded() {
+        let mut app = make_app();
+        app.action_stream.handle_event(&AgentEvent::ToolStarted {
+            tool: "run_command".to_string(),
+            args: "cargo test".to_string(),
+        });
+        let lines = action_group_lines(&app, 80);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.to_string())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(joined.contains("⚙"), "command emoji present");
+        assert!(joined.contains("cargo test"));
+    }
+
+    // ─── Render smoke tests (no panic across sizes and states) ─────────
+
+    fn draw(app: &TuiApp, width: u16, height: u16) {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|f| ui(f, app))
+            .expect("render must not panic");
+    }
+
+    fn app_with_task() -> TuiApp {
+        let mut app = make_app();
+        app.add_message(
+            MessageRole::User,
+            "Fix the parser bug and add regression tests.".to_string(),
+        );
+        app.action_stream.handle_event(&AgentEvent::AgentStarted {
+            agent: "main".to_string(),
+            task: "Fix parser".to_string(),
+        });
+        app.action_stream
+            .handle_event(&AgentEvent::AgentStatusChanged {
+                agent: "main".to_string(),
+                status: AgentStatus::Searching,
+            });
+        app.action_stream.handle_event(&AgentEvent::ToolStarted {
+            tool: "read_file".to_string(),
+            args: "src/agent/tool_parser.rs".to_string(),
+        });
+        app.action_stream.handle_event(&AgentEvent::ToolCompleted {
+            tool: "read_file".to_string(),
+            result: "fn parse() {}".to_string(),
+            success: true,
+        });
+        app.action_stream.handle_event(&AgentEvent::ToolStarted {
+            tool: "run_command".to_string(),
+            args: "cargo test".to_string(),
+        });
+        app.action_stream.handle_event(&AgentEvent::PtyOutput {
+            console: "c1".to_string(),
+            content: "running 2 tests\n".to_string(),
+        });
+        app.is_loading = true;
+        app
+    }
+
+    #[test]
+    fn test_render_idle_expanded() {
+        let app = make_app();
+        draw(&app, 120, 40);
+        draw(&app, 140, 50);
+    }
+
+    #[test]
+    fn test_render_idle_compact_narrow() {
+        let app = make_app();
+        draw(&app, 80, 24);
+        draw(&app, 60, 16);
+    }
+
+    #[test]
+    fn test_render_active_task_all_sizes() {
+        let app = app_with_task();
+        for (w, h) in [(120u16, 40u16), (100, 26), (80, 24), (140, 45), (110, 20)] {
+            draw(&app, w, h);
+        }
+    }
+
+    #[test]
+    fn test_render_active_task_rail_collapsed() {
+        let mut app = app_with_task();
+        app.rail_visible = false;
+        draw(&app, 120, 40);
+    }
+
+    #[test]
+    fn test_render_with_console_content() {
+        let mut app = app_with_task();
+        app.route_pty_output("c1", "compiling...\n");
+        app.route_pty_exit("c1", 0, "completed");
+        draw(&app, 120, 40);
+    }
+
+    #[test]
+    fn test_render_console_popup() {
+        let mut app = app_with_task();
+        app.route_pty_output("c1", "line one\nline two\n");
+        app.show_console = true;
+        draw(&app, 120, 40);
+        draw(&app, 80, 24);
+    }
+
+    #[test]
+    fn test_render_palette_and_picker() {
+        let mut app = make_app();
+        app.dashboard.show_command_palette = true;
+        draw(&app, 120, 40);
+        app.dashboard.show_command_palette = false;
+        app.dashboard.model_picker.open();
+        app.dashboard.model_picker.set_models(vec![
+            "agnes-2.5-flash".to_string(),
+            "gpt-4o".to_string(),
+            "qwen2.5-coder".to_string(),
+        ]);
+        draw(&app, 120, 40);
+    }
+
+    #[test]
+    fn test_render_overlay_panels() {
+        let mut app = app_with_task();
+        app.dashboard.show_agents = true;
+        draw(&app, 120, 40);
+        app.dashboard.show_agents = false;
+        app.dashboard.show_task_graph = true;
+        draw(&app, 120, 40);
+        app.dashboard.show_task_graph = false;
+        app.dashboard.show_metrics = true;
+        draw(&app, 120, 40);
+        app.dashboard.show_metrics = false;
+        app.dashboard.show_coordination = true;
+        draw(&app, 120, 40);
+        app.dashboard.show_coordination = false;
+        app.dashboard.show_memory = true;
+        draw(&app, 120, 40);
+        app.dashboard.show_memory = false;
+        app.dashboard.show_trace = true;
+        draw(&app, 120, 40);
+    }
+
+    #[test]
+    fn test_render_confirmation_and_secure_input() {
+        let mut app = make_app();
+        app.pending_confirmation = Some((
+            "Run dangerous command? (y/n)".to_string(),
+            PendingAction::RunShell("rm -rf /tmp/x".to_string()),
+        ));
+        draw(&app, 120, 40);
+        app.pending_confirmation = None;
+        app.secure_input = Some(crate::tui::app::SecureInputState {
+            provider: "openai".to_string(),
+            buffer: "sk-secret".to_string(),
+        });
+        draw(&app, 120, 40);
+    }
+
+    #[test]
+    fn test_render_scrolled_with_indicator() {
+        let mut app = make_app();
+        for i in 0..60 {
+            app.add_message(
+                MessageRole::Assistant,
+                format!("Response line {} with some markdown **bold** text here.", i),
+            );
+        }
+        app.scroll_up();
+        draw(&app, 120, 40);
+        draw(&app, 80, 24);
+    }
+
+    #[test]
+    fn test_render_terminal_smoke_all_panels_at_once() {
+        let mut app = app_with_task();
+        app.dashboard.show_agents = true;
+        app.dashboard.show_task_graph = true;
+        app.dashboard.show_metrics = true;
+        app.dashboard.show_coordination = true;
+        app.show_console = true;
+        app.route_pty_output("c1", "output\n");
+        app.add_message(
+            MessageRole::Assistant,
+            "The parser now handles nested structured arguments.".to_string(),
+        );
+        draw(&app, 160, 50);
+        draw(&app, 100, 26);
+    }
+
+    fn buffer_text(app: &TuiApp, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|f| ui(f, app))
+            .expect("render must not panic");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn test_render_expanded_layout_shows_header_chat_rail_footer() {
+        let app = app_with_task();
+        let text = buffer_text(&app, 120, 40);
+        assert!(text.contains("CodeBro"), "header identity");
+        assert!(text.contains("You"), "user message");
+        assert!(text.contains("AGENTS"), "rail: agents section");
+        assert!(text.contains("CURRENT ACTIVITY"), "rail: activity section");
+        assert!(text.contains("SESSION"), "rail: session section");
+        assert!(text.contains("Enter Send"), "input hint");
+        assert!(text.contains("Ctrl+P"), "footer hints");
+        assert!(text.contains("Ctrl+U Rail"), "footer rail hint");
+        assert!(text.contains("Ctrl+K Console"), "footer console hint");
+    }
+
+    #[test]
+    fn test_render_collapsed_hides_rail() {
+        let mut app = app_with_task();
+        app.rail_visible = false;
+        let text = buffer_text(&app, 120, 40);
+        assert!(!text.contains("AGENTS"), "rail hidden when collapsed");
+        assert!(text.contains("CodeBro"));
+        assert!(text.contains("Enter Send"));
+    }
+
+    #[test]
+    fn test_render_compact_hides_footer_and_rail() {
+        let app = app_with_task();
+        let text = buffer_text(&app, 80, 24);
+        assert!(!text.contains("AGENTS"), "rail off in compact");
+        assert!(text.contains("CodeBro"), "header kept");
+        assert!(text.contains("Enter Send"), "input kept");
+    }
+
+    #[test]
+    fn test_render_action_timeline_visible_in_chat() {
+        let app = app_with_task();
+        let text = buffer_text(&app, 120, 40);
+        assert!(text.contains("Research"), "phase label in chat");
+        assert!(text.contains("Read File"), "reading action line");
+        assert!(text.contains("src/agent/tool_parser.rs"), "read path");
+        assert!(text.contains("cargo test"), "command action line");
+    }
+
+    #[test]
+    fn test_render_new_activity_indicator_when_scrolled() {
+        let mut app = make_app();
+        for i in 0..80 {
+            app.add_message(
+                MessageRole::Assistant,
+                format!("Long response number {} with plenty of text to scroll.", i),
+            );
+        }
+        app.scroll_up();
+        let text = buffer_text(&app, 120, 40);
+        assert!(
+            text.contains("New activity"),
+            "scroll indicator shown when not at bottom"
+        );
+    }
+
+    // ─── F3: chronological order user → activity → response ───────────
+
+    #[test]
+    fn test_render_chat_order_is_user_timeline_response() {
+        let mut app = make_app();
+        app.dashboard.show_welcome = false;
+        app.add_message(MessageRole::User, "Order check task".to_string());
+        app.action_stream.handle_event(&AgentEvent::ToolStarted {
+            tool: "read_file".to_string(),
+            args: "src/order.rs".to_string(),
+        });
+        app.action_stream.handle_event(&AgentEvent::ToolCompleted {
+            tool: "read_file".to_string(),
+            result: "ok".to_string(),
+            success: true,
+        });
+        app.add_message(MessageRole::Assistant, "FINAL-RESPONSE-MARKER".to_string());
+
+        let text = buffer_text(&app, 120, 40);
+        let user_at = text.find("Order check task").expect("user message");
+        let activity_at = text.find("Read File").expect("action timeline");
+        let response_at = text.find("FINAL-RESPONSE-MARKER").expect("final response");
+        assert!(
+            user_at < activity_at && activity_at < response_at,
+            "expected user < activity < response, got user={} activity={} response={}",
+            user_at,
+            activity_at,
+            response_at
+        );
+    }
+
+    #[test]
+    fn test_render_chat_timeline_after_user_without_response() {
+        // No assistant response yet: the timeline still follows the user
+        // message and no ordering regression occurs.
+        let mut app = make_app();
+        app.dashboard.show_welcome = false;
+        app.add_message(MessageRole::User, "No response yet".to_string());
+        app.action_stream.handle_event(&AgentEvent::ToolStarted {
+            tool: "run_command".to_string(),
+            args: "cargo test".to_string(),
+        });
+        let text = buffer_text(&app, 120, 40);
+        let user_at = text.find("No response yet").expect("user message");
+        let activity_at = text.find("cargo test").expect("action timeline");
+        assert!(user_at < activity_at);
+    }
+
+    // ─── F1: renderer shows no permanent spinner after finalization ───
+
+    #[test]
+    fn test_render_completed_group_has_no_spinner() {
+        let mut app = make_app();
+        app.dashboard.show_welcome = false;
+        app.add_message(MessageRole::User, "Spinner check".to_string());
+        app.action_stream.handle_event(&AgentEvent::AgentStarted {
+            agent: "main".to_string(),
+            task: "spinner".to_string(),
+        });
+        app.action_stream
+            .handle_event(&AgentEvent::AgentStatusChanged {
+                agent: "main".to_string(),
+                status: AgentStatus::Thinking,
+            });
+        app.action_stream.handle_event(&AgentEvent::ToolStarted {
+            tool: "read_file".to_string(),
+            args: "a.rs".to_string(),
+        });
+        app.action_stream.finalize_response(true);
+        let lines = action_group_lines(&app, 80);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.to_string())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(
+            !joined.contains("Thinking"),
+            "finalized group must not render a stale action: {}",
+            joined
+        );
+        assert!(joined.contains("✓ Main"), "group completed: {}", joined);
     }
 }
