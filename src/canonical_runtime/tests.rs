@@ -6216,6 +6216,14 @@ fn test_deadline_budget_includes_enabled_specialists() {
     use super::task_deadline_budget;
     assert_eq!(task_deadline_budget(&TaskOptions::default()), 0);
 
+    // A caller that opted out of a task timeout must stay deadline-free even
+    // when phases are enabled — enabling phases never imposes a deadline.
+    assert_eq!(
+        task_deadline_budget(&TaskOptions::for_mode(TaskMode::Autonomous)),
+        0,
+        "no configured task timeout means no deadline"
+    );
+
     let mut autonomous = TaskOptions::for_mode(TaskMode::Autonomous);
     autonomous.task_timeout_ms = Some(30_000);
     assert_eq!(

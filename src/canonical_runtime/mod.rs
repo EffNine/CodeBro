@@ -118,13 +118,18 @@ const MAX_MODEL_CALLS: usize =
 
 /// The whole-pipeline deadline budget in milliseconds (Sprint 31A policy).
 ///
-/// `task_timeout_ms` budgets the MAIN ReAct loop. Each enabled autonomous
-/// specialist runs under its own session timeout, so the full pipeline is
-/// bounded by `task_timeout + Σ(enabled specialist timeouts)`. A zero or
-/// missing task timeout means no deadline (the per-phase limits still bound
-/// every specialist).
+/// `task_timeout_ms` budgets the MAIN ReAct loop. When a finite task timeout
+/// is configured, each enabled autonomous specialist is additionally budgeted
+/// by its own session timeout, so the whole pipeline is bounded by
+/// `task_timeout + Σ(enabled specialist timeouts)`. A zero or missing task
+/// timeout means NO deadline — enabling phases never imposes one on a caller
+/// that opted out (the per-phase limits still bound every specialist).
 fn task_deadline_budget(opts: &TaskOptions) -> u64 {
-    let mut budget = opts.task_timeout_ms.unwrap_or(0);
+    let configured = opts.task_timeout_ms.unwrap_or(0);
+    if configured == 0 {
+        return 0;
+    }
+    let mut budget = configured;
     if opts.research_enabled {
         budget = budget.saturating_add(crate::research::ResearchLimits::default().timeout_ms);
     }
