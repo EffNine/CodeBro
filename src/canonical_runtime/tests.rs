@@ -844,7 +844,7 @@ async fn test_empty_optional_context_task_executes() {
     let (_, emit) = event_sink();
     let on_chunk = |_c: &str| {};
     let req = crate::canonical_runtime::TaskRequest {
-        task: "hello",
+        task: "add a subtract function",
         conversation: no_conversation(),
         emit: &emit,
         on_chunk: &on_chunk,
@@ -918,7 +918,7 @@ async fn test_end_to_end_canonical_pipeline() {
     let on_chunk = move |c: &str| chunk_sink.lock().unwrap().push(c.to_string());
 
     let req = crate::canonical_runtime::TaskRequest {
-        task: "add a new feature to the project",
+        task: "add a subtract function",
         conversation: no_conversation(),
         emit: &emit,
         on_chunk: &on_chunk,
@@ -1948,11 +1948,12 @@ async fn test_task_timeout() {
         ..Default::default()
     };
     let req = crate::canonical_runtime::TaskRequest {
-        task: "explain the project",
+        task: "add a subtract function",
         conversation: no_conversation(),
         emit: &emit,
         on_chunk: &on_chunk,
     };
+
     let result = runtime.run_task_with_options(&req, options).await;
     // With a 1ms timeout the task may or may not time out depending on system
     // speed, but it should always terminate.
@@ -5474,4 +5475,212 @@ async fn test_coding_result_reaches_main_provider_prompt() {
     assert_eq!(coding.changes_applied, 1);
     assert_eq!(coding.verifications_run, 1);
     assert_eq!(coding.verifications_failed, 0);
+}
+
+// =========================================================================
+// Sprint 30G — Autonomous Review Subagent (parent integration)
+// =========================================================================
+
+/// The fixed final-review text the scripted "model" produces (a plain synthesis
+/// answer with no tool calls).
+fn review_final_answer() -> String {
+    "FINAL CODE REVIEW:\n\
+     ## Summary\n\
+     Reviewed src/lib.rs and verified the change.\n\
+     ## Findings\n\
+     (none)\n\
+     ## Verification Status\n\
+     - src/lib.rs [verified]\n\
+     ## Verdict\n\
+     PASS\n"
+        .to_string()
+}
+
+/// Full Sprint 30C/30D/30E/30F/30G chain → ReviewResult → ContextFragment →
+/// compiled main prompt. Research, Testing, Planning and Coding run first;
+/// Review consumes all structured results, inspects the repo, and its
+/// rendering must reach the final compiled prompt alongside the earlier
+/// fragments.
+#[tokio::test]
+async fn test_review_result_reaches_compiled_prompt() {
+    let dir = testing_workspace();
+    // Apply the coding change so Review can inspect it.
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn sub(a: i32, b: i32) -> i32 { a - b }\n#[cfg(test)]\nmod tests { #[test] fn ok() {} }\n",
+    )
+    .unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(ScriptedMockProvider::new(
+        "mock",
+        vec![
+            // Research iteration 1: read the library source.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Research final report.
+            "sub() is defined in src/lib.rs and returns a - b.".to_string(),
+            // Testing iteration 1: run a REAL cargo check.
+            r#"<invoke name="run_command">{"command": "cargo check"}</invoke>"#.to_string(),
+            // Testing final report.
+            "cargo check passed with exit code 0.".to_string(),
+            // Planning iteration 1: a single targeted read-only verify.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Planning final implementation plan.
+            planning_final_answer(),
+            // Coding iteration 1: apply the plan's step (already applied above
+            // for the integration test; the mock still produces the tool call
+            // so the chain proceeds correctly).
+            coding_sub_proposal(),
+            // Coding iteration 2: explicit verification (REAL cargo check).
+            coding_verify("cargo check"),
+            // Coding final synthesis report (no tool calls); the completion
+            // gate has nothing left to verify.
+            coding_final_answer(),
+            // Review iteration 1: read the changed file to inspect it.
+            r#"<invoke name="read_file">{"path": "src/lib.rs"}</invoke>"#.to_string(),
+            // Review final synthesis (no tool calls).
+            review_final_answer(),
+        ],
+    )));
+
+    let (context, compiled) = runtime
+        .compile_for_task_with_coding("add a subtract function", no_conversation())
+        .await
+        .expect("compile with coding+review");
+
+    // ReviewResult became a `review` ContextFragment.
+    let fragment = context
+        .context_fragments
+        .iter()
+        .find(|f| f.source == "review")
+        .map(|f| f.content.clone())
+        .expect("review fragment present");
+    assert!(
+        fragment.contains("## Autonomous Review"),
+        "review fragment must carry the rendered result:\n{}",
+        fragment
+    );
+    assert!(
+        fragment.contains("PASS"),
+        "review fragment must carry the verdict:\n{}",
+        fragment
+    );
+
+    // The compiled main prompt contains the review fragment after coding.
+    assert!(
+        compiled.prompt.contains("--- review () ---"),
+        "prompt must render the review fragment:\n{}",
+        compiled.prompt
+    );
+    assert!(
+        compiled.prompt.contains("## Autonomous Review"),
+        "prompt must contain the review rendering"
+    );
+    let research_at = compiled.prompt.find("--- research () ---");
+    let testing_at = compiled.prompt.find("--- testing () ---");
+    let planning_at = compiled.prompt.find("--- planning () ---");
+    let coding_at = compiled.prompt.find("--- coding () ---");
+    let review_at = compiled.prompt.find("--- review () ---");
+    assert!(
+        research_at.is_some()
+            && testing_at.is_some()
+            && planning_at.is_some()
+            && coding_at.is_some()
+            && review_at.is_some(),
+        "all phase markers must be present in the compiled prompt"
+    );
+    // Verify phase order: research < testing < planning < coding < review.
+    assert!(
+        research_at.unwrap() < testing_at.unwrap(),
+        "research must precede testing"
+    );
+    assert!(
+        testing_at.unwrap() < planning_at.unwrap(),
+        "testing must precede planning"
+    );
+    assert!(
+        planning_at.unwrap() < coding_at.unwrap(),
+        "planning must precede coding"
+    );
+    assert!(
+        coding_at.unwrap() < review_at.unwrap(),
+        "coding must precede review"
+    );
+    // The compile method runs the full chain; we verify the fragment directly.
+    assert!(fragment.contains("PASS"));
+}
+
+/// Review → ContextFragment → main provider prompt (with full chain).
+#[tokio::test]
+async fn test_review_result_reaches_main_provider_prompt() {
+    let dir = testing_workspace();
+    // Apply the coding change so Review can inspect it.
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn sub(a: i32, b: i32) -> i32 { a - b }\n#[cfg(test)]\nmod tests { #[test] fn ok() {} }\n",
+    )
+    .unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec![
+            // Review final synthesis (no tool calls).
+            review_final_answer(),
+            // Main loop answer.
+            "main task complete.".to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let noop_chunk = |_: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        research_enabled: true,
+        testing_enabled: true,
+        planning_enabled: true,
+        coding_enabled: true,
+        review_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "add a subtract function",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &noop_chunk,
+    };
+
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "main task must succeed with review enabled: {:?}",
+        result.error
+    );
+    // review fragment with the rendered review content.
+    let prompts = provider.all_prompts();
+    assert!(prompts.len() >= 2, "at least 2 prompts: review + main");
+    let main_prompt = prompts.last().expect("main prompt present");
+    assert!(
+        main_prompt.contains("--- review () ---"),
+        "main prompt must contain the review fragment:\n{}",
+        main_prompt
+    );
+    assert!(
+        main_prompt.contains("## Autonomous Review"),
+        "main prompt must contain the review rendering"
+    );
+    assert!(
+        main_prompt.contains("PASS"),
+        "main prompt must carry the review verdict"
+    );
+
+    // Review diagnostics were captured.
+    let review = result
+        .diagnostics
+        .review
+        .expect("review diagnostics recorded");
+    assert!(review.completed);
+    assert!(review.synthesis_complete);
 }

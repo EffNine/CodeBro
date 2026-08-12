@@ -168,6 +168,13 @@ pub struct TaskOptions {
     /// [`crate::coding::CodingResult`] into the main LLM context. Defaults to
     /// false.
     pub coding_enabled: bool,
+    /// When true, the coordinator runs the autonomous Review subagent
+    /// (Sprint 30G) after Coding, consuming the structured results of
+    /// Research, Testing, Planning and Coding, independently inspecting the
+    /// repository state, and injecting the evidence-backed
+    /// [`crate::review::ReviewResult`] into the main LLM context. Failure is
+    /// isolated: a review error never crashes the main task. Defaults to false.
+    pub review_enabled: bool,
 }
 
 /// The outcome of a directly-invoked streaming tool run (shell commands,
@@ -638,6 +645,7 @@ impl CanonicalRuntime {
 
         // Autonomous Coding (Sprint 30F): when enabled, run the plan-driven
         // Coding subagent AFTER Planning. Coding consumes the REAL
+        let mut coding_result: Option<crate::coding::CodingResult> = None;
         // PlanningResult, applies reversible changes through the change engine
         // (ChangePlan/PatchEngine behind a permission boundary), verifies them
         // through the Testing command policy (authoritative exit codes), and
@@ -658,8 +666,11 @@ impl CanonicalRuntime {
                 Ok(result) => {
                     let render = result.render();
                     diag.coding = Some(
-                        crate::canonical_runtime::diagnostics::CodingDiagnostics::from(result),
+                        crate::canonical_runtime::diagnostics::CodingDiagnostics::from(
+                            result.clone(),
+                        ),
                     );
+                    coding_result = Some(result);
                     context = extend_context(
                         context,
                         vec![ContextFragment {
@@ -677,6 +688,47 @@ impl CanonicalRuntime {
                     (req.emit)(AgentEvent::Log {
                         level: "pipeline".to_string(),
                         message: format!("Coding subagent failed (continuing without it): {e}"),
+                    });
+                }
+            }
+        }
+
+        // Autonomous Review (Sprint 30G): when enabled, run the read-only
+        // Review subagent AFTER Coding.
+        if opts.review_enabled {
+            let review = self
+                .run_autonomous_review(
+                    req,
+                    &memory_entries,
+                    &opts,
+                    research_result.clone(),
+                    testing_result.clone(),
+                    planning_result.clone(),
+                    coding_result.clone(),
+                )
+                .await;
+            match review {
+                Ok(result) => {
+                    let render = result.render();
+                    diag.review = Some(
+                        crate::canonical_runtime::diagnostics::ReviewDiagnostics::from(
+                            result.clone(),
+                        ),
+                    );
+                    context = extend_context(
+                        context,
+                        vec![ContextFragment {
+                            source: "review".to_string(),
+                            content: render,
+                            relevance_score: 0.85,
+                        }],
+                    );
+                    diag.context_fragments = context.fragment_count();
+                }
+                Err(e) => {
+                    (req.emit)(AgentEvent::Log {
+                        level: "pipeline".to_string(),
+                        message: format!("Review subagent failed (continuing without it): {e}"),
                     });
                 }
             }
@@ -1126,6 +1178,8 @@ impl CanonicalRuntime {
         // Assemble grounding once, then run the phases in order.
         let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
             .assemble_with_extras(task, &[], &memory_entries);
+        // Clone for the review phase which runs after coding consumes grounded.
+        let grounded_for_review = grounded.clone();
         let research = match self
             .run_research_task(task, grounded.clone(), &noop_emit, None)
             .await
@@ -1199,13 +1253,13 @@ impl CanonicalRuntime {
         // downstream phase decision honest: a PlanningResult with an empty
         // plan list is a REAL plan-shaped empty result — not evidence
         // supporting execution.
-        match self
+        let coding = match self
             .run_coding_task(
                 task,
                 grounded,
                 planning.clone(),
                 research.clone(),
-                testing,
+                testing.clone(),
                 &noop_emit,
                 None,
             )
@@ -1221,9 +1275,40 @@ impl CanonicalRuntime {
                         relevance_score: 0.85,
                     }],
                 );
+                result
             }
             Err(e) => {
                 return Err(format!("Autonomous coding failed: {e}"));
+            }
+        };
+
+        // Sprint 30G: Autonomous Review runs AFTER Coding.
+        match self
+            .run_review_task(
+                task,
+                grounded_for_review,
+                research,
+                testing,
+                planning,
+                Some(coding),
+                &noop_emit,
+                None,
+            )
+            .await
+        {
+            Ok(result) => {
+                let render = result.render();
+                context = extend_context(
+                    context,
+                    vec![ContextFragment {
+                        source: "review".to_string(),
+                        content: render,
+                        relevance_score: 0.85,
+                    }],
+                );
+            }
+            Err(e) => {
+                return Err(format!("Autonomous review failed: {e}"));
             }
         }
 
@@ -1502,6 +1587,91 @@ impl CanonicalRuntime {
         let cancel = opts.cancel.clone();
         self.run_coding_task(
             req.task, grounded, planning, research, testing, req.emit, cancel,
+        )
+        .await
+    }
+
+    // =====================================================================
+    // Autonomous Review (Sprint 30G)
+    // =====================================================================
+
+    /// Run the autonomous Review subagent over a grounded context using the
+    /// runtime's shared provider state and the read-only tooling. Review
+    /// consumes Research, Testing, Planning and Coding results, independently
+    /// inspects the repository, and returns the structured
+    /// [`crate::review::ReviewResult`].
+    pub async fn run_review_task(
+        &self,
+        task: &str,
+        grounding: GroundedContext,
+        research: Option<crate::research::ResearchResult>,
+        testing: Option<crate::testing::TestingResult>,
+        planning: Option<crate::planning::PlanningResult>,
+        coding: Option<crate::coding::CodingResult>,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        cancel: Option<crate::cancellation::CancellationToken>,
+    ) -> std::result::Result<crate::review::ReviewResult, String> {
+        self.run_review_task_with_limits(
+            task,
+            grounding,
+            research,
+            testing,
+            planning,
+            coding,
+            crate::review::ReviewLimits::default(),
+            emit,
+            cancel,
+        )
+        .await
+    }
+
+    pub async fn run_review_task_with_limits(
+        &self,
+        task: &str,
+        grounding: GroundedContext,
+        research: Option<crate::research::ResearchResult>,
+        testing: Option<crate::testing::TestingResult>,
+        planning: Option<crate::planning::PlanningResult>,
+        coding: Option<crate::coding::CodingResult>,
+        limits: crate::review::ReviewLimits,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        cancel: Option<crate::cancellation::CancellationToken>,
+    ) -> std::result::Result<crate::review::ReviewResult, String> {
+        let tooling = crate::review::ReviewTooling::new(&self.workspace_root);
+        let mut subagent = crate::review::ReviewSubagent::new(
+            self.provider_runtime.clone(),
+            self.router.clone(),
+            self.io_providers.clone(),
+            tooling,
+        );
+        let request = crate::review::ReviewRequest::new(task, self.workspace_root.clone())
+            .with_grounding(grounding)
+            .with_research(research)
+            .with_testing(testing)
+            .with_planning(planning)
+            .with_coding(coding)
+            .with_limits(limits);
+        Ok(subagent.run(request, emit, cancel).await)
+    }
+
+    /// Run the autonomous review subagent inside the canonical task pipeline
+    /// (used by `run_task_with_options`). Bounded by the task deadline and the
+    /// review limits; failure is isolated and reported as an error result.
+    async fn run_autonomous_review(
+        &self,
+        req: &TaskRequest<'_>,
+        memory_entries: &[String],
+        opts: &TaskOptions,
+        research: Option<crate::research::ResearchResult>,
+        testing: Option<crate::testing::TestingResult>,
+        planning: Option<crate::planning::PlanningResult>,
+        coding: Option<crate::coding::CodingResult>,
+    ) -> std::result::Result<crate::review::ReviewResult, String> {
+        let grounded = crate::agent::grounding::GroundingAssembler::new(&self.workspace_root)
+            .assemble_with_extras(req.task, &[], memory_entries);
+        let cancel = opts.cancel.clone();
+        self.run_review_task(
+            req.task, grounded, research, testing, planning, coding, req.emit, cancel,
         )
         .await
     }

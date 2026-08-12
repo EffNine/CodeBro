@@ -91,6 +91,8 @@ pub struct TaskDiagnostics {
     pub planning: Option<PlanningDiagnostics>,
     /// Autonomous coding diagnostics (Sprint 30F), when coding ran.
     pub coding: Option<CodingDiagnostics>,
+    /// Autonomous review diagnostics (Sprint 30G), when review ran.
+    pub review: Option<ReviewDiagnostics>,
 }
 
 impl TaskDiagnostics {
@@ -302,6 +304,46 @@ impl From<crate::coding::CodingResult> for CodingDiagnostics {
                 .filter(|r| !r.success && !r.denied)
                 .count(),
             revisions: result.revisions,
+            duration_ms: result.duration_ms,
+            provider: result.provider,
+            error: result.limitations.first().cloned(),
+        }
+    }
+}
+
+/// Observational diagnostics for one autonomous Review session (Sprint 30G).
+#[derive(Debug, Clone, Default)]
+pub struct ReviewDiagnostics {
+    pub completed: bool,
+    pub synthesis_complete: bool,
+    pub termination: String,
+    pub iterations: usize,
+    pub tool_calls: usize,
+    pub model_calls: usize,
+    pub findings: usize,
+    pub files_inspected: usize,
+    pub changed_files: usize,
+    pub unverified_changes: usize,
+    pub plan_deviations: usize,
+    pub duration_ms: u64,
+    pub provider: String,
+    pub error: Option<String>,
+}
+
+impl From<crate::review::ReviewResult> for ReviewDiagnostics {
+    fn from(result: crate::review::ReviewResult) -> Self {
+        ReviewDiagnostics {
+            completed: result.termination.is_completed(),
+            synthesis_complete: result.synthesis_complete,
+            termination: result.termination.to_string(),
+            iterations: result.iterations,
+            tool_calls: result.tool_calls,
+            model_calls: result.model_calls,
+            findings: result.findings.len(),
+            files_inspected: result.reviewed_files.len(),
+            changed_files: result.changed_files.len(),
+            unverified_changes: result.unverified_changes.len(),
+            plan_deviations: result.plan_deviations.len(),
             duration_ms: result.duration_ms,
             provider: result.provider,
             error: result.limitations.first().cloned(),

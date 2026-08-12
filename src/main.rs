@@ -35,6 +35,7 @@ mod providers;
 mod recommendation_engine;
 mod reliability;
 mod research;
+mod review;
 mod runtime;
 mod scanner;
 mod service_registry;
