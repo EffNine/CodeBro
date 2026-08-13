@@ -96,7 +96,7 @@ pub fn check_key_shortcuts(key: &KeyEvent) -> Option<Shortcut> {
         KeyCode::Char('c') => Some(Shortcut::CancelTask),
         KeyCode::Char('q') => Some(Shortcut::Quit),
         KeyCode::Char('p') => Some(Shortcut::OpenCommandPalette),
-        KeyCode::Char('v') => Some(Shortcut::ToggleMetrics),
+        KeyCode::Char('e') => Some(Shortcut::ToggleMetrics),
         // Design-spec: Ctrl+O toggles the intelligence rail.
         KeyCode::Char('o') => Some(Shortcut::ToggleRail),
         // Ctrl+U keeps coordination (swapped off Ctrl+O).
@@ -144,7 +144,7 @@ impl Shortcut {
             Shortcut::CancelTask => "Ctrl+C Cancel",
             Shortcut::Quit => "Ctrl+Q Quit",
             Shortcut::OpenCommandPalette => "Ctrl+P Palette",
-            Shortcut::ToggleMetrics => "Ctrl+V Metrics",
+            Shortcut::ToggleMetrics => "Ctrl+E Metrics",
             Shortcut::ToggleCoordination => "Ctrl+U Coord",
             Shortcut::ToggleRail => "Ctrl+O Rail",
             Shortcut::ToggleConsole => "Ctrl+K Console",
@@ -246,7 +246,7 @@ mod tests {
             Some(Shortcut::OpenCommandPalette)
         );
         assert_eq!(
-            check_key_shortcuts(&ctrl(KeyCode::Char('v'))),
+            check_key_shortcuts(&ctrl(KeyCode::Char('e'))),
             Some(Shortcut::ToggleMetrics)
         );
         assert_eq!(

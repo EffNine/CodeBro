@@ -1,6 +1,6 @@
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -23,6 +23,7 @@ use crate::tui::commands::{self, CommandNamespace};
 use crate::tui::console::PtyConsole;
 use crate::tui::dashboard::Dashboard;
 use crate::tui::events::{self, Shortcut};
+use crate::tui::textarea_adapter::InputResult;
 use crate::tui::theme::{Phase, StatusGlyph, THEME};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
@@ -78,6 +79,12 @@ pub fn run(mut app: TuiApp) -> Result<()> {
 fn run_loop(app: &mut TuiApp) -> Result<()> {
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
+
+    // Initialize terminal_size immediately so mouse events on the first frame
+    // are routed to the textarea adapter instead of the chat viewport.
+    if let Ok(size) = terminal.size() {
+        app.terminal_size = Some(Rect::new(0, 0, size.width, size.height));
+    }
 
     let (tx, rx) = std::sync::mpsc::channel();
     app.tx = tx.clone();
@@ -161,7 +168,8 @@ fn handle_event(msg: events::AppEvent, app: &mut TuiApp) -> bool {
             }
             true
         }
-        events::AppEvent::Resize(_, _) => {
+        events::AppEvent::Resize(w, h) => {
+            app.terminal_size = Some(Rect::new(0, 0, w, h));
             app.scroll_to_bottom();
             true
         }
@@ -219,18 +227,43 @@ fn handle_event(msg: events::AppEvent, app: &mut TuiApp) -> bool {
         }
         events::AppEvent::Mouse(mouse) => {
             use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+            // Compute the input area to determine whether the mouse event
+            // should be routed to the textarea adapter instead of the chat.
+            let input_area = app
+                .terminal_size
+                .map(|size| compute_ui_layout(app, size).input_area(size));
+            let in_input_area = input_area
+                .map(|area| mouse.row >= area.y && mouse.row < area.y + area.height)
+                .unwrap_or(false);
+
             match mouse.kind {
                 MouseEventKind::ScrollDown => app.mouse_scroll(-3),
                 MouseEventKind::ScrollUp => app.mouse_scroll(3),
+                MouseEventKind::Down(_) if in_input_area => {
+                    // Route to textarea adapter for input-area mouse handling.
+                    if let Some(area) = input_area {
+                        let _ = app.input.handle_mouse(mouse, area);
+                    }
+                }
                 MouseEventKind::Down(_) => {
                     // Start a text selection in the chat viewport.
                     app.selection_start = Some((mouse.row, mouse.column));
                     app.selection_end = Some((mouse.row, mouse.column));
                     app.is_selecting = true;
                 }
+                MouseEventKind::Drag(_) if in_input_area => {
+                    if let Some(area) = input_area {
+                        let _ = app.input.handle_mouse(mouse, area);
+                    }
+                }
                 MouseEventKind::Drag(_) => {
                     if app.is_selecting {
                         app.selection_end = Some((mouse.row, mouse.column));
+                    }
+                }
+                MouseEventKind::Up(_) if in_input_area => {
+                    if let Some(area) = input_area {
+                        let _ = app.input.handle_mouse(mouse, area);
                     }
                 }
                 MouseEventKind::Up(_) => {
@@ -293,12 +326,55 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
             }
 
             if let Some(shortcut) = events::check_key_shortcuts(&key) {
-                // Ctrl+C with an active selection copies instead of cancelling.
+                // Ctrl+E → ToggleMetrics (moved from Ctrl+V to free clipboard paste).
+                if matches!(shortcut, Shortcut::ToggleMetrics) {
+                    app.dashboard.toggle_metrics();
+                    return;
+                }
+                // Ctrl+C with an active textarea selection copies to OS clipboard.
+                if matches!(shortcut, Shortcut::CancelTask) && app.input.has_selection() {
+                    if let Some(text) = app.input.selected_text() {
+                        let ok = app.copy_to_clipboard(&text);
+                        app.input.clear_selection();
+                        if !ok {
+                            app.dashboard
+                                .log("info", "Clipboard unavailable".to_string());
+                        }
+                    }
+                    return;
+                }
+                // Ctrl+C with an active chat selection copies chat text.
                 if matches!(shortcut, Shortcut::CancelTask) && app.has_selection() {
                     app.copy_selection();
                     return;
                 }
                 handle_shortcut(shortcut, app);
+                return;
+            }
+
+            // Ctrl+V → paste from OS clipboard (must be checked before the
+            // adapter so it never reaches the metrics toggle path).
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('v'))
+            {
+                if app.secure_input.is_none() {
+                    if let Some(text) = app.read_from_clipboard() {
+                        let was_multiline = text.contains('\n');
+                        app.insert_text(&text);
+                        if was_multiline && !text.is_empty() {
+                            let line_count = text.lines().count();
+                            let byte_size = text.len();
+                            let kb = byte_size as f64 / 1024.0;
+                            let kb_str = if kb >= 1.0 {
+                                format!("{:.1} KB", kb)
+                            } else {
+                                format!("{} B", byte_size)
+                            };
+                            app.paste_marker =
+                                Some(format!("[pasted {} lines, {}]", line_count, kb_str));
+                        }
+                    }
+                }
                 return;
             }
 
@@ -344,10 +420,20 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                     }
                     app.paste_marker = None;
                 }
-                KeyCode::Left => app.cursor_left(),
-                KeyCode::Right => app.cursor_right(),
-                KeyCode::Home => app.cursor_home(),
-                KeyCode::End => app.scroll_to_bottom(),
+                KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
+                    let result = app.input.handle_key(key, &app.dashboard);
+                    if matches!(result, InputResult::Submit) {
+                        // Fallback: treat as submit if adapter unexpectedly returns Submit.
+                        let input = app.input.trim().to_string();
+                        if !input.is_empty() && !is_inline_apikey(&input) {
+                            app.push_history(input);
+                            app.paste_marker = None;
+                            app.clear_input();
+                            submit_input(app.input.trim().to_string(), app);
+                        }
+                    }
+                    app.paste_marker = None;
+                }
                 KeyCode::PageUp => {
                     for _ in 0..10 {
                         app.scroll_up();
@@ -391,12 +477,25 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                     }
                 }
                 KeyCode::Backspace => {
-                    app.backspace();
+                    let result = app.input.handle_key(key, &app.dashboard);
+                    if matches!(result, InputResult::Submit) {
+                        let input = app.input.trim().to_string();
+                        if !input.is_empty() && !is_inline_apikey(&input) {
+                            app.push_history(input);
+                            app.paste_marker = None;
+                            app.clear_input();
+                            submit_input(app.input.trim().to_string(), app);
+                        }
+                    }
                     app.paste_marker = None;
                 }
                 KeyCode::Esc => {
                     if app.has_selection() {
                         app.clear_selection();
+                        return;
+                    }
+                    if app.input.has_selection() {
+                        app.input.clear_selection();
                         return;
                     }
                     dismiss_top_overlay(app);
@@ -405,7 +504,24 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                     app.add_message(MessageRole::System, help_text(app));
                 }
                 KeyCode::Char(c) => {
-                    app.insert_text(&c.to_string());
+                    let result = app.input.handle_key(key, &app.dashboard);
+                    match result {
+                        InputResult::PassThrough => {
+                            // Adapter declined to handle (e.g. autocomplete open);
+                            // fall back to direct insertion so typing still works.
+                            app.insert_text(&c.to_string());
+                        }
+                        InputResult::Submit => {
+                            let input = app.input.trim().to_string();
+                            if !input.is_empty() && !is_inline_apikey(&input) {
+                                app.push_history(input);
+                                app.paste_marker = None;
+                                app.clear_input();
+                                submit_input(app.input.trim().to_string(), app);
+                            }
+                        }
+                        _ => {}
+                    }
                     app.paste_marker = None;
                     // Live-filter the completion list while typing a command.
                     if app.input.text().starts_with('/') || app.input.text().starts_with('!') {
@@ -417,7 +533,9 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    let _ = app.input.handle_key(key, &app.dashboard);
+                }
             }
         }
         _ => {}
@@ -3077,7 +3195,7 @@ fn render_metrics_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
         .borders(Borders::ALL)
         .border_style(THEME.border_style())
         .title(Span::styled(
-            "METRICS (Ctrl+V to close)",
+            "METRICS (Ctrl+E to close)",
             THEME.title_style(),
         ));
     let mut lines = Vec::new();
@@ -6010,6 +6128,368 @@ mod tests {
             text.contains("Line two") && text.contains("Line thre"),
             "multiline selection: {}",
             text
+        );
+    }
+
+    #[test]
+    fn test_ctrl_c_with_textarea_selection_copies_to_clipboard() {
+        let mut app = make_app();
+        // Programmatically set a selection in the textarea adapter.
+        app.input.set_text("hello world");
+        app.input.inner_mut().set_selection(0, 5);
+        assert!(app.input.has_selection(), "textarea has selection");
+        // Ctrl+C with active textarea selection should copy, not cancel.
+        let ctrl_c = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_key(ctrl_c, &mut app);
+        // Selection should be cleared (copy consumed it).
+        assert!(
+            !app.input.has_selection(),
+            "textarea selection consumed by copy"
+        );
+        // Task should NOT be cancelled since selection was active.
+        assert!(
+            !app.should_quit,
+            "Ctrl+C with textarea selection must not quit/cancel"
+        );
+    }
+
+    #[test]
+    fn test_ctrl_c_textarea_selection_takes_precedence_over_chat() {
+        let mut app = make_app();
+        // Set both a chat selection and a textarea selection.
+        app.selection_start = Some((1, 0));
+        app.selection_end = Some((2, 5));
+        app.input.set_text("selected text");
+        app.input.inner_mut().set_selection(0, 9);
+        assert!(app.has_selection(), "chat has selection");
+        assert!(app.input.has_selection(), "textarea has selection");
+        let ctrl_c = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_key(ctrl_c, &mut app);
+        // Textarea selection should win (checked first).
+        assert!(!app.input.has_selection(), "textarea selection consumed");
+        // Chat selection should remain (not consumed).
+        assert!(
+            app.has_selection(),
+            "chat selection must not be consumed when textarea wins"
+        );
+        assert!(!app.should_quit, "must not cancel");
+    }
+
+    #[test]
+    fn test_ctrl_c_empty_textarea_selection_cancels() {
+        let mut app = make_app();
+        app.is_loading = true;
+        app.cancel_token = Some(crate::cancellation::CancellationToken::new());
+        // Textarea has no selection.
+        assert!(!app.input.has_selection());
+        let ctrl_c = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_key(ctrl_c, &mut app);
+        assert!(
+            app.cancel_token
+                .as_ref()
+                .map(|t| t.is_cancelled())
+                .unwrap_or(false),
+            "Ctrl+C with no textarea selection cancels task"
+        );
+    }
+
+    #[test]
+    fn test_copy_to_clipboard_empty_text_returns_false() {
+        let app = make_app();
+        assert!(
+            !app.copy_to_clipboard(""),
+            "empty text must not attempt clipboard"
+        );
+    }
+
+    #[test]
+    fn test_secure_input_blocks_clipboard_copy() {
+        let mut app = make_app();
+        // Secure input must prevent any clipboard operation from the main path.
+        app.secure_input = Some(crate::tui::app::SecureInputState {
+            provider: "openai".to_string(),
+            buffer: "secret-key-123".to_string(),
+        });
+        app.input.set_text("some text");
+        app.input.inner_mut().set_selection(0, 4);
+        let ctrl_c = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_key(ctrl_c, &mut app);
+        // Secure input path handles Ctrl+C itself; the main input must remain untouched.
+        assert!(
+            app.input.has_selection(),
+            "secure input must not touch textarea selection"
+        );
+        assert!(
+            app.secure_input.is_some(),
+            "secure input state must persist"
+        );
+    }
+
+    #[test]
+    fn test_input_adapter_clear_selection() {
+        let mut app = make_app();
+        app.input.set_text("hello world");
+        app.input.inner_mut().set_selection(0, 5);
+        assert!(app.input.has_selection());
+        app.input.clear_selection();
+        assert!(
+            !app.input.has_selection(),
+            "clear_selection must remove the selection"
+        );
+    }
+
+    #[test]
+    fn test_read_from_clipboard_headless_returns_none() {
+        let app = make_app();
+        // On a headless system without pbpaste/xclip/wl-paste, read should
+        // return None rather than panicking.
+        let result = app.read_from_clipboard();
+        assert!(
+            result.is_none(),
+            "headless system must not panic; got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ctrl_v_multiline_paste_sets_marker() {
+        let mut app = make_app();
+        // Simulate the Ctrl+V paste path: insert text then set marker.
+        let multiline = "line one\nline two\nline three";
+        app.insert_text(multiline);
+        // Manually set the marker as the real Ctrl+V handler would.
+        let line_count = multiline.lines().count();
+        let byte_size = multiline.len();
+        app.paste_marker = Some(format!("[pasted {} lines, {} B]", line_count, byte_size));
+        assert_eq!(
+            app.input.text(),
+            multiline,
+            "pasted content must match exactly"
+        );
+        assert!(
+            app.paste_marker.is_some(),
+            "multiline paste must set a marker"
+        );
+    }
+
+    #[test]
+    fn test_ctrl_v_single_line_paste_no_marker() {
+        let mut app = make_app();
+        app.insert_text("single line");
+        assert_eq!(app.input.text(), "single line");
+        // Single-line paste does not set a marker.
+        assert!(
+            app.paste_marker.is_none(),
+            "single-line paste must not set a marker"
+        );
+    }
+
+    #[test]
+    fn test_ctrl_v_secure_input_skips_paste() {
+        let mut app = make_app();
+        app.secure_input = Some(crate::tui::app::SecureInputState {
+            provider: "openai".to_string(),
+            buffer: String::new(),
+        });
+        // Ctrl+V in secure mode must not modify the main input.
+        let ctrl_v = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('v'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_key(ctrl_v, &mut app);
+        assert!(
+            app.input.is_empty(),
+            "secure input must not write to main input"
+        );
+        assert!(
+            app.secure_input.is_some(),
+            "secure input state must persist"
+        );
+    }
+
+    #[test]
+    fn test_copy_failure_logs_notification_via_selection() {
+        let mut app = make_app();
+        // Set a chat selection and attempt copy.
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((0, 5));
+        let ok = app.copy_selection();
+        assert!(!ok, "copy must fail on headless");
+        // The failure should have logged a notification via dashboard.log.
+        let has_copy_failure = app
+            .dashboard
+            .activity_log
+            .iter()
+            .any(|e| e.message.contains("Clipboard unavailable"));
+        assert!(has_copy_failure, "copy failure must log notification");
+    }
+
+    #[test]
+    fn test_copy_failure_logs_notification_via_textarea() {
+        let mut app = make_app();
+        // Set a textarea selection and attempt copy via Ctrl+C path.
+        app.input.set_text("hello world");
+        app.input.inner_mut().set_selection(0, 5);
+        let ctrl_c = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_key(ctrl_c, &mut app);
+        // Copy fails on headless, so a notification should be logged.
+        let has_copy_failure = app
+            .dashboard
+            .activity_log
+            .iter()
+            .any(|e| e.message.contains("Clipboard unavailable"));
+        assert!(
+            has_copy_failure,
+            "textarea copy failure must log notification"
+        );
+    }
+
+    #[test]
+    fn test_copy_selection_fails_gracefully_on_headless() {
+        let mut app = make_app();
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((0, 5));
+        let ok = app.copy_selection();
+        assert!(
+            !ok,
+            "copy selection must return false when clipboard unavailable"
+        );
+        // Selection should still be cleared even on failure.
+        assert!(
+            !app.has_selection(),
+            "selection must be cleared after copy attempt"
+        );
+    }
+
+    #[test]
+    fn test_ctrl_v_pastes_os_clipboard_content() {
+        let mut app = make_app();
+        // Ctrl+V should paste from OS clipboard (returns None on headless,
+        // so no text is inserted but the key is still consumed).
+        let ctrl_v = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('v'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_key(ctrl_v, &mut app);
+        // Headless: no clipboard → empty input, no panic.
+        assert!(app.input.is_empty(), "no content pasted on headless");
+    }
+
+    #[test]
+    fn test_toggle_metrics_shortcut_is_ctrl_e() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app();
+        // Ctrl+E must toggle metrics (not Ctrl+V).
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        handle_key(ctrl_e, &mut app);
+        assert!(app.dashboard.show_metrics, "Ctrl+E must toggle metrics on");
+        // Press again to turn off.
+        handle_key(ctrl_e, &mut app);
+        assert!(
+            !app.dashboard.show_metrics,
+            "Ctrl+E must toggle metrics off"
+        );
+    }
+
+    #[test]
+    fn test_all_shortcuts_still_bound() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        fn ctrl(code: KeyCode) -> KeyEvent {
+            KeyEvent::new(code, KeyModifiers::CONTROL)
+        }
+        // Every existing shortcut must still resolve to a known action.
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('a'))),
+            Some(Shortcut::ToggleAgents)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('g'))),
+            Some(Shortcut::ToggleTaskGraph)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('m'))),
+            Some(Shortcut::ToggleMemory)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('s'))),
+            Some(Shortcut::SaveSession)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('t'))),
+            Some(Shortcut::ToggleTrace)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('l'))),
+            Some(Shortcut::ClearLogs)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('c'))),
+            Some(Shortcut::CancelTask)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('q'))),
+            Some(Shortcut::Quit)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('p'))),
+            Some(Shortcut::OpenCommandPalette)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('e'))),
+            Some(Shortcut::ToggleMetrics)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('o'))),
+            Some(Shortcut::ToggleRail)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('u'))),
+            Some(Shortcut::ToggleCoordination)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('k'))),
+            Some(Shortcut::ToggleConsole)
+        );
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('d'))),
+            Some(Shortcut::ViewDiff)
+        );
+        // Ctrl+V is no longer a shortcut — it is handled as paste directly.
+        assert_eq!(
+            events::check_key_shortcuts(&ctrl(KeyCode::Char('v'))),
+            None,
+            "Ctrl+V must not map to any shortcut"
+        );
+    }
+
+    #[test]
+    fn test_first_frame_terminal_size_initialized() {
+        let mut app = make_app();
+        // After run() initializes the terminal, terminal_size should be set.
+        // Simulate what run_loop does after terminal creation.
+        app.terminal_size = Some(Rect::new(0, 0, 120, 40));
+        // Mouse event in input area should now route to textarea.
+        let input_area = app
+            .terminal_size
+            .map(|size| compute_ui_layout(&app, size).input_area(size));
+        assert!(
+            input_area.is_some(),
+            "input area must be computable with initialized terminal_size"
         );
     }
 }

@@ -5,6 +5,7 @@ use crate::tui::console::{ConsoleStatus, PtyConsole};
 use crate::tui::dashboard::Dashboard;
 use crate::tui::textarea_adapter::InputAdapter;
 use anyhow::Result;
+use ratatui::layout::Rect;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::mpsc;
@@ -133,6 +134,9 @@ pub struct TuiApp {
     pub selection_start: Option<(u16, u16)>,
     pub selection_end: Option<(u16, u16)>,
     pub is_selecting: bool,
+    /// Current terminal viewport size, updated on every resize event.
+    /// Used to determine whether mouse events land in the input area.
+    pub terminal_size: Option<Rect>,
 }
 
 /// UI state for the provider management panel
@@ -291,6 +295,7 @@ impl TuiApp {
             selection_start: None,
             selection_end: None,
             is_selecting: false,
+            terminal_size: None,
         })
     }
 
@@ -386,6 +391,8 @@ impl TuiApp {
     }
 
     /// Copies text to the system clipboard (macOS: pbcopy, Linux: xclip/wl-copy).
+    /// Returns `true` on success, `false` if no backend is available.
+    /// On failure, logs a non-intrusive notification to the dashboard.
     pub fn copy_to_clipboard(&self, text: &str) -> bool {
         if text.is_empty() {
             return false;
@@ -410,6 +417,28 @@ impl TuiApp {
         false
     }
 
+    /// Reads text from the operating system clipboard.
+    /// Tries pbpaste (macOS), xclip -selection clipboard -o (Linux X11),
+    /// then wl-paste (Linux Wayland). Returns `Some(text)` on success,
+    /// `None` if no backend is available or the read fails.
+    pub fn read_from_clipboard(&self) -> Option<String> {
+        for cmd in ["pbpaste", "xclip", "wl-paste"] {
+            let mut c = std::process::Command::new(cmd);
+            if cmd == "xclip" {
+                c.args(["-selection", "clipboard", "-o"]);
+            }
+            match c.output() {
+                Ok(out) if out.status.success() => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    let text = text.trim_end_matches('\n').to_string();
+                    return Some(text);
+                }
+                _ => continue,
+            }
+        }
+        None
+    }
+
     // ─── Text selection ─────────────────────────────────────────────────
 
     /// Whether a mouse-driven text selection is currently active in the chat.
@@ -432,7 +461,12 @@ impl TuiApp {
         if text.is_empty() {
             return false;
         }
-        self.copy_to_clipboard(&text)
+        let ok = self.copy_to_clipboard(&text);
+        if !ok {
+            self.dashboard
+                .log("info", "Clipboard unavailable".to_string());
+        }
+        ok
     }
 
     /// Extract the plain-text content covered by the current mouse selection.

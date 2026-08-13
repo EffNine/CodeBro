@@ -32,6 +32,10 @@ pub enum InputResult {
     Submit,
     /// The user pressed Ctrl+Enter: insert a newline into the textarea.
     Newline,
+    /// The key was not handled by the adapter and should be passed back to
+    /// the host for further processing (e.g. typing a character while
+    /// autocomplete is open).
+    PassThrough,
 }
 
 /// Result of processing a mouse event.
@@ -114,6 +118,11 @@ impl InputAdapter {
         self.inner.take_clipboard()
     }
 
+    /// Clear the active selection without affecting the clipboard.
+    pub fn clear_selection(&mut self) {
+        self.inner.clear_selection();
+    }
+
     // ── Keyboard ──────────────────────────────────────────────────────────
 
     /// Process a key event. Returns `InputResult` describing what the host
@@ -125,8 +134,22 @@ impl InputAdapter {
     /// and this method is never invoked while it is active.
     pub fn handle_key(&mut self, key: KeyEvent, dashboard: &Dashboard) -> InputResult {
         // Autocomplete owns arrow / page / home / end / enter / esc while open.
+        // Characters and Backspace fall through so typing keeps filtering.
         if !dashboard.autocomplete.is_empty() {
-            return InputResult::Consumed;
+            return match key.code {
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Enter
+                | KeyCode::Esc
+                | KeyCode::Tab => InputResult::Consumed,
+                _ => InputResult::PassThrough,
+            };
         }
 
         match key.kind {
@@ -148,9 +171,8 @@ impl InputAdapter {
             if matches!(key.code, KeyCode::Enter) {
                 return InputResult::Submit;
             }
-            // Ctrl+V → paste from system clipboard.
+            // Ctrl+V → paste from system clipboard (handled by caller).
             if matches!(key.code, KeyCode::Char('v')) {
-                self.inner.input(key);
                 return InputResult::Consumed;
             }
             // All other Ctrl+ shortcuts belong to CodeBro.
