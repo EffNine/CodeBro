@@ -22,6 +22,7 @@ pub enum ProviderId {
     OpenAI,
     OpenRouter,
     DeepSeek,
+    AGNES,
     Ollama,
     LMStudio,
     Custom(String),
@@ -33,6 +34,7 @@ impl std::fmt::Display for ProviderId {
             ProviderId::OpenAI => write!(f, "OpenAI"),
             ProviderId::OpenRouter => write!(f, "OpenRouter"),
             ProviderId::DeepSeek => write!(f, "DeepSeek"),
+            ProviderId::AGNES => write!(f, "AGNES"),
             ProviderId::Ollama => write!(f, "Ollama"),
             ProviderId::LMStudio => write!(f, "LM Studio"),
             ProviderId::Custom(s) => write!(f, "{}", s),
@@ -46,6 +48,7 @@ impl ProviderId {
             ProviderId::OpenAI => "openai",
             ProviderId::OpenRouter => "openrouter",
             ProviderId::DeepSeek => "deepseek",
+            ProviderId::AGNES => "agnes",
             ProviderId::Ollama => "ollama",
             ProviderId::LMStudio => "lmstudio",
             ProviderId::Custom(s) => s,
@@ -56,7 +59,10 @@ impl ProviderId {
         match self {
             ProviderId::OpenAI => "https://api.openai.com/v1".to_string(),
             ProviderId::OpenRouter => "https://openrouter.ai/api/v1".to_string(),
-            ProviderId::DeepSeek => "https://api.deepseek.com/v1".to_string(),
+            // Official DeepSeek base URL (the bare host; `/v1` is a legacy
+            // suffix the API accepts but the official docs no longer use).
+            ProviderId::DeepSeek => "https://api.deepseek.com".to_string(),
+            ProviderId::AGNES => "https://apihub.agnes-ai.com/v1".to_string(),
             ProviderId::Ollama => "http://localhost:11434".to_string(),
             ProviderId::LMStudio => "http://localhost:1234/v1".to_string(),
             ProviderId::Custom(_) => String::new(),
@@ -68,6 +74,7 @@ impl ProviderId {
             "openai" => Some(ProviderId::OpenAI),
             "openrouter" => Some(ProviderId::OpenRouter),
             "deepseek" => Some(ProviderId::DeepSeek),
+            "agnes" => Some(ProviderId::AGNES),
             "ollama" => Some(ProviderId::Ollama),
             "lmstudio" | "lm studio" => Some(ProviderId::LMStudio),
             "" => None,
@@ -129,10 +136,31 @@ impl ProviderEntry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     pub is_default: bool,
+    /// Human-friendly display name; `None` when not known.
+    pub display_name: Option<String>,
+    /// Officially documented tool-calling support; `None` when unknown.
+    pub tool_calling: Option<bool>,
+    /// Officially documented context window in tokens; `None` when unknown.
+    pub context_tokens: Option<u64>,
+    /// How this model became known to CodeBro.
+    pub source: crate::providers::ModelSource,
+}
+
+impl ModelInfo {
+    pub fn from_discovered(m: &crate::providers::DiscoveredModel, is_default: bool) -> Self {
+        ModelInfo {
+            id: m.id.clone(),
+            is_default,
+            display_name: m.metadata.display_name.clone(),
+            tool_calling: m.metadata.tool_calling,
+            context_tokens: m.metadata.context_tokens,
+            source: m.source,
+        }
+    }
 }
 
 // ─── ProviderManager ─────────────────────────────────────────────────────────
@@ -165,6 +193,7 @@ impl ProviderManager {
             ProviderId::OpenAI,
             ProviderId::OpenRouter,
             ProviderId::DeepSeek,
+            ProviderId::AGNES,
             ProviderId::Ollama,
             ProviderId::LMStudio,
         ] {
@@ -212,6 +241,19 @@ impl ProviderManager {
             .and_then(|k| self.providers.get(k))
             .map(|p| p.current_model.clone())
             .unwrap_or_default()
+    }
+
+    /// Read-only access to a registered provider entry.
+    pub fn provider_entry(&self, provider_id: &str) -> Option<&ProviderEntry> {
+        self.providers.get(provider_id)
+    }
+
+    /// The stored API key for a provider, if any (in-memory secret; callers
+    /// must never log or render it).
+    pub fn api_key_for(&self, provider_id: &str) -> Option<&str> {
+        self.providers
+            .get(provider_id)
+            .and_then(|p| p.api_key.as_deref())
     }
 
     pub fn set_model(&mut self, model: &str) -> Result<()> {
@@ -279,6 +321,17 @@ impl ProviderManager {
 
     // ─── Health Checks ───────────────────────────────────────────────────
 
+    /// Check a provider's health by querying its `/models` endpoint.
+    ///
+    /// Failures are classified and surfaced with actionable reasons:
+    ///
+    /// - auth failures (401/403) and quota failures (402) are always
+    ///   `Unhealthy` — a stored key is invalid or has no balance;
+    /// - rate limiting (429) is `Unhealthy`;
+    /// - a broken/missing endpoint is `Unhealthy`, EXCEPT when the provider
+    ///   has a deterministic official catalog (e.g. DeepSeek): the provider
+    ///   is then marked `Healthy` because CodeBro can still serve its known
+    ///   models (labelled `provider default`, never `discovered`).
     pub async fn check_health(&mut self, provider_id: &str) -> Result<HealthStatus> {
         let entry = self
             .providers
@@ -286,33 +339,40 @@ impl ProviderManager {
             .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_id))?;
 
         let start = Instant::now();
-        let key = entry.api_key.as_deref();
-        let url = &entry.base_url;
+        let key = entry.api_key.as_deref().map(|s| s.to_string());
+        let url = entry.base_url.clone();
+        let provider = provider_id.to_string();
 
-        match fetch_models(url, key).await {
-            Ok(models) => {
-                let latency = start.elapsed().as_millis() as u64;
-                entry.latency_ms = Some(latency);
-                entry.last_health_check = Some(chrono::Utc::now());
-                entry.health = if models.is_empty() {
-                    HealthStatus::Unhealthy {
-                        reason: "Provider returned no models".to_string(),
+        let outcome = crate::providers::fetch_models_raw(&url, key.as_deref()).await;
+        let latency = start.elapsed().as_millis() as u64;
+        entry.latency_ms = Some(latency);
+        entry.last_health_check = Some(chrono::Utc::now());
+
+        let health = match &outcome {
+            Ok(models) if !models.is_empty() => HealthStatus::Healthy,
+            Ok(_) => HealthStatus::Unhealthy {
+                reason: "Provider returned no models".to_string(),
+            },
+            Err(err) => {
+                let human = err.human();
+                match err {
+                    crate::providers::DiscoveryError::Http(401)
+                    | crate::providers::DiscoveryError::Http(402)
+                    | crate::providers::DiscoveryError::Http(403)
+                    | crate::providers::DiscoveryError::Http(429) => {
+                        HealthStatus::Unhealthy { reason: human }
                     }
-                } else {
-                    HealthStatus::Healthy
-                };
-                Ok(entry.health.clone())
+                    // Endpoint down (network/5xx/404) but the provider has a
+                    // known official catalog: still usable via the fallback.
+                    _ if crate::providers::fallback_catalog(&provider).is_some() => {
+                        HealthStatus::Healthy
+                    }
+                    _ => HealthStatus::Unhealthy { reason: human },
+                }
             }
-            Err(e) => {
-                let latency = start.elapsed().as_millis() as u64;
-                entry.latency_ms = Some(latency);
-                entry.last_health_check = Some(chrono::Utc::now());
-                entry.health = HealthStatus::Unhealthy {
-                    reason: e.to_string(),
-                };
-                Ok(entry.health.clone())
-            }
-        }
+        };
+        entry.health = health.clone();
+        Ok(health)
     }
 
     pub async fn check_all_health(&mut self) -> Vec<(String, HealthStatus, Option<u64>)> {
@@ -342,21 +402,29 @@ impl ProviderManager {
 
     // ─── Models ──────────────────────────────────────────────────────────
 
+    /// Discover the provider's models: `/models` first, then the
+    /// provider-known fallback catalog when the endpoint is unavailable or
+    /// incomplete. The provenance (discovered vs provider default) is
+    /// attached to every model.
     pub async fn fetch_models(&mut self, provider_id: &str) -> Result<Vec<ModelInfo>> {
         let entry = self
             .providers
             .get(provider_id)
             .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_id))?;
 
-        let models = fetch_models(&entry.base_url, entry.api_key.as_deref()).await?;
-        let default_model = crate::providers::pick_default(&models);
+        let base_url = entry.base_url.clone();
+        let api_key = entry.api_key.clone();
+        let provider = provider_id.to_string();
 
-        Ok(models
-            .into_iter()
-            .map(|m| ModelInfo {
-                id: m.clone(),
-                is_default: default_model.as_deref() == Some(&m),
-            })
+        let discovery =
+            crate::providers::discover_models(&base_url, api_key.as_deref(), &provider).await;
+        let ids: Vec<String> = discovery.models.iter().map(|m| m.id.clone()).collect();
+        let default_model = crate::providers::pick_default(&ids);
+
+        Ok(discovery
+            .models
+            .iter()
+            .map(|m| ModelInfo::from_discovered(m, default_model.as_deref() == Some(&m.id)))
             .collect())
     }
 
@@ -364,10 +432,12 @@ impl ProviderManager {
         let entry = self.providers.get(provider_id)?.clone();
         let key = entry.api_key.as_deref().map(|s| s.to_string());
         let url = entry.base_url.clone();
+        let provider = provider_id.to_string();
 
         // Run discovery in a separate thread to avoid runtime nesting issues
         let key_clone = key.clone();
         let url_clone = url.clone();
+        let provider_clone = provider.clone();
         let discovered = std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -379,6 +449,7 @@ impl ProviderManager {
             rt.block_on(crate::providers::discover_model(
                 &url_clone,
                 key_clone.as_deref(),
+                &provider_clone,
             ))
         })
         .join()
@@ -395,6 +466,39 @@ impl ProviderManager {
             .iter()
             .map(|(k, v)| (k.as_str(), v))
             .collect()
+    }
+
+    /// Providers in a stable, human-friendly order: built-ins first
+    /// (OpenAI, OpenRouter, DeepSeek, AGNES, Ollama, LM Studio), then custom
+    /// providers alphabetically. Deterministic across calls.
+    pub fn list_providers_ordered(&self) -> Vec<(String, &ProviderEntry)> {
+        const KNOWN: [&str; 6] = [
+            "openai",
+            "openrouter",
+            "deepseek",
+            "agnes",
+            "ollama",
+            "lmstudio",
+        ];
+        let mut out = Vec::new();
+        for id in KNOWN {
+            if let Some(entry) = self.providers.get(id) {
+                out.push((id.to_string(), entry));
+            }
+        }
+        let mut rest: Vec<String> = self
+            .providers
+            .keys()
+            .filter(|k| !KNOWN.contains(&k.as_str()))
+            .cloned()
+            .collect();
+        rest.sort();
+        for id in rest {
+            if let Some(entry) = self.providers.get(&id) {
+                out.push((id, entry));
+            }
+        }
+        out
     }
 
     pub fn list_provider_ids(&self) -> Vec<String> {
@@ -465,7 +569,24 @@ impl ProviderManager {
 
         let loaded: ProviderManager =
             serde_json::from_str(&content).with_context(|| "Failed to parse providers.json")?;
-        self.providers = loaded.providers;
+        // Merge, never replace: entries registered locally (e.g. built-ins
+        // added by `register_builtin` like AGNES) survive even when the
+        // persisted file predates them. Persisted values (base URL, health,
+        // model) win for entries that already exist.
+        for (key, value) in loaded.providers {
+            match self.providers.get_mut(&key) {
+                Some(existing) => {
+                    existing.base_url = value.base_url;
+                    existing.current_model = value.current_model;
+                    existing.health = value.health;
+                    existing.last_health_check = value.last_health_check;
+                    existing.latency_ms = value.latency_ms;
+                }
+                None => {
+                    self.providers.insert(key, value);
+                }
+            }
+        }
         self.active_provider = loaded.active_provider;
 
         // Merge stored credentials back into memory so providers keep working
@@ -579,6 +700,7 @@ mod tests {
     #[test]
     fn test_provider_id_display() {
         assert_eq!(ProviderId::OpenAI.to_string(), "OpenAI");
+        assert_eq!(ProviderId::AGNES.to_string(), "AGNES");
         assert_eq!(
             ProviderId::Custom("myprovider".to_string()).to_string(),
             "myprovider"
@@ -602,9 +724,24 @@ mod tests {
             "https://api.openai.com/v1"
         );
         assert_eq!(
+            ProviderId::DeepSeek.default_base_url(),
+            "https://api.deepseek.com"
+        );
+        assert_eq!(
+            ProviderId::AGNES.default_base_url(),
+            "https://apihub.agnes-ai.com/v1"
+        );
+        assert_eq!(
             ProviderId::Ollama.default_base_url(),
             "http://localhost:11434"
         );
+    }
+
+    #[test]
+    fn test_provider_id_agnes_roundtrip() {
+        assert_eq!(ProviderId::from_str("agnes"), Some(ProviderId::AGNES));
+        assert_eq!(ProviderId::AGNES.as_str(), "agnes");
+        assert_eq!(ProviderId::AGNES.to_string(), "AGNES");
     }
 
     #[test]
@@ -644,14 +781,26 @@ mod tests {
             ModelInfo {
                 id: "gpt-4o".to_string(),
                 is_default: true,
+                display_name: None,
+                tool_calling: None,
+                context_tokens: None,
+                source: crate::providers::ModelSource::Discovered,
             },
             ModelInfo {
                 id: "gpt-4o-mini".to_string(),
                 is_default: false,
+                display_name: None,
+                tool_calling: None,
+                context_tokens: None,
+                source: crate::providers::ModelSource::Discovered,
             },
             ModelInfo {
                 id: "whisper-1".to_string(),
                 is_default: false,
+                display_name: None,
+                tool_calling: None,
+                context_tokens: None,
+                source: crate::providers::ModelSource::Discovered,
             },
         ];
 
@@ -745,5 +894,144 @@ mod tests {
         reloaded.register_builtin();
         reloaded.load().unwrap();
         assert!(!reloaded.has_api_key("openai"));
+    }
+
+    #[test]
+    fn test_builtin_registration_includes_agnes() {
+        let mut pm = ProviderManager::new(PathBuf::from("/tmp"));
+        pm.register_builtin();
+        let ids = pm.list_provider_ids();
+        assert!(ids.iter().any(|id| id == "agnes"), "AGNES registered");
+        assert!(ids.iter().any(|id| id == "deepseek"));
+        assert!(ids.iter().any(|id| id == "ollama"));
+    }
+
+    #[test]
+    fn test_configured_status_distinguishes_local_and_cloud() {
+        let mut pm = ProviderManager::new(PathBuf::from("/tmp"));
+        pm.register_builtin();
+        // Cloud providers need a key to be "configured".
+        assert!(!pm.has_api_key("deepseek"));
+        pm.set_api_key("deepseek", "sk-ds-test-123456").unwrap();
+        assert!(pm.has_api_key("deepseek"));
+        // Local providers exist without keys.
+        let ollama = pm.providers.get("ollama").unwrap();
+        assert!(!ollama.base_url.is_empty());
+        assert!(
+            crate::providers::is_local_provider("ollama"),
+            "Ollama is a local provider"
+        );
+    }
+
+    // ─── Health / discovery (deterministic local mock server) ────────────
+
+    async fn mock_server(status: u16, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn test_health_auth_failure_is_unhealthy_with_actionable_reason() {
+        let url = mock_server(401, r#"{"error":"invalid key"}"#).await;
+        let mut pm = ProviderManager::new(PathBuf::from("/tmp"));
+        pm.register_builtin();
+        pm.set_api_key("deepseek", "sk-wrong").unwrap();
+        pm.providers.get_mut("deepseek").unwrap().base_url = url;
+        let health = pm.check_health("deepseek").await.unwrap();
+        match health {
+            HealthStatus::Unhealthy { reason } => {
+                assert!(
+                    reason.contains("authentication failed"),
+                    "auth failure must be actionable, got: {}",
+                    reason
+                );
+            }
+            other => panic!("401 must be Unhealthy, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_down_uses_fallback_for_deepseek() {
+        // Nothing is listening on this port: connection refused.
+        let mut pm = ProviderManager::new(PathBuf::from("/tmp"));
+        pm.register_builtin();
+        pm.set_api_key("deepseek", "sk-test-123456").unwrap();
+        pm.providers.get_mut("deepseek").unwrap().base_url = "http://127.0.0.1:1".to_string();
+        let health = pm.check_health("deepseek").await.unwrap();
+        assert_eq!(
+            health,
+            HealthStatus::Healthy,
+            "known catalog keeps provider usable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_down_is_unhealthy_without_fallback() {
+        let mut pm = ProviderManager::new(PathBuf::from("/tmp"));
+        pm.register_builtin();
+        pm.providers.get_mut("openai").unwrap().base_url = "http://127.0.0.1:1".to_string();
+        let health = pm.check_health("openai").await.unwrap();
+        assert!(
+            matches!(health, HealthStatus::Unhealthy { .. }),
+            "openai has no fallback catalog; endpoint down must be Unhealthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_models_marks_fallback_as_provider_default() {
+        let mut pm = ProviderManager::new(PathBuf::from("/tmp"));
+        pm.register_builtin();
+        pm.set_api_key("deepseek", "sk-test-123456").unwrap();
+        pm.providers.get_mut("deepseek").unwrap().base_url = "http://127.0.0.1:1".to_string();
+        let models = pm.fetch_models("deepseek").await.unwrap();
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["deepseek-v4-flash", "deepseek-v4-pro"]);
+        assert!(
+            models
+                .iter()
+                .all(|m| m.source == crate::providers::ModelSource::ProviderDefault),
+            "fallback models must never claim to be discovered"
+        );
+        assert_eq!(models[0].tool_calling, Some(true));
+        assert_eq!(models[0].context_tokens, Some(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_models_marks_discovered_models() {
+        let url = mock_server(
+            200,
+            r#"{"data":[{"id":"deepseek-v4-flash"},{"id":"deepseek-v4-pro"}]}"#,
+        )
+        .await;
+        let mut pm = ProviderManager::new(PathBuf::from("/tmp"));
+        pm.register_builtin();
+        pm.set_api_key("deepseek", "sk-test-123456").unwrap();
+        pm.providers.get_mut("deepseek").unwrap().base_url = url;
+        let models = pm.fetch_models("deepseek").await.unwrap();
+        assert!(models.len() >= 2);
+        assert!(
+            models
+                .iter()
+                .all(|m| m.source == crate::providers::ModelSource::Discovered),
+            "advertised models must be marked discovered"
+        );
+        // Metadata is unknown for discovered models (never fabricated).
+        assert!(models.iter().all(|m| m.tool_calling.is_none()));
+        assert!(models.iter().all(|m| m.context_tokens.is_none()));
     }
 }

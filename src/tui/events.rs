@@ -13,8 +13,19 @@ pub enum AppEvent {
     StreamChunk(String),
     AgentEvent(crate::agent::events::AgentEvent),
     Resize(u16, u16),
-    ModelsFetched(Vec<String>),
+    /// Model discovery completed with provenance (discovered vs fallback).
+    ModelsFetched {
+        models: Vec<crate::provider_manager::ModelInfo>,
+        /// Optional note shown in the chat (e.g. fallback usage).
+        note: Option<String>,
+    },
     ModelsFetchFailed(String),
+    /// Provider health/model check completed right after an API key was
+    /// stored. `message` is the sanitized, actionable summary.
+    ProviderCheckResult {
+        provider: String,
+        message: String,
+    },
     /// A bracketed-paste block from the terminal (may contain newlines).
     Paste(String),
     Mouse(MouseEvent),

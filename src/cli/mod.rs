@@ -29,7 +29,10 @@ enum Commands {
 const FALLBACK_MODEL: &str = "gpt-4o";
 
 /// If no model is configured, query the provider's `/models` endpoint and pick
-/// a sensible default. Persists the choice so future launches are instant.
+/// a sensible default. When the endpoint is unavailable or incomplete but the
+/// provider has a deterministic official catalog (e.g. DeepSeek), the
+/// provider-known fallback is used instead — clearly labelled as such.
+/// Persists the choice so future launches are instant.
 fn resolve_model(config: &mut crate::config::Config) {
     if config.is_model_set() {
         return;
@@ -45,6 +48,7 @@ fn resolve_model(config: &mut crate::config::Config) {
     // block_on on this thread.
     let base_url = config.base_url.clone();
     let key = api_key.clone();
+    let provider = config.provider.clone();
     let discovered = std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -53,16 +57,30 @@ fn resolve_model(config: &mut crate::config::Config) {
             Ok(rt) => rt,
             Err(_) => return None,
         };
-        rt.block_on(crate::providers::discover_model(&base_url, key.as_deref()))
+        rt.block_on(crate::providers::discover_models(
+            &base_url,
+            key.as_deref(),
+            &provider,
+        ))
+        .into()
     })
     .join()
     .ok()
     .flatten();
 
     match discovered {
-        Some(model) if !model.is_empty() => {
+        Some(discovery) if !discovery.models.is_empty() => {
+            let model = crate::providers::pick_default_from_discovery(&discovery);
+            let model = model.unwrap_or_else(|| discovery.models[0].id.clone());
             config.model = model.clone();
-            println!("Auto-detected model: {} (from {})", model, config.base_url);
+            if discovery.used_fallback {
+                println!(
+                    "Model endpoint unavailable; using provider-known fallback models from {}: {}",
+                    config.base_url, model
+                );
+            } else {
+                println!("Auto-detected model: {} (from {})", model, config.base_url);
+            }
             let _ = config.persist_model();
         }
         _ => {
@@ -194,6 +212,7 @@ async fn run_onboarding_wizard(
             Ok(rt) => rt.block_on(crate::providers::discover_model(
                 &provider_for_discovery.default_base_url(),
                 Some(&api_key),
+                provider_for_discovery.as_str(),
             )),
             Err(_) => None,
         }

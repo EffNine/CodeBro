@@ -130,24 +130,30 @@ pub struct TuiApp {
 /// UI state for the provider management panel
 #[derive(Debug, Clone)]
 pub struct ProviderPanel {
+    pub open: bool,
     pub active_provider: Option<String>,
     pub selected_provider_index: usize,
+    /// When set, the detail view for this provider is shown instead of the
+    /// provider list.
+    pub detail_provider: Option<String>,
     pub health_results: Vec<(String, crate::provider_manager::HealthStatus, Option<u64>)>,
     pub loading_health: bool,
-    pub show_api_key_input: bool,
-    pub api_key_input: String,
 }
 
 impl ProviderPanel {
     pub fn new() -> Self {
         ProviderPanel {
+            open: false,
             active_provider: None,
             selected_provider_index: 0,
+            detail_provider: None,
             health_results: Vec::new(),
             loading_health: false,
-            show_api_key_input: false,
-            api_key_input: String::new(),
         }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
     }
 }
 
@@ -191,7 +197,7 @@ impl TuiApp {
         Self::new_with_config(config)
     }
 
-    pub fn new_with_config(config: Config) -> Result<Self> {
+    pub fn new_with_config(mut config: Config) -> Result<Self> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let (tx, _rx) = std::sync::mpsc::channel();
 
@@ -203,6 +209,18 @@ impl TuiApp {
             crate::provider_manager::ProviderManager::new(config_dir.clone());
         provider_manager.register_builtin();
         let _ = provider_manager.load();
+
+        // Onboarding bridge: credentials stored via `//apikey` live in the
+        // secure credential store. When the runtime config has no key but the
+        // active provider does, sync it so chat actually authenticates — the
+        // secret is never printed or serialized into config.toml.
+        if config.api_key.is_none() {
+            if let Some(active) = provider_manager.active_provider().cloned() {
+                if let Some(key) = provider_manager.api_key_for(&active) {
+                    config.api_key = Some(key.to_string());
+                }
+            }
+        }
 
         let settings = crate::settings::SettingsManager::new(config.clone(), config_dir.clone());
 
@@ -769,37 +787,68 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Opens the interactive model picker and fetches the provider's models.
+    /// Opens the interactive model picker and discovers the active provider's
+    /// models: `/models` first, provider-known fallback catalog when the
+    /// endpoint is unavailable or incomplete. Failures arrive as actionable,
+    /// sanitized messages — never raw HTTP bodies or secrets.
     pub fn open_model_picker(&mut self) {
         self.dashboard.model_picker.open();
 
         let base_url = self.config.base_url.clone();
         let api_key = self.config.api_key.clone();
+        let provider = self.config.provider.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let key = api_key
                 .clone()
                 .or_else(|| std::env::var("CODEBRO_API_KEY").ok());
-            // We're already inside the app's tokio runtime — just await.
-            match crate::providers::fetch_models(&base_url, key.as_deref()).await {
-                Ok(models) if !models.is_empty() => {
-                    let _ = tx.send(events::AppEvent::ModelsFetched(models));
-                }
-                Ok(_) => {
-                    let _ = tx.send(events::AppEvent::ModelsFetchFailed(
-                        "Provider returned no models".to_string(),
-                    ));
-                }
-                Err(e) => {
-                    let _ = tx.send(events::AppEvent::ModelsFetchFailed(e.to_string()));
-                }
+            let discovery =
+                crate::providers::discover_models(&base_url, key.as_deref(), &provider).await;
+            if discovery.models.is_empty() {
+                let msg = match &discovery.error {
+                    Some(err) => crate::providers::actionable_model_error(&provider, err),
+                    None => format!(
+                        "{} model discovery failed\nModel endpoint unavailable",
+                        crate::providers::provider_display_name(&provider)
+                    ),
+                };
+                let _ = tx.send(events::AppEvent::ModelsFetchFailed(msg));
+                return;
             }
+            let ids: Vec<String> = discovery.models.iter().map(|m| m.id.clone()).collect();
+            let default_model = crate::providers::pick_default(&ids);
+            let models: Vec<crate::provider_manager::ModelInfo> = discovery
+                .models
+                .iter()
+                .map(|m| {
+                    crate::provider_manager::ModelInfo::from_discovered(
+                        m,
+                        default_model.as_deref() == Some(&m.id),
+                    )
+                })
+                .collect();
+            let note = if discovery.used_fallback {
+                Some(format!(
+                    "Model endpoint unavailable\nUsing provider-known fallback models"
+                ))
+            } else {
+                None
+            };
+            let _ = tx.send(events::AppEvent::ModelsFetched { models, note });
         });
     }
 
-    pub fn handle_models_fetched(&mut self, models: Vec<String>) {
+    pub fn handle_models_fetched(
+        &mut self,
+        models: Vec<crate::provider_manager::ModelInfo>,
+        note: Option<String>,
+    ) {
         self.dashboard.model_picker.set_models(models);
         self.dashboard.log("info", "Model list loaded".to_string());
+        if let Some(note) = note {
+            self.dashboard.log("info", note.clone());
+            self.add_message(MessageRole::System, note);
+        }
     }
 
     pub fn handle_models_failed(&mut self, error: String) {
@@ -809,7 +858,7 @@ impl TuiApp {
             .log("error", format!("Model fetch failed: {}", error));
         self.add_message(
             MessageRole::System,
-            format!("Failed to load models: {}", error),
+            format!("Failed to load models:\n{}", error),
         );
     }
 
@@ -820,6 +869,13 @@ impl TuiApp {
         }
         self.config.model = model.clone();
         let _ = self.config.persist_model();
+        // Keep the provider manager's model record in sync.
+        if let Some(ref mut pm) = self.provider_manager {
+            if pm.active_provider().is_some() {
+                let _ = pm.set_model(&model);
+                let _ = pm.persist();
+            }
+        }
         self.dashboard.model_picker.close();
         self.add_message(MessageRole::System, format!("Model set to {}", model));
         self.dashboard
@@ -903,22 +959,28 @@ impl TuiApp {
 
     pub fn open_provider_manager(&mut self) {
         self.provider_panel = ProviderPanel::new();
+        self.provider_panel.open = true;
         if let Some(ref pm) = self.provider_manager {
             self.provider_panel.active_provider = pm.active_provider().cloned();
+            let active_index = pm
+                .list_provider_ids()
+                .iter()
+                .position(|id| Some(id) == pm.active_provider())
+                .unwrap_or(0);
+            self.provider_panel.selected_provider_index = active_index;
         }
     }
 
     pub fn close_provider_manager(&mut self) {
-        self.provider_panel = ProviderPanel::new();
+        self.provider_panel.open = false;
+        self.provider_panel.detail_provider = None;
     }
 
     pub fn toggle_provider_manager(&mut self) {
-        if self.provider_panel.active_provider.is_none()
-            && self.provider_panel.health_results.is_empty()
-        {
-            self.open_provider_manager();
-        } else {
+        if self.provider_panel.is_open() {
             self.close_provider_manager();
+        } else {
+            self.open_provider_manager();
         }
     }
 
@@ -942,22 +1004,101 @@ impl TuiApp {
         self.provider_panel.loading_health = false;
     }
 
+    /// Store an API key for a provider in the secure credential store and
+    /// sync the runtime config. Returns the key status; the secret itself is
+    /// never returned, logged, or echoed.
     pub fn set_provider_api_key(&mut self, provider_id: &str, key: &str) -> Result<()> {
         if let Some(ref mut pm) = self.provider_manager {
             pm.set_api_key(provider_id, key)?;
             pm.persist()?;
+            // The runtime talks to providers through `self.config`: sync the
+            // fresh secret (and provider identity) so the key is actually
+            // used, without ever printing it.
+            if let Some(active) = pm.active_provider().cloned() {
+                if active == provider_id {
+                    self.config.api_key = Some(key.to_string());
+                }
+            }
             self.add_message(
                 MessageRole::System,
-                format!("API key set for {}", provider_id),
+                format!("✓ API key stored securely for {}", provider_id),
             );
         }
         Ok(())
     }
 
+    /// Run an immediate provider health + model-discovery check after a key
+    /// was stored, so the user sees an actionable result right away.
+    pub fn check_provider_after_apikey(&mut self, provider_id: &str) {
+        let Some(ref mut pm) = self.provider_manager else {
+            return;
+        };
+        let mut pm_clone = pm.clone();
+        let tx = self.tx.clone();
+        let provider = provider_id.to_string();
+        tokio::spawn(async move {
+            let health = pm_clone.check_health(&provider).await.ok();
+            let models = pm_clone.fetch_models(&provider).await.ok();
+            let display = crate::providers::provider_display_name(&provider);
+            let message = match (&health, &models) {
+                (Some(crate::provider_manager::HealthStatus::Healthy), Some(models))
+                    if !models.is_empty() =>
+                {
+                    let any_fallback = models
+                        .iter()
+                        .any(|m| m.source == crate::providers::ModelSource::ProviderDefault);
+                    if any_fallback {
+                        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+                        format!(
+                            "✓ {} reachable — using provider-known fallback models ({})",
+                            display,
+                            ids.join(", ")
+                        )
+                    } else {
+                        format!(
+                            "✓ {} reachable — {} model{} discovered",
+                            display,
+                            models.len(),
+                            if models.len() == 1 { "" } else { "s" }
+                        )
+                    }
+                }
+                (Some(crate::provider_manager::HealthStatus::Unhealthy { reason }), _) => {
+                    format!(
+                        "{} check failed\n{}\nCheck //apikey {}",
+                        display, reason, provider
+                    )
+                }
+                _ => {
+                    format!(
+                        "{} check failed\nProvider not reachable\nCheck //apikey {}",
+                        display, provider
+                    )
+                }
+            };
+            let _ = tx.send(events::AppEvent::ProviderCheckResult {
+                provider: provider.clone(),
+                message,
+            });
+        });
+    }
+
     pub fn switch_provider(&mut self, provider_id: &str) -> Result<()> {
         if let Some(ref mut pm) = self.provider_manager {
             pm.set_active(provider_id)?;
+            // Sync the runtime config (provider, base URL, model, key) from
+            // the provider manager so the next task actually uses the newly
+            // selected provider.
+            if let Some(entry) = pm.provider_entry(provider_id) {
+                self.config.provider = entry.id.as_str().to_string();
+                self.config.base_url = entry.base_url.clone();
+                if !entry.current_model.is_empty() {
+                    self.config.model = entry.current_model.clone();
+                }
+                self.config.api_key = entry.api_key.clone();
+            }
             pm.persist()?;
+            let _ = self.config.persist_model();
             self.provider_panel.active_provider = Some(provider_id.to_string());
             self.add_message(
                 MessageRole::System,

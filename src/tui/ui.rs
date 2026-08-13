@@ -165,8 +165,8 @@ fn handle_event(msg: events::AppEvent, app: &mut TuiApp) -> bool {
             app.scroll_to_bottom();
             true
         }
-        events::AppEvent::ModelsFetched(models) => {
-            app.handle_models_fetched(models);
+        events::AppEvent::ModelsFetched { models, note } => {
+            app.handle_models_fetched(models, note);
             true
         }
         events::AppEvent::ModelsFetchFailed(err) => {
@@ -175,6 +175,10 @@ fn handle_event(msg: events::AppEvent, app: &mut TuiApp) -> bool {
         }
         events::AppEvent::ProviderHealthResults(results) => {
             app.handle_provider_health_results(results);
+            true
+        }
+        events::AppEvent::ProviderCheckResult { message, .. } => {
+            app.add_message(MessageRole::System, message);
             true
         }
         events::AppEvent::WorkspaceDiscovered {
@@ -224,6 +228,10 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                 handle_palette_key(key, app);
                 return;
             }
+            if app.provider_panel.is_open() {
+                handle_provider_manager_key(key, app);
+                return;
+            }
             if app.pending_confirmation.is_some() {
                 handle_confirmation_key(key, app);
                 return;
@@ -232,6 +240,15 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
             // by the secure buffer, never by the main input field.
             if app.secure_input.is_some() {
                 handle_secure_input_key(key, app);
+                return;
+            }
+            // Slash-command autocomplete owns the arrow keys while open so
+            // Up/Down navigate the completion list instead of chat history.
+            // Characters and Backspace fall through so typing keeps filtering.
+            if !app.dashboard.autocomplete.is_empty()
+                && (app.input.starts_with('/') || app.input.starts_with('!'))
+                && handle_autocomplete_key(key, app)
+            {
                 return;
             }
 
@@ -385,6 +402,10 @@ fn dismiss_top_overlay(app: &mut TuiApp) {
         app.dashboard.toggle_command_palette();
         return;
     }
+    if app.provider_panel.is_open() {
+        app.close_provider_manager();
+        return;
+    }
     if app.dashboard.model_picker.is_open() {
         app.dashboard.model_picker.close();
         return;
@@ -455,8 +476,12 @@ fn handle_secure_input_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
             }
             match app.set_provider_api_key(&provider, &secret) {
                 Ok(()) => {
-                    // set_provider_api_key already reports success without
-                    // echoing the value.
+                    // set_provider_api_key already reports "✓ API key stored
+                    // securely" without echoing the value. Immediately run a
+                    // provider health + model-discovery check so the user sees
+                    // an actionable result (auth failures, quota, reachability)
+                    // instead of a silent hang.
+                    app.check_provider_after_apikey(&provider);
                 }
                 Err(e) => {
                     app.add_message(MessageRole::System, format!("API key error: {}", e));
@@ -792,8 +817,8 @@ fn handle_runtime_command(input: &str, app: &mut TuiApp) {
         }
         "//provider" => {
             if arg.is_empty() {
-                let status = app.provider_status_text();
-                app.add_message(MessageRole::System, format!("Providers:\n{}", status));
+                app.open_provider_manager();
+                app.check_provider_health();
             } else if let Err(e) = app.switch_provider(arg) {
                 app.add_message(MessageRole::System, format!("Provider error: {}", e));
             }
@@ -1544,6 +1569,9 @@ fn ui(f: &mut Frame, app: &TuiApp) {
     // Overlays (rendered over the chat when open).
     if app.dashboard.show_command_palette {
         render_command_palette(f, app, layout.chat_area(size));
+    }
+    if app.provider_panel.is_open() {
+        render_provider_manager(f, app, layout.chat_area(size));
     }
     if !app.dashboard.autocomplete.is_empty() && !app.dashboard.model_picker.is_open() {
         render_autocomplete(f, app, layout.input_area(size));
@@ -3073,10 +3101,18 @@ fn render_confirmation(f: &mut Frame, message: &str, input_area: Rect) {
 }
 
 fn render_autocomplete(f: &mut Frame, app: &TuiApp, input_area: Rect) {
-    let entries: Vec<String> = app.dashboard.autocomplete.iter().take(6).cloned().collect();
-    if entries.is_empty() {
+    let all: Vec<String> = app.dashboard.autocomplete.clone();
+    if all.is_empty() {
         return;
     }
+    // Show at most one page of entries, keeping the selection in view.
+    let page = crate::tui::dashboard::NAV_PAGE_SIZE;
+    let start = if app.dashboard.autocomplete_index >= page {
+        app.dashboard.autocomplete_index - page + 1
+    } else {
+        0
+    };
+    let entries: Vec<String> = all.iter().skip(start).take(page).cloned().collect();
     let width = input_area.width.min(60);
     let height = (entries.len() as u16 + 1).min(input_area.y.saturating_sub(2));
     if height < 2 {
@@ -3086,7 +3122,8 @@ fn render_autocomplete(f: &mut Frame, app: &TuiApp, input_area: Rect) {
     let popup = Rect::new(input_area.x, top, width, height);
 
     let mut lines: Vec<Line> = Vec::new();
-    for (i, entry) in entries.iter().enumerate() {
+    for (offset, entry) in entries.iter().enumerate() {
+        let i = start + offset;
         let selected = i == app.dashboard.autocomplete_index;
         let spec = commands::all_commands().find(|s| s.command == entry.as_str());
         let desc = spec.map(|s| s.description).unwrap_or("");
@@ -3126,7 +3163,12 @@ fn render_command_palette(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
     let query = app.dashboard.palette_query.clone();
     let entries = palette_entries(&query);
     let width = chat_area.width.min(72);
-    let height = (entries.len() as u16 + 2).min(chat_area.height.min(18));
+    // An empty result still renders a "No matching commands" body.
+    let height = if entries.is_empty() {
+        chat_area.height.min(9)
+    } else {
+        (entries.len() as u16 + 2).min(chat_area.height.min(18))
+    };
     if height < 3 {
         return;
     }
@@ -3153,24 +3195,38 @@ fn render_command_palette(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
     ]));
 
     let inner_h = height.saturating_sub(3) as usize;
-    for (i, (cmd, desc)) in entries.iter().take(inner_h).enumerate() {
-        let selected = i == app.dashboard.palette_index;
-        let style = if selected {
-            Style::default()
-                .fg(THEME.bg)
-                .bg(THEME.purple)
-                .add_modifier(Modifier::BOLD)
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No matching commands",
+            Style::default().fg(THEME.muted),
+        )));
+    } else {
+        // Keep the selection inside the visible window while the list
+        // scrolls as the user navigates.
+        let start = if app.dashboard.palette_index >= inner_h {
+            app.dashboard.palette_index - inner_h + 1
         } else {
-            Style::default().fg(THEME.primary)
+            0
         };
-        lines.push(Line::from(vec![
-            Span::styled(if selected { "> " } else { "  " }, style),
-            Span::styled(cmd.clone(), style),
-            Span::styled(
-                format!("  {}", truncate_to(desc, width as usize)),
-                Style::default().fg(THEME.muted),
-            ),
-        ]));
+        for (i, (cmd, desc)) in entries.iter().enumerate().skip(start).take(inner_h) {
+            let selected = i == app.dashboard.palette_index;
+            let style = if selected {
+                Style::default()
+                    .fg(THEME.bg)
+                    .bg(THEME.purple)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(THEME.primary)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "> " } else { "  " }, style),
+                Span::styled(cmd.clone(), style),
+                Span::styled(
+                    format!("  {}", truncate_to(desc, width as usize)),
+                    Style::default().fg(THEME.muted),
+                ),
+            ]));
+        }
     }
 
     f.render_widget(
@@ -3193,9 +3249,263 @@ fn palette_entries(filter: &str) -> Vec<(String, &'static str)> {
         .collect()
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Provider manager overlay (//provider)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The provider list renders one row per provider with a status badge:
+/// configured / not configured / local. API keys are never shown — only a
+/// masked suffix in the detail view.
+fn render_provider_manager(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
+    let Some(ref pm) = app.provider_manager else {
+        return;
+    };
+    let width = chat_area.width.min(72);
+    let height = chat_area.height.min(20);
+    let popup = centered_popup(chat_area, width, height);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(THEME.border_style())
+        .title(Span::styled("PROVIDER", THEME.title_style()));
+
+    let mut lines: Vec<Line> = Vec::new();
+    let ordered = pm.list_providers_ordered();
+
+    if let Some(detail) = &app.provider_panel.detail_provider {
+        render_provider_detail(app, pm, detail, &ordered, &mut lines, width);
+    } else {
+        let active = pm.active_provider().cloned();
+        for (i, (id, entry)) in ordered.iter().enumerate() {
+            let selected = i == app.provider_panel.selected_provider_index;
+            let style = if selected {
+                Style::default()
+                    .fg(THEME.bg)
+                    .bg(THEME.purple)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(THEME.primary)
+            };
+            let is_active = active.as_deref() == Some(id.as_str());
+            let status = if crate::providers::is_local_provider(id) {
+                "○ local".to_string()
+            } else if pm.has_api_key(id) {
+                "● configured".to_string()
+            } else {
+                "○ not configured".to_string()
+            };
+            let status_style = if selected {
+                style
+            } else if pm.has_api_key(id) {
+                Style::default().fg(THEME.green)
+            } else if crate::providers::is_local_provider(id) {
+                Style::default().fg(THEME.secondary)
+            } else {
+                Style::default().fg(THEME.muted)
+            };
+            let mut spans = vec![
+                Span::styled(if selected { "> " } else { "  " }, style),
+                Span::styled(
+                    crate::providers::provider_display_name(id).to_string(),
+                    style,
+                ),
+                Span::styled("  ", Style::default()),
+                Span::styled(status, status_style),
+            ];
+            if is_active {
+                spans.push(Span::styled(
+                    "  [active]",
+                    Style::default().fg(if selected { THEME.bg } else { THEME.green }),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(Span::styled(
+            "  ↑↓ navigate · Enter view details · Esc close",
+            Style::default().fg(THEME.muted),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  //apikey <provider> sets a key via masked prompt",
+            Style::default().fg(THEME.muted),
+        )));
+    }
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().bg(THEME.bg)),
+        popup,
+    );
+}
+
+fn render_provider_detail(
+    app: &TuiApp,
+    pm: &crate::provider_manager::ProviderManager,
+    id: &str,
+    _ordered: &[(String, &crate::provider_manager::ProviderEntry)],
+    lines: &mut Vec<Line>,
+    width: u16,
+) {
+    let Some(entry) = pm.provider_entry(id) else {
+        return;
+    };
+    let display = crate::providers::provider_display_name(id);
+    let inner = width.saturating_sub(6) as usize;
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {} ", display),
+            Style::default()
+                .fg(THEME.purple)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if pm.active_provider().map(|a| a == id).unwrap_or(false) {
+                "[active]"
+            } else {
+                ""
+            },
+            Style::default().fg(THEME.green),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("  Provider:  {}", display),
+        Style::default().fg(THEME.primary),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("  Base URL:  {}", truncate_to(&entry.base_url, inner)),
+        Style::default().fg(THEME.primary),
+    )));
+    let auth = match pm.api_key_masked(id) {
+        Some(masked) => format!("● configured ({})", masked),
+        None => "○ not configured".to_string(),
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  Auth:      {}", auth),
+        Style::default().fg(if pm.has_api_key(id) {
+            THEME.green
+        } else {
+            THEME.yellow
+        }),
+    )));
+    let model = if entry.current_model.is_empty() {
+        "auto (run //model to choose)".to_string()
+    } else {
+        entry.current_model.clone()
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  Model:     {}", truncate_to(&model, inner)),
+        Style::default().fg(THEME.primary),
+    )));
+    let health = app
+        .provider_panel
+        .health_results
+        .iter()
+        .find(|(pid, _, _)| pid == id)
+        .map(|(_, h, _)| h)
+        .unwrap_or(&entry.health);
+    let health_line = match health {
+        crate::provider_manager::HealthStatus::Healthy => "✓ healthy".to_string(),
+        crate::provider_manager::HealthStatus::Unhealthy { reason } => {
+            format!("✗ {}", truncate_to(reason, inner))
+        }
+        crate::provider_manager::HealthStatus::Unknown => "○ unknown".to_string(),
+    };
+    let health_style = match health {
+        crate::provider_manager::HealthStatus::Healthy => THEME.green,
+        crate::provider_manager::HealthStatus::Unhealthy { .. } => THEME.red,
+        crate::provider_manager::HealthStatus::Unknown => THEME.muted,
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  Health:    {}", health_line),
+        Style::default().fg(health_style),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Enter switch to this provider · Esc back",
+        Style::default().fg(THEME.muted),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("  Set a key with //apikey {}", id),
+        Style::default().fg(THEME.muted),
+    )));
+}
+
+fn handle_provider_manager_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
+    let Some(pm) = app.provider_manager.as_ref() else {
+        return;
+    };
+    let ordered = pm.list_providers_ordered();
+    let len = ordered.len();
+
+    if app.provider_panel.detail_provider.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                app.provider_panel.detail_provider = None;
+            }
+            KeyCode::Enter => {
+                if let Some(detail) = app.provider_panel.detail_provider.clone() {
+                    if let Err(e) = app.switch_provider(&detail) {
+                        app.add_message(MessageRole::System, format!("Provider error: {}", e));
+                    }
+                    app.close_provider_manager();
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Up => {
+            app.provider_panel.selected_provider_index = crate::tui::dashboard::nav_wrap(
+                app.provider_panel.selected_provider_index,
+                len,
+                -1,
+            );
+        }
+        KeyCode::Down => {
+            app.provider_panel.selected_provider_index =
+                crate::tui::dashboard::nav_wrap(app.provider_panel.selected_provider_index, len, 1);
+        }
+        KeyCode::PageUp => {
+            app.provider_panel.selected_provider_index = crate::tui::dashboard::nav_page(
+                app.provider_panel.selected_provider_index,
+                len,
+                -1,
+                crate::tui::dashboard::NAV_PAGE_SIZE,
+            );
+        }
+        KeyCode::PageDown => {
+            app.provider_panel.selected_provider_index = crate::tui::dashboard::nav_page(
+                app.provider_panel.selected_provider_index,
+                len,
+                1,
+                crate::tui::dashboard::NAV_PAGE_SIZE,
+            );
+        }
+        KeyCode::Home => {
+            app.provider_panel.selected_provider_index = 0;
+        }
+        KeyCode::End => {
+            app.provider_panel.selected_provider_index = len.saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            if let Some((id, _)) = ordered.get(app.provider_panel.selected_provider_index) {
+                app.provider_panel.detail_provider = Some(id.clone());
+                app.provider_panel.selected_provider_index = 0;
+            }
+        }
+        KeyCode::Esc => {
+            app.close_provider_manager();
+        }
+        _ => {}
+    }
+}
+
 fn render_model_picker(f: &mut Frame, app: &TuiApp) {
     let size = f.size();
-    let width = (size.width as usize).min(70);
+    let width = (size.width as usize).min(72);
     let height = (size.height as usize).min(24);
 
     let x = ((size.width as usize).saturating_sub(width)) / 2;
@@ -3210,7 +3520,7 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
     let mut lines: Vec<Line> = Vec::new();
 
     let header = format!(
-        "  Model picker - {} models (type to filter, Enter=select, Esc=cancel)",
+        "  Model picker — {} models (type to filter, ↑↓=select, Enter=select, Esc=cancel)",
         picker.count()
     );
     lines.push(Line::from(Span::styled(
@@ -3222,46 +3532,110 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
 
     if picker.loading {
         lines.push(Line::from(Span::styled(
-            "  Loading models...",
+            "  Loading models…",
             Style::default().fg(THEME.yellow),
         )));
     } else if let Some(ref err) = picker.error {
         lines.push(Line::from(Span::styled(
-            format!("  Error: {}", err),
+            format!("  ✗ {}", err),
             Style::default().fg(THEME.red),
         )));
     } else {
         let visible = picker.visible_models();
-        let current = app.config.model.clone();
-        let start = picker
-            .index
-            .saturating_sub(height.saturating_sub(4) as usize / 2);
-        for (i, model) in visible
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(height as usize - 3)
-        {
-            let selected = i == picker.index;
-            let is_current = model == &current;
-            let marker = if selected { ">" } else { " " };
-            let mut spans = vec![Span::raw(format!("{} ", marker))];
-            if is_current {
-                spans.push(Span::styled(
-                    format!("{}  (current)", model),
-                    Style::default().fg(THEME.green),
-                ));
+        if visible.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No matching models",
+                Style::default().fg(THEME.muted),
+            )));
+        } else {
+            let current = app.config.model.clone();
+            // Each model renders as a 4-line block + separator.
+            let block_h = 5usize;
+            let inner_h = height.saturating_sub(3) as usize;
+            let items_per_page = (inner_h / block_h).max(1);
+            let start = if picker.index >= items_per_page {
+                picker.index - items_per_page + 1
             } else {
-                spans.push(Span::styled(
-                    truncate_to(model, width.saturating_sub(6)),
-                    Style::default().fg(if selected {
-                        THEME.yellow
-                    } else {
-                        THEME.primary
-                    }),
-                ));
+                0
+            };
+
+            for (i, model) in visible.iter().enumerate().skip(start).take(items_per_page) {
+                let selected = i == picker.index;
+                let is_current = model.id == current;
+                let marker = if selected { "> " } else { "  " };
+                let name = model
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| model.id.clone());
+                let id_style = if selected {
+                    Style::default()
+                        .fg(THEME.bg)
+                        .bg(THEME.purple)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(THEME.primary)
+                };
+                let name_style = if selected {
+                    Style::default()
+                        .fg(THEME.bg)
+                        .bg(THEME.purple)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_current {
+                    Style::default()
+                        .fg(THEME.green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(THEME.primary)
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled(marker, name_style),
+                    Span::styled(truncate_to(&name, width.saturating_sub(5)), name_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(truncate_to(&model.id, width.saturating_sub(8)), id_style),
+                    Span::styled(
+                        format!("  [{}]", model.source.label()),
+                        Style::default().fg(THEME.muted),
+                    ),
+                ]));
+                // Only display metadata that is actually known.
+                let tool_line = match model.tool_calling {
+                    Some(true) => "✓ tool calling".to_string(),
+                    Some(false) => "✗ no tool calling".to_string(),
+                    None => "tool calling: unknown".to_string(),
+                };
+                let ctx_line = match model.context_tokens {
+                    Some(tokens) => {
+                        if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
+                            format!("{}M context", tokens / 1_000_000)
+                        } else if tokens >= 1_000 {
+                            format!("{}K context", tokens / 1_000)
+                        } else {
+                            format!("{} tokens context", tokens)
+                        }
+                    }
+                    None => "context: unknown".to_string(),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(tool_line, Style::default().fg(THEME.secondary)),
+                    Span::styled("  ·  ", Style::default().fg(THEME.muted)),
+                    Span::styled(ctx_line, Style::default().fg(THEME.secondary)),
+                ]));
+                if is_current {
+                    lines.push(Line::from(Span::styled(
+                        "    ⦿ current model",
+                        Style::default().fg(THEME.green),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        "    ",
+                        Style::default().fg(THEME.border),
+                    )));
+                }
             }
-            lines.push(Line::from(spans));
         }
     }
 
@@ -3275,7 +3649,7 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(THEME.border_style())
-        .title("Model");
+        .title("MODEL");
     let widget = Paragraph::new(Text::from(lines))
         .block(block)
         .style(Style::default().bg(THEME.bg));
@@ -3286,34 +3660,26 @@ fn handle_model_picker_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
     match key.code {
         KeyCode::Up => app.dashboard.model_picker.prev(),
         KeyCode::Down => app.dashboard.model_picker.next(),
-        KeyCode::PageUp => {
-            for _ in 0..5 {
-                app.dashboard.model_picker.prev();
-            }
-        }
-        KeyCode::PageDown => {
-            for _ in 0..5 {
-                app.dashboard.model_picker.next();
-            }
-        }
+        KeyCode::PageUp => app.dashboard.model_picker.page_prev(),
+        KeyCode::PageDown => app.dashboard.model_picker.page_next(),
+        KeyCode::Home => app.dashboard.model_picker.home(),
+        KeyCode::End => app.dashboard.model_picker.end(),
         KeyCode::Enter => {
             if let Some(model) = app.dashboard.model_picker.selected() {
-                app.apply_model(model);
+                app.apply_model(model.id);
             }
         }
         KeyCode::Esc => {
             app.dashboard.model_picker.close();
         }
         KeyCode::Backspace => {
-            app.dashboard.model_picker.filter.pop();
-            app.dashboard.model_picker.index = 0;
+            app.dashboard.model_picker.pop_filter();
         }
         KeyCode::Char(c) => {
             if app.dashboard.model_picker.loading {
                 return;
             }
-            app.dashboard.model_picker.filter.push(c);
-            app.dashboard.model_picker.index = 0;
+            app.dashboard.model_picker.push_filter(c);
         }
         _ => {}
     }
@@ -3321,34 +3687,49 @@ fn handle_model_picker_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
 
 fn handle_palette_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
     let filtered = palette_entries(&app.dashboard.palette_query);
+    let len = filtered.len();
     match key.code {
         KeyCode::Char(c) => {
-            app.dashboard.palette_query.push(c);
-            app.dashboard.palette_index = 0;
+            let mut query = app.dashboard.palette_query.clone();
+            query.push(c);
+            let entries = palette_entries(&query);
+            // Preserve a valid selection: if the previously selected entry
+            // still matches, its index survives the filter change.
+            let prev_selected = filtered
+                .get(app.dashboard.palette_index)
+                .map(|e| e.0.clone());
+            app.dashboard.palette_query = query;
+            app.dashboard.palette_index = prev_selected
+                .and_then(|cmd| entries.iter().position(|(c, _)| *c == cmd))
+                .unwrap_or_else(|| crate::tui::dashboard::nav_clamp(0, entries.len()));
         }
         KeyCode::Backspace => {
-            app.dashboard.palette_query.pop();
-            app.dashboard.palette_index = 0;
+            let mut query = app.dashboard.palette_query.clone();
+            query.pop();
+            let entries = palette_entries(&query);
+            let prev_selected = filtered
+                .get(app.dashboard.palette_index)
+                .map(|e| e.0.clone());
+            app.dashboard.palette_query = query;
+            app.dashboard.palette_index = prev_selected
+                .and_then(|cmd| entries.iter().position(|(c, _)| *c == cmd))
+                .unwrap_or_else(|| crate::tui::dashboard::nav_clamp(0, entries.len()));
         }
-        KeyCode::Up => {
-            if !filtered.is_empty() {
-                app.dashboard.palette_index =
-                    (app.dashboard.palette_index + filtered.len() - 1) % filtered.len();
-            }
-        }
-        KeyCode::Down | KeyCode::Tab => {
-            if !filtered.is_empty() {
-                app.dashboard.palette_index = (app.dashboard.palette_index + 1) % filtered.len();
-            }
-        }
+        KeyCode::Up => app.dashboard.palette_nav(-1, len),
+        KeyCode::Down | KeyCode::Tab => app.dashboard.palette_nav(1, len),
+        KeyCode::PageUp => app.dashboard.palette_page(-1, len),
+        KeyCode::PageDown => app.dashboard.palette_page(1, len),
+        KeyCode::Home => app.dashboard.palette_home(),
+        KeyCode::End => app.dashboard.palette_end(len),
         KeyCode::Enter => {
             if let Some(cmd) = filtered
                 .get(app.dashboard.palette_index)
                 .map(|c| c.0.clone())
             {
-                app.dashboard.toggle_command_palette();
-                app.add_message(MessageRole::User, cmd.clone());
                 app.dashboard.show_command_palette = false;
+                app.add_message(MessageRole::User, cmd.clone());
+                app.dashboard.palette_query.clear();
+                app.dashboard.palette_index = 0;
                 app.is_loading = false;
                 submit_input(cmd, app);
             } else {
@@ -3359,6 +3740,50 @@ fn handle_palette_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
             app.dashboard.toggle_command_palette();
         }
         _ => {}
+    }
+}
+
+/// Arrow/Page/Home/End/Enter/Esc handling for the `/` and `//` autocomplete
+/// list. Returns true when the key was consumed by the completion overlay;
+/// false lets typing (characters, backspace) fall through to the input.
+fn handle_autocomplete_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) -> bool {
+    match key.code {
+        KeyCode::Up => {
+            app.dashboard.autocomplete_nav(-1);
+            true
+        }
+        KeyCode::Down => {
+            app.dashboard.autocomplete_nav(1);
+            true
+        }
+        KeyCode::PageUp => {
+            app.dashboard.autocomplete_page(-1);
+            true
+        }
+        KeyCode::PageDown => {
+            app.dashboard.autocomplete_page(1);
+            true
+        }
+        KeyCode::Home => {
+            app.dashboard.autocomplete_home();
+            true
+        }
+        KeyCode::End => {
+            app.dashboard.autocomplete_end();
+            true
+        }
+        KeyCode::Enter => {
+            if let Some(applied) = app.dashboard.autocomplete_apply(&app.input) {
+                app.input = applied;
+                app.input_cursor = app.input.len();
+            }
+            true
+        }
+        KeyCode::Esc => {
+            dismiss_top_overlay(app);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -3870,11 +4295,33 @@ mod tests {
         app.dashboard.show_command_palette = false;
         app.dashboard.model_picker.open();
         app.dashboard.model_picker.set_models(vec![
-            "agnes-2.5-flash".to_string(),
-            "gpt-4o".to_string(),
-            "qwen2.5-coder".to_string(),
+            crate::provider_manager::ModelInfo {
+                id: "agnes-2.5-flash".to_string(),
+                is_default: false,
+                display_name: None,
+                tool_calling: None,
+                context_tokens: None,
+                source: crate::providers::ModelSource::Discovered,
+            },
+            crate::provider_manager::ModelInfo {
+                id: "gpt-4o".to_string(),
+                is_default: true,
+                display_name: None,
+                tool_calling: None,
+                context_tokens: None,
+                source: crate::providers::ModelSource::Discovered,
+            },
+            crate::provider_manager::ModelInfo {
+                id: "qwen2.5-coder".to_string(),
+                is_default: false,
+                display_name: None,
+                tool_calling: None,
+                context_tokens: None,
+                source: crate::providers::ModelSource::Discovered,
+            },
         ]);
         draw(&app, 120, 40);
+        draw(&app, 80, 24);
     }
 
     #[test]
@@ -4278,5 +4725,737 @@ mod tests {
         assert!(text.contains("SESSION"));
         assert!(text.contains("Duration"));
         assert!(text.contains("Tools"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Sprint 30UI.3 — command palette / autocomplete / picker navigation
+    // ═══════════════════════════════════════════════════════════════════
+
+    fn key(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn open_palette(app: &mut TuiApp) {
+        app.dashboard.show_command_palette = true;
+        app.dashboard.palette_query.clear();
+        app.dashboard.palette_index = 0;
+    }
+
+    fn palette_length() -> usize {
+        palette_entries("").len()
+    }
+
+    #[test]
+    fn test_palette_down_navigation() {
+        let mut app = make_app();
+        open_palette(&mut app);
+        handle_palette_key(key(KeyCode::Down), &mut app);
+        assert_eq!(app.dashboard.palette_index, 1);
+        handle_palette_key(key(KeyCode::Down), &mut app);
+        assert_eq!(app.dashboard.palette_index, 2);
+    }
+
+    #[test]
+    fn test_palette_up_navigation() {
+        let mut app = make_app();
+        open_palette(&mut app);
+        app.dashboard.palette_index = 3;
+        handle_palette_key(key(KeyCode::Up), &mut app);
+        assert_eq!(app.dashboard.palette_index, 2);
+    }
+
+    #[test]
+    fn test_palette_wrap_behavior() {
+        let mut app = make_app();
+        open_palette(&mut app);
+        // Down past the last entry wraps to the first.
+        app.dashboard.palette_index = palette_length() - 1;
+        handle_palette_key(key(KeyCode::Down), &mut app);
+        assert_eq!(app.dashboard.palette_index, 0, "Down wraps to first");
+        // Up past the first wraps to the last.
+        handle_palette_key(key(KeyCode::Up), &mut app);
+        assert_eq!(
+            app.dashboard.palette_index,
+            palette_length() - 1,
+            "Up wraps to last"
+        );
+    }
+
+    #[test]
+    fn test_palette_page_navigation() {
+        let mut app = make_app();
+        open_palette(&mut app);
+        handle_palette_key(key(KeyCode::PageDown), &mut app);
+        assert_eq!(
+            app.dashboard.palette_index,
+            crate::tui::dashboard::NAV_PAGE_SIZE,
+            "PageDown advances one page"
+        );
+        app.dashboard.palette_index = palette_length() - 1;
+        handle_palette_key(key(KeyCode::PageDown), &mut app);
+        assert_eq!(
+            app.dashboard.palette_index,
+            palette_length() - 1,
+            "PageDown clamps at the end"
+        );
+        handle_palette_key(key(KeyCode::PageUp), &mut app);
+        assert_eq!(
+            app.dashboard.palette_index,
+            palette_length() - 1 - crate::tui::dashboard::NAV_PAGE_SIZE,
+            "PageUp steps back one page"
+        );
+        app.dashboard.palette_index = 2;
+        handle_palette_key(key(KeyCode::PageUp), &mut app);
+        assert_eq!(app.dashboard.palette_index, 0, "PageUp clamps at start");
+    }
+
+    #[test]
+    fn test_palette_home_end() {
+        let mut app = make_app();
+        open_palette(&mut app);
+        handle_palette_key(key(KeyCode::End), &mut app);
+        assert_eq!(app.dashboard.palette_index, palette_length() - 1);
+        handle_palette_key(key(KeyCode::Home), &mut app);
+        assert_eq!(app.dashboard.palette_index, 0);
+    }
+
+    #[test]
+    fn test_palette_filtering_preserves_selection() {
+        let mut app = make_app();
+        open_palette(&mut app);
+        // Move down to //provider, then type "//prov" — the selection must
+        // survive onto the still-matching entry instead of resetting.
+        while app.dashboard.palette_index < palette_length() - 1 {
+            let idx = app.dashboard.palette_index;
+            handle_palette_key(key(KeyCode::Down), &mut app);
+            if app.dashboard.palette_index <= idx {
+                break;
+            }
+            let entry = palette_entries(&app.dashboard.palette_query)
+                .get(app.dashboard.palette_index)
+                .map(|e| e.0.clone());
+            if entry.as_deref() == Some("//provider") {
+                break;
+            }
+        }
+        let before = palette_entries("")
+            .iter()
+            .position(|(c, _)| c == "//provider")
+            .unwrap();
+        app.dashboard.palette_index = before;
+        handle_palette_key(key(KeyCode::Char('p')), &mut app);
+        handle_palette_key(key(KeyCode::Char('r')), &mut app);
+        handle_palette_key(key(KeyCode::Char('o')), &mut app);
+        handle_palette_key(key(KeyCode::Char('v')), &mut app);
+        let filtered = palette_entries("prov");
+        assert!(filtered.iter().any(|(c, _)| c == "//provider"));
+        let selected = palette_entries(&app.dashboard.palette_query)
+            .get(app.dashboard.palette_index)
+            .map(|e| e.0.clone());
+        assert_eq!(
+            selected.as_deref(),
+            Some("//provider"),
+            "selection preserved"
+        );
+    }
+
+    #[test]
+    fn test_palette_filter_no_matches() {
+        let mut app = make_app();
+        open_palette(&mut app);
+        for c in "zzzz-no-match-xyz".chars() {
+            handle_palette_key(key(KeyCode::Char(c)), &mut app);
+        }
+        assert_eq!(palette_entries(&app.dashboard.palette_query).len(), 0);
+        assert_eq!(app.dashboard.palette_index, 0, "index stays valid");
+        let text = buffer_text(&app, 120, 40);
+        assert!(
+            text.contains("No matching commands"),
+            "empty palette must say so, got: {}",
+            truncate_to(&text, 200)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_palette_enter_selects_and_executes() {
+        let mut app = make_app();
+        open_palette(&mut app);
+        for c in "//verb".chars() {
+            handle_palette_key(key(KeyCode::Char(c)), &mut app);
+        }
+        let filtered = palette_entries("//verb");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "//verbose");
+        app.dashboard.palette_index = 0;
+        handle_palette_key(key(KeyCode::Enter), &mut app);
+        assert!(
+            !app.dashboard.show_command_palette,
+            "Enter closes the palette"
+        );
+        assert!(app.dashboard.verbose, "selected command executed");
+    }
+
+    #[test]
+    fn test_palette_esc_dismisses() {
+        let mut app = make_app();
+        open_palette(&mut app);
+        handle_palette_key(key(KeyCode::Esc), &mut app);
+        assert!(!app.dashboard.show_command_palette);
+    }
+
+    #[test]
+    fn test_palette_long_list_selection_stays_visible() {
+        let mut app = make_app();
+        open_palette(&mut app);
+        // Jump near the end; the render window must follow.
+        app.dashboard.palette_index = palette_length() - 1;
+        let text = buffer_text(&app, 120, 40);
+        let last = palette_entries("")
+            .last()
+            .map(|e| e.0.clone())
+            .unwrap_or_default();
+        let marker_line = format!("> {}", last);
+        let marker_line2 = format!(">{}", last);
+        assert!(
+            text.contains(&marker_line) || text.contains(&marker_line2),
+            "selected last entry must be rendered inside the window: {}",
+            truncate_to(&text, 300)
+        );
+    }
+
+    #[test]
+    fn test_palette_index_clamped_on_open() {
+        let mut app = make_app();
+        app.dashboard.palette_index = 999;
+        app.dashboard.toggle_command_palette();
+        assert_eq!(app.dashboard.palette_index, 0);
+    }
+
+    // ─── Autocomplete (Part 7) ─────────────────────────────────────────
+
+    fn autocomplete_open(app: &mut TuiApp) {
+        app.input = "//v".to_string();
+        app.input_cursor = app.input.len();
+        app.dashboard.autocomplete = vec![
+            "//verbose".to_string(),
+            "//version".to_string(),
+            "//viewdiff".to_string(),
+        ];
+        app.dashboard.autocomplete_index = 0;
+    }
+
+    #[test]
+    fn test_autocomplete_down_up() {
+        let mut app = make_app();
+        autocomplete_open(&mut app);
+        let mut ev = key(KeyCode::Down);
+        ev.modifiers = crossterm::event::KeyModifiers::NONE;
+        handle_autocomplete_key(ev, &mut app);
+        assert_eq!(app.dashboard.autocomplete_index, 1);
+        handle_autocomplete_key(key(KeyCode::Down), &mut app);
+        assert_eq!(app.dashboard.autocomplete_index, 2);
+        handle_autocomplete_key(key(KeyCode::Up), &mut app);
+        assert_eq!(app.dashboard.autocomplete_index, 1);
+    }
+
+    #[test]
+    fn test_autocomplete_wrap() {
+        let mut app = make_app();
+        autocomplete_open(&mut app);
+        app.dashboard.autocomplete_index = 2;
+        handle_autocomplete_key(key(KeyCode::Down), &mut app);
+        assert_eq!(app.dashboard.autocomplete_index, 0, "Down wraps");
+        handle_autocomplete_key(key(KeyCode::Up), &mut app);
+        assert_eq!(app.dashboard.autocomplete_index, 2, "Up wraps");
+    }
+
+    #[test]
+    fn test_autocomplete_page_home_end() {
+        let mut app = make_app();
+        autocomplete_open(&mut app);
+        // Long list to force paging.
+        app.dashboard.autocomplete = (0..20).map(|i| format!("//cmd{}", i)).collect();
+        app.dashboard.autocomplete_index = 0;
+        handle_autocomplete_key(key(KeyCode::PageDown), &mut app);
+        assert_eq!(
+            app.dashboard.autocomplete_index,
+            crate::tui::dashboard::NAV_PAGE_SIZE
+        );
+        handle_autocomplete_key(key(KeyCode::Home), &mut app);
+        assert_eq!(app.dashboard.autocomplete_index, 0);
+        handle_autocomplete_key(key(KeyCode::End), &mut app);
+        assert_eq!(app.dashboard.autocomplete_index, 19);
+        handle_autocomplete_key(key(KeyCode::PageDown), &mut app);
+        assert_eq!(app.dashboard.autocomplete_index, 19, "clamps at end");
+        handle_autocomplete_key(key(KeyCode::PageUp), &mut app);
+        assert_eq!(app.dashboard.autocomplete_index, 13);
+    }
+
+    #[tokio::test]
+    async fn test_autocomplete_enter_applies_selection() {
+        let mut app = make_app();
+        autocomplete_open(&mut app);
+        app.dashboard.autocomplete_index = 1; // //version
+        handle_autocomplete_key(key(KeyCode::Enter), &mut app);
+        assert_eq!(
+            app.input, "//version",
+            "Enter applies the selected completion"
+        );
+        assert!(app.dashboard.autocomplete.is_empty(), "list consumed");
+    }
+
+    #[test]
+    fn test_autocomplete_esc_dismisses() {
+        let mut app = make_app();
+        autocomplete_open(&mut app);
+        handle_autocomplete_key(key(KeyCode::Esc), &mut app);
+        assert!(app.dashboard.autocomplete.is_empty());
+        assert_eq!(app.dashboard.autocomplete_index, 0);
+    }
+
+    #[test]
+    fn test_autocomplete_arrows_not_swallowed_by_chat() {
+        let mut app = make_app();
+        app.input_history.push("previous input".to_string());
+        autocomplete_open(&mut app);
+        app.dashboard.autocomplete_index = 0;
+        // With the completion open, Up/Down must navigate the list, not the
+        // chat input history.
+        handle_key(key(KeyCode::Down), &mut app);
+        assert_eq!(app.dashboard.autocomplete_index, 1);
+        assert_eq!(app.input, "//v", "chat input untouched");
+        assert!(app.history_index.is_none());
+    }
+
+    #[test]
+    fn test_autocomplete_long_list_scrolls_selection_into_view() {
+        let mut app = make_app();
+        app.input = "//".to_string();
+        app.dashboard.autocomplete = (0..40).map(|i| format!("//cmd{:02}", i)).collect();
+        app.dashboard.autocomplete_index = 39;
+        let text = buffer_text(&app, 120, 40);
+        assert!(
+            text.contains("> //cmd39"),
+            "selection at the end of a long list must be rendered: {}",
+            truncate_to(&text, 300)
+        );
+        assert!(
+            text.contains("//cmd39"),
+            "last entry present in the scrolled window"
+        );
+    }
+
+    #[test]
+    fn test_autocomplete_chars_still_filter() {
+        let mut app = make_app();
+        autocomplete_open(&mut app);
+        // Characters must fall through to the input handler.
+        assert!(!handle_autocomplete_key(key(KeyCode::Char('e')), &mut app));
+        handle_key(key(KeyCode::Char('e')), &mut app);
+        assert_eq!(app.input, "//ve");
+        assert!(!app.dashboard.autocomplete.is_empty(), "list refreshed");
+    }
+
+    // ─── Model picker (Part 5) ──────────────────────────────────────────
+
+    fn picker_with_deepseek_fallback(app: &mut TuiApp) {
+        app.dashboard.model_picker.open();
+        app.dashboard.model_picker.set_models(vec![
+            crate::provider_manager::ModelInfo {
+                id: "deepseek-v4-flash".to_string(),
+                is_default: true,
+                display_name: Some("DeepSeek V4 Flash".to_string()),
+                tool_calling: Some(true),
+                context_tokens: Some(1_000_000),
+                source: crate::providers::ModelSource::ProviderDefault,
+            },
+            crate::provider_manager::ModelInfo {
+                id: "deepseek-v4-pro".to_string(),
+                is_default: false,
+                display_name: Some("DeepSeek V4 Pro".to_string()),
+                tool_calling: Some(true),
+                context_tokens: Some(1_000_000),
+                source: crate::providers::ModelSource::ProviderDefault,
+            },
+        ]);
+    }
+
+    #[test]
+    fn test_model_picker_renders_fallback_metadata() {
+        let mut app = make_app();
+        picker_with_deepseek_fallback(&mut app);
+        let text = buffer_text(&app, 120, 40);
+        assert!(text.contains("DeepSeek V4 Flash"), "display name shown");
+        assert!(text.contains("deepseek-v4-flash"), "model id shown");
+        assert!(text.contains("✓ tool calling"), "known capability shown");
+        assert!(text.contains("1M context"), "known context shown");
+        assert!(
+            text.contains("provider default"),
+            "fallback models must be labelled provider default"
+        );
+    }
+
+    #[test]
+    fn test_model_picker_renders_unknown_metadata_honestly() {
+        let mut app = make_app();
+        app.dashboard.model_picker.open();
+        app.dashboard
+            .model_picker
+            .set_models(vec![crate::provider_manager::ModelInfo {
+                id: "gpt-4o".to_string(),
+                is_default: true,
+                display_name: None,
+                tool_calling: None,
+                context_tokens: None,
+                source: crate::providers::ModelSource::Discovered,
+            }]);
+        let text = buffer_text(&app, 120, 40);
+        assert!(
+            text.contains("tool calling: unknown"),
+            "unknown capability must say unknown, not yes: {}",
+            truncate_to(&text, 300)
+        );
+        assert!(!text.contains("✓ tool calling"));
+        assert!(text.contains("context: unknown"));
+        assert!(text.contains("discovered"));
+    }
+
+    #[test]
+    fn test_model_picker_key_navigation() {
+        let mut app = make_app();
+        picker_with_deepseek_fallback(&mut app);
+        handle_model_picker_key(key(KeyCode::Down), &mut app);
+        assert_eq!(app.dashboard.model_picker.index, 1);
+        handle_model_picker_key(key(KeyCode::Down), &mut app);
+        assert_eq!(app.dashboard.model_picker.index, 0, "Down wraps");
+        handle_model_picker_key(key(KeyCode::Up), &mut app);
+        assert_eq!(app.dashboard.model_picker.index, 1, "Up wraps");
+        handle_model_picker_key(key(KeyCode::Home), &mut app);
+        assert_eq!(app.dashboard.model_picker.index, 0);
+        handle_model_picker_key(key(KeyCode::End), &mut app);
+        assert_eq!(app.dashboard.model_picker.index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_model_picker_enter_applies_selection() {
+        let mut app = make_app();
+        picker_with_deepseek_fallback(&mut app);
+        handle_model_picker_key(key(KeyCode::Enter), &mut app);
+        assert_eq!(app.config.model, "deepseek-v4-flash");
+        assert!(!app.dashboard.model_picker.is_open(), "picker closed");
+    }
+
+    #[test]
+    fn test_model_picker_filter_no_match_renders() {
+        let mut app = make_app();
+        picker_with_deepseek_fallback(&mut app);
+        app.dashboard.model_picker.filter.push_str("zzz");
+        let text = buffer_text(&app, 120, 40);
+        assert!(text.contains("No matching models"));
+    }
+
+    #[tokio::test]
+    async fn test_apply_model_syncs_provider_manager() {
+        let mut app = make_app();
+        if let Some(pm) = app.provider_manager.as_mut() {
+            pm.set_active("deepseek").unwrap();
+        }
+        app.apply_model("deepseek-v4-pro".to_string());
+        assert_eq!(app.config.model, "deepseek-v4-pro");
+        if let Some(pm) = app.provider_manager.as_ref() {
+            assert_eq!(pm.active_model(), "deepseek-v4-pro");
+        }
+    }
+
+    // ─── Provider manager overlay (Part 3) ──────────────────────────────
+
+    /// An app whose provider manager is hermetic (fresh built-ins in a temp
+    /// dir) so tests never depend on the developer's real `~/.codebro`.
+    fn app_with_fresh_providers() -> TuiApp {
+        let mut app = make_app();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = crate::provider_manager::ProviderManager::new(dir.path().to_path_buf());
+        pm.register_builtin();
+        app.provider_manager = Some(pm);
+        app
+    }
+
+    #[test]
+    fn test_provider_manager_lists_statuses() {
+        let mut app = app_with_fresh_providers();
+        app.open_provider_manager();
+        if let Some(pm) = app.provider_manager.as_mut() {
+            pm.set_api_key("deepseek", "sk-ds-1234567890abcdef")
+                .unwrap();
+            pm.set_active("deepseek").unwrap();
+        }
+        let text = buffer_text(&app, 120, 40);
+        assert!(text.contains("PROVIDER"));
+        assert!(text.contains("DeepSeek"));
+        assert!(text.contains("AGNES"));
+        assert!(text.contains("● configured"), "configured badge");
+        assert!(text.contains("○ not configured"), "unconfigured badge");
+        assert!(text.contains("○ local"), "local badge");
+        assert!(text.contains("[active]"), "active marker");
+        assert!(
+            !text.contains("sk-ds-1234567890abcdef"),
+            "raw API key must never render"
+        );
+    }
+
+    #[test]
+    fn test_provider_manager_navigation() {
+        let mut app = app_with_fresh_providers();
+        app.open_provider_manager();
+        // Six built-ins: openai, openrouter, deepseek, agnes, ollama, lmstudio.
+        handle_provider_manager_key(key(KeyCode::Down), &mut app);
+        assert_eq!(app.provider_panel.selected_provider_index, 1);
+        handle_provider_manager_key(key(KeyCode::Up), &mut app);
+        assert_eq!(app.provider_panel.selected_provider_index, 0);
+        handle_provider_manager_key(key(KeyCode::End), &mut app);
+        assert_eq!(app.provider_panel.selected_provider_index, 5);
+        handle_provider_manager_key(key(KeyCode::Home), &mut app);
+        assert_eq!(app.provider_panel.selected_provider_index, 0);
+        // PageDown from the top clamps to the last row on a 6-item list.
+        handle_provider_manager_key(key(KeyCode::PageDown), &mut app);
+        assert_eq!(app.provider_panel.selected_provider_index, 5);
+        handle_provider_manager_key(key(KeyCode::Up), &mut app);
+        assert_eq!(app.provider_panel.selected_provider_index, 4);
+        // Up past the top wraps to the bottom.
+        app.provider_panel.selected_provider_index = 0;
+        handle_provider_manager_key(key(KeyCode::Up), &mut app);
+        assert_eq!(app.provider_panel.selected_provider_index, 5);
+    }
+
+    #[test]
+    fn test_provider_manager_detail_view_masks_key() {
+        let mut app = app_with_fresh_providers();
+        app.open_provider_manager();
+        if let Some(pm) = app.provider_manager.as_mut() {
+            pm.set_api_key("deepseek", "sk-ds-1234567890abcdef")
+                .unwrap();
+        }
+        app.provider_panel.selected_provider_index = 2; // deepseek
+        handle_provider_manager_key(key(KeyCode::Enter), &mut app);
+        assert_eq!(
+            app.provider_panel.detail_provider.as_deref(),
+            Some("deepseek")
+        );
+        let text = buffer_text(&app, 120, 40);
+        assert!(text.contains("Base URL"), "detail shows base URL");
+        assert!(text.contains("https://api.deepseek.com"));
+        assert!(text.contains("••••cdef"), "masked key suffix");
+        assert!(
+            !text.contains("sk-ds-1234567890abcdef"),
+            "raw key must not appear in the detail view"
+        );
+        handle_provider_manager_key(key(KeyCode::Esc), &mut app);
+        assert!(
+            app.provider_panel.detail_provider.is_none(),
+            "Esc returns to list"
+        );
+    }
+
+    #[test]
+    fn test_provider_manager_esc_closes() {
+        let mut app = app_with_fresh_providers();
+        app.open_provider_manager();
+        handle_provider_manager_key(key(KeyCode::Esc), &mut app);
+        assert!(!app.provider_panel.is_open());
+    }
+
+    #[tokio::test]
+    async fn test_provider_manager_enter_detail_switches_provider() {
+        let mut app = app_with_fresh_providers();
+        app.open_provider_manager();
+        if let Some(pm) = app.provider_manager.as_mut() {
+            pm.set_api_key("deepseek", "sk-ds-1234567890abcdef")
+                .unwrap();
+        }
+        // Navigate to deepseek (index 2) and open detail, then activate.
+        app.provider_panel.selected_provider_index = 2;
+        handle_provider_manager_key(key(KeyCode::Enter), &mut app);
+        handle_provider_manager_key(key(KeyCode::Enter), &mut app);
+        assert!(!app.provider_panel.is_open(), "overlay closed after switch");
+        assert_eq!(
+            app.config.provider, "deepseek",
+            "runtime config follows the switched provider"
+        );
+        assert_eq!(
+            app.config.base_url, "https://api.deepseek.com",
+            "base URL synced to the provider"
+        );
+        assert_eq!(
+            app.config.api_key.as_deref(),
+            Some("sk-ds-1234567890abcdef"),
+            "secret synced to the runtime config (never printed)"
+        );
+    }
+
+    #[test]
+    fn test_autocomplete_vs_palette_priority() {
+        let mut app = make_app();
+        autocomplete_open(&mut app);
+        open_palette(&mut app);
+        // The palette owns arrows while open, even with autocomplete active.
+        handle_palette_key(key(KeyCode::Down), &mut app);
+        assert_eq!(app.dashboard.palette_index, 1);
+        assert_eq!(app.dashboard.autocomplete_index, 0);
+    }
+
+    #[test]
+    fn test_new_overlays_render_at_required_terminal_sizes() {
+        // Manual-verification sizes from the sprint: 160x48, 120x32, 80x24.
+        for (w, h) in [(160u16, 48u16), (120, 32), (80, 24)] {
+            // Command palette (with a filter that leaves a long list).
+            let mut app = make_app();
+            open_palette(&mut app);
+            draw(&app, w, h);
+            // Autocomplete with a long list, selection near the end.
+            let mut app = make_app();
+            app.input = "//".to_string();
+            app.dashboard.autocomplete = (0..40).map(|i| format!("//cmd{:02}", i)).collect();
+            app.dashboard.autocomplete_index = 39;
+            draw(&app, w, h);
+            // Model picker with DeepSeek fallback metadata.
+            let mut app = make_app();
+            picker_with_deepseek_fallback(&mut app);
+            draw(&app, w, h);
+            // Provider manager (list + detail).
+            let mut app = app_with_fresh_providers();
+            app.open_provider_manager();
+            draw(&app, w, h);
+            app.provider_panel.selected_provider_index = 2;
+            handle_provider_manager_key(key(KeyCode::Enter), &mut app);
+            draw(&app, w, h);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Sprint 30UI.3 — security: API keys never reach surfaces
+    // ═══════════════════════════════════════════════════════════════════
+
+    const SECRET_KEY: &str = "sk-sprint-secret-key-1234567890abcdef";
+
+    #[test]
+    fn test_inline_apikey_rejected_and_not_in_history() {
+        let mut app = make_app();
+        app.input = format!("//apikey openai {}", SECRET_KEY);
+        app.input_cursor = app.input.len();
+        // Enter on an inline key must not submit, store, or echo it.
+        handle_key(key(KeyCode::Enter), &mut app);
+        assert!(
+            app.input_history.iter().all(|h| !h.contains(SECRET_KEY)),
+            "inline key must never reach history"
+        );
+        let conv = app.conversation_text();
+        assert!(
+            !conv.contains(SECRET_KEY),
+            "inline key must never reach the conversation"
+        );
+        assert!(app.input.is_empty(), "input consumed without executing");
+    }
+
+    #[tokio::test]
+    async fn test_masked_apikey_flow_leaks_nowhere() {
+        let mut app = make_app();
+        app.secure_input = Some(crate::tui::app::SecureInputState {
+            provider: "openai".to_string(),
+            buffer: SECRET_KEY.to_string(),
+        });
+        handle_key(key(KeyCode::Enter), &mut app);
+        assert!(app.secure_input.is_none(), "secure input consumed");
+        assert!(
+            app.input_history.iter().all(|h| !h.contains(SECRET_KEY)),
+            "key never reaches input history"
+        );
+        let conv = app.conversation_text();
+        assert!(
+            !conv.contains(SECRET_KEY),
+            "key never reaches the conversation"
+        );
+        let stream = format!("{:?}", app.action_stream.groups);
+        assert!(
+            !stream.contains(SECRET_KEY),
+            "key never reaches the action stream"
+        );
+        if let Some(pm) = app.provider_manager.as_ref() {
+            assert!(pm.has_api_key("openai"), "key stored securely");
+            assert_eq!(pm.api_key_masked("openai"), Some("••••cdef".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_apikey_never_in_session_export() {
+        let mut app = make_app();
+        if let Some(pm) = app.provider_manager.as_mut() {
+            pm.set_api_key("openai", SECRET_KEY).unwrap();
+            pm.set_active("openai").unwrap();
+        }
+        app.config.api_key = Some(SECRET_KEY.to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.json");
+        app.export_state(path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains(SECRET_KEY),
+            "API key must never appear in session export"
+        );
+    }
+
+    #[test]
+    fn test_apikey_never_in_providers_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().to_path_buf();
+        let mut pm = crate::provider_manager::ProviderManager::new(config_dir.clone());
+        pm.register_builtin();
+        pm.set_api_key("openai", SECRET_KEY).unwrap();
+        pm.persist().unwrap();
+        let providers_json = std::fs::read_to_string(config_dir.join("providers.json")).unwrap();
+        assert!(!providers_json.contains(SECRET_KEY));
+        // Credentials live only in the secure store.
+        let creds = std::fs::read_to_string(config_dir.join("credentials.json")).unwrap();
+        assert!(creds.contains(SECRET_KEY));
+    }
+
+    #[test]
+    fn test_apikey_not_rendered_in_provider_or_model_ui() {
+        let mut app = make_app();
+        if let Some(pm) = app.provider_manager.as_mut() {
+            pm.set_api_key("openai", SECRET_KEY).unwrap();
+        }
+        app.open_provider_manager();
+        let text = buffer_text(&app, 120, 40);
+        assert!(
+            !text.contains(SECRET_KEY),
+            "provider list must not render the raw key"
+        );
+        // Model picker with secure input active: still no raw key.
+        app.dashboard.model_picker.open();
+        app.secure_input = Some(crate::tui::app::SecureInputState {
+            provider: "openai".to_string(),
+            buffer: SECRET_KEY.to_string(),
+        });
+        let text = buffer_text(&app, 120, 40);
+        assert!(
+            !text.contains(SECRET_KEY),
+            "masked input must render bullets, never the key"
+        );
+        assert!(text.contains('•'), "masked bullets rendered");
+    }
+
+    #[test]
+    fn test_switch_provider_never_echoes_secret() {
+        let mut app = make_app();
+        if let Some(pm) = app.provider_manager.as_mut() {
+            pm.set_api_key("openai", SECRET_KEY).unwrap();
+            pm.set_active("openai").unwrap();
+        }
+        app.switch_provider("openai").unwrap();
+        let conv = app.conversation_text();
+        assert!(
+            !conv.contains(SECRET_KEY),
+            "switch feedback must not echo the key"
+        );
     }
 }

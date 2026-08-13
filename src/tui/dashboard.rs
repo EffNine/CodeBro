@@ -2,6 +2,7 @@
 use crate::agent::events::AgentEvent;
 use crate::agent::status::{AgentStatus, AgentStatusMonitor};
 use crate::agent::task_graph::{TaskGraph, TaskStatus};
+use crate::provider_manager::ModelInfo;
 use crate::tui::animation::{ActivityType, AnimationState};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -9,6 +10,44 @@ use std::collections::VecDeque;
 /// Maximum characters retained in the live streaming buffer. A pathological
 /// provider response (or PTY burst) cannot grow memory without bound.
 pub const MAX_STREAMING_BUFFER_CHARS: usize = 1_000_000;
+
+/// Wrap-around list navigation (Up/Down). Moving past the last item returns
+/// to the first, and past the first wraps to the last.
+pub fn nav_wrap(index: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len_i = len as isize;
+    let mut i = index as isize + delta;
+    i %= len_i;
+    if i < 0 {
+        i += len_i;
+    }
+    i as usize
+}
+
+/// Page navigation (PageUp/PageDown). Moves by `page` rows and clamps at the
+/// ends; it never wraps around.
+pub fn nav_page(index: usize, len: usize, delta: isize, page: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let step = page as isize * delta;
+    let target = index as isize + step;
+    target.clamp(0, len as isize - 1) as usize
+}
+
+/// Clamp an index into a list (used when a filter shrinks the list).
+pub fn nav_clamp(index: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        index.min(len - 1)
+    }
+}
+
+/// The default page size used by PageUp/PageDown in overlay selectors.
+pub const NAV_PAGE_SIZE: usize = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -57,7 +96,7 @@ pub struct AgentPanelEntry {
 
 #[derive(Debug, Clone)]
 pub struct ModelPicker {
-    pub models: Vec<String>,
+    pub models: Vec<ModelInfo>,
     pub index: usize,
     pub open: bool,
     pub loading: bool,
@@ -94,43 +133,68 @@ impl ModelPicker {
         self.open
     }
 
-    pub fn set_models(&mut self, models: Vec<String>) {
+    pub fn set_models(&mut self, models: Vec<ModelInfo>) {
         self.models = models;
         self.loading = false;
         self.index = 0;
     }
 
     pub fn next(&mut self) {
-        let visible = self.visible_models();
-        if !visible.is_empty() {
-            self.index = (self.index + 1) % visible.len();
-        }
+        let visible = self.visible_models().len();
+        self.index = nav_wrap(self.index, visible, 1);
     }
 
     pub fn prev(&mut self) {
+        let visible = self.visible_models().len();
+        self.index = nav_wrap(self.index, visible, -1);
+    }
+
+    pub fn page_next(&mut self) {
+        let visible = self.visible_models().len();
+        self.index = nav_page(self.index, visible, 1, NAV_PAGE_SIZE);
+    }
+
+    pub fn page_prev(&mut self) {
+        let visible = self.visible_models().len();
+        self.index = nav_page(self.index, visible, -1, NAV_PAGE_SIZE);
+    }
+
+    pub fn home(&mut self) {
+        self.index = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.index = self.visible_models().len().saturating_sub(1);
+    }
+
+    pub fn selected(&self) -> Option<ModelInfo> {
         let visible = self.visible_models();
-        if !visible.is_empty() {
-            self.index = if self.index == 0 {
-                visible.len() - 1
-            } else {
-                self.index - 1
-            };
-        }
+        let i = nav_clamp(self.index, visible.len());
+        visible.get(i).map(|m| (*m).clone())
     }
 
-    pub fn selected(&self) -> Option<String> {
-        self.visible_models().get(self.index).map(|s| s.to_string())
+    /// Push a filter character and reset the selection (the filtered window
+    /// may be shorter than the previous one).
+    pub fn push_filter(&mut self, c: char) {
+        self.filter.push(c);
+        self.index = 0;
     }
 
-    pub fn visible_models(&self) -> Vec<&str> {
+    /// Pop a filter character and reset the selection.
+    pub fn pop_filter(&mut self) {
+        self.filter.pop();
+        self.index = 0;
+    }
+
+    /// Models matching the filter, in list order.
+    pub fn visible_models(&self) -> Vec<&ModelInfo> {
         let f = self.filter.to_lowercase();
         if f.is_empty() {
-            self.models.iter().map(|s| s.as_str()).collect()
+            self.models.iter().collect()
         } else {
             self.models
                 .iter()
-                .filter(|m| m.to_lowercase().contains(&f))
-                .map(|s| s.as_str())
+                .filter(|m| m.id.to_lowercase().contains(&f))
                 .collect()
         }
     }
@@ -538,6 +602,61 @@ impl Dashboard {
         }
     }
 
+    /// Apply the currently selected autocomplete entry to the input line.
+    /// Returns the new input; the selection is reset.
+    pub fn autocomplete_apply(&mut self, input: &str) -> Option<String> {
+        let cmd = self.autocomplete.get(self.autocomplete_index)?.to_string();
+        let rest = match input.split_once(' ') {
+            Some((_, args)) => format!("{} {}", cmd, args),
+            None => cmd,
+        };
+        self.autocomplete.clear();
+        self.autocomplete_index = 0;
+        Some(rest)
+    }
+
+    pub fn autocomplete_nav(&mut self, delta: isize) {
+        let len = self.autocomplete.len();
+        self.autocomplete_index = nav_wrap(self.autocomplete_index, len, delta);
+    }
+
+    pub fn autocomplete_page(&mut self, delta: isize) {
+        let len = self.autocomplete.len();
+        self.autocomplete_index = nav_page(self.autocomplete_index, len, delta, NAV_PAGE_SIZE);
+    }
+
+    pub fn autocomplete_home(&mut self) {
+        self.autocomplete_index = 0;
+    }
+
+    pub fn autocomplete_end(&mut self) {
+        self.autocomplete_index = self.autocomplete.len().saturating_sub(1);
+    }
+
+    pub fn palette_nav(&mut self, delta: isize, len: usize) {
+        self.palette_index = nav_wrap(self.palette_index, len, delta);
+    }
+
+    pub fn palette_page(&mut self, delta: isize, len: usize) {
+        self.palette_index = nav_page(self.palette_index, len, delta, NAV_PAGE_SIZE);
+    }
+
+    pub fn palette_home(&mut self) {
+        self.palette_index = 0;
+    }
+
+    pub fn palette_end(&mut self, len: usize) {
+        self.palette_index = len.saturating_sub(1);
+    }
+
+    /// Keep the palette selection valid after a filter change. The selection
+    /// index is preserved when the previously selected entry still matches;
+    /// otherwise it clamps to the new list length.
+    pub fn palette_filter(&mut self, query: &str, entries: &[(String, &'static str)]) {
+        self.palette_query = query.to_string();
+        self.palette_index = nav_clamp(self.palette_index, entries.len());
+    }
+
     pub fn toggle_coordination(&mut self) {
         self.show_coordination = !self.show_coordination;
     }
@@ -847,5 +966,272 @@ mod tests {
             !dashboard.activity_log.is_empty(),
             "PTY exit is always logged"
         );
+    }
+
+    // ─── Overlay navigation helpers (Sprint 30UI.3) ─────────────────────
+
+    #[test]
+    fn test_nav_wrap_forward() {
+        assert_eq!(nav_wrap(0, 5, 1), 1);
+        assert_eq!(nav_wrap(4, 5, 1), 0, "forward wraps to first");
+        assert_eq!(nav_wrap(4, 5, 3), 2);
+    }
+
+    #[test]
+    fn test_nav_wrap_backward() {
+        assert_eq!(nav_wrap(0, 5, -1), 4, "backward wraps to last");
+        assert_eq!(nav_wrap(3, 5, -1), 2);
+        assert_eq!(nav_wrap(2, 5, -3), 4);
+    }
+
+    #[test]
+    fn test_nav_wrap_empty_and_single() {
+        assert_eq!(nav_wrap(0, 0, 1), 0);
+        assert_eq!(nav_wrap(0, 1, 1), 0);
+        assert_eq!(nav_wrap(0, 1, -1), 0);
+    }
+
+    #[test]
+    fn test_nav_page_no_wrap() {
+        assert_eq!(nav_page(0, 20, 1, NAV_PAGE_SIZE), 6);
+        assert_eq!(nav_page(18, 20, 1, NAV_PAGE_SIZE), 19, "clamps at last");
+        assert_eq!(nav_page(10, 20, -1, NAV_PAGE_SIZE), 4);
+        assert_eq!(nav_page(2, 20, -1, NAV_PAGE_SIZE), 0, "clamps at first");
+        assert_eq!(nav_page(0, 0, 1, NAV_PAGE_SIZE), 0);
+    }
+
+    #[test]
+    fn test_nav_clamp() {
+        assert_eq!(nav_clamp(7, 3), 2);
+        assert_eq!(nav_clamp(1, 3), 1);
+        assert_eq!(nav_clamp(0, 0), 0);
+    }
+
+    fn model_info(id: &str, source: crate::providers::ModelSource) -> ModelInfo {
+        ModelInfo {
+            id: id.to_string(),
+            is_default: false,
+            display_name: None,
+            tool_calling: None,
+            context_tokens: None,
+            source,
+        }
+    }
+
+    #[test]
+    fn test_model_picker_navigation_full_cycle() {
+        let mut picker = ModelPicker::new();
+        picker.set_models(vec![
+            model_info("a", crate::providers::ModelSource::Discovered),
+            model_info("b", crate::providers::ModelSource::Discovered),
+            model_info("c", crate::providers::ModelSource::Discovered),
+        ]);
+        assert_eq!(picker.index, 0);
+        picker.next();
+        assert_eq!(picker.index, 1);
+        picker.next();
+        assert_eq!(picker.index, 2);
+        picker.next();
+        assert_eq!(picker.index, 0, "Down wraps to first");
+        picker.prev();
+        assert_eq!(picker.index, 2, "Up wraps to last");
+        picker.prev();
+        assert_eq!(picker.index, 1);
+    }
+
+    #[test]
+    fn test_model_picker_home_end() {
+        let mut picker = ModelPicker::new();
+        picker.set_models(vec![
+            model_info("a", crate::providers::ModelSource::Discovered),
+            model_info("b", crate::providers::ModelSource::Discovered),
+            model_info("c", crate::providers::ModelSource::Discovered),
+        ]);
+        picker.end();
+        assert_eq!(picker.index, 2);
+        picker.home();
+        assert_eq!(picker.index, 0);
+    }
+
+    #[test]
+    fn test_model_picker_page_navigation() {
+        let mut picker = ModelPicker::new();
+        let models: Vec<ModelInfo> = (0..20)
+            .map(|i| {
+                model_info(
+                    &format!("m{}", i),
+                    crate::providers::ModelSource::Discovered,
+                )
+            })
+            .collect();
+        picker.set_models(models);
+        picker.page_next();
+        assert_eq!(picker.index, NAV_PAGE_SIZE);
+        picker.end();
+        picker.page_next();
+        assert_eq!(picker.index, 19, "PageDown clamps at last");
+        picker.page_prev();
+        assert_eq!(picker.index, 13);
+        picker.home();
+        picker.page_prev();
+        assert_eq!(picker.index, 0, "PageUp clamps at first");
+    }
+
+    #[test]
+    fn test_model_picker_filter_keeps_selection_valid() {
+        let mut picker = ModelPicker::new();
+        picker.set_models(vec![
+            model_info("gpt-4o", crate::providers::ModelSource::Discovered),
+            model_info("gpt-4o-mini", crate::providers::ModelSource::Discovered),
+            model_info(
+                "deepseek-v4-flash",
+                crate::providers::ModelSource::ProviderDefault,
+            ),
+        ]);
+        picker.next();
+        picker.next();
+        assert_eq!(picker.index, 2);
+        picker.push_filter('g');
+        assert_eq!(picker.visible_models().len(), 2);
+        assert_eq!(picker.index, 0, "filter resets selection to the new window");
+        picker.next();
+        assert_eq!(picker.index, 1);
+        assert_eq!(
+            picker.selected().map(|m| m.id),
+            Some("gpt-4o-mini".to_string())
+        );
+        // Even a stale out-of-range index never selects nothing.
+        picker.index = 9;
+        assert_eq!(
+            picker.selected().map(|m| m.id),
+            Some("gpt-4o-mini".to_string())
+        );
+    }
+
+    #[test]
+    fn test_model_picker_empty_selection() {
+        let mut picker = ModelPicker::new();
+        picker.set_models(Vec::new());
+        assert_eq!(picker.selected(), None);
+        picker.next();
+        assert_eq!(picker.index, 0);
+    }
+
+    #[test]
+    fn test_palette_navigation_keys() {
+        let mut dashboard = Dashboard::new();
+        let entries = vec![
+            ("//model".to_string(), "m"),
+            ("//provider".to_string(), "p"),
+            ("//apikey".to_string(), "k"),
+            ("//settings".to_string(), "s"),
+        ];
+        let len = entries.len();
+        dashboard.palette_nav(1, len);
+        assert_eq!(dashboard.palette_index, 1);
+        dashboard.palette_nav(1, len);
+        dashboard.palette_nav(1, len);
+        dashboard.palette_nav(1, len);
+        assert_eq!(dashboard.palette_index, 0, "Down wraps around");
+        dashboard.palette_nav(-1, len);
+        assert_eq!(dashboard.palette_index, 3, "Up wraps to last");
+        dashboard.palette_home();
+        assert_eq!(dashboard.palette_index, 0);
+        dashboard.palette_end(len);
+        assert_eq!(dashboard.palette_index, 3);
+    }
+
+    #[test]
+    fn test_palette_page_navigation() {
+        let mut dashboard = Dashboard::new();
+        let len = 30;
+        dashboard.palette_page(1, len);
+        assert_eq!(dashboard.palette_index, NAV_PAGE_SIZE);
+        dashboard.palette_page(-1, len);
+        assert_eq!(dashboard.palette_index, 0);
+        dashboard.palette_end(len);
+        dashboard.palette_page(1, len);
+        assert_eq!(dashboard.palette_index, 29, "page down clamps at end");
+    }
+
+    #[test]
+    fn test_palette_filter_preserves_valid_selection() {
+        let mut dashboard = Dashboard::new();
+        dashboard.palette_index = 3;
+        // 4 entries; filter shrinks to 4+ still valid.
+        let entries = vec![
+            ("//model".to_string(), "Show or change the current model"),
+            (
+                "//provider".to_string(),
+                "Show or change the current provider",
+            ),
+            ("//apikey".to_string(), "Set a provider API key"),
+            ("//settings".to_string(), "View and edit all settings"),
+        ];
+        dashboard.palette_filter("", &entries);
+        assert_eq!(dashboard.palette_index, 3);
+        // A filter that drops everything clamps to 0 rather than panicking.
+        let empty: Vec<(String, &'static str)> = Vec::new();
+        dashboard.palette_filter("zzz-no-match", &empty);
+        assert_eq!(dashboard.palette_index, 0);
+    }
+
+    #[test]
+    fn test_autocomplete_navigation_keys() {
+        let mut dashboard = Dashboard::new();
+        dashboard.autocomplete = vec![
+            "//model".to_string(),
+            "//provider".to_string(),
+            "//apikey".to_string(),
+            "//settings".to_string(),
+        ];
+        dashboard.autocomplete_nav(1);
+        assert_eq!(dashboard.autocomplete_index, 1);
+        dashboard.autocomplete_nav(-1);
+        assert_eq!(dashboard.autocomplete_index, 0);
+        dashboard.autocomplete_nav(-1);
+        assert_eq!(dashboard.autocomplete_index, 3, "Up wraps to last");
+        dashboard.autocomplete_nav(1);
+        assert_eq!(dashboard.autocomplete_index, 0, "Down wraps to first");
+        dashboard.autocomplete_home();
+        assert_eq!(dashboard.autocomplete_index, 0);
+        dashboard.autocomplete_end();
+        assert_eq!(dashboard.autocomplete_index, 3);
+    }
+
+    #[test]
+    fn test_autocomplete_page_navigation() {
+        let mut dashboard = Dashboard::new();
+        dashboard.autocomplete = (0..20).map(|i| format!("//cmd{}", i)).collect();
+        dashboard.autocomplete_page(1);
+        assert_eq!(dashboard.autocomplete_index, NAV_PAGE_SIZE);
+        dashboard.autocomplete_end();
+        dashboard.autocomplete_page(1);
+        assert_eq!(dashboard.autocomplete_index, 19, "clamps at end");
+        dashboard.autocomplete_page(-1);
+        assert_eq!(dashboard.autocomplete_index, 13);
+        dashboard.autocomplete_home();
+        dashboard.autocomplete_page(-1);
+        assert_eq!(dashboard.autocomplete_index, 0, "clamps at start");
+    }
+
+    #[test]
+    fn test_autocomplete_apply_replaces_token() {
+        let mut dashboard = Dashboard::new();
+        dashboard.autocomplete = vec!["//verbose".to_string()];
+        dashboard.autocomplete_index = 0;
+        let applied = dashboard.autocomplete_apply("//verb").unwrap();
+        assert_eq!(applied, "//verbose");
+        assert!(dashboard.autocomplete.is_empty(), "selection consumed");
+        assert_eq!(dashboard.autocomplete_index, 0);
+    }
+
+    #[test]
+    fn test_autocomplete_apply_preserves_args() {
+        let mut dashboard = Dashboard::new();
+        dashboard.autocomplete = vec!["//model".to_string()];
+        dashboard.autocomplete_index = 0;
+        let applied = dashboard.autocomplete_apply("//m gpt-4o").unwrap();
+        assert_eq!(applied, "//model gpt-4o");
     }
 }

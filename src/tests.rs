@@ -19,6 +19,7 @@ use crate::agent::SubAgent;
 use crate::agent::TraceStore;
 use crate::config::Config;
 use crate::dispatcher::ToolDispatcher;
+use crate::providers::Provider as _;
 use crate::scanner::ProjectInfo;
 use crate::tools::filesystem::{CreateFile, EditFile, ListFiles, ReadFile};
 use crate::tools::git::{GitDiff, GitStatus};
@@ -2810,7 +2811,133 @@ async fn test_coordinator_grounded_context_reaches_every_subagent() {
     );
 }
 
+// ===== Sprint 30UI.3 — Real-provider smoke =====
+//
+// Model discovery → model selection → simple chat → structured tool-call
+// probe against ONE real provider. DeepSeek is preferred; when no DeepSeek
+// credential exists, the valid AGNES credential is used instead. The
+// credential is read from the environment and never printed or persisted.
+#[tokio::test]
+#[ignore]
+async fn real_provider_smoke_models_chat_tools() {
+    let deepseek_key = std::env::var("DEEPSEEK_API_KEY").ok();
+    let agnes_key = std::env::var("AGNES_API_KEY").ok();
+
+    let (base_url, api_key, provider, catalog) = if let Some(key) = deepseek_key {
+        (
+            "https://api.deepseek.com".to_string(),
+            key,
+            "deepseek".to_string(),
+            crate::providers::DEEPSEEK_CATALOG,
+        )
+    } else if let Some(key) = agnes_key {
+        (
+            "https://apihub.agnes-ai.com/v1".to_string(),
+            key,
+            "agnes".to_string(),
+            crate::providers::AGNES_CATALOG,
+        )
+    } else {
+        eprintln!("REAL PROVIDER: BLOCKED (no DEEPSEEK_API_KEY / AGNES_API_KEY in environment)");
+        return;
+    };
+
+    eprintln!(
+        "REAL PROVIDER: using {} ({}); key read from environment, never printed",
+        provider, base_url
+    );
+
+    // 1. /models discovery (falls back to the official catalog on failure).
+    let discovery = crate::providers::discover_models(&base_url, Some(&api_key), &provider).await;
+    assert!(
+        !discovery.models.is_empty(),
+        "model discovery must return models for {}",
+        provider
+    );
+    eprintln!(
+        "REAL PROVIDER: {} model(s) known (fallback={})",
+        discovery.models.len(),
+        discovery.used_fallback
+    );
+
+    // 2. Select the preferred model from the official catalog.
+    let model = catalog[0].id.to_string();
+    assert!(
+        discovery.models.iter().any(|m| m.id == model),
+        "catalog model {} must be selectable from discovery",
+        model
+    );
+
+    // 3. Simple chat round-trip.
+    let config = crate::config::Config {
+        provider: provider.clone(),
+        base_url: base_url.clone(),
+        model: model.clone(),
+        api_key: Some(api_key.clone()),
+    };
+    let client = crate::providers::OpenAiProvider::new(config.clone());
+    let reply = client
+        .send_message("Reply with exactly: OK")
+        .await
+        .expect("simple chat round-trip must succeed");
+    assert!(!reply.trim().is_empty(), "reply must not be empty");
+    eprintln!(
+        "REAL PROVIDER: chat reply = {:?}",
+        crate::tools::shell::redact_secrets_public(&reply)
+    );
+    let reply_redacted = crate::tools::shell::redact_secrets_public(&reply);
+    assert!(
+        !reply_redacted.contains(&api_key),
+        "reply must never echo the credential"
+    );
+
+    // 4. Structured tool-call probe.
+    let tools = vec![crate::providers::ToolDefinition {
+        name: "get_weather".to_string(),
+        description: "Get the current weather for a city".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+        }),
+    }];
+    let (text, tool_calls) = client
+        .stream_response_with_tools(
+            "What is the weather in Paris? Use the get_weather tool if available.",
+            &tools,
+        )
+        .await
+        .expect("structured tool-call probe must complete");
+    assert!(
+        !text.trim().is_empty() || !tool_calls.is_empty(),
+        "probe must produce prose or a structured tool call"
+    );
+    for call in &tool_calls {
+        assert!(!call.name.is_empty(), "tool call carries a name");
+        assert!(
+            !call.arguments.contains(&api_key),
+            "tool-call arguments must never contain the credential"
+        );
+    }
+    eprintln!(
+        "REAL PROVIDER: tool probe → text={} chars, tool_calls={}",
+        text.chars().count(),
+        tool_calls.len()
+    );
+}
+
 // ===== Model Picker Tests =====
+
+fn picker_model(id: &str) -> crate::provider_manager::ModelInfo {
+    crate::provider_manager::ModelInfo {
+        id: id.to_string(),
+        is_default: false,
+        display_name: None,
+        tool_calling: None,
+        context_tokens: None,
+        source: crate::providers::ModelSource::Discovered,
+    }
+}
 
 #[test]
 fn test_model_picker_open_close() {
@@ -2826,39 +2953,53 @@ fn test_model_picker_open_close() {
 #[test]
 fn test_model_picker_set_models_and_navigate() {
     let mut picker = crate::tui::dashboard::ModelPicker::new();
-    picker.set_models(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    picker.set_models(vec![
+        picker_model("a"),
+        picker_model("b"),
+        picker_model("c"),
+    ]);
     assert_eq!(picker.count(), 3);
-    assert_eq!(picker.selected().as_deref(), Some("a"));
+    assert_eq!(picker.selected().map(|m| m.id), Some("a".to_string()));
     picker.next();
-    assert_eq!(picker.selected().as_deref(), Some("b"));
+    assert_eq!(picker.selected().map(|m| m.id), Some("b".to_string()));
     picker.next();
-    assert_eq!(picker.selected().as_deref(), Some("c"));
+    assert_eq!(picker.selected().map(|m| m.id), Some("c".to_string()));
     // wraps around
     picker.next();
-    assert_eq!(picker.selected().as_deref(), Some("a"));
+    assert_eq!(picker.selected().map(|m| m.id), Some("a".to_string()));
     // prev wraps backwards
     picker.prev();
-    assert_eq!(picker.selected().as_deref(), Some("c"));
+    assert_eq!(picker.selected().map(|m| m.id), Some("c".to_string()));
 }
 
 #[test]
 fn test_model_picker_filter() {
     let mut picker = crate::tui::dashboard::ModelPicker::new();
     picker.set_models(vec![
-        "deepseek/deepseek-v4-pro".to_string(),
-        "qwen3-coder-plus".to_string(),
-        "gpt-4o".to_string(),
+        picker_model("deepseek/deepseek-v4-pro"),
+        picker_model("qwen3-coder-plus"),
+        picker_model("gpt-4o"),
     ]);
     picker.filter = "qwen".to_string();
-    assert_eq!(picker.visible_models(), vec!["qwen3-coder-plus"]);
+    let visible: Vec<&str> = picker
+        .visible_models()
+        .iter()
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(visible, vec!["qwen3-coder-plus"]);
     picker.filter = "deepseek".to_string();
-    assert_eq!(picker.visible_models(), vec!["deepseek/deepseek-v4-pro"]);
+    let visible: Vec<&str> = picker
+        .visible_models()
+        .iter()
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(visible, vec!["deepseek/deepseek-v4-pro"]);
 }
 
 #[test]
 fn test_model_picker_filter_empty_shows_all() {
     let mut picker = crate::tui::dashboard::ModelPicker::new();
-    picker.set_models(vec!["x".to_string(), "y".to_string()]);
+    picker.set_models(vec![picker_model("x"), picker_model("y")]);
     assert_eq!(picker.visible_models().len(), 2);
 }
 
