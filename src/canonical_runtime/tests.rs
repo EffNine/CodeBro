@@ -1258,19 +1258,63 @@ fn test_dedup_same_source_same_content_removes_duplicate() {
     let mut frags = vec![
         ContextFragment {
             structured_facts: None,
-            source: "tool_result".to_string(),
+            source: "diagnostic".to_string(),
             content: "output one".to_string(),
             relevance_score: 0.9,
         },
         ContextFragment {
             structured_facts: None,
-            source: "tool_result".to_string(),
+            source: "diagnostic".to_string(),
             content: "output one".to_string(),
             relevance_score: 0.9,
         },
     ];
     super::dedup_fragments(&mut frags);
     assert_eq!(frags.len(), 1, "identical fragments must deduplicate");
+}
+
+#[test]
+fn test_dedup_preserves_tool_observations() {
+    // Tool observations are the evidence trail: identical results from
+    // separate iterations must ALL reach the next prompt, so a model that
+    // re-issued a call still sees every observation.
+    let mut frags = vec![
+        ContextFragment {
+            structured_facts: None,
+            source: "tool_result".to_string(),
+            content: "Tool result for list_files: src\n".to_string(),
+            relevance_score: 0.9,
+        },
+        ContextFragment {
+            structured_facts: None,
+            source: "tool_result".to_string(),
+            content: "Tool result for list_files: src\n".to_string(),
+            relevance_score: 0.9,
+        },
+        ContextFragment {
+            structured_facts: None,
+            source: "diagnostic".to_string(),
+            content: "dup".to_string(),
+            relevance_score: 0.9,
+        },
+        ContextFragment {
+            structured_facts: None,
+            source: "diagnostic".to_string(),
+            content: "dup".to_string(),
+            relevance_score: 0.9,
+        },
+    ];
+    super::dedup_fragments(&mut frags);
+    assert_eq!(
+        frags.iter().filter(|f| f.source == "tool_result").count(),
+        2,
+        "every tool observation must survive dedup"
+    );
+    assert_eq!(
+        frags.iter().filter(|f| f.source == "diagnostic").count(),
+        1,
+        "non-observation fragments still deduplicate"
+    );
 }
 
 #[test]
@@ -3115,10 +3159,12 @@ struct FunctionCallingMockProvider {
     name: String,
     model: String,
     /// Scripted responses. Each entry is a JSON string of the `tool_calls`
-    /// array (or `[]` for plain text). Consumed sequentially.
+    /// array (or `[]` / plain text). Consumed sequentially.
     responses: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// Tool definitions received on the last invocation.
     received_tools: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Every prompt this provider was asked to generate from.
+    prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// When true, `stream_response_with_tools` returns an error immediately.
     fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -3130,6 +3176,7 @@ impl FunctionCallingMockProvider {
             model: format!("{}-model", name),
             responses: std::sync::Arc::new(std::sync::Mutex::new(responses)),
             received_tools: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            prompts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             fail: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -3143,6 +3190,12 @@ impl FunctionCallingMockProvider {
     /// The tool definitions received on the last invocation (names).
     fn received_tool_names(&self) -> Vec<String> {
         self.received_tools.lock().unwrap().clone()
+    }
+
+    /// Every prompt this provider was asked to generate from (one per model
+    /// call).
+    fn all_prompts(&self) -> Vec<String> {
+        self.prompts.lock().unwrap().clone()
     }
 
     fn next_response(&self) -> String {
@@ -3212,7 +3265,7 @@ impl Provider for FunctionCallingMockProvider {
 
     fn stream_response_with_tools(
         &self,
-        _message: &str,
+        message: &str,
         tools: &[crate::providers::ToolDefinition],
     ) -> std::pin::Pin<
         Box<
@@ -3227,6 +3280,7 @@ impl Provider for FunctionCallingMockProvider {
             let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
             self.received_tools.lock().unwrap().extend(names);
         }
+        self.prompts.lock().unwrap().push(message.to_string());
 
         if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
             return Box::pin(
@@ -3236,12 +3290,53 @@ impl Provider for FunctionCallingMockProvider {
 
         let response = self.next_response();
         Box::pin(async move {
-            // The response is a JSON `tool_calls` array.
+            // A response is either a JSON `tool_calls` array, plain final
+            // text, or a combined `{"text": ..., "tool_calls": [...]}` object
+            // (mirroring a real OpenAI-compatible provider).
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&response) {
+                if let Some(map) = obj.as_object() {
+                    if map.contains_key("text") || map.contains_key("tool_calls") {
+                        let text = map
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let calls = map
+                            .get("tool_calls")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|item| {
+                                        let id = item
+                                            .get("id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let name = item["function"]["name"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let arguments = item["function"]["arguments"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        crate::providers::StructuredToolCall {
+                                            id,
+                                            name,
+                                            arguments,
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        return Ok((text, calls));
+                    }
+                }
+            }
             let calls: Vec<crate::providers::StructuredToolCall> =
                 if response.trim().is_empty() || response == "[]" {
                     Vec::new()
-                } else {
-                    let arr: Vec<serde_json::Value> = serde_json::from_str(&response)?;
+                } else if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&response) {
                     arr.into_iter()
                         .map(|item| {
                             let id = item
@@ -3261,8 +3356,18 @@ impl Provider for FunctionCallingMockProvider {
                             }
                         })
                         .collect()
+                } else {
+                    Vec::new()
                 };
-            Ok((String::new(), calls))
+            let text = if response.trim().is_empty()
+                || response == "[]"
+                || serde_json::from_str::<Vec<serde_json::Value>>(&response).is_ok()
+            {
+                String::new()
+            } else {
+                response
+            };
+            Ok((text, calls))
         })
     }
 }
@@ -3304,7 +3409,7 @@ async fn test_structured_sends_tool_definitions() {
     let mut runtime =
         CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
     runtime.with_retry_policy(RetryPolicy::immediate(0));
-    let provider = FunctionCallingMockProvider::new("fc-mock", vec!["[]".to_string()]);
+    let provider = FunctionCallingMockProvider::new("fc-mock", vec!["Done.".to_string()]);
     let provider_arc = Arc::new(provider);
     let provider_copy = provider_arc.clone();
     runtime.register_provider(provider_arc);
@@ -3333,13 +3438,18 @@ async fn test_structured_single_tool_call() {
         r#"[{"id": "call_1", "function": {"name": "list_files", "arguments": "{\"path\": \".\"}"}}]"#
             .to_string(),
         // Final text answer.
-        "[]".to_string(),
+        "Done.".to_string(),
     ]);
     let result = run_structured_task(&mut runtime, "list files").await;
     assert!(
         result.success,
         "structured single tool call should succeed: {:?}",
         result.error
+    );
+    assert!(
+        result.response.contains("Done."),
+        "the final text answer must be returned: {:?}",
+        result.response
     );
 }
 
@@ -3354,13 +3464,18 @@ async fn test_structured_multiple_tool_calls() {
             {"id": "call_2", "function": {"name": "read_file", "arguments": "{\"path\": \"README.md\"}"}}
         ]"#
         .to_string(),
-        "[]".to_string(),
+        "Done with both steps.".to_string(),
     ]);
     let result = run_structured_task(&mut runtime, "inspect the repo").await;
     assert!(
         result.success,
         "structured multiple tool calls should succeed: {:?}",
         result.error
+    );
+    assert!(
+        result.response.contains("Done with both steps."),
+        "the final text answer must be returned: {:?}",
+        result.response
     );
 }
 
@@ -3373,7 +3488,7 @@ async fn test_structured_tool_result_feeds_next_iteration() {
         // First iteration: structured call.
         r#"[{"id": "call_1", "function": {"name": "list_files", "arguments": "{}"}}]"#.to_string(),
         // Second iteration: final answer after observing the tool result.
-        "[]".to_string(),
+        "Done.".to_string(),
     ]);
     let result = run_structured_task(&mut runtime, "list files then summarize").await;
     assert!(
@@ -3458,13 +3573,326 @@ async fn test_structured_multistep_task_completion() {
         r#"[{"id": "call_2", "function": {"name": "read_file", "arguments": "{\"path\": \"README.md\"}"}}]"#
             .to_string(),
         // Step 3: final answer.
-        "[]".to_string(),
+        "Done.".to_string(),
     ]);
     let result = run_structured_task(&mut runtime, "list then read the readme").await;
     assert!(
         result.success,
         "structured multi-step should succeed: {:?}",
         result.error
+    );
+    assert!(
+        result.response.contains("Done."),
+        "the final text answer must be returned: {:?}",
+        result.response
+    );
+}
+
+// =========================================================================
+// ReAct termination regression (Sprint): the loop must recognize completion.
+// =========================================================================
+
+/// 1. A text-only response completes successfully with zero tool calls.
+#[tokio::test]
+async fn test_text_only_response_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec!["OK".to_string()],
+    ));
+    runtime.register_provider(provider.clone());
+    let result = run_structured_task(&mut runtime, "say ok").await;
+    assert!(
+        result.success,
+        "text-only must complete: {:?}",
+        result.error
+    );
+    assert_eq!(result.response.trim(), "OK");
+    assert!(!result.cancelled);
+}
+
+/// 2. A text-only response does not consume the iteration budget: exactly one
+///    model call happens even with the tightest budget.
+#[tokio::test]
+async fn test_text_only_response_does_not_consume_iterations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec!["final answer".to_string()],
+    ));
+    runtime.register_provider(provider.clone());
+    let result = run_structured_task(&mut runtime, "answer briefly").await;
+    assert!(result.success, "must succeed: {:?}", result.error);
+    assert_eq!(
+        provider.all_prompts().len(),
+        1,
+        "a text-only answer must terminate on the first iteration"
+    );
+}
+
+/// 3. Structured tool call → tool execution → final text → complete.
+#[tokio::test]
+async fn test_tool_call_then_final_text_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(FunctionCallingMockProvider::new(
+        "fc-mock",
+        vec![
+            r#"[{"id": "call_1", "function": {"name": "list_files", "arguments": "{}"}}]"#
+                .to_string(),
+            "Done.".to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "list files then finish",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    assert!(result.success, "must complete: {:?}", result.error);
+    assert!(result.response.contains("Done."));
+    let evs = events.lock().unwrap();
+    // The loop executes the scripted structured call exactly once; the
+    // observe phase may run its own pipeline tools, so assert the loop's
+    // model-call count (the authoritative iteration invariant) and that at
+    // least one loop-driven execution happened.
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, AgentEvent::ToolStarted { .. })),
+        "the structured call must reach the tool registry"
+    );
+    assert_eq!(
+        provider.all_prompts().len(),
+        2,
+        "tool call iteration + final text iteration"
+    );
+}
+
+/// 4. Streamed text (plain protocol) completes.
+#[tokio::test]
+async fn test_streamed_text_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec!["Streamed answer over the channel.".to_string()],
+    )));
+    let result = run_structured_task(&mut runtime, "say something").await;
+    assert!(
+        result.success,
+        "streamed text must complete: {:?}",
+        result.error
+    );
+    assert!(result.response.contains("Streamed answer"));
+}
+
+/// 5. Structured tool call then final text completes.
+#[tokio::test]
+async fn test_streamed_tool_call_then_final_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(FunctionCallingMockProvider::new(
+        "fc-mock",
+        vec![
+            r#"[{"id": "c1", "function": {"name": "list_files", "arguments": "{}"}}]"#.to_string(),
+            r#"{"text": "Here is the final summary.", "tool_calls": []}"#.to_string(),
+        ],
+    )));
+    let result = run_structured_task(&mut runtime, "list and summarize").await;
+    assert!(result.success, "must complete: {:?}", result.error);
+    assert!(result.response.contains("final summary"));
+}
+
+/// 6. An empty response terminates as a bounded error after exactly one
+///    model call — it never loops to the iteration cap.
+#[tokio::test]
+async fn test_empty_response_does_not_loop_forever() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new("mock", vec![String::new()]));
+    runtime.register_provider(provider.clone());
+    let result = run_structured_task(&mut runtime, "say nothing").await;
+    assert!(
+        !result.success,
+        "empty response must fail explicitly, got: {:?}",
+        result.error
+    );
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("no usable response"),
+        "the error must be the explicit empty-response termination: {:?}",
+        result.error
+    );
+    assert_eq!(
+        provider.all_prompts().len(),
+        1,
+        "an empty response must never consume another iteration"
+    );
+}
+
+/// 7. A malformed structured call (empty name) is bounded: explicit error,
+///    exactly one model call, no "Unknown tool" execution, no iteration spin.
+#[tokio::test]
+async fn test_malformed_tool_response_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(FunctionCallingMockProvider::new(
+        "fc-mock",
+        vec![
+            // Placeholder tool-call delta: index present, name/arguments empty.
+            r#"[{"id": "p1"}]"#.to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+    let (events, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "do something",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task(&req).await;
+    assert!(
+        !result.success,
+        "malformed call must be a bounded error, got: {:?}",
+        result.error
+    );
+    let evs = events.lock().unwrap();
+    assert!(
+        evs.iter()
+            .all(|e| !matches!(e, AgentEvent::ToolStarted { .. })),
+        "a malformed tool call must never be executed"
+    );
+    assert_eq!(
+        provider.all_prompts().len(),
+        1,
+        "a malformed response must not consume another iteration"
+    );
+}
+
+/// 8. `finish_reason == "stop"` semantics: text with a leftover placeholder
+///    tool-call delta terminates with the text as the final answer.
+#[tokio::test]
+async fn test_finish_reason_stop_overrides_placeholder_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    runtime.register_provider(Arc::new(FunctionCallingMockProvider::new(
+        "fc-mock",
+        vec![
+            // Final prose + an incomplete/empty placeholder tool-call delta.
+            r#"{"text": "OK", "tool_calls": [{"id": "p1"}]}"#.to_string(),
+        ],
+    )));
+    let result = run_structured_task(&mut runtime, "reply ok").await;
+    assert!(
+        result.success,
+        "stop + text must terminate successfully: {:?}",
+        result.error
+    );
+    assert!(result.response.contains("OK"));
+}
+
+/// 9. `finish_reason == "tool_calls"` without a usable structured call must
+///    not silently loop (covered at loop level by the malformed-call test;
+///    this pins the classifier contract for the exact finish-reason case).
+#[test]
+fn test_finish_reason_tool_calls_requires_structured_call() {
+    let d = crate::canonical_runtime::execution::classify_response(
+        "",
+        vec![crate::providers::StructuredToolCall {
+            id: "c1".to_string(),
+            name: String::new(),
+            arguments: String::new(),
+        }],
+    );
+    assert!(
+        matches!(
+            d,
+            crate::canonical_runtime::execution::ResponseDisposition::Empty(_)
+        ),
+        "tool_calls finish reason without a usable call must be a bounded error"
+    );
+}
+
+/// 10. Assist-style: Research subagent completes with its report, then the
+///     main loop completes with a text-only final answer.
+#[tokio::test]
+async fn test_research_then_main_final_text() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+    let mut runtime =
+        CanonicalRuntime::new_without_default_provider(test_config(), dir.path()).unwrap();
+    runtime.with_retry_policy(RetryPolicy::immediate(0));
+    let provider = Arc::new(RecordingScriptedProvider::new(
+        "mock",
+        vec![
+            // Research subagent's final report (text-only → research completes).
+            "Research report: the crate exposes demo().".to_string(),
+            // Main loop's final answer (text-only → task completes).
+            "Final answer: the crate exposes demo().".to_string(),
+        ],
+    ));
+    runtime.register_provider(provider.clone());
+
+    let (_, emit) = event_sink();
+    let on_chunk = |_c: &str| {};
+    let options = crate::canonical_runtime::TaskOptions {
+        research_enabled: true,
+        ..Default::default()
+    };
+    let req = crate::canonical_runtime::TaskRequest {
+        task: "explain the crate",
+        conversation: no_conversation(),
+        emit: &emit,
+        on_chunk: &on_chunk,
+    };
+    let result = runtime.run_task_with_options(&req, options).await;
+    assert!(
+        result.success,
+        "research → main text-only must complete: {:?}",
+        result.error
+    );
+    assert!(
+        result.response.contains("Final answer"),
+        "the main final response must be returned: {:?}",
+        result.response
+    );
+    assert_eq!(
+        provider.all_prompts().len(),
+        2,
+        "one research call + one main call, no wasted iterations"
     );
 }
 
@@ -3767,7 +4195,7 @@ async fn test_structured_input_envelope_unwrapped_for_real_tools() {
                 r#"[{{"id": "call_1", "function": {{"name": "read_file", "arguments": "{{\"input\": \"{}\"}}"}}}}]"#,
                 abs
             ),
-            "[]".to_string(),
+            "Done.".to_string(),
         ],
     )));
 
@@ -5659,6 +6087,14 @@ async fn test_review_result_reaches_main_provider_prompt() {
     let provider = Arc::new(RecordingScriptedProvider::new(
         "mock",
         vec![
+            // Research final synthesis (text-only → research completes).
+            "Research complete: src/lib.rs exposes sub().".to_string(),
+            // Testing final synthesis (text-only → testing completes).
+            "Testing complete: no test failures.".to_string(),
+            // Planning final synthesis (text-only → planning completes).
+            "Planning complete: plan ready.".to_string(),
+            // Coding final synthesis (text-only → coding completes).
+            "Coding complete: change applied.".to_string(),
             // Review final synthesis (no tool calls).
             review_final_answer(),
             // Main loop answer.

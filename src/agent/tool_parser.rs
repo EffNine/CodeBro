@@ -3,7 +3,7 @@ use anyhow::Result;
 use serde_json;
 
 /// Parsed tool call extracted from LLM response.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

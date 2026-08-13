@@ -183,43 +183,27 @@ impl ResearchSubagent {
                     state.model_calls += 1;
                     state.iterations += 1;
 
-                    let calls: Vec<ToolCall> = {
-                        let parsed = if !structured.is_empty() {
-                            structured
-                                .into_iter()
-                                .map(|c: StructuredToolCall| ToolCall {
-                                    id: c.id,
-                                    name: c.name,
-                                    arguments: c.arguments,
-                                })
-                                .collect::<Vec<_>>()
-                        } else {
-                            tool_parser::parse_tool_calls(&full).unwrap_or_default()
-                        };
-                        // Structured calls arrive wrapped in the `{"input":
-                        // ...}` envelope; text-encoded calls may carry the same
-                        // envelope. Unwrap so the restricted registry receives
-                        // the raw argument string. A no-op for raw strings.
-                        parsed
-                            .into_iter()
-                            .map(|mut c| {
-                                c.arguments = tool_parser::unwrap_tool_arguments(&c.arguments);
-                                c
-                            })
-                            .collect()
+                    // Classify the complete response into one of the three
+                    // loop states (final text / usable tool calls / neither).
+                    // A valid text-only report completes the research
+                    // immediately; an empty or malformed response terminates
+                    // as a bounded error; only genuine usable tool calls
+                    // continue gathering evidence.
+                    let calls: Vec<ToolCall> = match execution::classify_response(&full, structured)
+                    {
+                        execution::ResponseDisposition::Execute(calls) => calls,
+                        execution::ResponseDisposition::Final(text) => {
+                            state.final_answer = Some(text);
+                            state.synthesis_complete = true;
+                            let model = provider_model;
+                            return self
+                                .finish(state, ResearchTermination::Completed, started, emit)
+                                .with_provider(provider_id.as_str().to_string(), model);
+                        }
+                        execution::ResponseDisposition::Empty(msg) => {
+                            return self.finish_error(state, msg, started, emit);
+                        }
                     };
-
-                    // No tool call → the model produced its final report. This
-                    // is the synthesis-complete signal: the model stopped
-                    // gathering evidence and wrote a prose summary.
-                    if calls.is_empty() {
-                        state.final_answer = Some(full);
-                        state.synthesis_complete = true;
-                        let model = provider_model;
-                        return self
-                            .finish(state, ResearchTermination::Completed, started, emit)
-                            .with_provider(provider_id.as_str().to_string(), model);
-                    }
 
                     // The reserved synthesis call must not keep gathering
                     // evidence: the model-call budget reserved for it is spent.
