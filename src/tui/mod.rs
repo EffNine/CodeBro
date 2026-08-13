@@ -8,6 +8,7 @@ pub mod dashboard;
 pub mod diff_view;
 pub mod events;
 pub mod markdown;
+pub mod textarea_adapter;
 pub mod theme;
 pub mod ui;
 

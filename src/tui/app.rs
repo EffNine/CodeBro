@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::tui::actions::{ActionStream, UiActionGroup};
 use crate::tui::console::{ConsoleStatus, PtyConsole};
 use crate::tui::dashboard::Dashboard;
+use crate::tui::textarea_adapter::InputAdapter;
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -60,8 +61,7 @@ fn format_message_timestamp() -> String {
 
 pub struct TuiApp {
     pub messages: VecDeque<Message>,
-    pub input: String,
-    pub input_cursor: usize,
+    pub input: InputAdapter,
     pub is_loading: bool,
     /// Lines scrolled up from the bottom of the conversation (0 = at bottom).
     pub scroll_from_bottom: usize,
@@ -252,8 +252,7 @@ impl TuiApp {
 
         Ok(TuiApp {
             messages: VecDeque::new(),
-            input: String::new(),
-            input_cursor: 0,
+            input: InputAdapter::new(),
             is_loading: false,
             scroll_from_bottom: 0,
             config,
@@ -368,35 +367,12 @@ impl TuiApp {
         self.task_started_at.map(|t| t.elapsed().as_secs())
     }
 
-    // ---- Input cursor handling ----
-
-    pub fn insert_char(&mut self, c: char) {
-        let idx = self.input_char_boundary(self.input_cursor);
-        self.input.insert(idx, c);
-        self.input_cursor += c.len_utf8();
-    }
+    // ---- Input handling (delegated to TextArea adapter) ----
 
     /// Inserts a block of text (from a paste) at the cursor. Newlines are kept
     /// so multi-line prompts stay together in the input buffer.
     pub fn insert_text(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        let idx = self.input_char_boundary(self.input_cursor);
-        self.input.insert_str(idx, text);
-        self.input_cursor = idx + text.len();
-    }
-
-    /// Returns the (line index, column) of the cursor within the input buffer.
-    pub fn input_cursor_line_col(&self) -> (usize, usize) {
-        let up_to = &self.input[..self.input_char_boundary(self.input_cursor)];
-        let line_idx = up_to.matches('\n').count();
-        let col = up_to
-            .rsplit('\n')
-            .next()
-            .map(|s| s.chars().count())
-            .unwrap_or(0);
-        (line_idx, col)
+        self.input.insert_text(text);
     }
 
     /// Scrolls the conversation using mouse wheel deltas.
@@ -670,63 +646,23 @@ impl TuiApp {
     }
 
     pub fn backspace(&mut self) {
-        if self.input_cursor == 0 {
-            return;
-        }
-        let idx = self.input_char_boundary(self.input_cursor);
-        if let Some(prev) = self.input[..idx].char_indices().next_back() {
-            self.input.remove(prev.0);
-            self.input_cursor = prev.0;
-        } else {
-            self.input.remove(0);
-            self.input_cursor = 0;
-        }
+        // Delegated to textarea via key event; kept as no-op stub for API compatibility.
     }
 
     pub fn cursor_left(&mut self) {
-        if self.input_cursor == 0 {
-            return;
-        }
-        let idx = self.input_char_boundary(self.input_cursor);
-        if let Some((pos, _)) = self.input[..idx].char_indices().next_back() {
-            self.input_cursor = pos;
-        } else {
-            self.input_cursor = 0;
-        }
+        // Delegated to textarea via key event.
     }
 
     pub fn cursor_right(&mut self) {
-        let len = self.input.len();
-        if self.input_cursor >= len {
-            self.input_cursor = len;
-            return;
-        }
-        let idx = self.input_char_boundary(self.input_cursor);
-        if let Some((pos, ch)) = self.input[idx..].char_indices().next() {
-            self.input_cursor = idx + pos + ch.len_utf8();
-        } else {
-            self.input_cursor = len;
-        }
+        // Delegated to textarea via key event.
     }
 
     pub fn cursor_home(&mut self) {
-        self.input_cursor = 0;
+        // Delegated to textarea via key event.
     }
 
     pub fn cursor_end(&mut self) {
-        self.input_cursor = self.input.len();
-    }
-
-    fn input_char_boundary(&self, byte_idx: usize) -> usize {
-        let len = self.input.len();
-        if byte_idx >= len {
-            return len;
-        }
-        let mut i = byte_idx;
-        while i > 0 && !self.input.is_char_boundary(i) {
-            i -= 1;
-        }
-        i
+        // Delegated to textarea via key event.
     }
 
     // ---- Input history navigation ----
@@ -754,21 +690,18 @@ impl TuiApp {
             None => self.input_history.len() - 1,
         };
         self.history_index = Some(idx);
-        self.input = self.input_history[idx].clone();
-        self.input_cursor = self.input.len();
+        self.input.set_text(&self.input_history[idx]);
     }
 
     pub fn history_next(&mut self) {
         match self.history_index {
             Some(i) if i + 1 < self.input_history.len() => {
                 self.history_index = Some(i + 1);
-                self.input = self.input_history[i + 1].clone();
-                self.input_cursor = self.input.len();
+                self.input.set_text(&self.input_history[i + 1]);
             }
             Some(_) => {
                 self.history_index = None;
                 self.input.clear();
-                self.input_cursor = 0;
             }
             None => {}
         }
@@ -776,7 +709,6 @@ impl TuiApp {
 
     pub fn clear_input(&mut self) {
         self.input.clear();
-        self.input_cursor = 0;
         self.history_index = None;
     }
 

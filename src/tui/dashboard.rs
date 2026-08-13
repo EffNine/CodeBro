@@ -698,28 +698,28 @@ impl Dashboard {
         }
     }
 
-    /// Slash-command autocomplete: pops the current completion and replaces
-    /// `input` with the next matching command. Returns true if a completion
-    /// was applied (so the caller can skip normal TAB behaviour).
-    pub fn autocomplete_command(&mut self, input: &mut String, candidates: Vec<String>) {
+    /// Slash-command autocomplete: pops the current completion and returns
+    /// the next candidate string to insert into the input. Returns `None`
+    /// when the candidate list is empty.
+    pub fn autocomplete_command(&mut self, input: &str, candidates: Vec<String>) -> Option<String> {
         if candidates.is_empty() {
             self.autocomplete.clear();
             self.autocomplete_index = 0;
-            return;
+            return None;
         }
         if self.autocomplete != candidates {
             self.autocomplete = candidates;
             self.autocomplete_index = 0;
         }
-        if let Some(cmd) = self.autocomplete.get(self.autocomplete_index) {
+        self.autocomplete.get(self.autocomplete_index).map(|cmd| {
             // Replace the command token, preserving any typed argument.
             let rest = match input.split_once(' ') {
                 Some((_, args)) => format!("{} {}", cmd, args),
                 None => cmd.to_string(),
             };
-            *input = rest;
             self.autocomplete_index = (self.autocomplete_index + 1) % self.autocomplete.len();
-        }
+            rest
+        })
     }
 
     /// Apply the currently selected autocomplete entry to the input line.

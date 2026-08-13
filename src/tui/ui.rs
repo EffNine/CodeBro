@@ -286,7 +286,7 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
             // Up/Down navigate the completion list instead of chat history.
             // Characters and Backspace fall through so typing keeps filtering.
             if !app.dashboard.autocomplete.is_empty()
-                && (app.input.starts_with('/') || app.input.starts_with('!'))
+                && (app.input.text().starts_with('/') || app.input.text().starts_with('!'))
                 && handle_autocomplete_key(key, app)
             {
                 return;
@@ -311,14 +311,19 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                             app.dashboard
                                 .log("info", "focused action group".to_string());
                         }
-                    } else if app.input.starts_with('/') || app.input.starts_with('!') {
-                        let candidates = commands::completion_candidates(&app.input, app);
+                    } else if app.input.text().starts_with('/') || app.input.text().starts_with('!')
+                    {
+                        let candidates = commands::completion_candidates(app.input.text(), app);
                         let names: Vec<String> =
                             candidates.iter().map(|c| c.command.to_string()).collect();
                         if names.is_empty() {
                             app.dashboard.autocomplete.clear();
                         } else {
-                            app.dashboard.autocomplete_command(&mut app.input, names);
+                            if let Some(next) =
+                                app.dashboard.autocomplete_command(app.input.text(), names)
+                            {
+                                app.input.set_text(&next);
+                            }
                         }
                     }
                     app.paste_marker = None;
@@ -360,7 +365,7 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                         .modifiers
                         .contains(crossterm::event::KeyModifiers::SHIFT)
                     {
-                        app.insert_char('\n');
+                        app.insert_text("\n");
                         app.paste_marker = None;
                         return;
                     }
@@ -400,11 +405,11 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                     app.add_message(MessageRole::System, help_text(app));
                 }
                 KeyCode::Char(c) => {
-                    app.insert_char(c);
+                    app.insert_text(&c.to_string());
                     app.paste_marker = None;
                     // Live-filter the completion list while typing a command.
-                    if app.input.starts_with('/') || app.input.starts_with('!') {
-                        let candidates = commands::completion_candidates(&app.input, app);
+                    if app.input.text().starts_with('/') || app.input.text().starts_with('!') {
+                        let candidates = commands::completion_candidates(app.input.text(), app);
                         app.dashboard.autocomplete =
                             candidates.iter().map(|c| c.command.to_string()).collect();
                         if app.dashboard.autocomplete.is_empty() {
@@ -1613,7 +1618,7 @@ fn compute_ui_layout(app: &TuiApp, size: Rect) -> UiLayout {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn ui(f: &mut Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let layout = compute_ui_layout(app, size);
 
     render_header(f, app, layout.header_area(size));
@@ -2652,13 +2657,26 @@ fn render_rail_section(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let prefix = if let Some(s) = &app.secure_input {
-        format!("API key for {}: ", s.provider)
-    } else if app.dashboard.animation.is_active() {
+    // Secure input uses the old masked path — the textarea does not support
+    // masked mode, so we keep it separate.
+    if let Some(s) = &app.secure_input {
+        render_secure_input(f, app, area, s);
+        return;
+    }
+
+    // Multiline paste marker: show a compact representation instead of the
+    // raw textarea (which would expand to many lines and break the layout).
+    if let Some(ref marker) = app.paste_marker {
+        render_paste_marker_input(f, app, area, marker);
+        return;
+    }
+
+    let prefix = if app.dashboard.animation.is_active() {
         format!("{}❯ ", spinner_char_now())
     } else {
         "❯ ".to_string()
     };
+    let prefix_w = prefix.chars().count() as u16;
 
     let inner_h = area.height.saturating_sub(1) as usize;
     let inner_w = area.width.saturating_sub(2) as usize;
@@ -2666,49 +2684,26 @@ fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
         return;
     }
 
-    let (display_lines, cursor_line_rel, cursor_col) = if let Some(s) = &app.secure_input {
-        // Masked secret display: the raw buffer is never rendered.
-        let masked: String = "•".repeat(s.buffer.chars().count());
-        let line = if masked.is_empty() {
-            "(secret)".to_string()
-        } else {
-            masked
-        };
-        (vec![line], 0usize, s.buffer.chars().count())
-    } else if let Some(ref marker) = app.paste_marker {
-        // Multiline paste: show a compact marker instead of the raw text.
-        (vec![marker.clone()], 0, marker.chars().count())
-    } else {
-        input_display_lines(&app.input, app.input_cursor, inner_h, inner_w)
-    };
+    // Render the upstream textarea in the main area.
+    app.input.render(area, f.buffer_mut());
 
-    let mut text_lines = Vec::new();
-    for (i, line) in display_lines.iter().enumerate() {
-        let full = if i == 0 {
-            format!("{}{}", prefix, line)
-        } else {
-            line.clone()
-        };
-        text_lines.push(Line::from(truncate_to(&full, area.width as usize)));
-    }
-    if app.input.is_empty() && app.secure_input.is_none() {
-        text_lines[0] = Line::from(Span::styled(
-            format!("{}Ask CodeBro anything... (Ctrl+Enter to send)", prefix),
-            Style::default().fg(THEME.muted),
-        ));
+    // Draw the prompt prefix on the first visual line.
+    if area.width >= prefix_w + 1 {
+        let prefix_line = Line::from(Span::styled(prefix, Style::default().fg(THEME.primary)));
+        f.render_widget(prefix_line, Rect::new(area.x, area.y, prefix_w, 1));
     }
 
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(THEME.border_style())
-        .style(Style::default().bg(THEME.surface));
-    let paragraph = Paragraph::new(Text::from(text_lines))
-        .block(block)
-        .style(Style::default().fg(THEME.primary).bg(THEME.surface));
-    f.render_widget(paragraph, area);
+    // Placeholder hint when empty.
+    if app.input.is_empty() {
+        let hint = "Ask CodeBro anything... (Ctrl+Enter to send)";
+        let hint_w = hint.chars().count() as u16;
+        let hint_area = Rect::new(area.x + prefix_w, area.y, hint_w, 1);
+        let hint_line = Line::from(Span::styled(hint, Style::default().fg(THEME.muted)));
+        f.render_widget(hint_line, hint_area);
+    }
 
-    // Right-aligned action chips matching the design-spec input chrome.
-    if area.height >= 2 && area.width >= 28 && app.secure_input.is_none() {
+    // Right-aligned action chips.
+    if area.height >= 2 && area.width >= 28 {
         let hints: Vec<(&str, &str, Color)> = if app.has_active_task() {
             vec![("Ctrl+C", "Cancel", THEME.yellow)]
         } else {
@@ -2738,16 +2733,74 @@ fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
         }
     }
 
+    // Cursor positioning via the textarea's screen-position helper, clamped.
     if area.width >= 4 && area.height >= 2 {
-        let x_off = if cursor_line_rel == 0 {
-            prefix.chars().count() + cursor_col
-        } else {
-            cursor_col
-        };
-        let x = (area.x + x_off as u16).min(area.x + area.width.saturating_sub(2));
-        let y = (area.y + 1 + cursor_line_rel as u16).min(area.y + area.height.saturating_sub(2));
-        f.set_cursor(x, y);
+        if let Some((cx, cy)) = app.input.cursor_pos(area) {
+            let cx = cx.min(area.x + area.width.saturating_sub(1));
+            let cy = cy.min(area.y + area.height.saturating_sub(1));
+            f.set_cursor_position((cx, cy));
+        }
     }
+}
+
+fn render_paste_marker_input(f: &mut Frame, app: &TuiApp, area: Rect, marker: &str) {
+    let prefix = if app.dashboard.animation.is_active() {
+        format!("{}❯ ", spinner_char_now())
+    } else {
+        "❯ ".to_string()
+    };
+    let line = format!("{}{}", prefix, marker);
+    let text_lines = vec![Line::from(truncate_to(&line, area.width as usize))];
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(THEME.border_style())
+        .style(Style::default().bg(THEME.surface));
+    let paragraph = Paragraph::new(Text::from(text_lines))
+        .block(block)
+        .style(Style::default().fg(THEME.primary).bg(THEME.surface));
+    f.render_widget(paragraph, area);
+
+    let cursor_col = line.chars().count();
+    let x = (area.x + cursor_col as u16).min(area.x + area.width.saturating_sub(1));
+    let y = area.y.min(area.y + area.height.saturating_sub(1));
+    f.set_cursor_position((x, y));
+}
+
+fn render_secure_input(
+    f: &mut Frame,
+    app: &TuiApp,
+    area: Rect,
+    s: &crate::tui::app::SecureInputState,
+) {
+    let prefix = format!("API key for {}: ", s.provider);
+    let masked: String = "•".repeat(s.buffer.chars().count());
+    let line = if masked.is_empty() {
+        "(secret)".to_string()
+    } else {
+        masked
+    };
+    let mut text_lines = Vec::new();
+    text_lines.push(Line::from(format!("{}{}", prefix, line)));
+    if app.input.is_empty() && s.buffer.is_empty() {
+        text_lines[0] = Line::from(Span::styled(
+            format!("{}(secret)", prefix),
+            Style::default().fg(THEME.muted),
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(THEME.border_style())
+        .style(Style::default().bg(THEME.surface));
+    let paragraph = Paragraph::new(Text::from(text_lines))
+        .block(block)
+        .style(Style::default().fg(THEME.primary).bg(THEME.surface));
+    f.render_widget(paragraph, area);
+
+    // Cursor at end of masked display.
+    let cursor_col = prefix.chars().count() + line.chars().count();
+    let x = (area.x + cursor_col as u16).min(area.x + area.width.saturating_sub(1));
+    let y = area.y.min(area.y + area.height.saturating_sub(1));
+    f.set_cursor_position((x, y));
 }
 
 fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
@@ -3654,7 +3707,7 @@ fn handle_provider_manager_key(key: crossterm::event::KeyEvent, app: &mut TuiApp
 }
 
 fn render_model_picker(f: &mut Frame, app: &TuiApp) {
-    let size = f.size();
+    let size = f.area();
     let width = (size.width as usize).min(72);
     let height = (size.height as usize).min(24);
 
@@ -3924,9 +3977,8 @@ fn handle_autocomplete_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) ->
             true
         }
         KeyCode::Enter => {
-            if let Some(applied) = app.dashboard.autocomplete_apply(&app.input) {
-                app.input = applied;
-                app.input_cursor = app.input.len();
+            if let Some(applied) = app.dashboard.autocomplete_apply(app.input.text()) {
+                app.input.set_text(&applied);
             }
             true
         }
@@ -5085,8 +5137,7 @@ mod tests {
     // ─── Autocomplete (Part 7) ─────────────────────────────────────────
 
     fn autocomplete_open(app: &mut TuiApp) {
-        app.input = "//v".to_string();
-        app.input_cursor = app.input.len();
+        app.input.set_text("//v");
         app.dashboard.autocomplete = vec![
             "//verbose".to_string(),
             "//version".to_string(),
@@ -5149,7 +5200,8 @@ mod tests {
         app.dashboard.autocomplete_index = 1; // //version
         handle_autocomplete_key(key(KeyCode::Enter), &mut app);
         assert_eq!(
-            app.input, "//version",
+            app.input.text(),
+            "//version",
             "Enter applies the selected completion"
         );
         assert!(app.dashboard.autocomplete.is_empty(), "list consumed");
@@ -5174,14 +5226,14 @@ mod tests {
         // chat input history.
         handle_key(key(KeyCode::Down), &mut app);
         assert_eq!(app.dashboard.autocomplete_index, 1);
-        assert_eq!(app.input, "//v", "chat input untouched");
+        assert_eq!(app.input.text(), "//v", "chat input untouched");
         assert!(app.history_index.is_none());
     }
 
     #[test]
     fn test_autocomplete_long_list_scrolls_selection_into_view() {
         let mut app = make_app();
-        app.input = "//".to_string();
+        app.input.set_text("//");
         app.dashboard.autocomplete = (0..40).map(|i| format!("//cmd{:02}", i)).collect();
         app.dashboard.autocomplete_index = 39;
         let text = buffer_text(&app, 120, 40);
@@ -5203,7 +5255,7 @@ mod tests {
         // Characters must fall through to the input handler.
         assert!(!handle_autocomplete_key(key(KeyCode::Char('e')), &mut app));
         handle_key(key(KeyCode::Char('e')), &mut app);
-        assert_eq!(app.input, "//ve");
+        assert_eq!(app.input.text(), "//ve");
         assert!(!app.dashboard.autocomplete.is_empty(), "list refreshed");
     }
 
@@ -5470,7 +5522,7 @@ mod tests {
             draw(&app, w, h);
             // Autocomplete with a long list, selection near the end.
             let mut app = make_app();
-            app.input = "//".to_string();
+            app.input.set_text("//");
             app.dashboard.autocomplete = (0..40).map(|i| format!("//cmd{:02}", i)).collect();
             app.dashboard.autocomplete_index = 39;
             draw(&app, w, h);
@@ -5497,8 +5549,8 @@ mod tests {
     #[test]
     fn test_inline_apikey_rejected_and_not_in_history() {
         let mut app = make_app();
-        app.input = format!("//apikey openai {}", SECRET_KEY);
-        app.input_cursor = app.input.len();
+        app.input
+            .set_text(&format!("//apikey openai {}", SECRET_KEY));
         // Enter on an inline key must not submit, store, or echo it.
         handle_key(key(KeyCode::Enter), &mut app);
         assert!(
@@ -5707,7 +5759,11 @@ mod tests {
         app.insert_text(multiline);
         app.paste_marker = Some("[pasted 3 lines, 27 B]".to_string());
         // When submitted, the raw text (not the marker) is used.
-        assert_eq!(app.input, multiline, "raw text preserved in input buffer");
+        assert_eq!(
+            app.input.text(),
+            multiline,
+            "raw text preserved in input buffer"
+        );
         // Simulate Enter submission path: input is trimmed and submitted,
         // then input is cleared and marker is cleared.
         let input = app.input.trim().to_string();
