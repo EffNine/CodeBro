@@ -153,11 +153,12 @@ impl Provider for ResearchMockProvider {
         self.prompts.lock().unwrap().push(message.to_string());
         let response = self.next();
         Box::pin(async move {
+            // A response is either a JSON `tool_calls` array or plain final
+            // text (mirroring a real OpenAI-compatible provider).
             let calls: Vec<crate::providers::StructuredToolCall> =
                 if response.trim().is_empty() || response == "[]" {
                     Vec::new()
-                } else {
-                    let arr: Vec<serde_json::Value> = serde_json::from_str(&response)?;
+                } else if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&response) {
                     arr.into_iter()
                         .map(|item| {
                             let id = item
@@ -177,8 +178,18 @@ impl Provider for ResearchMockProvider {
                             }
                         })
                         .collect()
+                } else {
+                    Vec::new()
                 };
-            Ok((String::new(), calls))
+            let text = if response.trim().is_empty()
+                || response == "[]"
+                || serde_json::from_str::<Vec<serde_json::Value>>(&response).is_ok()
+            {
+                String::new()
+            } else {
+                response
+            };
+            Ok((text, calls))
         })
     }
 }
@@ -407,7 +418,7 @@ async fn test_research_structured_tool_calling_reaches_restricted_registry() {
                 .to_string(),
             r#"[{"id": "c2", "function": {"name": "read_file", "arguments": "{\"path\": \"src/parser.rs\"}"}}]"#
                 .to_string(),
-            "[]".to_string(),
+            "Final report: the parser is traced.".to_string(),
         ],
     )));
     let result = run_research(harness, "trace the parser", dir.path(), None).await;
@@ -441,7 +452,7 @@ async fn test_research_structured_input_envelope_is_unwrapped() {
                 r#"[{{"id": "c1", "function": {{"name": "read_file", "arguments": "{{\"input\": \"{}\"}}"}}}}]"#,
                 abs
             ),
-            "[]".to_string(),
+            "Final report: parser inspected.".to_string(),
         ],
     )));
     let result = run_research(harness, "inspect the parser", dir.path(), None).await;

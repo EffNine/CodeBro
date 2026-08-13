@@ -10,11 +10,88 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::agent::tool_parser::ToolCall;
 use crate::provider_runtime::routing::ProviderRoutingDecision;
 use crate::provider_runtime::{ProviderId, ProviderRuntime, RetryController, TokenUsage};
 use crate::providers::{Provider, StructuredToolCall, ToolDefinition};
 
 use super::TaskOptions;
+
+/// What the reasoning loop must do with a provider response.
+///
+/// This is the single three-state classification the ReAct loops use:
+///
+/// ```text
+/// model response
+///      │
+///      ├── usable final text (no usable tool calls)   → Final(text)
+///      ├── usable tool calls                          → Execute(calls)
+///      └── neither                                    → Empty(reason)
+/// ```
+///
+/// STATE 1 (final text) and STATE 3 (nothing usable) are deliberately
+/// distinct: a valid text-only answer like `OK` terminates successfully with
+/// zero tool calls, while a response with no usable text and no usable tool
+/// calls terminates as a bounded error instead of consuming another
+/// reasoning iteration.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ResponseDisposition {
+    /// Usable final text and no usable tool calls → the task is complete.
+    Final(String),
+    /// Usable tool calls → execute them, feed the observations back, iterate.
+    Execute(Vec<ToolCall>),
+    /// Neither usable text nor usable tool calls → bounded error. Never
+    /// silently continue.
+    Empty(String),
+}
+
+/// Classify a provider response into the three loop states.
+///
+/// A tool call is *usable* when it carries a non-empty name. Structured
+/// providers sometimes stream placeholder tool-call deltas (an index with an
+/// empty name/arguments) even when the response finishes with prose; such
+/// calls are malformed and must never be executed as "Unknown tool" nor
+/// allowed to consume a reasoning iteration. When the response has usable
+/// text and only malformed/empty calls, the text IS the final answer
+/// (this implements `finish_reason == "stop"` semantics: the provider
+/// finished, the answer is already in hand). When neither exists, the
+/// response is empty/malformed and the loop must terminate honestly.
+pub(crate) fn classify_response(
+    full: &str,
+    structured: Vec<StructuredToolCall>,
+) -> ResponseDisposition {
+    let mut parsed: Vec<ToolCall> = if !structured.is_empty() {
+        structured
+            .into_iter()
+            .map(|c| ToolCall {
+                id: c.id,
+                name: c.name,
+                arguments: c.arguments,
+            })
+            .collect()
+    } else {
+        crate::agent::tool_parser::parse_tool_calls(full).unwrap_or_default()
+    };
+    // Normalize structured and text-parsed tool calls into the same internal
+    // representation (the `{"input": ...}` envelope unwrap is a no-op for raw
+    // argument strings).
+    for call in parsed.iter_mut() {
+        call.arguments = crate::agent::tool_parser::unwrap_tool_arguments(&call.arguments);
+    }
+    let usable: Vec<ToolCall> = parsed
+        .into_iter()
+        .filter(|c| !c.name.trim().is_empty())
+        .collect();
+    if !usable.is_empty() {
+        return ResponseDisposition::Execute(usable);
+    }
+    if !full.trim().is_empty() {
+        return ResponseDisposition::Final(full.to_string());
+    }
+    ResponseDisposition::Empty(
+        "Model returned no usable response (empty text and no usable tool calls).".to_string(),
+    )
+}
 
 /// Stream a response from the routed provider with circuit breaker gate,
 /// health reporting and retry policy. Never bypasses the circuit breaker.
@@ -216,5 +293,124 @@ pub(crate) async fn stream_once(
             crate::provider_runtime::ProviderCost::default(),
         );
         return Ok((full, structured));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::StructuredToolCall;
+
+    fn call(name: &str) -> StructuredToolCall {
+        StructuredToolCall {
+            id: "c1".to_string(),
+            name: name.to_string(),
+            arguments: r#"{"input": "x"}"#.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_text_only_is_final() {
+        // STATE 1: usable text, no tool calls → Final.
+        let d = classify_response("OK", vec![]);
+        assert_eq!(d, ResponseDisposition::Final("OK".to_string()));
+    }
+
+    #[test]
+    fn test_whitespace_only_text_is_not_final() {
+        // Whitespace is not an answer.
+        let d = classify_response("\n\n  \n", vec![]);
+        assert_eq!(
+            d,
+            ResponseDisposition::Empty(
+                "Model returned no usable response (empty text and no usable tool calls)."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_empty_response_is_bounded_error_not_continue() {
+        // STATE 3: no text, no calls → Empty (never silently continue).
+        let d = classify_response("", vec![]);
+        assert!(matches!(d, ResponseDisposition::Empty(_)));
+    }
+
+    #[test]
+    fn test_structured_call_is_execute() {
+        // STATE 2: usable structured call → Execute.
+        let d = classify_response("", vec![call("list_files")]);
+        match d {
+            ResponseDisposition::Execute(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "list_files");
+                // The `{"input": ...}` envelope is unwrapped.
+                assert_eq!(calls[0].arguments, "x");
+            }
+            other => panic!("expected Execute, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_text_with_tool_call_is_execute() {
+        // ReAct: text + usable tool calls → execute and continue.
+        let d = classify_response("Let me check.", vec![call("list_files")]);
+        assert!(matches!(d, ResponseDisposition::Execute(_)));
+    }
+
+    #[test]
+    fn test_text_parsed_tool_call_is_execute() {
+        // Text-protocol tool call.
+        let d = classify_response(
+            r#"<invoke name="list_files">{"path": "."}</invoke>"#,
+            vec![],
+        );
+        match d {
+            ResponseDisposition::Execute(calls) => {
+                assert_eq!(calls[0].name, "list_files");
+            }
+            other => panic!("expected Execute, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_placeholder_call_with_text_is_final() {
+        // A provider that streams a placeholder tool-call delta (empty name)
+        // but finishes with prose: the text IS the final answer. This is the
+        // `finish_reason == "stop"` over placeholder calls case.
+        let d = classify_response(
+            "The answer is OK.",
+            vec![StructuredToolCall {
+                id: "p1".to_string(),
+                name: String::new(),
+                arguments: String::new(),
+            }],
+        );
+        assert_eq!(
+            d,
+            ResponseDisposition::Final("The answer is OK.".to_string())
+        );
+    }
+
+    #[test]
+    fn test_placeholder_call_without_text_is_bounded_error() {
+        // `finish_reason == "tool_calls"` without a usable call: no silent
+        // loop, no "Unknown tool" execution — bounded error.
+        let d = classify_response(
+            "",
+            vec![StructuredToolCall {
+                id: "p1".to_string(),
+                name: String::new(),
+                arguments: String::new(),
+            }],
+        );
+        assert!(matches!(d, ResponseDisposition::Empty(_)));
+    }
+
+    #[test]
+    fn test_malformed_call_never_executed() {
+        // Empty-name calls must never reach the tool registry.
+        let d = classify_response("", vec![call("")]);
+        assert!(matches!(d, ResponseDisposition::Empty(_)));
     }
 }

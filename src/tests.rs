@@ -2690,6 +2690,223 @@ async fn real_provider_smoke_models_chat_tools() {
     );
 }
 
+// ===== REACT termination bug reproduction (Sprint) =====
+//
+// Runs the REAL canonical ReAct loop (not just send_message) against a real
+// provider. This is the exact path that produced
+// "Reached the maximum number of reasoning iterations without a final answer"
+// in real user testing. Cases:
+//   A. text-only answer, no tools
+//   B. tool call(s) then final answer
+//   C. read_file then final answer
+// Runs twice per case: plain loop, then Assist-mode (research enabled).
+
+/// A provider wrapper that records every prompt and response (text length,
+/// structured calls) without ever recording the credential.
+struct RecordingOpenAiProvider {
+    inner: crate::providers::OpenAiProvider,
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RecordingOpenAiProvider {
+    fn new(config: crate::config::Config) -> Self {
+        RecordingOpenAiProvider {
+            inner: crate::providers::OpenAiProvider::new(config),
+            log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn capture(&self, line: String) {
+        self.log.lock().unwrap().push(line);
+    }
+}
+
+impl crate::providers::Provider for RecordingOpenAiProvider {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn base_url(&self) -> &str {
+        self.inner.base_url()
+    }
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+    fn api_key(&self) -> Option<&str> {
+        self.inner.api_key()
+    }
+    fn supports_function_calling(&self) -> bool {
+        self.inner.supports_function_calling()
+    }
+    fn send_message(
+        &self,
+        message: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>>
+    {
+        self.inner.send_message(message)
+    }
+    fn stream_response(
+        &self,
+        message: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<String>>,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.inner.stream_response(message)
+    }
+    fn stream_response_with_tools(
+        &self,
+        message: &str,
+        tools: &[crate::providers::ToolDefinition],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<(String, Vec<crate::providers::StructuredToolCall>)>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let log = self.log.clone();
+        let prompt = crate::tools::shell::redact_secrets_public(message)
+            .chars()
+            .take(400)
+            .collect::<String>();
+        let fut = self.inner.stream_response_with_tools(message, tools);
+        Box::pin(async move {
+            log.lock()
+                .unwrap()
+                .push(format!("PROMPT({}): {}", prompt.len(), prompt));
+            match fut.await {
+                Ok((text, calls)) => {
+                    log.lock().unwrap().push(format!(
+                        "RESPONSE text_len={} text={:?} structured_calls={:?}",
+                        text.chars().count(),
+                        crate::tools::shell::redact_secrets_public(&text)
+                            .chars()
+                            .take(200)
+                            .collect::<String>(),
+                        calls
+                            .iter()
+                            .map(|c| format!(
+                                "{}[{}]",
+                                c.name,
+                                c.arguments.chars().take(60).collect::<String>()
+                            ))
+                            .collect::<Vec<_>>()
+                    ));
+                    Ok((text, calls))
+                }
+                Err(e) => {
+                    log.lock().unwrap().push(format!("RESPONSE ERROR: {e}"));
+                    Err(e)
+                }
+            }
+        })
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn real_provider_react_termination_repro() {
+    let api_key = std::env::var("AGNES_API_KEY")
+        .ok()
+        .or_else(|| std::env::var("CODEBRO_API_KEY").ok());
+    let Some(api_key) = api_key else {
+        eprintln!("REAL PROVIDER: BLOCKED (no AGNES_API_KEY in environment)");
+        return;
+    };
+    let base_url = std::env::var("CODEBRO_BASE_URL")
+        .unwrap_or_else(|_| "https://apihub.agnes-ai.com/v1".to_string());
+    let model = std::env::var("CODEBRO_MODEL").unwrap_or_else(|_| "agnes-2.5-flash".to_string());
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    let cases: &[(&str, &str)] = &[
+        (
+            "CASE A",
+            "Reply with exactly: OK. Do not use any tools.",
+        ),
+        (
+            "CASE B",
+            "List the files in the repository and summarize the result. Do not modify anything.",
+        ),
+        (
+            "CASE C",
+            "Inspect src/tui/actions.rs and return a two-sentence summary of its purpose. Do not modify anything.",
+        ),
+    ];
+
+    for (label, task) in cases {
+        for research_enabled in [false, true] {
+            let config = crate::config::Config {
+                provider: "openai".to_string(),
+                base_url: base_url.clone(),
+                model: model.clone(),
+                api_key: Some(api_key.clone()),
+            };
+            let provider = std::sync::Arc::new(RecordingOpenAiProvider::new(config.clone()));
+            let recording = provider.clone();
+            let mut runtime =
+                crate::canonical_runtime::CanonicalRuntime::new_without_default_provider(
+                    config, &root,
+                )
+                .expect("runtime");
+            runtime.with_retry_policy(crate::provider_runtime::RetryPolicy::immediate(0));
+            runtime.register_provider(provider);
+
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = events.clone();
+            let emit = move |e: crate::agent::events::AgentEvent| sink.lock().unwrap().push(e);
+            let on_chunk = |_c: &str| {};
+            let req = crate::canonical_runtime::TaskRequest {
+                task,
+                conversation: Vec::new(),
+                emit: &emit,
+                on_chunk: &on_chunk,
+            };
+            let mut options = crate::canonical_runtime::TaskOptions::default();
+            options.research_enabled = research_enabled;
+            options.task_timeout_ms = Some(120_000);
+
+            let result = runtime.run_task_with_options(&req, options).await;
+            let tool_starts: Vec<String> = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    crate::agent::events::AgentEvent::ToolStarted { tool, .. } => {
+                        Some(tool.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let response_redacted = crate::tools::shell::redact_secrets_public(&result.response);
+            eprintln!(
+                "\n[{}] research={} success={} cancelled={}\n  error={:?}\n  tools={:?}\n  response={:?}",
+                label,
+                research_enabled,
+                result.success,
+                result.cancelled,
+                result.error,
+                tool_starts,
+                response_redacted.chars().take(300).collect::<String>()
+            );
+            for line in recording.log.lock().unwrap().iter() {
+                eprintln!("  {line}");
+            }
+            if !research_enabled {
+                assert!(
+                    result.success,
+                    "{} (plain loop) must terminate successfully, got error: {:?}",
+                    label, result.error
+                );
+            }
+        }
+    }
+}
+
 // ===== Model Picker Tests =====
 
 fn picker_model(id: &str) -> crate::provider_manager::ModelInfo {

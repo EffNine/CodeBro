@@ -2461,113 +2461,98 @@ impl CanonicalRuntime {
             {
                 Ok((full, structured)) => {
                     model_calls += 1;
-                    // Normalize structured and text-parsed tool calls into the
-                    // same internal `ToolCall` representation.
-                    let calls: Vec<ToolCall> = {
-                        let parsed = if !structured.is_empty() {
-                            structured
-                                .into_iter()
-                                .map(|c| ToolCall {
-                                    id: c.id,
-                                    name: c.name,
-                                    arguments: c.arguments,
-                                })
-                                .collect::<Vec<_>>()
-                        } else {
-                            tool_parser::parse_tool_calls(&full).unwrap_or_default()
-                        };
-                        // Normalize structured and text-parsed tool calls into
-                        // the same internal representation. Structured calls
-                        // arrive wrapped in the `{"input": ...}` envelope;
-                        // text-encoded calls may carry the same envelope. The
-                        // unwrap is a no-op for raw argument strings, so it is
-                        // safe to apply to every tool call.
-                        parsed
-                            .into_iter()
-                            .map(|mut c| {
-                                c.arguments = tool_parser::unwrap_tool_arguments(&c.arguments);
-                                c
-                            })
-                            .collect()
+                    // Classify the complete response into one of the three
+                    // loop states (final text / usable tool calls / neither).
+                    // A valid text-only answer terminates immediately; an
+                    // empty or malformed response terminates as a bounded
+                    // error; only genuine usable tool calls consume another
+                    // reasoning iteration.
+                    let calls: Vec<ToolCall> = match execution::classify_response(&full, structured)
+                    {
+                        execution::ResponseDisposition::Execute(calls) => calls,
+                        execution::ResponseDisposition::Final(text) => {
+                            trace.exec_ms = started.elapsed().as_millis() as u64;
+                            return (Ok(text), trace);
+                        }
+                        execution::ResponseDisposition::Empty(msg) => {
+                            trace.exec_ms = started.elapsed().as_millis() as u64;
+                            return (Err(msg), trace);
+                        }
                     };
-                    if !calls.is_empty() {
-                        // Enforce per-iteration tool call limit.
-                        if total_tool_calls + calls.len() > max_total_tool_calls {
-                            return (
-                                Err(format!(
-                                    "Maximum total tool calls ({}) exceeded",
-                                    max_total_tool_calls
-                                )),
-                                trace,
-                            );
-                        }
-                        if calls.len() > max_tool_calls_per_iter {
-                            return (
-                                Err(format!(
-                                    "Maximum tool calls per iteration ({}) exceeded",
-                                    max_tool_calls_per_iter
-                                )),
-                                trace,
-                            );
-                        }
-
-                        let mut extra = Vec::new();
-                        for call in &calls {
-                            // Compute a deterministic fingerprint for repeated-action
-                            // detection: tool name + first 80 chars of arguments.
-                            let fingerprint = format!(
-                                "{}:{}",
-                                call.name,
-                                &call.arguments[..call
-                                    .arguments
-                                    .char_indices()
-                                    .take(80)
-                                    .last()
-                                    .map(|(i, _)| i)
-                                    .unwrap_or(call.arguments.len())]
-                            );
-                            repeated_actions.push(fingerprint.clone());
-                            // Trim repeated_actions to only keep the last
-                            // MAX_REPEATED_ACTIONS entries.
-                            if repeated_actions.len() > MAX_REPEATED_ACTIONS {
-                                repeated_actions.remove(0);
-                            }
-                            // Detect repeated identical actions.
-                            if repeated_actions.len() == MAX_REPEATED_ACTIONS
-                                && repeated_actions.iter().all(|a| a == &repeated_actions[0])
-                            {
-                                return (
-                                    Err(format!(
-                                        "Repeated identical action detected: {}",
-                                        repeated_actions[0]
-                                    )),
-                                    trace,
-                                );
-                            }
-
-                            (req.emit)(AgentEvent::ToolStarted {
-                                tool: call.name.clone(),
-                                args: redact_secrets_public(&call.arguments),
-                            });
-                            let result = self.execute_tool(call, req.emit, opts).await;
-                            (req.emit)(AgentEvent::ToolCompleted {
-                                tool: call.name.clone(),
-                                result: result.clone(),
-                                success: !result.starts_with("Error:"),
-                            });
-                            extra.push(ContextFragment {
-                                source: "tool_result".to_string(),
-                                content: format!("Tool result for {}: {}", call.name, result),
-                                relevance_score: 0.9,
-                                structured_facts: None,
-                            });
-                            total_tool_calls += 1;
-                        }
-                        context = extend_context(context, extra);
-                        continue;
+                    // Enforce per-iteration tool call limit.
+                    if total_tool_calls + calls.len() > max_total_tool_calls {
+                        return (
+                            Err(format!(
+                                "Maximum total tool calls ({}) exceeded",
+                                max_total_tool_calls
+                            )),
+                            trace,
+                        );
                     }
-                    trace.exec_ms = started.elapsed().as_millis() as u64;
-                    return (Ok(full), trace);
+                    if calls.len() > max_tool_calls_per_iter {
+                        return (
+                            Err(format!(
+                                "Maximum tool calls per iteration ({}) exceeded",
+                                max_tool_calls_per_iter
+                            )),
+                            trace,
+                        );
+                    }
+
+                    let mut extra = Vec::new();
+                    for call in &calls {
+                        // Compute a deterministic fingerprint for repeated-action
+                        // detection: tool name + first 80 chars of arguments.
+                        let fingerprint = format!(
+                            "{}:{}",
+                            call.name,
+                            &call.arguments[..call
+                                .arguments
+                                .char_indices()
+                                .take(80)
+                                .last()
+                                .map(|(i, _)| i)
+                                .unwrap_or(call.arguments.len())]
+                        );
+                        repeated_actions.push(fingerprint.clone());
+                        // Trim repeated_actions to only keep the last
+                        // MAX_REPEATED_ACTIONS entries.
+                        if repeated_actions.len() > MAX_REPEATED_ACTIONS {
+                            repeated_actions.remove(0);
+                        }
+                        // Detect repeated identical actions.
+                        if repeated_actions.len() == MAX_REPEATED_ACTIONS
+                            && repeated_actions.iter().all(|a| a == &repeated_actions[0])
+                        {
+                            return (
+                                Err(format!(
+                                    "Repeated identical action detected: {}",
+                                    repeated_actions[0]
+                                )),
+                                trace,
+                            );
+                        }
+
+                        (req.emit)(AgentEvent::ToolStarted {
+                            tool: call.name.clone(),
+                            args: redact_secrets_public(&call.arguments),
+                        });
+                        let result = self.execute_tool(call, req.emit, opts).await;
+                        (req.emit)(AgentEvent::ToolCompleted {
+                            tool: call.name.clone(),
+                            result: result.clone(),
+                            success: !result.starts_with("Error:"),
+                        });
+                        extra.push(ContextFragment {
+                            source: "tool_result".to_string(),
+                            content: format!("Tool result for {}: {}", call.name, result),
+                            relevance_score: 0.9,
+                            structured_facts: None,
+                        });
+                        total_tool_calls += 1;
+                    }
+                    context = extend_context(context, extra);
+                    continue;
                 }
                 Err(e) => {
                     trace.exec_ms = started.elapsed().as_millis() as u64;
@@ -3132,6 +3117,14 @@ fn extract_keywords(task: &str) -> Vec<String> {
 fn dedup_fragments(fragments: &mut Vec<ContextFragment>) {
     let mut seen = std::collections::BTreeSet::new();
     fragments.retain(|f| {
+        // Tool observations are part of the evidence trail: iteration N+1's
+        // prompt must include EVERY observation, including ones identical to
+        // an earlier iteration. Deduplicating them here made the prompt stale
+        // for a model that re-issued a call, silently erasing the very
+        // observation it needed to proceed.
+        if f.source == "tool_result" {
+            return true;
+        }
         seen.insert(crate::assembly::sources::fragment_fingerprint(
             &f.source, &f.content,
         ))
