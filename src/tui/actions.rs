@@ -515,6 +515,9 @@ impl ActionStream {
     /// results: completed actions keep their facts.
     pub fn cancel_active(&mut self) {
         for group in self.groups.iter_mut() {
+            if group.duration_ms.is_none() {
+                group.duration_ms = Some(group.started_at.elapsed().as_millis() as u64);
+            }
             if !group.status.is_terminal() {
                 group.status = UiActionStatus::Cancelled;
                 group.outcome = Some("Cancelled by user".to_string());
@@ -543,6 +546,9 @@ impl ActionStream {
     /// the lifecycle state moves to the parent's outcome.
     pub fn finalize_response(&mut self, success: bool) {
         for group in self.groups.iter_mut() {
+            if group.duration_ms.is_none() {
+                group.duration_ms = Some(group.started_at.elapsed().as_millis() as u64);
+            }
             if !group.status.is_terminal() {
                 group.status = if success {
                     UiActionStatus::Completed
@@ -564,12 +570,23 @@ impl ActionStream {
                     action.live_output.clear();
                 }
             }
-            // Completed/failed groups collapse to their summary; failure
-            // details stay visible for inspection via expand.
-            group.expanded = group.has_failure();
+            // Completed groups auto-collapse; failures/warnings stay expanded
+            // until the user addresses them (design-spec progressive disclosure).
+            group.expanded = group.has_failure()
+                || matches!(group.status, UiActionStatus::Warning);
         }
         self.current_agent = None;
         self.touch();
+    }
+
+    /// Take ownership of all groups (used to seal a turn onto a user message).
+    /// Counters and focus reset; the stream is ready for the next turn.
+    pub fn take_groups(&mut self) -> VecDeque<UiActionGroup> {
+        let groups = std::mem::take(&mut self.groups);
+        self.focused_from_back = None;
+        self.current_agent = None;
+        self.current_phase = Phase::Main;
+        groups
     }
 
     pub fn touch(&mut self) {
@@ -849,27 +866,32 @@ impl ActionStream {
     // ─── Expand / collapse navigation ──────────────────────────────────
 
     /// Cycle the focused group (from the back). Returns true when the focus
-    /// moved so the caller can redraw.
+    /// moved so the caller can redraw. First focus lands on the newest group
+    /// (`from_back = 0`).
     pub fn cycle_focus(&mut self, forward: bool) -> bool {
         if self.groups.is_empty() {
             self.focused_from_back = None;
             return false;
         }
         let n = self.groups.len();
-        let cur = self.focused_from_back.unwrap_or(0).min(n - 1);
-        self.focused_from_back = Some(if forward {
-            if cur == n - 1 {
-                0
-            } else {
-                cur + 1
+        let next = match self.focused_from_back {
+            None => 0, // first Tab: newest group
+            Some(cur) => {
+                let cur = cur.min(n - 1);
+                if forward {
+                    if cur == n - 1 {
+                        0
+                    } else {
+                        cur + 1
+                    }
+                } else if cur == 0 {
+                    n - 1
+                } else {
+                    cur - 1
+                }
             }
-        } else {
-            if cur == 0 {
-                n - 1
-            } else {
-                cur - 1
-            }
-        });
+        };
+        self.focused_from_back = Some(next);
         true
     }
 

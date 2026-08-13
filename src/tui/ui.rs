@@ -136,6 +136,8 @@ fn handle_event(msg: events::AppEvent, app: &mut TuiApp) -> bool {
         }
         events::AppEvent::TaskFinished { success } => {
             app.action_stream.finalize_response(success);
+            // Keep groups live under the current turn until the next user
+            // message seals them (turn-scoped timeline).
             true
         }
         events::AppEvent::Response(content) => {
@@ -190,7 +192,13 @@ fn handle_event(msg: events::AppEvent, app: &mut TuiApp) -> bool {
             true
         }
         events::AppEvent::Paste(text) => {
-            app.insert_text(&text);
+            // Masked API-key mode must receive paste into the secure buffer,
+            // never into the ordinary input (where secrets could leak).
+            if let Some(ref mut secure) = app.secure_input {
+                secure.buffer.push_str(&text);
+            } else {
+                app.insert_text(&text);
+            }
             true
         }
         events::AppEvent::Mouse(mouse) => {
@@ -309,6 +317,12 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                     }
                 }
                 KeyCode::Backspace => app.backspace(),
+                KeyCode::Esc => {
+                    dismiss_top_overlay(app);
+                }
+                KeyCode::Char('?') if app.input.is_empty() => {
+                    app.add_message(MessageRole::System, help_text(app));
+                }
                 KeyCode::Char(c) => {
                     app.insert_char(c);
                     // Live-filter the completion list while typing a command.
@@ -319,16 +333,6 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                         if app.dashboard.autocomplete.is_empty() {
                             app.dashboard.autocomplete_index = 0;
                         }
-                    }
-                }
-                KeyCode::Esc => {
-                    if !app.dashboard.autocomplete.is_empty() {
-                        app.dashboard.autocomplete.clear();
-                        app.dashboard.autocomplete_index = 0;
-                    } else if app.dashboard.show_command_palette {
-                        app.dashboard.toggle_command_palette();
-                    } else if app.dashboard.model_picker.is_open() {
-                        app.dashboard.model_picker.close();
                     }
                 }
                 _ => {}
@@ -365,20 +369,52 @@ fn submit_input(input: String, app: &mut TuiApp) {
             handle_runtime_command(&input, app);
         }
         None => {
-            app.add_message(MessageRole::User, input.clone());
-            app.is_loading = true;
-            app.begin_task(input.clone());
-            app.dashboard
-                .animation
-                .start_activity(crate::tui::animation::ActivityType::Thinking);
-            let token = app.begin_cancellable_task();
-            let config = app.config.clone();
-            let tx = app.tx.clone();
-            let conversation = conversation_from(app);
-            tokio::spawn(async move {
-                run_chat_pipeline(&config, &input, conversation, &tx, token).await;
-            });
+            submit_task(app, input);
         }
+    }
+}
+
+/// Close the topmost overlay / transient UI. Design-spec: Esc dismisses.
+fn dismiss_top_overlay(app: &mut TuiApp) {
+    if !app.dashboard.autocomplete.is_empty() {
+        app.dashboard.autocomplete.clear();
+        app.dashboard.autocomplete_index = 0;
+        return;
+    }
+    if app.dashboard.show_command_palette {
+        app.dashboard.toggle_command_palette();
+        return;
+    }
+    if app.dashboard.model_picker.is_open() {
+        app.dashboard.model_picker.close();
+        return;
+    }
+    if app.show_console {
+        app.show_console = false;
+        return;
+    }
+    if app.dashboard.show_agents {
+        app.dashboard.show_agents = false;
+        return;
+    }
+    if app.dashboard.show_task_graph {
+        app.dashboard.show_task_graph = false;
+        return;
+    }
+    if app.dashboard.show_metrics {
+        app.dashboard.show_metrics = false;
+        return;
+    }
+    if app.dashboard.show_coordination {
+        app.dashboard.show_coordination = false;
+        return;
+    }
+    if app.dashboard.show_memory {
+        app.dashboard.show_memory = false;
+        return;
+    }
+    if app.dashboard.show_trace {
+        app.dashboard.show_trace = false;
     }
 }
 
@@ -444,15 +480,16 @@ fn handle_confirmation_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
         key.code,
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N')
     );
-    if let Some((_, action)) = app.pending_confirmation.take() {
-        if confirmed {
+    if confirmed {
+        if let Some((_, action)) = app.pending_confirmation.take() {
             confirm_action(action, app);
-        } else {
-            app.add_message(MessageRole::System, "Action cancelled".to_string());
         }
     } else if cancelled {
-        // Nothing pending; Esc is a no-op here.
+        if app.pending_confirmation.take().is_some() {
+            app.add_message(MessageRole::System, "Action cancelled".to_string());
+        }
     }
+    // Any other key leaves the confirmation pending (no silent dismiss).
 }
 
 fn confirm_action(action: PendingAction, app: &mut TuiApp) {
@@ -1122,7 +1159,7 @@ fn help_text(app: &TuiApp) -> String {
     lines.push("    e.g. !git status, !cargo test, !ls".to_string());
     lines.push("".to_string());
     lines.push(
-        "  Shortcuts: Ctrl+P commands · Ctrl+C cancel · Ctrl+L clear · Ctrl+U rail · Ctrl+K console · Ctrl+D diff · Esc dismiss".to_string(),
+        "  Shortcuts: Ctrl+P palette · Ctrl+O rail · Ctrl+D diff · Ctrl+M memory · Ctrl+Enter send · Esc dismiss · ? help".to_string(),
     );
     lines.push(
         "  Chat: Tab focuses an action group · Enter expands/collapses it · End returns to live"
@@ -1133,6 +1170,8 @@ fn help_text(app: &TuiApp) -> String {
 
 /// Submit a natural-language engineering task through the canonical runtime.
 fn submit_task(app: &mut TuiApp, task: String) {
+    // Seal the previous turn's timeline onto its user message first.
+    app.seal_actions_to_last_user();
     app.add_message(MessageRole::User, task.clone());
     app.is_loading = true;
     app.begin_task(task.clone());
@@ -1544,94 +1583,97 @@ fn render_header(f: &mut Frame, app: &TuiApp, area: Rect) {
     if area.height < 1 || area.width < 4 {
         return;
     }
-    // Workspace identity is cached at app startup; the render path performs
-    // no subprocess/filesystem work (see TuiApp::workspace_name).
-    let workspace = app.workspace_name.clone();
     let model = if app.config.model.trim().is_empty() {
         "auto".to_string()
     } else {
         app.config.model.clone()
     };
 
+    let working = app.has_active_task() || app.action_stream.has_running();
     let mut spans = vec![
         Span::styled(
             "CodeBro",
             Style::default()
-                .fg(THEME.purple)
+                .fg(THEME.primary)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(" v{}", env!("CARGO_PKG_VERSION")),
             Style::default().fg(THEME.muted),
         ),
-        Span::styled("  · ", Style::default().fg(THEME.muted)),
-        Span::styled(workspace, Style::default().fg(THEME.green)),
-        Span::styled("  · ", Style::default().fg(THEME.muted)),
+        Span::styled("   ", Style::default()),
+        Span::styled(
+            if working { "●" } else { "○" },
+            Style::default().fg(if working { THEME.green } else { THEME.muted }),
+        ),
+        Span::styled(
+            if working {
+                " AUTONOMOUS MODE"
+            } else {
+                " READY"
+            },
+            Style::default()
+                .fg(if working { THEME.green } else { THEME.secondary })
+                .add_modifier(Modifier::BOLD),
+        ),
     ];
 
-    // Real working state: an active task means the autonomous pipeline runs.
-    let working = app.has_active_task() || app.action_stream.has_running();
-    spans.push(Span::styled(
-        if working { "●" } else { "○" },
-        Style::default().fg(if working { THEME.purple } else { THEME.green }),
-    ));
-    spans.push(Span::styled(
-        if working { " Working" } else { " Ready" },
-        Style::default().fg(if working { THEME.purple } else { THEME.green }),
-    ));
-
-    spans.push(Span::styled("  · ", Style::default().fg(THEME.muted)));
-    spans.push(Span::styled(
-        format!("Model: {}", truncate_to(&model, 22)),
-        Style::default().fg(THEME.secondary),
-    ));
-    spans.push(Span::styled(" · ", Style::default().fg(THEME.muted)));
-    spans.push(Span::styled(
-        format!("Provider: {}", truncate_to(&app.config.provider, 14)),
-        Style::default().fg(THEME.secondary),
-    ));
-
-    // Provider health, when a real check ran. Never shows credentials.
-    let active_provider = app
-        .provider_manager
-        .as_ref()
-        .and_then(|pm| pm.active_provider().cloned());
-    if let Some(provider) = active_provider {
-        let health = app
-            .provider_panel
-            .health_results
-            .iter()
-            .find(|(id, _, _)| id == &provider)
-            .map(|(_, h, _)| h);
-        let (glyph, color, label) = match health {
-            Some(crate::provider_manager::HealthStatus::Healthy) => ("●", THEME.green, "Connected"),
-            Some(crate::provider_manager::HealthStatus::Unhealthy { reason: _ }) => {
-                ("⚠", THEME.yellow, "Provider unavailable")
-            }
-            Some(crate::provider_manager::HealthStatus::Unknown) | None => {
-                ("○", THEME.muted, "Provider")
-            }
-        };
-        spans.push(Span::styled("  · ", Style::default().fg(THEME.muted)));
-        spans.push(Span::styled(glyph, Style::default().fg(color)));
-        spans.push(Span::styled(
-            format!(" {}", label),
-            Style::default().fg(color),
-        ));
-    }
-
-    // Restrained spinner while the agent works.
     if working {
         spans.push(Span::styled(
-            format!("  {}", spinner_char_now()),
+            format!(" {}", spinner_char_now()),
             Style::default().fg(THEME.purple),
         ));
     }
 
-    let line = Line::from(spans);
-    let paragraph = Paragraph::new(truncate_line_to(&line, area.width as usize))
-        .style(Style::default().bg(THEME.bg));
-    f.render_widget(paragraph, area);
+    // Right-side metadata: model · tokens · tools (real values only).
+    let mut right: Vec<Span<'static>> = Vec::new();
+    right.push(Span::styled(
+        truncate_to(&model, 24),
+        Style::default().fg(THEME.secondary),
+    ));
+    if let Some(metrics) = &app.dashboard.metrics {
+        let tokens = metrics.total_tokens();
+        if tokens > 0 {
+            right.push(Span::styled("  ·  ", Style::default().fg(THEME.muted)));
+            right.push(Span::styled(
+                crate::metrics::format_token_count(tokens),
+                Style::default().fg(THEME.secondary),
+            ));
+        }
+    }
+    if app.action_stream.tool_calls > 0 {
+        right.push(Span::styled("  ·  ", Style::default().fg(THEME.muted)));
+        right.push(Span::styled(
+            format!("{} tools", app.action_stream.tool_calls),
+            Style::default().fg(THEME.secondary),
+        ));
+    }
+
+    let left_line = Line::from(spans);
+    let right_line = Line::from(right);
+    let right_width = right_line
+        .spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>() as u16;
+    let left_budget = area.width.saturating_sub(right_width.saturating_add(2));
+
+    f.render_widget(
+        Paragraph::new(truncate_line_to(&left_line, left_budget as usize))
+            .style(Style::default().bg(THEME.bg)),
+        Rect::new(area.x, area.y, left_budget, 1),
+    );
+    if right_width > 0 && area.width > right_width {
+        f.render_widget(
+            Paragraph::new(right_line).style(Style::default().bg(THEME.bg)),
+            Rect::new(
+                area.x + area.width.saturating_sub(right_width),
+                area.y,
+                right_width,
+                1,
+            ),
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1650,8 +1692,10 @@ fn render_chat(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     if app.dashboard.show_welcome && app.messages.is_empty() && !has_actions && !has_console {
         lines.push(Line::from(Span::styled(
-            "🧠 Ready.",
-            Style::default().fg(THEME.blue).add_modifier(Modifier::BOLD),
+            "CodeBro",
+            Style::default()
+                .fg(THEME.purple)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1660,18 +1704,18 @@ fn render_chat(f: &mut Frame, app: &TuiApp, area: Rect) {
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Type a task, or / for commands · // for runtime · ! for shell · Ctrl+P palette",
+            "Type a task · / commands · // runtime · ! shell · Ctrl+P palette · ? help",
             Style::default().fg(THEME.muted),
         )));
         lines.push(Line::from(Span::styled(
-            "Tab focuses an action group · Enter expands/collapses it · Ctrl+U rail · Ctrl+K console",
+            "Tab focuses an action group · Enter expands/collapses · Ctrl+O rail · Esc dismiss",
             Style::default().fg(THEME.muted),
         )));
         lines.push(Line::from(""));
     } else {
         if let Some(ref err) = app.dashboard.last_error {
             lines.push(Line::from(vec![
-                Span::styled("❌ ", Style::default().fg(THEME.red)),
+                Span::styled("✗ ", Style::default().fg(THEME.red)),
                 Span::styled(
                     truncate_to(err, inner_w.saturating_sub(2)),
                     Style::default().fg(THEME.red),
@@ -1680,52 +1724,55 @@ fn render_chat(f: &mut Frame, app: &TuiApp, area: Rect) {
             lines.push(Line::from(""));
         }
 
-        // Conversation messages. The action timeline belongs to the most
-        // recent user request: it is inserted right after the last User
-        // message, so the chronological flow reads
-        //   user → activity → assistant response
-        // instead of rendering every response above the timeline. Messages
-        // before that point (earlier turns) keep their order.
+        // Turn-scoped timeline: sealed actions render under their user
+        // message; the live stream renders after the latest user message.
         let last_user = app
             .messages
             .iter()
             .rposition(|m| m.role == MessageRole::User);
-        let timeline_at = last_user.map(|i| i + 1).unwrap_or(usize::MAX);
 
         for (idx, msg) in app.messages.iter().enumerate() {
-            if idx == timeline_at {
-                let action_lines = action_group_lines(app, inner_w);
-                if !action_lines.is_empty() {
-                    lines.push(Line::from(""));
-                    lines.extend(action_lines);
-                }
-            }
             match msg.role {
                 MessageRole::User => {
-                    lines.push(Line::from(Span::styled(
+                    lines.extend(message_header_lines(
+                        "●",
+                        THEME.purple,
                         "You",
-                        Style::default()
-                            .fg(THEME.green)
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                    for (i, content_line) in msg.content.lines().enumerate() {
-                        let rendered = if i == 0 {
-                            content_line.to_string()
-                        } else {
-                            format!("  {}", content_line)
-                        };
+                        THEME.purple,
+                        &msg.timestamp,
+                        inner_w,
+                    ));
+                    for content_line in msg.content.lines() {
                         lines.push(Line::from(Span::styled(
-                            truncate_to(&rendered, inner_w),
+                            truncate_to(content_line, inner_w),
                             Style::default().fg(THEME.primary),
                         )));
                     }
                     lines.push(Line::from(""));
+                    // Historical sealed groups for this turn.
+                    if let Some(groups) = &msg.sealed_actions {
+                        lines.extend(render_action_groups(
+                            groups.iter(),
+                            app.action_stream.focused_from_back,
+                            groups.len(),
+                            inner_w,
+                            false,
+                        ));
+                    }
+                    // Live stream belongs to the latest user turn only.
+                    if Some(idx) == last_user && !app.action_stream.groups.is_empty() {
+                        lines.extend(action_group_lines(app, inner_w));
+                    }
                 }
                 MessageRole::Assistant => {
-                    lines.push(Line::from(Span::styled(
+                    lines.extend(message_header_lines(
+                        "●",
+                        THEME.blue,
                         "CodeBro",
-                        Style::default().fg(THEME.blue).add_modifier(Modifier::BOLD),
-                    )));
+                        THEME.blue,
+                        &msg.timestamp,
+                        inner_w,
+                    ));
                     for md_line in crate::tui::markdown::render_markdown(&msg.content, inner_w) {
                         lines.push(md_line);
                     }
@@ -1743,30 +1790,22 @@ fn render_chat(f: &mut Frame, app: &TuiApp, area: Rect) {
             }
         }
 
-        // The last user message is at the end of the conversation (or there is
-        // no user message yet, e.g. `!` command sessions): the timeline still
-        // reads after the conversation and before the streaming response.
-        if timeline_at >= app.messages.len() {
-            let action_lines = action_group_lines(app, inner_w);
-            if !action_lines.is_empty() {
-                lines.push(Line::from(""));
-                lines.extend(action_lines);
-            }
+        // Shell-only sessions (no user chat turn): show the live stream at end.
+        if last_user.is_none() && !app.action_stream.groups.is_empty() {
+            lines.extend(action_group_lines(app, inner_w));
         }
 
         // Streaming response.
         if app.dashboard.is_streaming && !app.dashboard.streaming_buffer.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{} ", spinner_char_now()),
-                    Style::default().fg(THEME.blue).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "CodeBro",
-                    Style::default().fg(THEME.blue).add_modifier(Modifier::BOLD),
-                ),
-            ]));
+            lines.extend(message_header_lines(
+                spinner_char_now(),
+                THEME.blue,
+                "CodeBro",
+                THEME.blue,
+                "",
+                inner_w,
+            ));
             for md_line in
                 crate::tui::markdown::render_markdown(&app.dashboard.streaming_buffer, inner_w)
             {
@@ -1775,8 +1814,32 @@ fn render_chat(f: &mut Frame, app: &TuiApp, area: Rect) {
             lines.push(Line::from(""));
         }
 
-        // Live task console was moved to the Ctrl+K overlay; a subtle pointer
-        // is kept so users discover it while a command runs.
+        // Task-complete banner when the stream finished successfully.
+        if !app.has_active_task()
+            && !app.action_stream.has_running()
+            && app
+                .action_stream
+                .groups
+                .iter()
+                .any(|g| g.status == crate::tui::actions::UiActionStatus::Completed)
+            && last_user.is_some()
+        {
+            lines.push(Line::from(vec![
+                Span::styled("━", Style::default().fg(THEME.green)),
+                Span::styled(
+                    " ✓ Complete ",
+                    Style::default()
+                        .fg(THEME.green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "─".repeat(inner_w.saturating_sub(14).min(40)),
+                    Style::default().fg(THEME.border),
+                ),
+            ]));
+            lines.push(Line::from(""));
+        }
+
         if app.has_active_task() && app.has_console_content() {
             lines.push(Line::from(Span::styled(
                 "  [PTY output live — Ctrl+K to view]",
@@ -1816,16 +1879,65 @@ fn render_chat(f: &mut Frame, app: &TuiApp, area: Rect) {
     }
 }
 
+/// Message avatar + name + optional right-aligned timestamp.
+fn message_header_lines(
+    avatar: &str,
+    avatar_color: Color,
+    name: &str,
+    name_color: Color,
+    timestamp: &str,
+    inner_w: usize,
+) -> Vec<Line<'static>> {
+    let mut spans = vec![
+        Span::styled(
+            format!("{} ", avatar),
+            Style::default().fg(avatar_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            name.to_string(),
+            Style::default()
+                .fg(name_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !timestamp.is_empty() {
+        let used = avatar.chars().count() + 1 + name.chars().count();
+        let pad = inner_w.saturating_sub(used + timestamp.chars().count());
+        spans.push(Span::styled(
+            format!("{}{}", " ".repeat(pad), timestamp),
+            Style::default().fg(THEME.muted),
+        ));
+    }
+    vec![Line::from(spans)]
+}
+
 /// Build the chat lines for the phase-grouped action timeline.
 fn action_group_lines(app: &TuiApp, inner_w: usize) -> Vec<Line<'static>> {
     let stream = &app.action_stream;
-    let mut out: Vec<Line<'static>> = Vec::new();
+    render_action_groups(
+        stream.groups.iter(),
+        stream.focused_from_back,
+        stream.groups.len(),
+        inner_w,
+        true,
+    )
+}
 
-    for (offset, group) in stream.groups.iter().enumerate() {
-        let from_back = stream.groups.len() - 1 - offset;
-        let focused = stream.focused_from_back == Some(from_back);
-        let lines = group_lines(group, inner_w, focused);
-        out.extend(lines);
+fn render_action_groups<'a, I>(
+    groups: I,
+    focused_from_back: Option<usize>,
+    group_count: usize,
+    inner_w: usize,
+    focusable: bool,
+) -> Vec<Line<'static>>
+where
+    I: Iterator<Item = &'a UiActionGroup>,
+{
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for (offset, group) in groups.enumerate() {
+        let from_back = group_count.saturating_sub(1).saturating_sub(offset);
+        let focused = focusable && focused_from_back == Some(from_back);
+        out.extend(group_lines(group, inner_w, focused));
     }
     out
 }
@@ -1834,33 +1946,44 @@ fn group_lines(group: &UiActionGroup, inner_w: usize, focused: bool) -> Vec<Line
     let mut out = Vec::new();
     let phase_color = THEME.phase_color(group.phase);
 
-    // Title:  📚 Research  ✓  4.1s
+    // Accent bar — design-spec phase color strip above the card.
+    out.push(Line::from(Span::styled(
+        "━".repeat(inner_w.min(48).max(8)),
+        Style::default().fg(phase_color),
+    )));
+
+    // Title: » 📚 Research  ✓  4.1s
     let mut title = String::new();
     if focused {
-        title.push('»');
-        title.push(' ');
+        title.push_str("» ");
     }
     title.push_str(group.phase.emoji());
     title.push(' ');
-    title.push_str(group.phase.label());
+    // Gerund while live ("Researching"); stable label once terminal ("Research").
+    let phase_name = if group.status.is_terminal() {
+        group.phase.label()
+    } else {
+        phase_gerund(group.phase)
+    };
+    title.push_str(phase_name);
     title.push(' ');
     title.push_str(group.status.glyph().glyph());
-    if let Some(ms) = group.duration_ms {
-        title.push_str(&format!("  {:>7}", format_duration(ms)));
-    } else {
-        title.push_str(&format!("  {:>7}", format_duration(group.elapsed_ms())));
-    }
+    let duration = group
+        .duration_ms
+        .unwrap_or_else(|| group.elapsed_ms());
+    title.push_str(&format!("  {}", format_duration(duration)));
 
     let mut title_spans = vec![Span::styled(
-        truncate_to(&title, inner_w),
-        Style::default().fg(phase_color),
+        truncate_to(&title, inner_w.saturating_sub(10)),
+        Style::default()
+            .fg(phase_color)
+            .add_modifier(Modifier::BOLD),
     )];
     if group.status.is_terminal() {
-        // Subtle completion timestamp (real).
         let ts = format_timestamp(group.started_at);
-        let pad = inner_w.saturating_sub(title.chars().count());
+        let pad = inner_w.saturating_sub(title.chars().count() + ts.chars().count());
         title_spans.push(Span::styled(
-            format!("{}{}", " ".repeat(pad.min(4)), ts),
+            format!("{}{}", " ".repeat(pad.max(2)), ts),
             Style::default().fg(THEME.muted),
         ));
     }
@@ -1869,7 +1992,7 @@ fn group_lines(group: &UiActionGroup, inner_w: usize, focused: bool) -> Vec<Line
     let expanded = group.expanded || group.is_running();
     if expanded {
         for action in group.actions.iter() {
-            out.push(action_line(action, inner_w));
+            out.extend(action_card_lines(action, inner_w, phase_color));
         }
         if let Some(v) = &group.verification {
             if let Some(s) = v.summary() {
@@ -1900,74 +2023,122 @@ fn group_lines(group: &UiActionGroup, inner_w: usize, focused: bool) -> Vec<Line
     out
 }
 
-fn action_line(action: &crate::tui::actions::UiAction, inner_w: usize) -> Line<'static> {
+fn phase_gerund(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Research => "Researching",
+        Phase::Testing => "Testing",
+        Phase::Planning => "Planning",
+        Phase::Coding => "Coding",
+        Phase::Review => "Reviewing",
+        Phase::Verification => "Verifying",
+        Phase::Main => "Thinking",
+    }
+}
+
+/// Multi-line action card: status row plus nested command/file detail box.
+fn action_card_lines(
+    action: &crate::tui::actions::UiAction,
+    inner_w: usize,
+    phase_color: Color,
+) -> Vec<Line<'static>> {
     let glyph = action.status.glyph();
     let color = THEME.status_color(glyph);
-    // Running actions use the spinner instead of a static glyph.
     let status_mark = if action.status == UiActionStatus::Running {
         spinner_char_now().to_string()
     } else {
         glyph.glyph().to_string()
     };
 
-    let mut text = format!(
+    let mut lines = Vec::new();
+    let mut head = format!(
         "  {} {} {}",
         status_mark,
         action.kind.emoji(),
         action.kind.label()
     );
-
-    if !action.detail.is_empty() {
-        text.push_str(" · ");
-        text.push_str(&action.detail);
-    }
-
-    // Live PTY tail for running commands: last non-empty line, real output.
-    if action.status == UiActionStatus::Running
-        && matches!(
+    if !action.detail.is_empty()
+        && !matches!(
             action.kind,
             UiActionKind::RunningCommand | UiActionKind::Testing
         )
-        && !action.live_output().is_empty()
     {
+        head.push_str(" · ");
+        head.push_str(&action.detail);
+    }
+    if let Some(summary) = &action.result_summary {
+        if !matches!(
+            action.kind,
+            UiActionKind::RunningCommand | UiActionKind::Testing
+        ) {
+            head.push_str("  ");
+            head.push_str(summary);
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        truncate_to(&head, inner_w),
+        Style::default().fg(color),
+    )));
+
+    // Nested terminal / file detail box for commands and edits.
+    let box_w = inner_w.saturating_sub(4).max(8);
+    if matches!(
+        action.kind,
+        UiActionKind::RunningCommand | UiActionKind::Testing
+    ) && (!action.detail.is_empty() || !action.live_output().is_empty())
+    {
+        lines.push(Line::from(Span::styled(
+            format!("  ┌{}┐", "─".repeat(box_w.saturating_sub(2))),
+            Style::default().fg(THEME.border),
+        )));
+        if !action.detail.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(THEME.border)),
+                Span::styled(
+                    truncate_to(&action.detail, box_w.saturating_sub(2)),
+                    Style::default().fg(phase_color),
+                ),
+            ]));
+        }
         let tail = action
             .live_output()
             .lines()
             .filter(|l| !l.trim().is_empty())
             .last()
-            .unwrap_or(action.live_output())
-            .trim();
-        if !tail.is_empty() {
-            text.push_str(&format!("  {}", truncate_to(tail, 40)));
-        }
-    }
-
-    if let Some(summary) = &action.result_summary {
-        text.push_str("  ");
-        text.push_str(summary);
-    }
-
-    let mut spans = vec![Span::styled(
-        truncate_to(&text, inner_w),
-        Style::default().fg(color),
-    )];
-    // Dim the trailing detail slightly by splitting at the first ' · '.
-    if let Some(idx) = text.find(" · ") {
-        let (head, tail) = text.split_at(idx);
-        if head.len() < text.len() {
-            spans = vec![
-                Span::styled(truncate_to(head, inner_w), Style::default().fg(color)),
+            .map(|s| s.trim().to_string())
+            .or_else(|| action.result_summary.clone());
+        if let Some(t) = tail {
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(THEME.border)),
                 Span::styled(
-                    truncate_to(
-                        tail,
-                        inner_w.saturating_sub(head.chars().count().min(inner_w)),
-                    ),
+                    truncate_to(&t, box_w.saturating_sub(2)),
+                    Style::default().fg(THEME.secondary),
+                ),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  └{}┘", "─".repeat(box_w.saturating_sub(2))),
+            Style::default().fg(THEME.border),
+        )));
+    } else if matches!(action.kind, UiActionKind::Editing) && !action.detail.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  ├─ ", Style::default().fg(THEME.border)),
+            Span::styled(
+                truncate_to(&action.detail, inner_w.saturating_sub(4)),
+                Style::default().fg(THEME.secondary),
+            ),
+        ]));
+        if let Some(summary) = &action.result_summary {
+            lines.push(Line::from(vec![
+                Span::styled("  └─ ", Style::default().fg(THEME.border)),
+                Span::styled(
+                    truncate_to(summary, inner_w.saturating_sub(4)),
                     Style::default().fg(THEME.muted),
                 ),
-            ];
+            ]));
         }
     }
-    Line::from(spans)
+
+    lines
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2067,25 +2238,71 @@ fn render_rail_agents(f: &mut Frame, app: &TuiApp, area: Rect) {
     for (phase, name) in rows {
         let (glyph, label, duration) = specialist_status(app, name);
         let color = THEME.status_color(glyph);
-        let mut row = format!("  {} {}", glyph.glyph(), phase.label());
-        let pad = 14usize.saturating_sub(row.chars().count());
-        row = format!("{}{}{}", row, " ".repeat(pad), label);
-        if let Some(ms) = duration {
-            row.push_str(&format!("  {}", format_duration(ms)));
-        }
+        let mark = if glyph == StatusGlyph::Running {
+            spinner_char_now().to_string()
+        } else {
+            glyph.glyph().to_string()
+        };
+        let mut left = format!("{} {} {}", mark, phase.emoji(), phase.label());
+        let right = if let Some(ms) = duration {
+            format!("{} {}", label, format_duration(ms))
+        } else {
+            label
+        };
+        let pad = inner
+            .saturating_sub(left.chars().count() + right.chars().count() + 1)
+            .max(1);
+        left = format!("{}{}{}", left, " ".repeat(pad), right);
         lines.push(Line::from(Span::styled(
-            truncate_to(&row, inner),
+            truncate_to(&left, inner),
             Style::default().fg(color),
         )));
     }
-    render_rail_section(f, area, "AGENTS", lines);
+    render_rail_section(f, area, "▾ AGENTS", lines);
 }
 
 fn render_rail_progress(f: &mut Frame, app: &TuiApp, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let inner = area.width.saturating_sub(2) as usize;
     let graph = app.dashboard.graph_entries();
+    let phases = [
+        (Phase::Research, "research"),
+        (Phase::Testing, "testing"),
+        (Phase::Planning, "planning"),
+        (Phase::Coding, "coding"),
+        (Phase::Review, "review"),
+    ];
+    let done = phases
+        .iter()
+        .filter(|(_, name)| {
+            matches!(
+                specialist_status(app, name).0,
+                StatusGlyph::Completed
+            )
+        })
+        .count();
+    let total = phases.len();
+    let bar_w = inner.saturating_sub(8).max(4);
+    let filled = if total == 0 {
+        0
+    } else {
+        (done * bar_w) / total
+    };
+    let bar = format!(
+        "{}{}",
+        "█".repeat(filled),
+        "░".repeat(bar_w.saturating_sub(filled))
+    );
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {}/{} ", done, total),
+            Style::default().fg(THEME.secondary),
+        ),
+        Span::styled(bar, Style::default().fg(THEME.purple)),
+    ]));
+
     if !graph.is_empty() {
-        for (desc, agent, status) in graph.iter().take(area.height.saturating_sub(2) as usize) {
+        for (desc, agent, status) in graph.iter().take(area.height.saturating_sub(3) as usize) {
             let (icon, color) = match status {
                 TaskStatus::Completed => ("✓", THEME.green),
                 TaskStatus::Failed => ("✗", THEME.red),
@@ -2094,85 +2311,104 @@ fn render_rail_progress(f: &mut Frame, app: &TuiApp, area: Rect) {
                 _ => ("○", THEME.muted),
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
-                Span::styled(truncate_to(agent, 10), Style::default().fg(THEME.secondary)),
+                Span::styled(format!(" {} ", icon), Style::default().fg(color)),
                 Span::styled(
-                    format!(
-                        " {}",
-                        truncate_to(desc, area.width.saturating_sub(20) as usize)
+                    truncate_to(
+                        &format!("{} {}", agent, desc),
+                        inner.saturating_sub(3),
                     ),
                     Style::default().fg(THEME.primary),
                 ),
             ]));
         }
     } else {
-        // No task graph: show the real phase statuses (no fabricated progress).
-        for (phase, name) in [
-            (Phase::Research, "research"),
-            (Phase::Testing, "testing"),
-            (Phase::Planning, "planning"),
-            (Phase::Coding, "coding"),
-            (Phase::Review, "review"),
-        ] {
+        for (phase, name) in phases {
             let (glyph, _, _) = specialist_status(app, name);
             let color = THEME.status_color(glyph);
-            lines.push(Line::from(vec![Span::styled(
-                format!("  {} {}", glyph.glyph(), phase.label()),
+            lines.push(Line::from(Span::styled(
+                format!(" {} {}", glyph.glyph(), phase.label()),
                 Style::default().fg(color),
-            )]));
+            )));
         }
     }
-    render_rail_section(f, area, "TASK PROGRESS", lines);
+    render_rail_section(f, area, "▾ TASK PROGRESS", lines);
 }
 
 fn render_rail_context(f: &mut Frame, app: &TuiApp, area: Rect) {
     let s = &app.action_stream;
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let files = s.files_inspected.len();
-    if files > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("  📄 Files    ", Style::default().fg(THEME.secondary)),
-            Span::styled(format!("{}", files), Style::default().fg(THEME.primary)),
-        ]));
-    }
-    if !s.tools_used.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("  🧰 Tools    ", Style::default().fg(THEME.secondary)),
-            Span::styled(
-                format!("{}", s.tools_used.len()),
-                Style::default().fg(THEME.primary),
-            ),
-        ]));
-    }
-    if s.tests_total > 0 {
-        // Every PTY-backed command exit is counted; label the metric
-        // "Commands" (not "Tests") since plain commands (cargo check, …) are
-        // not tests — see UiActionGroup::test_counts.
-        lines.push(Line::from(vec![
-            Span::styled("  ⚙ Commands ", Style::default().fg(THEME.secondary)),
-            Span::styled(
-                format!("{} / {}", s.tests_passed, s.tests_total),
-                Style::default().fg(if s.tests_passed == s.tests_total {
+    let inner = area.width.saturating_sub(2) as usize;
+    let col = (inner / 2).max(8);
+
+    // 2-column grid of real counters (design-spec Context Summary).
+    let cells: Vec<(&str, String, Color)> = {
+        let mut c = Vec::new();
+        let files = s.files_inspected.len();
+        if files > 0 {
+            c.push(("Files", format!("{}", files), THEME.primary));
+        }
+        if !s.tools_used.is_empty() {
+            c.push(("Tools", format!("{}", s.tools_used.len()), THEME.primary));
+        }
+        if s.tests_total > 0 {
+            c.push((
+                "Tests",
+                format!("{}/{}", s.tests_passed, s.tests_total),
+                if s.tests_passed == s.tests_total {
                     THEME.green
                 } else {
                     THEME.yellow
-                }),
-            ),
-        ]));
-    }
-    if s.failures > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("  ⚠ Failures ", Style::default().fg(THEME.secondary)),
-            Span::styled(format!("{}", s.failures), Style::default().fg(THEME.red)),
-        ]));
-    }
-    if lines.is_empty() {
+                },
+            ));
+        }
+        if s.tool_calls > 0 {
+            c.push(("Calls", format!("{}", s.tool_calls), THEME.primary));
+        }
+        c
+    };
+
+    if cells.is_empty() {
         lines.push(Line::from(Span::styled(
             "  —",
             Style::default().fg(THEME.muted),
         )));
+    } else {
+        for pair in cells.chunks(2) {
+            let mut spans = Vec::new();
+            for (i, (label, value, color)) in pair.iter().enumerate() {
+                let cell = format!("{} {}", label, value);
+                let padded = if i == 0 {
+                    format!(" {:<width$}", cell, width = col.saturating_sub(1))
+                } else {
+                    cell
+                };
+                spans.push(Span::styled(
+                    truncate_to(&padded, col),
+                    Style::default().fg(*color),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
     }
-    render_rail_section(f, area, "CONTEXT", lines);
+
+    if s.failures > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(" ⚠ Risks ", Style::default().fg(THEME.yellow)),
+            Span::styled(format!("{}", s.failures), Style::default().fg(THEME.yellow)),
+        ]));
+    }
+    let verified = s
+        .groups
+        .iter()
+        .filter(|g| g.verification.as_ref().and_then(|v| v.summary()).is_some())
+        .count();
+    if verified > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(" ✓ Verified ", Style::default().fg(THEME.green)),
+            Span::styled(format!("{}", verified), Style::default().fg(THEME.green)),
+        ]));
+    }
+    render_rail_section(f, area, "▾ CONTEXT", lines);
 }
 
 fn render_rail_activity(f: &mut Frame, app: &TuiApp, area: Rect) {
@@ -2182,68 +2418,50 @@ fn render_rail_activity(f: &mut Frame, app: &TuiApp, area: Rect) {
             let color = THEME.phase_color(group.phase);
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  {} {}", group.phase.emoji(), group.phase.label()),
+                    format!(" {} {}", group.phase.emoji(), phase_gerund(group.phase)),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("  {}", action.kind.label()),
-                    Style::default().fg(THEME.secondary),
-                ),
             ]));
-            if !action.title.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  {}",
-                        truncate_to(&action.title, area.width.saturating_sub(3) as usize)
-                    ),
-                    Style::default().fg(THEME.primary),
-                )));
-            }
-            if !action.detail.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  {}",
-                        truncate_to(&action.detail, area.width.saturating_sub(3) as usize)
-                    ),
-                    Style::default().fg(THEME.muted),
-                )));
-            }
+            let detail = if !action.detail.is_empty() {
+                action.detail.clone()
+            } else if !action.title.is_empty() {
+                action.title.clone()
+            } else {
+                action.kind.label().to_string()
+            };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {}",
+                    truncate_to(&detail, area.width.saturating_sub(3) as usize)
+                ),
+                Style::default().fg(THEME.primary),
+            )));
         }
         None => {
             lines.push(Line::from(Span::styled(
-                "  ○ Idle",
+                " ○ Idle",
                 Style::default().fg(THEME.muted),
             )));
         }
     }
-    render_rail_section(f, area, "CURRENT ACTIVITY", lines);
+    render_rail_section(f, area, "▾ CURRENT ACTIVITY", lines);
 }
 
 fn render_rail_session(f: &mut Frame, app: &TuiApp, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let status = if app.has_active_task() || app.action_stream.has_running() {
-        ("● Running", THEME.purple)
-    } else {
-        ("○ Idle", THEME.muted)
-    };
+    let started = chrono::Local::now()
+        - chrono::Duration::seconds(app.session_duration_secs() as i64);
     lines.push(Line::from(vec![
-        Span::styled("  Status    ", Style::default().fg(THEME.secondary)),
-        Span::styled(status.0, Style::default().fg(status.1)),
-    ]));
-    let duration = app
-        .task_duration_secs()
-        .unwrap_or_else(|| app.session_duration_secs());
-    lines.push(Line::from(vec![
-        Span::styled("  Duration  ", Style::default().fg(THEME.secondary)),
+        Span::styled(" Started  ", Style::default().fg(THEME.secondary)),
         Span::styled(
-            format_duration(duration as u64 * 1000),
+            started.format("%H:%M").to_string(),
             Style::default().fg(THEME.primary),
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  Tool calls", Style::default().fg(THEME.secondary)),
+        Span::styled(" Duration ", Style::default().fg(THEME.secondary)),
         Span::styled(
-            format!("  {}", app.action_stream.tool_calls),
+            format_duration(app.session_duration_secs() * 1000),
             Style::default().fg(THEME.primary),
         ),
     ]));
@@ -2251,15 +2469,22 @@ fn render_rail_session(f: &mut Frame, app: &TuiApp, area: Rect) {
         let tokens = metrics.total_tokens();
         if tokens > 0 {
             lines.push(Line::from(vec![
-                Span::styled("  Tokens    ", Style::default().fg(THEME.secondary)),
+                Span::styled(" Tokens   ", Style::default().fg(THEME.secondary)),
                 Span::styled(
-                    format!("  {}", crate::metrics::format_token_count(tokens)),
+                    crate::metrics::format_token_count(tokens),
                     Style::default().fg(THEME.primary),
                 ),
             ]));
         }
     }
-    render_rail_section(f, area, "SESSION", lines);
+    lines.push(Line::from(vec![
+        Span::styled(" Tools    ", Style::default().fg(THEME.secondary)),
+        Span::styled(
+            format!("{}", app.action_stream.tool_calls),
+            Style::default().fg(THEME.primary),
+        ),
+    ]));
+    render_rail_section(f, area, "▾ SESSION", lines);
 }
 
 fn render_rail_section(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {
@@ -2270,6 +2495,7 @@ fn render_rail_section(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(THEME.border_style())
+        .style(Style::default().bg(THEME.surface))
         .title(Span::styled(title, THEME.title_style()));
     let mut visible = lines;
     visible.truncate(inner_h);
@@ -2287,9 +2513,9 @@ fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
     let prefix = if let Some(s) = &app.secure_input {
         format!("API key for {}: ", s.provider)
     } else if app.dashboard.animation.is_active() {
-        format!("{}> ", spinner_char_now())
+        format!("{}❯ ", spinner_char_now())
     } else {
-        "> ".to_string()
+        "❯ ".to_string()
     };
 
     let inner_h = area.height.saturating_sub(1) as usize;
@@ -2320,39 +2546,51 @@ fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
         };
         text_lines.push(Line::from(truncate_to(&full, area.width as usize)));
     }
-    // Dim placeholder when the input is empty and nothing is being typed.
     if app.input.is_empty() && app.secure_input.is_none() {
         text_lines[0] = Line::from(Span::styled(
-            format!("{}Ask CodeBro anything...", prefix),
+            format!("{}Ask CodeBro anything... (Ctrl+Enter to send)", prefix),
             Style::default().fg(THEME.muted),
         ));
     }
 
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(THEME.border_style());
+        .border_style(THEME.border_style())
+        .style(Style::default().bg(THEME.surface));
     let paragraph = Paragraph::new(Text::from(text_lines))
         .block(block)
-        .style(Style::default().fg(THEME.primary));
+        .style(Style::default().fg(THEME.primary).bg(THEME.surface));
     f.render_widget(paragraph, area);
 
-    // Right-aligned contextual hint (Enter Send / Ctrl+C cancel).
-    if area.height >= 2 && area.width >= 16 && app.secure_input.is_none() {
-        let hint = if app.has_active_task() {
-            "Ctrl+C cancel"
+    // Right-aligned action chips matching the design-spec input chrome.
+    if area.height >= 2 && area.width >= 28 && app.secure_input.is_none() {
+        let hints: Vec<(&str, &str, Color)> = if app.has_active_task() {
+            vec![("Ctrl+C", "Cancel", THEME.yellow)]
         } else {
-            "Enter Send"
+            vec![
+                ("Ctrl+P", "Actions", THEME.secondary),
+                ("Enter", "Send", THEME.purple),
+            ]
         };
-        let hint_w = hint.len() as u16 + 2;
-        let x = area.x + area.width.saturating_sub(hint_w);
-        let y = area.y;
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(" {}", hint),
-                Style::default().fg(THEME.muted),
-            ))),
-            Rect::new(x, y, hint_w, 1),
-        );
+        let mut x = area.x + area.width;
+        for (key, label, color) in hints.into_iter().rev() {
+            let text = format!(" {} {} ", key, label);
+            let w = text.chars().count() as u16;
+            x = x.saturating_sub(w + 1);
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", key),
+                        Style::default().fg(THEME.muted).bg(THEME.border),
+                    ),
+                    Span::styled(
+                        format!("{} ", label),
+                        Style::default().fg(color).bg(THEME.border),
+                    ),
+                ])),
+                Rect::new(x, area.y, w, 1),
+            );
+        }
     }
 
     if area.width >= 4 && area.height >= 2 {
@@ -2371,33 +2609,89 @@ fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
     if area.height < 1 || area.width < 8 {
         return;
     }
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let entries: [&str; 8] = [
-        "Ctrl+P Palette",
-        "Ctrl+G Graph",
-        "Ctrl+V Metrics",
-        "Ctrl+O Coord",
-        "Ctrl+U Rail",
-        "Ctrl+K Console",
-        "Ctrl+D Diff",
-        "Ctrl+C Cancel",
+
+    let mut left: Vec<Span<'static>> = Vec::new();
+    let entries: [(&str, &str); 5] = [
+        ("Ctrl+M", "Memory"),
+        ("Ctrl+P", "Palette"),
+        ("Ctrl+D", "Diff"),
+        ("Ctrl+O", "Rail"),
+        ("?", "Help"),
     ];
-    for (i, entry) in entries.iter().enumerate() {
+    for (i, (key, rest)) in entries.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled("  ", Style::default().fg(THEME.muted)));
+            left.push(Span::styled("  ", Style::default().fg(THEME.muted)));
         }
-        let (key, rest) = entry.split_once(' ').unwrap_or((entry, ""));
-        spans.push(Span::styled(
-            format!("{}{}", key, if rest.is_empty() { "" } else { " " }),
+        left.push(Span::styled(
+            format!("{} ", key),
             Style::default().fg(THEME.secondary),
         ));
-        spans.push(Span::styled(rest, Style::default().fg(THEME.muted)));
+        left.push(Span::styled(*rest, Style::default().fg(THEME.muted)));
     }
-    let line = truncate_line_to(&Line::from(spans), area.width as usize);
+
+    let mut right: Vec<Span<'static>> = Vec::new();
+    let (dot, conn_color, conn_label) = {
+        let active = app
+            .provider_manager
+            .as_ref()
+            .and_then(|pm| pm.active_provider().cloned());
+        let health = active.as_ref().and_then(|id| {
+            app.provider_panel
+                .health_results
+                .iter()
+                .find(|(pid, _, _)| pid == id)
+                .map(|(_, h, _)| h)
+        });
+        match health {
+            Some(crate::provider_manager::HealthStatus::Healthy) => {
+                ("●", THEME.green, "Connected")
+            }
+            Some(crate::provider_manager::HealthStatus::Unhealthy { .. }) => {
+                ("⚠", THEME.yellow, "Unavailable")
+            }
+            _ => ("○", THEME.muted, "Ready"),
+        }
+    };
+    right.push(Span::styled(
+        format!("{} {}", dot, conn_label),
+        Style::default().fg(conn_color),
+    ));
+    if !app.workspace_path_display.is_empty() {
+        right.push(Span::styled("  ", Style::default()));
+        right.push(Span::styled(
+            truncate_to(&app.workspace_path_display, 28),
+            Style::default().fg(THEME.secondary),
+        ));
+    }
+    if !app.git_branch.is_empty() {
+        right.push(Span::styled("  ⎇ ", Style::default().fg(THEME.muted)));
+        right.push(Span::styled(
+            app.git_branch.clone(),
+            Style::default().fg(THEME.green),
+        ));
+    }
+
+    let right_w = right
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>() as u16;
+    let left_budget = area.width.saturating_sub(right_w.saturating_add(2));
     f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(THEME.bg)),
-        area,
+        Paragraph::new(truncate_line_to(&Line::from(left), left_budget as usize))
+            .style(Style::default().bg(THEME.bg)),
+        Rect::new(area.x, area.y, left_budget.max(1), 1),
     );
+    if right_w > 0 && area.width > right_w {
+        f.render_widget(
+            Paragraph::new(Line::from(right)).style(Style::default().bg(THEME.bg)),
+            Rect::new(
+                area.x + area.width.saturating_sub(right_w),
+                area.y,
+                right_w,
+                1,
+            ),
+        );
+    }
 }
 
 /// Truncate a line of spans to `width` columns, dropping trailing spans.
@@ -3088,6 +3382,20 @@ fn handle_shortcut(shortcut: Shortcut, app: &mut TuiApp) {
         Shortcut::ToggleConsole => {
             app.toggle_console();
         }
+        Shortcut::SendInput => {
+            if app.secure_input.is_some() || app.pending_confirmation.is_some() {
+                return;
+            }
+            let input = app.input.trim().to_string();
+            if input.is_empty() {
+                return;
+            }
+            if !is_inline_apikey(&input) {
+                app.push_history(input.clone());
+            }
+            app.clear_input();
+            submit_input(input, app);
+        }
         Shortcut::ViewDiff => {
             // Reuses the existing staged-change preview flow (`/apply` →
             // `//approve`); no new diff engine.
@@ -3635,10 +3943,10 @@ mod tests {
         assert!(text.contains("AGENTS"), "rail: agents section");
         assert!(text.contains("CURRENT ACTIVITY"), "rail: activity section");
         assert!(text.contains("SESSION"), "rail: session section");
-        assert!(text.contains("Enter Send"), "input hint");
+        assert!(text.contains("Send"), "input send hint");
         assert!(text.contains("Ctrl+P"), "footer hints");
-        assert!(text.contains("Ctrl+U Rail"), "footer rail hint");
-        assert!(text.contains("Ctrl+K Console"), "footer console hint");
+        assert!(text.contains("Ctrl+O"), "footer rail hint");
+        assert!(text.contains("Ready") || text.contains("Connected"), "footer status");
     }
 
     #[test]
@@ -3648,7 +3956,7 @@ mod tests {
         let text = buffer_text(&app, 120, 40);
         assert!(!text.contains("AGENTS"), "rail hidden when collapsed");
         assert!(text.contains("CodeBro"));
-        assert!(text.contains("Enter Send"));
+        assert!(text.contains("Send"));
     }
 
     #[test]
@@ -3657,7 +3965,7 @@ mod tests {
         let text = buffer_text(&app, 80, 24);
         assert!(!text.contains("AGENTS"), "rail off in compact");
         assert!(text.contains("CodeBro"), "header kept");
-        assert!(text.contains("Enter Send"), "input kept");
+        assert!(text.contains("Ask CodeBro") || text.contains("Send"), "input kept");
     }
 
     #[test]

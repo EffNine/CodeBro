@@ -307,10 +307,18 @@ codebro
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+C` | Exit |
-| `Ctrl+L` | Clear screen |
-| `Ctrl+S` | Save session |
-| `Up/Down` | Scroll conversation |
+| `Ctrl+Enter` / `Enter` | Send message |
+| `Ctrl+P` | Command palette |
+| `Ctrl+O` | Toggle intelligence rail |
+| `Ctrl+D` | View staged diff |
+| `Ctrl+M` | Memory panel |
+| `Ctrl+K` | PTY console |
+| `Ctrl+C` | Cancel current task |
+| `Ctrl+Q` | Quit |
+| `Esc` | Dismiss top overlay |
+| `?` | Help (when input is empty) |
+| `Tab` | Focus action group |
+| `Up/Down` | Scroll conversation (empty input) / history |
 
 ## Supported Providers
 

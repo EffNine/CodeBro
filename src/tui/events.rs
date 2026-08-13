@@ -86,10 +86,14 @@ pub fn check_key_shortcuts(key: &KeyEvent) -> Option<Shortcut> {
         KeyCode::Char('q') => Some(Shortcut::Quit),
         KeyCode::Char('p') => Some(Shortcut::OpenCommandPalette),
         KeyCode::Char('v') => Some(Shortcut::ToggleMetrics),
-        KeyCode::Char('o') => Some(Shortcut::ToggleCoordination),
-        KeyCode::Char('u') => Some(Shortcut::ToggleRail),
+        // Design-spec: Ctrl+O toggles the intelligence rail.
+        KeyCode::Char('o') => Some(Shortcut::ToggleRail),
+        // Ctrl+U keeps coordination (swapped off Ctrl+O).
+        KeyCode::Char('u') => Some(Shortcut::ToggleCoordination),
         KeyCode::Char('k') => Some(Shortcut::ToggleConsole),
         KeyCode::Char('d') => Some(Shortcut::ViewDiff),
+        // Design-spec: Ctrl+Enter sends the current input.
+        KeyCode::Enter => Some(Shortcut::SendInput),
         _ => None,
     }
 }
@@ -113,6 +117,8 @@ pub enum Shortcut {
     ToggleConsole,
     /// Show the staged change preview (the existing `/apply` diff flow).
     ViewDiff,
+    /// Submit the current input (Ctrl+Enter).
+    SendInput,
 }
 
 impl Shortcut {
@@ -126,12 +132,13 @@ impl Shortcut {
             Shortcut::ClearLogs => "Ctrl+L Clear",
             Shortcut::CancelTask => "Ctrl+C Cancel",
             Shortcut::Quit => "Ctrl+Q Quit",
-            Shortcut::OpenCommandPalette => "Ctrl+P Commands",
+            Shortcut::OpenCommandPalette => "Ctrl+P Palette",
             Shortcut::ToggleMetrics => "Ctrl+V Metrics",
-            Shortcut::ToggleCoordination => "Ctrl+O Coordination",
-            Shortcut::ToggleRail => "Ctrl+U Rail",
+            Shortcut::ToggleCoordination => "Ctrl+U Coord",
+            Shortcut::ToggleRail => "Ctrl+O Rail",
             Shortcut::ToggleConsole => "Ctrl+K Console",
             Shortcut::ViewDiff => "Ctrl+D Diff",
+            Shortcut::SendInput => "Ctrl+Enter Send",
         }
     }
 }
@@ -155,8 +162,6 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
-    // ─── F9: Ctrl+D maps to the diff shortcut ─────────────────────────
-
     #[test]
     fn test_ctrl_d_maps_to_view_diff() {
         assert_eq!(
@@ -164,6 +169,31 @@ mod tests {
             Some(Shortcut::ViewDiff)
         );
         assert_eq!(Shortcut::ViewDiff.label(), "Ctrl+D Diff");
+    }
+
+    #[test]
+    fn test_ctrl_o_toggles_rail() {
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('o'))),
+            Some(Shortcut::ToggleRail)
+        );
+        assert_eq!(Shortcut::ToggleRail.label(), "Ctrl+O Rail");
+    }
+
+    #[test]
+    fn test_ctrl_u_toggles_coordination() {
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Char('u'))),
+            Some(Shortcut::ToggleCoordination)
+        );
+    }
+
+    #[test]
+    fn test_ctrl_enter_sends_input() {
+        assert_eq!(
+            check_key_shortcuts(&ctrl(KeyCode::Enter)),
+            Some(Shortcut::SendInput)
+        );
     }
 
     #[test]
@@ -207,14 +237,6 @@ mod tests {
         assert_eq!(
             check_key_shortcuts(&ctrl(KeyCode::Char('v'))),
             Some(Shortcut::ToggleMetrics)
-        );
-        assert_eq!(
-            check_key_shortcuts(&ctrl(KeyCode::Char('o'))),
-            Some(Shortcut::ToggleCoordination)
-        );
-        assert_eq!(
-            check_key_shortcuts(&ctrl(KeyCode::Char('u'))),
-            Some(Shortcut::ToggleRail)
         );
         assert_eq!(
             check_key_shortcuts(&ctrl(KeyCode::Char('k'))),
