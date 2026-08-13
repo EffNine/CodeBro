@@ -120,6 +120,11 @@ pub struct TuiApp {
     pub workspace_path_display: String,
     /// Current git branch from `.git/HEAD` (cached at startup; empty if none).
     pub git_branch: String,
+    /// The canonical task mode the TUI submission actually runs
+    /// (production behavior is `TaskMode::Assist` today). This is the ONLY
+    /// authority for the header mode label and the rail progress phase set;
+    /// the UI never infers a mode from "a task is running".
+    pub task_mode: crate::canonical_runtime::TaskMode,
 }
 
 /// UI state for the provider management panel
@@ -250,6 +255,7 @@ impl TuiApp {
             workspace_name,
             workspace_path_display,
             git_branch,
+            task_mode: crate::canonical_runtime::TaskMode::Assist,
         })
     }
 
@@ -1135,11 +1141,10 @@ mod tests {
         use crate::agent::events::AgentEvent;
         let mut app = make_app();
         app.add_message(MessageRole::User, "first".to_string());
-        app.action_stream
-            .handle_event(&AgentEvent::ToolStarted {
-                tool: "read_file".to_string(),
-                args: "a.rs".to_string(),
-            });
+        app.action_stream.handle_event(&AgentEvent::ToolStarted {
+            tool: "read_file".to_string(),
+            args: "a.rs".to_string(),
+        });
         app.action_stream.finalize_response(true);
         assert!(!app.action_stream.groups.is_empty());
         app.seal_actions_to_last_user();

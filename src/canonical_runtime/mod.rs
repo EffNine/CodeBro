@@ -284,6 +284,19 @@ impl TaskMode {
             TaskMode::Autonomous => (true, true, true, true, true),
         }
     }
+
+    /// The enabled specialist phase agent names for this mode, in pipeline
+    /// order. This is the single source of truth for "which specialists
+    /// participate in this mode". `Main` is never listed: the main loop runs
+    /// in every mode, so it is excluded from specialist progress denominators.
+    pub fn enabled_phase_names(&self) -> &'static [&'static str] {
+        match self {
+            TaskMode::Assist => &["research"],
+            TaskMode::Validate => &["research", "testing"],
+            TaskMode::Plan => &["research", "testing", "planning"],
+            TaskMode::Autonomous => &["research", "testing", "planning", "coding", "review"],
+        }
+    }
 }
 
 /// The outcome of a directly-invoked streaming tool run (shell commands,

@@ -16,7 +16,7 @@ use crate::agent::events::AgentEvent;
 use crate::agent::status::AgentStatus;
 use crate::agent::task_graph::TaskStatus;
 use crate::config::Config;
-use crate::tui::actions::{UiActionGroup, UiActionKind, UiActionStatus};
+use crate::tui::actions::{ActionStream, UiActionGroup, UiActionKind, UiActionStatus};
 use crate::tui::animation::SPINNER_FRAMES;
 use crate::tui::app::{MessageRole, PendingAction, TuiApp};
 use crate::tui::commands::{self, CommandNamespace};
@@ -1182,8 +1182,13 @@ fn submit_task(app: &mut TuiApp, task: String) {
     let config = app.config.clone();
     let tx = app.tx.clone();
     let conversation = conversation_from(app);
+    // The TUI submission runs Assist today (Research + Main): research is
+    // enabled, no autonomous specialists. The header and rail derive their
+    // claims from this explicit mode — never from "a task is running".
+    let mode = crate::canonical_runtime::TaskMode::Assist;
+    app.task_mode = mode;
     tokio::spawn(async move {
-        run_chat_pipeline(&config, &task, conversation, &tx, token).await;
+        run_chat_pipeline(&config, &task, conversation, &tx, token, mode).await;
     });
 }
 
@@ -1352,6 +1357,7 @@ async fn run_chat_pipeline(
     conversation: Vec<crate::engineering_context::ConversationMessage>,
     tx: &std::sync::mpsc::Sender<events::AppEvent>,
     token: crate::cancellation::CancellationToken,
+    mode: crate::canonical_runtime::TaskMode,
 ) {
     let emit_tx = tx.clone();
     let emit = move |event: AgentEvent| {
@@ -1386,15 +1392,11 @@ async fn run_chat_pipeline(
         emit: &emit,
         on_chunk: &on_chunk,
     };
-    let options = crate::canonical_runtime::TaskOptions {
-        cancel: Some(token),
-        on_pty: Some(on_pty),
-        // Autonomous research (Sprint 30C): run the read-only Research
-        // subagent before the main loop and feed its evidence-backed result
-        // into the main LLM context.
-        research_enabled: true,
-        ..Default::default()
-    };
+    // The canonical per-mode option set: the same flags `phase_flags()`
+    // defines, so the header/progress claims always match the runtime.
+    let mut options = crate::canonical_runtime::TaskOptions::for_mode(mode);
+    options.cancel = Some(token);
+    options.on_pty = Some(on_pty);
 
     let result = runtime.run_task_with_options(&request, options).await;
 
@@ -1579,6 +1581,22 @@ fn ui(f: &mut Frame, app: &TuiApp) {
 // Header
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// The header's mode label. Idle always renders READY; a running task renders
+/// the actual [`TaskMode`] the TUI submission is using. The mode is explicit
+/// state — it is NEVER inferred from "a task is running" or from whichever
+/// agent events happened to arrive.
+pub fn header_mode_label(mode: crate::canonical_runtime::TaskMode, working: bool) -> &'static str {
+    if !working {
+        return "READY";
+    }
+    match mode {
+        crate::canonical_runtime::TaskMode::Assist => "ASSIST",
+        crate::canonical_runtime::TaskMode::Validate => "VALIDATE",
+        crate::canonical_runtime::TaskMode::Plan => "PLAN",
+        crate::canonical_runtime::TaskMode::Autonomous => "AUTONOMOUS",
+    }
+}
+
 fn render_header(f: &mut Frame, app: &TuiApp, area: Rect) {
     if area.height < 1 || area.width < 4 {
         return;
@@ -1590,6 +1608,7 @@ fn render_header(f: &mut Frame, app: &TuiApp, area: Rect) {
     };
 
     let working = app.has_active_task() || app.action_stream.has_running();
+    let mode_label = header_mode_label(app.task_mode, working);
     let mut spans = vec![
         Span::styled(
             "CodeBro",
@@ -1607,13 +1626,13 @@ fn render_header(f: &mut Frame, app: &TuiApp, area: Rect) {
             Style::default().fg(if working { THEME.green } else { THEME.muted }),
         ),
         Span::styled(
-            if working {
-                " AUTONOMOUS MODE"
-            } else {
-                " READY"
-            },
+            format!(" {}", mode_label),
             Style::default()
-                .fg(if working { THEME.green } else { THEME.secondary })
+                .fg(if working {
+                    THEME.green
+                } else {
+                    THEME.secondary
+                })
                 .add_modifier(Modifier::BOLD),
         ),
     ];
@@ -1891,13 +1910,13 @@ fn message_header_lines(
     let mut spans = vec![
         Span::styled(
             format!("{} ", avatar),
-            Style::default().fg(avatar_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(avatar_color)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             name.to_string(),
-            Style::default()
-                .fg(name_color)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(name_color).add_modifier(Modifier::BOLD),
         ),
     ];
     if !timestamp.is_empty() {
@@ -1968,9 +1987,7 @@ fn group_lines(group: &UiActionGroup, inner_w: usize, focused: bool) -> Vec<Line
     title.push_str(phase_name);
     title.push(' ');
     title.push_str(group.status.glyph().glyph());
-    let duration = group
-        .duration_ms
-        .unwrap_or_else(|| group.elapsed_ms());
+    let duration = group.duration_ms.unwrap_or_else(|| group.elapsed_ms());
     title.push_str(&format!("  {}", format_duration(duration)));
 
     let mut title_spans = vec![Span::styled(
@@ -2261,27 +2278,32 @@ fn render_rail_agents(f: &mut Frame, app: &TuiApp, area: Rect) {
     render_rail_section(f, area, "▾ AGENTS", lines);
 }
 
+/// (done, total) of the rail's specialist progress. `total` is the number of
+/// specialist phases ENABLED by the task's actual [`TaskMode`] (from the
+/// canonical `enabled_phase_names`), and `done` counts those with real
+/// Completed runtime status. Disabled phases never appear — a mode with only
+/// Research enabled shows 0/1, never 0/5. Main is never counted: the rail
+/// tracks specialists.
+pub fn rail_progress_counts(app: &TuiApp) -> (usize, usize) {
+    let names = app.task_mode.enabled_phase_names();
+    let done = names
+        .iter()
+        .filter(|name| matches!(specialist_status(app, name).0, StatusGlyph::Completed))
+        .count();
+    (done, names.len())
+}
+
 fn render_rail_progress(f: &mut Frame, app: &TuiApp, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let inner = area.width.saturating_sub(2) as usize;
     let graph = app.dashboard.graph_entries();
-    let phases = [
-        (Phase::Research, "research"),
-        (Phase::Testing, "testing"),
-        (Phase::Planning, "planning"),
-        (Phase::Coding, "coding"),
-        (Phase::Review, "review"),
-    ];
-    let done = phases
+    let phases: Vec<(Phase, &str)> = app
+        .task_mode
+        .enabled_phase_names()
         .iter()
-        .filter(|(_, name)| {
-            matches!(
-                specialist_status(app, name).0,
-                StatusGlyph::Completed
-            )
-        })
-        .count();
-    let total = phases.len();
+        .filter_map(|name| ActionStream::phase_for(name).map(|phase| (phase, *name)))
+        .collect();
+    let (done, total) = rail_progress_counts(app);
     let bar_w = inner.saturating_sub(8).max(4);
     let filled = if total == 0 {
         0
@@ -2313,10 +2335,7 @@ fn render_rail_progress(f: &mut Frame, app: &TuiApp, area: Rect) {
             lines.push(Line::from(vec![
                 Span::styled(format!(" {} ", icon), Style::default().fg(color)),
                 Span::styled(
-                    truncate_to(
-                        &format!("{} {}", agent, desc),
-                        inner.saturating_sub(3),
-                    ),
+                    truncate_to(&format!("{} {}", agent, desc), inner.saturating_sub(3)),
                     Style::default().fg(THEME.primary),
                 ),
             ]));
@@ -2416,12 +2435,10 @@ fn render_rail_activity(f: &mut Frame, app: &TuiApp, area: Rect) {
     match app.action_stream.current_activity() {
         Some((group, action)) => {
             let color = THEME.phase_color(group.phase);
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {} {}", group.phase.emoji(), phase_gerund(group.phase)),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                format!(" {} {}", group.phase.emoji(), phase_gerund(group.phase)),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )]));
             let detail = if !action.detail.is_empty() {
                 action.detail.clone()
             } else if !action.title.is_empty() {
@@ -2447,43 +2464,44 @@ fn render_rail_activity(f: &mut Frame, app: &TuiApp, area: Rect) {
     render_rail_section(f, area, "▾ CURRENT ACTIVITY", lines);
 }
 
-fn render_rail_session(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let started = chrono::Local::now()
-        - chrono::Duration::seconds(app.session_duration_secs() as i64);
-    lines.push(Line::from(vec![
-        Span::styled(" Started  ", Style::default().fg(THEME.secondary)),
-        Span::styled(
-            started.format("%H:%M").to_string(),
-            Style::default().fg(THEME.primary),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" Duration ", Style::default().fg(THEME.secondary)),
-        Span::styled(
-            format_duration(app.session_duration_secs() * 1000),
-            Style::default().fg(THEME.primary),
-        ),
-    ]));
+/// Session panel rows, built from real machine state only. No "Started" row
+/// exists: there is no authoritative wall-clock session-start timestamp in
+/// the app (only an elapsed duration), so a start time would have to be
+/// reconstructed — it is never shown. Duration, Tokens (when available) and
+/// Tools are real.
+pub fn session_panel_rows(app: &TuiApp) -> Vec<(String, String)> {
+    let mut rows = vec![(
+        "Duration".to_string(),
+        format_duration(app.session_duration_secs() * 1000),
+    )];
     if let Some(metrics) = &app.dashboard.metrics {
         let tokens = metrics.total_tokens();
         if tokens > 0 {
-            lines.push(Line::from(vec![
-                Span::styled(" Tokens   ", Style::default().fg(THEME.secondary)),
-                Span::styled(
-                    crate::metrics::format_token_count(tokens),
-                    Style::default().fg(THEME.primary),
-                ),
-            ]));
+            rows.push((
+                "Tokens".to_string(),
+                crate::metrics::format_token_count(tokens),
+            ));
         }
     }
-    lines.push(Line::from(vec![
-        Span::styled(" Tools    ", Style::default().fg(THEME.secondary)),
-        Span::styled(
-            format!("{}", app.action_stream.tool_calls),
-            Style::default().fg(THEME.primary),
-        ),
-    ]));
+    rows.push((
+        "Tools".to_string(),
+        format!("{}", app.action_stream.tool_calls),
+    ));
+    rows
+}
+
+fn render_rail_session(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let rows = session_panel_rows(app);
+    for (label, value) in rows {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:<9}", label),
+                Style::default().fg(THEME.secondary),
+            ),
+            Span::styled(value, Style::default().fg(THEME.primary)),
+        ]));
+    }
     render_rail_section(f, area, "▾ SESSION", lines);
 }
 
@@ -2643,9 +2661,7 @@ fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
                 .map(|(_, h, _)| h)
         });
         match health {
-            Some(crate::provider_manager::HealthStatus::Healthy) => {
-                ("●", THEME.green, "Connected")
-            }
+            Some(crate::provider_manager::HealthStatus::Healthy) => ("●", THEME.green, "Connected"),
             Some(crate::provider_manager::HealthStatus::Unhealthy { .. }) => {
                 ("⚠", THEME.yellow, "Unavailable")
             }
@@ -3507,6 +3523,7 @@ fn input_display_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical_runtime::TaskMode;
 
     fn make_app() -> TuiApp {
         TuiApp::new().expect("app creation")
@@ -3806,7 +3823,17 @@ mod tests {
     #[test]
     fn test_render_active_task_all_sizes() {
         let app = app_with_task();
-        for (w, h) in [(120u16, 40u16), (100, 26), (80, 24), (140, 45), (110, 20)] {
+        for (w, h) in [
+            (160u16, 48u16),
+            (140, 40),
+            (120, 32),
+            (120, 40),
+            (100, 26),
+            (80, 24),
+            (60, 16),
+            (140, 45),
+            (110, 20),
+        ] {
             draw(&app, w, h);
         }
     }
@@ -3946,7 +3973,10 @@ mod tests {
         assert!(text.contains("Send"), "input send hint");
         assert!(text.contains("Ctrl+P"), "footer hints");
         assert!(text.contains("Ctrl+O"), "footer rail hint");
-        assert!(text.contains("Ready") || text.contains("Connected"), "footer status");
+        assert!(
+            text.contains("Ready") || text.contains("Connected"),
+            "footer status"
+        );
     }
 
     #[test]
@@ -3965,7 +3995,10 @@ mod tests {
         let text = buffer_text(&app, 80, 24);
         assert!(!text.contains("AGENTS"), "rail off in compact");
         assert!(text.contains("CodeBro"), "header kept");
-        assert!(text.contains("Ask CodeBro") || text.contains("Send"), "input kept");
+        assert!(
+            text.contains("Ask CodeBro") || text.contains("Send"),
+            "input kept"
+        );
     }
 
     #[test]
@@ -4077,5 +4110,173 @@ mod tests {
             joined
         );
         assert!(joined.contains("✓ Main"), "group completed: {}", joined);
+    }
+
+    // ─── Sprint 30UI.2 F1: header claims the REAL task mode ───────────
+
+    #[test]
+    fn test_header_assist_mode() {
+        assert_eq!(header_mode_label(TaskMode::Assist, true), "ASSIST");
+    }
+
+    #[test]
+    fn test_header_validate_mode() {
+        assert_eq!(header_mode_label(TaskMode::Validate, true), "VALIDATE");
+    }
+
+    #[test]
+    fn test_header_plan_mode() {
+        assert_eq!(header_mode_label(TaskMode::Plan, true), "PLAN");
+    }
+
+    #[test]
+    fn test_header_autonomous_mode() {
+        assert_eq!(header_mode_label(TaskMode::Autonomous, true), "AUTONOMOUS");
+    }
+
+    #[test]
+    fn test_header_idle_state() {
+        // Idle renders READY for every mode — never a mode claim.
+        assert_eq!(header_mode_label(TaskMode::Assist, false), "READY");
+        assert_eq!(header_mode_label(TaskMode::Autonomous, false), "READY");
+    }
+
+    #[test]
+    fn test_task_mode_matches_header() {
+        let mut app = make_app();
+        // Production submission runs Assist: a running task claims ASSIST,
+        // never a mode inferred from "a task is running" or from events.
+        app.task_mode = TaskMode::Assist;
+        app.action_stream.handle_event(&AgentEvent::ToolStarted {
+            tool: "run_command".to_string(),
+            args: "cargo test".to_string(),
+        });
+        assert!(app.action_stream.has_running(), "task is running");
+        let working = app.has_active_task() || app.action_stream.has_running();
+        assert_eq!(header_mode_label(app.task_mode, working), "ASSIST");
+        // Changing the mode changes the claim with it.
+        app.task_mode = TaskMode::Autonomous;
+        assert_eq!(
+            header_mode_label(app.task_mode, working),
+            "AUTONOMOUS",
+            "header follows the explicit task mode"
+        );
+        // Idle: no mode claim at all.
+        let idle = make_app();
+        assert_eq!(
+            header_mode_label(idle.task_mode, false),
+            "READY",
+            "idle app never claims a running mode"
+        );
+    }
+
+    // ─── Sprint 30UI.2 F3: rail progress uses enabled specialist phases
+
+    fn set_agent_completed(app: &mut TuiApp, name: &str) {
+        app.dashboard.status_monitor.register_agent(name);
+        app.dashboard
+            .status_monitor
+            .update_status(name, AgentStatus::Completed);
+    }
+
+    #[test]
+    fn test_progress_assist_mode() {
+        let app = make_app();
+        assert_eq!(app.task_mode, TaskMode::Assist);
+        assert_eq!(rail_progress_counts(&app), (0, 1));
+        let mut app = make_app();
+        set_agent_completed(&mut app, "research");
+        assert_eq!(rail_progress_counts(&app), (1, 1));
+    }
+
+    #[test]
+    fn test_progress_validate_mode() {
+        let mut app = make_app();
+        app.task_mode = TaskMode::Validate;
+        assert_eq!(rail_progress_counts(&app), (0, 2));
+        set_agent_completed(&mut app, "research");
+        assert_eq!(rail_progress_counts(&app), (1, 2));
+        set_agent_completed(&mut app, "testing");
+        assert_eq!(rail_progress_counts(&app), (2, 2));
+    }
+
+    #[test]
+    fn test_progress_plan_mode() {
+        let mut app = make_app();
+        app.task_mode = TaskMode::Plan;
+        assert_eq!(rail_progress_counts(&app), (0, 3));
+        set_agent_completed(&mut app, "research");
+        set_agent_completed(&mut app, "testing");
+        assert_eq!(rail_progress_counts(&app), (2, 3));
+        set_agent_completed(&mut app, "planning");
+        assert_eq!(rail_progress_counts(&app), (3, 3));
+    }
+
+    #[test]
+    fn test_progress_autonomous_mode() {
+        let mut app = make_app();
+        app.task_mode = TaskMode::Autonomous;
+        assert_eq!(rail_progress_counts(&app), (0, 5));
+        for name in ["research", "testing", "planning", "coding", "review"] {
+            set_agent_completed(&mut app, name);
+        }
+        assert_eq!(rail_progress_counts(&app), (5, 5));
+    }
+
+    #[test]
+    fn test_progress_partial_autonomous() {
+        let mut app = make_app();
+        app.task_mode = TaskMode::Autonomous;
+        set_agent_completed(&mut app, "research");
+        set_agent_completed(&mut app, "testing");
+        app.dashboard.status_monitor.register_agent("planning");
+        app.dashboard
+            .status_monitor
+            .update_status("planning", AgentStatus::Planning);
+        // Coding + Review pending must not render as unfinished phases that
+        // were never started — they simply stay in the 2/5 denominator.
+        assert_eq!(
+            rail_progress_counts(&app),
+            (2, 5),
+            "research+testing done, planning running, coding/review pending"
+        );
+    }
+
+    #[test]
+    fn test_task_mode_matches_progress() {
+        for mode in [
+            TaskMode::Assist,
+            TaskMode::Validate,
+            TaskMode::Plan,
+            TaskMode::Autonomous,
+        ] {
+            let mut app = make_app();
+            app.task_mode = mode;
+            let (_, total) = rail_progress_counts(&app);
+            assert_eq!(
+                total,
+                mode.enabled_phase_names().len(),
+                "progress denominator comes from the mode's canonical phases"
+            );
+        }
+    }
+
+    // ─── Sprint 30UI.2 F4: no fabricated session start time ───────────
+
+    #[test]
+    fn test_session_panel_omits_started_without_authoritative_timestamp() {
+        let app = make_app();
+        let rows = session_panel_rows(&app);
+        assert!(
+            rows.iter().all(|(label, _)| label != "Started"),
+            "no reconstructed start time without an authoritative wall-clock timestamp"
+        );
+        assert!(rows.iter().any(|(label, _)| label == "Duration"));
+        assert!(rows.iter().any(|(label, _)| label == "Tools"));
+        // Render smoke: the session panel still draws its real rows.
+        let text = buffer_text(&app, 120, 40);
+        assert!(text.contains("SESSION"));
+        assert!(text.contains("Duration"));
+        assert!(text.contains("Tools"));
     }
 }

@@ -6214,6 +6214,40 @@ fn test_disabled_flags_do_not_leak_between_tasks() {
     assert!(!assist_again.coding_enabled);
 }
 
+/// Sprint 30UI.2 invariant: the enabled specialist phase set is derived from
+/// the same canonical `phase_flags` — Assist 1, Validate 2, Plan 3,
+/// Autonomous 5 — and never lists Main. The TUI's progress denominator uses
+/// exactly this list, so a mode can never display a phase it did not enable.
+#[test]
+fn test_enabled_phase_names_match_mode_flags() {
+    use crate::canonical_runtime::TaskMode;
+    for mode in [
+        TaskMode::Assist,
+        TaskMode::Validate,
+        TaskMode::Plan,
+        TaskMode::Autonomous,
+    ] {
+        let names = mode.enabled_phase_names();
+        let (research, testing, planning, coding, review) = mode.phase_flags();
+        let flags = [research, testing, planning, coding, review];
+        assert_eq!(
+            names.len(),
+            flags.iter().filter(|f| **f).count(),
+            "{:?} phase count matches its flags",
+            mode
+        );
+        assert!(
+            !names.contains(&"main"),
+            "{:?} must never list Main as a specialist phase",
+            mode
+        );
+    }
+    assert_eq!(
+        TaskMode::Autonomous.enabled_phase_names(),
+        &["research", "testing", "planning", "coding", "review"]
+    );
+}
+
 /// Sprint 31A invariant: the whole-pipeline deadline budgets the main loop
 /// plus every enabled specialist's own session timeout, so enabling phases
 /// can never starve the main loop's budget.

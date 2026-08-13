@@ -572,8 +572,7 @@ impl ActionStream {
             }
             // Completed groups auto-collapse; failures/warnings stay expanded
             // until the user addresses them (design-spec progressive disclosure).
-            group.expanded = group.has_failure()
-                || matches!(group.status, UiActionStatus::Warning);
+            group.expanded = group.has_failure() || matches!(group.status, UiActionStatus::Warning);
         }
         self.current_agent = None;
         self.touch();
@@ -825,6 +824,12 @@ impl ActionStream {
         });
 
         let mut matched = false;
+        // Whether the finalized action is semantically test-like. ONLY
+        // completed actions of kind Testing/Verification may move the rail's
+        // test counters — the same classification `UiActionGroup::test_counts`
+        // uses. Ordinary commands (cargo check, cargo build, cargo fmt, …)
+        // never count as tests, regardless of their command text or exit code.
+        let mut test_like = false;
         if let Some(group) = self
             .groups
             .iter_mut()
@@ -837,12 +842,17 @@ impl ActionStream {
                 .rev()
                 .find(|a| a.status == UiActionStatus::Running)
             {
+                test_like = matches!(
+                    action.kind,
+                    UiActionKind::Testing | UiActionKind::Verification
+                );
                 action.finish(action_status, summary.clone(), Some(exit_code));
                 matched = true;
             }
         }
         if !matched {
-            // A PTY exit without a tracked start: surface the machine fact.
+            // A PTY exit without a tracked start: surface the machine fact as
+            // an ordinary command — never as a test.
             let phase = self.current_phase;
             let idx = self.group_for(phase, self.current_agent.clone());
             let mut action = UiAction::new(
@@ -854,10 +864,13 @@ impl ActionStream {
             self.push_action(idx, action);
         }
 
-        self.tests_total += 1;
-        if exit_code == 0 {
-            self.tests_passed += 1;
-        } else if !matches!(status, "cancelled" | "timed out") {
+        if test_like {
+            self.tests_total += 1;
+            if exit_code == 0 {
+                self.tests_passed += 1;
+            }
+        }
+        if exit_code != 0 && !matches!(status, "cancelled" | "timed out") {
             self.failures += 1;
         }
         self.touch();
@@ -1349,7 +1362,7 @@ mod tests {
     #[test]
     fn test_pty_exit_is_authoritative() {
         let mut stream = ActionStream::new();
-        stream.handle_event(&tool_started("run_command", "cargo test"));
+        stream.handle_event(&tool_started("run_tests", "cargo test"));
         stream.handle_event(&AgentEvent::PtyOutput {
             console: "c1".to_string(),
             content: "running 3 tests".to_string(),
@@ -1893,5 +1906,116 @@ mod tests {
             .collect();
         stream.handle_event(&tool_completed("list_files", &many, true));
         assert!(stream.files_inspected.len() <= MAX_FILES_TRACKED);
+    }
+
+    // ─── F2 (Sprint 30UI.2): only Testing/Verification actions count as
+    // tests in the rail. Ordinary PTY commands never do. ─────────────────
+
+    fn pty_exit(stream: &mut ActionStream, exit_code: i32, status: &str) {
+        stream.handle_event(&AgentEvent::PtyExited {
+            console: "c1".to_string(),
+            exit_code,
+            status: status.to_string(),
+        });
+    }
+
+    #[test]
+    fn test_pty_command_does_not_increment_tests() {
+        let mut stream = ActionStream::new();
+        stream.handle_event(&tool_started("run_command", "cargo check"));
+        pty_exit(&mut stream, 0, "completed");
+        assert_eq!(
+            stream.tests_total, 0,
+            "cargo check is a command, not a test"
+        );
+        assert_eq!(stream.tests_passed, 0);
+        assert_eq!(stream.failures, 0);
+    }
+
+    #[test]
+    fn test_pty_command_failure_does_not_increment_tests() {
+        let mut stream = ActionStream::new();
+        stream.handle_event(&tool_started("run_command", "cargo check"));
+        pty_exit(&mut stream, 101, "failed");
+        assert_eq!(
+            stream.tests_total, 0,
+            "a failing command must not be counted as a failed test"
+        );
+        assert_eq!(stream.tests_passed, 0);
+        assert_eq!(stream.failures, 1, "the real failure is still a risk");
+    }
+
+    #[test]
+    fn test_testing_action_increments_tests() {
+        let mut stream = ActionStream::new();
+        stream.handle_event(&tool_started("run_tests", "cargo test"));
+        pty_exit(&mut stream, 0, "completed");
+        assert_eq!(stream.tests_total, 1);
+        assert_eq!(stream.tests_passed, 1);
+        let group = stream.groups.back().unwrap();
+        assert_eq!(
+            group.test_counts(),
+            (1, 1),
+            "rail matches group test_counts"
+        );
+    }
+
+    #[test]
+    fn test_testing_failure_increments_total_not_passed() {
+        let mut stream = ActionStream::new();
+        stream.handle_event(&tool_started("run_tests", "cargo test"));
+        pty_exit(&mut stream, 101, "failed");
+        assert_eq!(stream.tests_total, 1);
+        assert_eq!(stream.tests_passed, 0, "exit 101 must not count as passed");
+        assert_eq!(stream.failures, 1);
+        let group = stream.groups.back().unwrap();
+        assert_eq!(
+            group.test_counts(),
+            (0, 1),
+            "rail matches group test_counts"
+        );
+    }
+
+    #[test]
+    fn test_verification_action_uses_test_semantics() {
+        let mut stream = ActionStream::new();
+        stream.handle_event(&tool_started("verify", "cargo build"));
+        pty_exit(&mut stream, 0, "completed");
+        assert_eq!(stream.tests_total, 1);
+        assert_eq!(stream.tests_passed, 1);
+        let group = stream.groups.back().unwrap();
+        assert_eq!(group.test_counts(), (1, 1));
+    }
+
+    #[test]
+    fn test_pty_exit_matches_context_test_counter() {
+        // Mixed sequence: ordinary commands and real test actions. The rail
+        // counters must equal the sum of group-level test_counts — the single
+        // semantic definition of "test".
+        let mut stream = ActionStream::new();
+        stream.handle_event(&tool_started("run_command", "cargo build"));
+        pty_exit(&mut stream, 0, "completed");
+        stream.handle_event(&tool_started("run_command", "cargo fmt"));
+        pty_exit(&mut stream, 0, "completed");
+        stream.handle_event(&tool_started("run_tests", "cargo test"));
+        pty_exit(&mut stream, 0, "completed");
+        stream.handle_event(&tool_started("verify", "cargo build --release"));
+        pty_exit(&mut stream, 101, "failed");
+        stream.handle_event(&tool_started("run_command", "cargo clippy"));
+        pty_exit(&mut stream, 101, "failed");
+
+        let group_total: u32 = stream.groups.iter().map(|g| g.test_counts().1).sum();
+        let group_passed: u32 = stream.groups.iter().map(|g| g.test_counts().0).sum();
+        assert_eq!(stream.tests_total, group_total);
+        assert_eq!(stream.tests_passed, group_passed);
+        assert_eq!(
+            stream.tests_total, 2,
+            "only the two test-like actions count"
+        );
+        assert_eq!(stream.tests_passed, 1);
+        assert_eq!(
+            stream.failures, 2,
+            "cargo clippy + verify failures are risks"
+        );
     }
 }
