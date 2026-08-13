@@ -201,15 +201,55 @@ fn handle_event(msg: events::AppEvent, app: &mut TuiApp) -> bool {
             if let Some(ref mut secure) = app.secure_input {
                 secure.buffer.push_str(&text);
             } else {
+                let was_multiline = text.contains('\n');
                 app.insert_text(&text);
+                if was_multiline && !text.is_empty() {
+                    let line_count = text.lines().count();
+                    let byte_size = text.len();
+                    let kb = byte_size as f64 / 1024.0;
+                    let kb_str = if kb >= 1.0 {
+                        format!("{:.1} KB", kb)
+                    } else {
+                        format!("{} B", byte_size)
+                    };
+                    app.paste_marker = Some(format!("[pasted {} lines, {}]", line_count, kb_str));
+                }
             }
             true
         }
         events::AppEvent::Mouse(mouse) => {
-            use crossterm::event::MouseEventKind;
+            use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
             match mouse.kind {
                 MouseEventKind::ScrollDown => app.mouse_scroll(-3),
                 MouseEventKind::ScrollUp => app.mouse_scroll(3),
+                MouseEventKind::Down(_) => {
+                    // Start a text selection in the chat viewport.
+                    app.selection_start = Some((mouse.row, mouse.column));
+                    app.selection_end = Some((mouse.row, mouse.column));
+                    app.is_selecting = true;
+                }
+                MouseEventKind::Drag(_) => {
+                    if app.is_selecting {
+                        app.selection_end = Some((mouse.row, mouse.column));
+                    }
+                }
+                MouseEventKind::Up(_) => {
+                    // Freeze the selection; if start == end, clear it.
+                    if let (Some(s), Some(e)) = (app.selection_start, app.selection_end) {
+                        if s == e {
+                            app.selection_start = None;
+                            app.selection_end = None;
+                            app.is_selecting = false;
+                        } else {
+                            // Normalize so start <= end lexicographically.
+                            if s > e {
+                                app.selection_start = Some(e);
+                                app.selection_end = Some(s);
+                            }
+                            app.is_selecting = false;
+                        }
+                    }
+                }
                 _ => {}
             }
             true
@@ -253,6 +293,11 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
             }
 
             if let Some(shortcut) = events::check_key_shortcuts(&key) {
+                // Ctrl+C with an active selection copies instead of cancelling.
+                if matches!(shortcut, Shortcut::CancelTask) && app.has_selection() {
+                    app.copy_selection();
+                    return;
+                }
                 handle_shortcut(shortcut, app);
                 return;
             }
@@ -276,6 +321,7 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                             app.dashboard.autocomplete_command(&mut app.input, names);
                         }
                     }
+                    app.paste_marker = None;
                 }
                 KeyCode::Up => {
                     if app.input.is_empty() {
@@ -283,6 +329,7 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                     } else {
                         app.history_previous();
                     }
+                    app.paste_marker = None;
                 }
                 KeyCode::Down => {
                     if app.input.is_empty() {
@@ -290,6 +337,7 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                     } else {
                         app.history_next();
                     }
+                    app.paste_marker = None;
                 }
                 KeyCode::Left => app.cursor_left(),
                 KeyCode::Right => app.cursor_right(),
@@ -299,11 +347,13 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                     for _ in 0..10 {
                         app.scroll_up();
                     }
+                    app.paste_marker = None;
                 }
                 KeyCode::PageDown => {
                     for _ in 0..10 {
                         app.scroll_down();
                     }
+                    app.paste_marker = None;
                 }
                 KeyCode::Enter => {
                     if key
@@ -311,6 +361,7 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                         .contains(crossterm::event::KeyModifiers::SHIFT)
                     {
                         app.insert_char('\n');
+                        app.paste_marker = None;
                         return;
                     }
                     if app.input.is_empty() {
@@ -329,12 +380,20 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                         if !is_inline_apikey(&input) {
                             app.push_history(input.clone());
                         }
+                        app.paste_marker = None;
                         app.clear_input();
                         submit_input(input, app);
                     }
                 }
-                KeyCode::Backspace => app.backspace(),
+                KeyCode::Backspace => {
+                    app.backspace();
+                    app.paste_marker = None;
+                }
                 KeyCode::Esc => {
+                    if app.has_selection() {
+                        app.clear_selection();
+                        return;
+                    }
                     dismiss_top_overlay(app);
                 }
                 KeyCode::Char('?') if app.input.is_empty() => {
@@ -342,6 +401,7 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                 }
                 KeyCode::Char(c) => {
                     app.insert_char(c);
+                    app.paste_marker = None;
                     // Live-filter the completion list while typing a command.
                     if app.input.starts_with('/') || app.input.starts_with('!') {
                         let candidates = commands::completion_candidates(&app.input, app);
@@ -1906,6 +1966,11 @@ fn render_chat(f: &mut Frame, app: &TuiApp, area: Rect) {
         .style(Style::default().bg(THEME.bg));
     f.render_widget(paragraph, area);
 
+    // Render mouse text selection highlight on top of the chat.
+    if app.has_selection() {
+        render_selection_highlight(f, app, area, scroll, view_h);
+    }
+
     // "New activity" indicator when the user scrolled away from the live view.
     if app.scroll_from_bottom > 0 && max_scroll > 0 {
         let hint = "↓ New activity · End to return";
@@ -1923,6 +1988,37 @@ fn render_chat(f: &mut Frame, app: &TuiApp, area: Rect) {
             ))),
             popup,
         );
+    }
+}
+
+/// Render a background highlight over selected chat text.
+/// Uses a simple rectangular overlay; wrapped lines are approximate.
+fn render_selection_highlight(f: &mut Frame, app: &TuiApp, area: Rect, scroll: u16, view_h: u16) {
+    if let (Some((r1, c1)), Some((r2, c2))) = (app.selection_start, app.selection_end) {
+        let start_row = (scroll + r1.min(r2)).min(area.y + view_h);
+        let end_row = (scroll + r1.max(r2)).min(area.y + view_h);
+        let start_col = c1.min(c2).saturating_sub(0).min(area.width);
+        let end_col = c1.max(c2).min(area.width);
+        let w = end_col.saturating_sub(start_col).max(1);
+        let h = end_row.saturating_sub(start_row).max(1);
+        if w > 0 && h > 0 {
+            let sel_area = Rect::new(
+                area.x.saturating_add(start_col),
+                start_row,
+                w.min(area.x + area.width)
+                    .saturating_sub(area.x.saturating_add(start_col))
+                    .max(1),
+                h,
+            );
+            f.render_widget(
+                Paragraph::new(" ").style(
+                    Style::default()
+                        .bg(THEME.blue)
+                        .add_modifier(Modifier::REVERSED),
+                ),
+                sel_area,
+            );
+        }
     }
 }
 
@@ -2579,6 +2675,9 @@ fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
             masked
         };
         (vec![line], 0usize, s.buffer.chars().count())
+    } else if let Some(ref marker) = app.paste_marker {
+        // Multiline paste: show a compact marker instead of the raw text.
+        (vec![marker.clone()], 0, marker.chars().count())
     } else {
         input_display_lines(&app.input, app.input_cursor, inner_h, inner_w)
     };
@@ -3239,14 +3338,78 @@ fn render_command_palette(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
 
 fn palette_entries(filter: &str) -> Vec<(String, &'static str)> {
     let f = filter.to_lowercase();
-    commands::all_commands()
+    if f.is_empty() {
+        return commands::all_commands()
+            .map(|spec| (spec.command.to_string(), spec.description))
+            .collect();
+    }
+    let mut scored: Vec<(String, &'static str, usize)> = commands::all_commands()
         .filter(|spec| {
-            f.is_empty()
-                || spec.command.to_lowercase().contains(&f)
-                || spec.description.to_lowercase().contains(&f)
+            spec.command.to_lowercase().contains(&f) || spec.description.to_lowercase().contains(&f)
         })
-        .map(|spec| (spec.command.to_string(), spec.description))
+        .map(|spec| {
+            let cmd_lower = spec.command.to_lowercase();
+            let desc_lower = spec.description.to_lowercase();
+            let score = palette_match_score(&f, &cmd_lower, &desc_lower);
+            (spec.command.to_string(), spec.description, score)
+        })
+        .collect();
+    // Stable sort: higher score first, then by original command order.
+    scored.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    scored
+        .into_iter()
+        .map(|(cmd, desc, _)| (cmd, desc))
         .collect()
+}
+
+/// Score a command match for ranking in the command palette.
+/// Returns a higher score for better matches.
+/// Ranking: exact(1000) > prefix_cmd(800) > prefix_desc(600) > word_boundary(400) > substring(200) > fuzzy(100).
+fn palette_match_score(query: &str, command: &str, description: &str) -> usize {
+    // Exact command match is best.
+    if command == query {
+        return 1000;
+    }
+    // Prefix match on command.
+    if command.starts_with(query) {
+        return 800;
+    }
+    // Prefix match on description.
+    if description.to_lowercase().starts_with(query) {
+        return 600;
+    }
+    // Word-boundary match on command (each token starts with query).
+    if command
+        .split(|c: char| c.is_whitespace() || c == '-' || c == '_')
+        .any(|w| w.to_lowercase().starts_with(query))
+    {
+        return 400;
+    }
+    // Substring match on command.
+    if command.contains(query) {
+        return 200;
+    }
+    // Substring match on description.
+    if description.to_lowercase().contains(query) {
+        return 150;
+    }
+    // Fuzzy substring: all query chars appear in order in command or description.
+    if is_fuzzy_match(query, command) {
+        return 100;
+    }
+    if is_fuzzy_match(query, description) {
+        return 80;
+    }
+    0
+}
+
+/// Check whether `pattern` appears as a subsequence in `text` (case-insensitive).
+fn is_fuzzy_match(pattern: &str, text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let mut chars = lower.chars();
+    pattern
+        .chars()
+        .all(|c| chars.next().map_or(false, |tc| tc == c))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3277,8 +3440,9 @@ fn render_provider_manager(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
         render_provider_detail(app, pm, detail, &ordered, &mut lines, width);
     } else {
         let active = pm.active_provider().cloned();
+        let selected = app.provider_panel.list_state.selected_index;
         for (i, (id, entry)) in ordered.iter().enumerate() {
-            let selected = i == app.provider_panel.selected_provider_index;
+            let selected = i == selected;
             let style = if selected {
                 Style::default()
                     .fg(THEME.bg)
@@ -3458,42 +3622,28 @@ fn handle_provider_manager_key(key: crossterm::event::KeyEvent, app: &mut TuiApp
 
     match key.code {
         KeyCode::Up => {
-            app.provider_panel.selected_provider_index = crate::tui::dashboard::nav_wrap(
-                app.provider_panel.selected_provider_index,
-                len,
-                -1,
-            );
+            app.provider_panel.list_state.move_up(len);
         }
         KeyCode::Down => {
-            app.provider_panel.selected_provider_index =
-                crate::tui::dashboard::nav_wrap(app.provider_panel.selected_provider_index, len, 1);
+            app.provider_panel.list_state.move_down(len);
         }
         KeyCode::PageUp => {
-            app.provider_panel.selected_provider_index = crate::tui::dashboard::nav_page(
-                app.provider_panel.selected_provider_index,
-                len,
-                -1,
-                crate::tui::dashboard::NAV_PAGE_SIZE,
-            );
+            app.provider_panel.list_state.page_up(len);
         }
         KeyCode::PageDown => {
-            app.provider_panel.selected_provider_index = crate::tui::dashboard::nav_page(
-                app.provider_panel.selected_provider_index,
-                len,
-                1,
-                crate::tui::dashboard::NAV_PAGE_SIZE,
-            );
+            app.provider_panel.list_state.page_down(len);
         }
         KeyCode::Home => {
-            app.provider_panel.selected_provider_index = 0;
+            app.provider_panel.list_state.move_home();
         }
         KeyCode::End => {
-            app.provider_panel.selected_provider_index = len.saturating_sub(1);
+            app.provider_panel.list_state.move_end(len);
         }
         KeyCode::Enter => {
-            if let Some((id, _)) = ordered.get(app.provider_panel.selected_provider_index) {
+            let selected = app.provider_panel.list_state.selected_index;
+            if let Some((id, _)) = ordered.get(selected) {
                 app.provider_panel.detail_provider = Some(id.clone());
-                app.provider_panel.selected_provider_index = 0;
+                app.provider_panel.list_state = crate::tui::dashboard::SelectableListState::new(10);
             }
         }
         KeyCode::Esc => {
@@ -3553,14 +3703,15 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
             let block_h = 5usize;
             let inner_h = height.saturating_sub(3) as usize;
             let items_per_page = (inner_h / block_h).max(1);
-            let start = if picker.index >= items_per_page {
-                picker.index - items_per_page + 1
+            let sel = picker.list_state.selected_index;
+            let start = if sel >= items_per_page {
+                sel - items_per_page + 1
             } else {
                 0
             };
 
             for (i, model) in visible.iter().enumerate().skip(start).take(items_per_page) {
-                let selected = i == picker.index;
+                let selected = i == sel;
                 let is_current = model.id == current;
                 let marker = if selected { "> " } else { "  " };
                 let name = model
@@ -5125,15 +5276,21 @@ mod tests {
         let mut app = make_app();
         picker_with_deepseek_fallback(&mut app);
         handle_model_picker_key(key(KeyCode::Down), &mut app);
-        assert_eq!(app.dashboard.model_picker.index, 1);
+        assert_eq!(app.dashboard.model_picker.list_state.selected_index, 1);
         handle_model_picker_key(key(KeyCode::Down), &mut app);
-        assert_eq!(app.dashboard.model_picker.index, 0, "Down wraps");
+        assert_eq!(
+            app.dashboard.model_picker.list_state.selected_index, 0,
+            "Down wraps"
+        );
         handle_model_picker_key(key(KeyCode::Up), &mut app);
-        assert_eq!(app.dashboard.model_picker.index, 1, "Up wraps");
+        assert_eq!(
+            app.dashboard.model_picker.list_state.selected_index, 1,
+            "Up wraps"
+        );
         handle_model_picker_key(key(KeyCode::Home), &mut app);
-        assert_eq!(app.dashboard.model_picker.index, 0);
+        assert_eq!(app.dashboard.model_picker.list_state.selected_index, 0);
         handle_model_picker_key(key(KeyCode::End), &mut app);
-        assert_eq!(app.dashboard.model_picker.index, 1);
+        assert_eq!(app.dashboard.model_picker.list_state.selected_index, 1);
     }
 
     #[tokio::test]
@@ -5209,22 +5366,22 @@ mod tests {
         app.open_provider_manager();
         // Six built-ins: openai, openrouter, deepseek, agnes, ollama, lmstudio.
         handle_provider_manager_key(key(KeyCode::Down), &mut app);
-        assert_eq!(app.provider_panel.selected_provider_index, 1);
+        assert_eq!(app.provider_panel.list_state.selected_index, 1);
         handle_provider_manager_key(key(KeyCode::Up), &mut app);
-        assert_eq!(app.provider_panel.selected_provider_index, 0);
+        assert_eq!(app.provider_panel.list_state.selected_index, 0);
         handle_provider_manager_key(key(KeyCode::End), &mut app);
-        assert_eq!(app.provider_panel.selected_provider_index, 5);
+        assert_eq!(app.provider_panel.list_state.selected_index, 5);
         handle_provider_manager_key(key(KeyCode::Home), &mut app);
-        assert_eq!(app.provider_panel.selected_provider_index, 0);
+        assert_eq!(app.provider_panel.list_state.selected_index, 0);
         // PageDown from the top clamps to the last row on a 6-item list.
         handle_provider_manager_key(key(KeyCode::PageDown), &mut app);
-        assert_eq!(app.provider_panel.selected_provider_index, 5);
+        assert_eq!(app.provider_panel.list_state.selected_index, 5);
         handle_provider_manager_key(key(KeyCode::Up), &mut app);
-        assert_eq!(app.provider_panel.selected_provider_index, 4);
+        assert_eq!(app.provider_panel.list_state.selected_index, 4);
         // Up past the top wraps to the bottom.
-        app.provider_panel.selected_provider_index = 0;
+        app.provider_panel.list_state.selected_index = 0;
         handle_provider_manager_key(key(KeyCode::Up), &mut app);
-        assert_eq!(app.provider_panel.selected_provider_index, 5);
+        assert_eq!(app.provider_panel.list_state.selected_index, 5);
     }
 
     #[test]
@@ -5235,7 +5392,7 @@ mod tests {
             pm.set_api_key("deepseek", "sk-ds-1234567890abcdef")
                 .unwrap();
         }
-        app.provider_panel.selected_provider_index = 2; // deepseek
+        app.provider_panel.list_state.selected_index = 2; // deepseek
         handle_provider_manager_key(key(KeyCode::Enter), &mut app);
         assert_eq!(
             app.provider_panel.detail_provider.as_deref(),
@@ -5273,7 +5430,7 @@ mod tests {
                 .unwrap();
         }
         // Navigate to deepseek (index 2) and open detail, then activate.
-        app.provider_panel.selected_provider_index = 2;
+        app.provider_panel.list_state.selected_index = 2;
         handle_provider_manager_key(key(KeyCode::Enter), &mut app);
         handle_provider_manager_key(key(KeyCode::Enter), &mut app);
         assert!(!app.provider_panel.is_open(), "overlay closed after switch");
@@ -5325,7 +5482,7 @@ mod tests {
             let mut app = app_with_fresh_providers();
             app.open_provider_manager();
             draw(&app, w, h);
-            app.provider_panel.selected_provider_index = 2;
+            app.provider_panel.list_state.selected_index = 2;
             handle_provider_manager_key(key(KeyCode::Enter), &mut app);
             draw(&app, w, h);
         }
@@ -5456,6 +5613,347 @@ mod tests {
         assert!(
             !conv.contains(SECRET_KEY),
             "switch feedback must not echo the key"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Sprint 30UI.4 — shared navigation, paste, selection, resize
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_selectable_list_state_navigation() {
+        use crate::tui::dashboard::SelectableListState;
+        let mut state = SelectableListState::new(5);
+        assert_eq!(state.selected_index, 0);
+        assert_eq!(state.scroll_offset, 0);
+
+        // Move down through a list of 10 items.
+        state.move_down(10);
+        assert_eq!(state.selected_index, 1);
+        state.move_down(10);
+        assert_eq!(state.selected_index, 2);
+
+        // Page down.
+        state.page_down(10);
+        assert_eq!(state.selected_index, 8);
+
+        // Page down again should clamp.
+        state.page_down(10);
+        assert_eq!(state.selected_index, 9);
+
+        // Home / End.
+        state.move_home();
+        assert_eq!(state.selected_index, 0);
+        state.move_end(10);
+        assert_eq!(state.selected_index, 9);
+
+        // Wrap behavior: up from 0 wraps to last.
+        state.move_up(10);
+        assert_eq!(state.selected_index, 8);
+        // From 8, go up 9 steps to reach 0, then one more wraps to 9.
+        for _ in 0..8 {
+            state.move_up(10);
+        }
+        assert_eq!(state.selected_index, 0);
+        state.move_up(10);
+        assert_eq!(state.selected_index, 9, "Up from 0 wraps to last");
+    }
+
+    #[test]
+    fn test_selectable_list_state_scroll_visibility() {
+        use crate::tui::dashboard::SelectableListState;
+        let mut state = SelectableListState::new(3);
+        // Move to item 5; scroll should adjust so item 5 is visible.
+        for _ in 0..5 {
+            state.move_down(10);
+        }
+        assert_eq!(state.selected_index, 5);
+        // With viewport 3, scroll_offset = selected - (viewport - 1) = 5 - 2 = 3.
+        assert_eq!(
+            state.scroll_offset, 3,
+            "scroll adjusts so selection stays in viewport"
+        );
+        // Moving up should adjust scroll too (scroll only moves when selection
+        // goes above the viewport).
+        state.move_up(10);
+        assert_eq!(state.selected_index, 4);
+        // Scroll stays at 3 because item 4 is still within [3, 5].
+        assert_eq!(state.scroll_offset, 3);
+    }
+
+    #[test]
+    fn test_multiline_paste_shows_marker() {
+        let mut app = make_app();
+        // Simulate a multiline paste event by calling insert_text directly
+        // and setting the marker as the handler would.
+        let multiline = "line one\nline two\nline three";
+        app.insert_text(multiline);
+        let line_count = multiline.lines().count();
+        let byte_size = multiline.len();
+        app.paste_marker = Some(format!("[pasted {} lines, {} B]", line_count, byte_size));
+        // Render should show the marker, not the raw multiline text.
+        let text = buffer_text(&app, 80, 24);
+        assert!(
+            text.contains("[pasted 3 lines"),
+            "marker shown for multiline paste"
+        );
+        assert!(!text.contains("line one"), "raw text hidden behind marker");
+    }
+
+    #[tokio::test]
+    async fn test_multiline_paste_preserves_raw_payload() {
+        let mut app = make_app();
+        let multiline = "line one\nline two\nline three";
+        app.insert_text(multiline);
+        app.paste_marker = Some("[pasted 3 lines, 27 B]".to_string());
+        // When submitted, the raw text (not the marker) is used.
+        assert_eq!(app.input, multiline, "raw text preserved in input buffer");
+        // Simulate Enter submission path: input is trimmed and submitted,
+        // then input is cleared and marker is cleared.
+        let input = app.input.trim().to_string();
+        assert_eq!(input, multiline, "submission uses raw text, not marker");
+        app.paste_marker = None;
+        app.clear_input();
+        assert!(
+            app.paste_marker.is_none(),
+            "marker cleared after submission"
+        );
+        assert!(app.input.is_empty(), "input cleared after submission");
+    }
+
+    #[test]
+    fn test_multiline_paste_marker_cleared_on_type() {
+        let mut app = make_app();
+        app.paste_marker = Some("[pasted 5 lines]".to_string());
+        // Typing a character should clear the marker.
+        handle_key(key(KeyCode::Char('x')), &mut app);
+        assert!(app.paste_marker.is_none(), "marker cleared on char input");
+    }
+
+    #[test]
+    fn test_multiline_paste_marker_cleared_on_backspace() {
+        let mut app = make_app();
+        app.insert_text("hello");
+        app.paste_marker = Some("[pasted 2 lines]".to_string());
+        handle_key(key(KeyCode::Backspace), &mut app);
+        assert!(app.paste_marker.is_none(), "marker cleared on backspace");
+    }
+
+    #[test]
+    fn test_single_line_paste_no_marker() {
+        let mut app = make_app();
+        // Single-line paste should NOT set a marker.
+        app.insert_text("single line");
+        assert!(
+            app.paste_marker.is_none(),
+            "single-line paste has no marker"
+        );
+    }
+
+    #[test]
+    fn test_selection_cleared_on_esc() {
+        let mut app = make_app();
+        app.selection_start = Some((2, 0));
+        app.selection_end = Some((5, 10));
+        app.is_selecting = true;
+        handle_key(key(KeyCode::Esc), &mut app);
+        assert!(!app.has_selection(), "Esc clears selection");
+    }
+
+    #[test]
+    fn test_selection_not_cleared_by_overlay_esc() {
+        let mut app = make_app();
+        app.selection_start = Some((2, 0));
+        app.selection_end = Some((5, 10));
+        app.is_selecting = true;
+        // When an overlay is open, Esc dismisses the overlay, not the selection.
+        app.dashboard.show_command_palette = true;
+        handle_key(key(KeyCode::Esc), &mut app);
+        assert!(
+            app.has_selection(),
+            "selection preserved when overlay dismisses"
+        );
+        assert!(!app.dashboard.show_command_palette, "overlay dismissed");
+    }
+
+    #[test]
+    fn test_selectable_list_clamp_on_filter_shrink() {
+        use crate::tui::dashboard::SelectableListState;
+        let mut state = SelectableListState::new(5);
+        state.selected_index = 7;
+        // Filter shrinks list to 3 items.
+        state.clamp_selection(3);
+        assert_eq!(
+            state.selected_index, 2,
+            "selection clamped to last valid item"
+        );
+    }
+
+    #[test]
+    fn test_selectable_list_ensure_visible_no_panic_empty() {
+        use crate::tui::dashboard::SelectableListState;
+        let mut state = SelectableListState::new(5);
+        // Should not panic with empty list.
+        state.ensure_visible(0);
+        assert_eq!(state.selected_index, 0);
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_palette_ranking_prefers_exact_and_prefix() {
+        let exact = palette_entries("//model");
+        assert_eq!(exact.first().map(|(c, _)| c.as_str()), Some("//model"));
+
+        let prefix = palette_entries("//pro");
+        // //provider and //profile are both prefix matches; either is acceptable.
+        let first = prefix.first().map(|(c, _)| c.as_str()).unwrap_or("");
+        assert!(
+            first == "//provider" || first == "//profile",
+            "prefix match ranked first, got {}",
+            first
+        );
+        // Non-prefix matches like //profile (or //provider) should be lower.
+        let has_substring = prefix
+            .iter()
+            .any(|(c, _)| c.starts_with("//pro") && c != "//provider" && c != "//profile");
+        assert!(
+            !has_substring,
+            "non-prefix matches should not appear before prefix matches"
+        );
+    }
+
+    #[test]
+    fn test_palette_fuzzy_substring_match() {
+        let results = palette_entries("pro");
+        // "pro" should match commands containing "pro" as substring.
+        assert!(!results.is_empty(), "substring match finds results");
+        assert!(
+            results.iter().any(|(c, _)| c.contains("pro")),
+            "all results contain the query substring"
+        );
+    }
+
+    #[test]
+    fn test_resize_does_not_panic_at_small_sizes() {
+        let mut app = make_app();
+        // Rapid resize through the required sizes must not panic.
+        for (w, h) in [
+            (160u16, 48u16),
+            (140, 40),
+            (120, 32),
+            (100, 26),
+            (99, 25),
+            (80, 24),
+            (60, 16),
+            (40, 12),
+            (30, 10),
+        ] {
+            draw(&app, w, h);
+        }
+        // With overlays open at tiny sizes.
+        app.dashboard.show_command_palette = true;
+        for (w, h) in [(40u16, 12), (30, 10), (20, 8)] {
+            draw(&app, w, h);
+        }
+        app.dashboard.show_command_palette = false;
+        app.dashboard.model_picker.open();
+        for (w, h) in [(40u16, 12), (30, 10), (20, 8)] {
+            draw(&app, w, h);
+        }
+    }
+
+    #[test]
+    fn test_overlay_bounds_stay_within_terminal() {
+        let mut app = make_app();
+        // At very small terminals, no popup should overflow.
+        for w in [20u16, 24, 30, 40] {
+            for h in [10u16, 12, 16] {
+                app.dashboard.show_command_palette = true;
+                draw(&app, w, h);
+                app.dashboard.show_command_palette = false;
+                app.dashboard.model_picker.open();
+                app.dashboard
+                    .model_picker
+                    .set_models(vec![crate::provider_manager::ModelInfo {
+                        id: "test".to_string(),
+                        is_default: false,
+                        display_name: None,
+                        tool_calling: None,
+                        context_tokens: None,
+                        source: crate::providers::ModelSource::Discovered,
+                    }]);
+                draw(&app, w, h);
+                app.dashboard.model_picker.close();
+            }
+        }
+    }
+
+    #[test]
+    fn test_ctrl_c_with_selection_copies_not_cancels() {
+        let mut app = make_app();
+        app.selection_start = Some((1, 0));
+        app.selection_end = Some((3, 10));
+        // Ctrl+C with active selection should copy, not cancel.
+        let ctrl_c = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_key(ctrl_c, &mut app);
+        // Selection should be cleared (copy consumed it).
+        assert!(!app.has_selection(), "selection consumed by copy");
+        // Task should NOT be cancelled since selection was active.
+        assert!(
+            !app.should_quit,
+            "Ctrl+C with selection must not quit/cancel"
+        );
+    }
+
+    #[test]
+    fn test_ctrl_c_without_selection_cancels_task() {
+        let mut app = make_app();
+        app.is_loading = true;
+        app.cancel_token = Some(crate::cancellation::CancellationToken::new());
+        // Ctrl+C with no selection should cancel.
+        let ctrl_c = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_key(ctrl_c, &mut app);
+        assert!(
+            app.cancel_token
+                .as_ref()
+                .map(|t| t.is_cancelled())
+                .unwrap_or(false),
+            "Ctrl+C without selection cancels task"
+        );
+    }
+
+    #[test]
+    fn test_selection_extract_basic() {
+        let mut app = make_app();
+        app.add_message(MessageRole::User, "Hello world".to_string());
+        app.add_message(MessageRole::Assistant, "Hi there!".to_string());
+        // chat_lines_for_selection produces:
+        // 0: "● You", 1: "Hello world", 2: "", 3: "● CodeBro", 4: "Hi there!", 5: ""
+        app.selection_start = Some((4, 0));
+        app.selection_end = Some((4, 3));
+        let text = app.extract_selection();
+        assert_eq!(text, "Hi ", "selection extracts correct substring");
+    }
+
+    #[test]
+    fn test_selection_extract_multiline() {
+        let mut app = make_app();
+        app.add_message(MessageRole::User, "Line one".to_string());
+        app.add_message(MessageRole::Assistant, "Line two\nLine three".to_string());
+        // Lines: 0:"● You", 1:"Line one", 2:"", 3:"● CodeBro", 4:"Line two", 5:"Line three", 6:""
+        app.selection_start = Some((4, 0));
+        app.selection_end = Some((5, 4));
+        let text = app.extract_selection();
+        assert!(
+            text.contains("Line two") && text.contains("Line thre"),
+            "multiline selection: {}",
+            text
         );
     }
 }

@@ -49,6 +49,125 @@ pub fn nav_clamp(index: usize, len: usize) -> usize {
 /// The default page size used by PageUp/PageDown in overlay selectors.
 pub const NAV_PAGE_SIZE: usize = 6;
 
+/// Shared list-navigation state for every selectable overlay: command palette,
+/// slash-autocomplete, provider picker, model picker, settings list.
+///
+/// The contract every caller must honour:
+///   - `selected` is always clamped to `[0, item_count)`.
+///   - When items are added/removed, the caller re-renders after calling
+///     `clamp_selection()` or the constructor reset.
+///   - `scroll_offset` tracks how many rows above the selected row are visible;
+///     it is adjusted automatically when the selection moves so the selected
+///     row never leaves the viewport.
+#[derive(Debug, Clone, Default)]
+pub struct SelectableListState {
+    pub selected_index: usize,
+    pub scroll_offset: usize,
+    pub viewport_height: usize,
+}
+
+impl SelectableListState {
+    pub fn new(viewport_height: usize) -> Self {
+        SelectableListState {
+            selected_index: 0,
+            scroll_offset: 0,
+            viewport_height,
+        }
+    }
+
+    /// Move selection up by one (wraps to last).
+    pub fn move_up(&mut self, item_count: usize) {
+        if item_count == 0 {
+            return;
+        }
+        self.selected_index = nav_wrap(self.selected_index, item_count, -1);
+        self.ensure_visible(item_count);
+    }
+
+    /// Move selection down by one (wraps to first).
+    pub fn move_down(&mut self, item_count: usize) {
+        if item_count == 0 {
+            return;
+        }
+        self.selected_index = nav_wrap(self.selected_index, item_count, 1);
+        self.ensure_visible(item_count);
+    }
+
+    /// Page up (clamps, no wrap).
+    pub fn page_up(&mut self, item_count: usize) {
+        if item_count == 0 {
+            return;
+        }
+        self.selected_index = nav_page(self.selected_index, item_count, -1, NAV_PAGE_SIZE);
+        self.ensure_visible(item_count);
+    }
+
+    /// Page down (clamps, no wrap).
+    pub fn page_down(&mut self, item_count: usize) {
+        if item_count == 0 {
+            return;
+        }
+        self.selected_index = nav_page(self.selected_index, item_count, 1, NAV_PAGE_SIZE);
+        self.ensure_visible(item_count);
+    }
+
+    /// Jump to the first item.
+    pub fn move_home(&mut self) {
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+    }
+
+    /// Jump to the last item.
+    pub fn move_end(&mut self, item_count: usize) {
+        if item_count == 0 {
+            return;
+        }
+        self.selected_index = item_count - 1;
+        self.ensure_visible(item_count);
+    }
+
+    /// Clamp the selection into the valid range and adjust scroll so the
+    /// selected row stays visible.
+    pub fn clamp_selection(&mut self, item_count: usize) {
+        if item_count == 0 {
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+            return;
+        }
+        self.selected_index = self.selected_index.min(item_count - 1);
+        self.ensure_visible(item_count);
+    }
+
+    /// Adjust `scroll_offset` so that `selected_index` is always within the
+    /// currently visible window `[scroll_offset, scroll_offset + viewport_height)`.
+    pub fn ensure_visible(&mut self, item_count: usize) {
+        if item_count == 0 || self.viewport_height == 0 {
+            return;
+        }
+        let idx = self.selected_index.min(item_count - 1);
+        if idx < self.scroll_offset {
+            self.scroll_offset = idx;
+        } else if idx >= self.scroll_offset + self.viewport_height {
+            self.scroll_offset = idx.saturating_sub(self.viewport_height - 1);
+        }
+    }
+
+    /// Visible range for rendering: `(start_index, end_index)`.
+    pub fn visible_range(&self, item_count: usize) -> (usize, usize) {
+        let start = self.scroll_offset.min(item_count);
+        let end = (start + self.viewport_height).min(item_count);
+        (start, end)
+    }
+
+    /// Refresh viewport height (e.g. after resize). Clamps scroll if needed.
+    pub fn set_viewport_height(&mut self, height: usize) {
+        self.viewport_height = height;
+        self.scroll_offset = self
+            .scroll_offset
+            .min(self.selected_index.saturating_sub(height.saturating_sub(1)));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub timestamp: String,
@@ -97,7 +216,7 @@ pub struct AgentPanelEntry {
 #[derive(Debug, Clone)]
 pub struct ModelPicker {
     pub models: Vec<ModelInfo>,
-    pub index: usize,
+    pub list_state: SelectableListState,
     pub open: bool,
     pub loading: bool,
     pub error: Option<String>,
@@ -108,7 +227,7 @@ impl ModelPicker {
     pub fn new() -> Self {
         ModelPicker {
             models: Vec::new(),
-            index: 0,
+            list_state: SelectableListState::new(NAV_PAGE_SIZE * 2),
             open: false,
             loading: false,
             error: None,
@@ -119,7 +238,7 @@ impl ModelPicker {
     pub fn open(&mut self) {
         self.open = true;
         self.loading = true;
-        self.index = 0;
+        self.list_state = SelectableListState::new(NAV_PAGE_SIZE * 2);
         self.error = None;
         self.filter.clear();
     }
@@ -136,40 +255,41 @@ impl ModelPicker {
     pub fn set_models(&mut self, models: Vec<ModelInfo>) {
         self.models = models;
         self.loading = false;
-        self.index = 0;
+        self.list_state = SelectableListState::new(NAV_PAGE_SIZE * 2);
+    }
+
+    /// Visible model count used for navigation calculations.
+    pub fn visible_count(&self) -> usize {
+        self.visible_models().len()
     }
 
     pub fn next(&mut self) {
-        let visible = self.visible_models().len();
-        self.index = nav_wrap(self.index, visible, 1);
+        self.list_state.move_down(self.visible_count());
     }
 
     pub fn prev(&mut self) {
-        let visible = self.visible_models().len();
-        self.index = nav_wrap(self.index, visible, -1);
+        self.list_state.move_up(self.visible_count());
     }
 
     pub fn page_next(&mut self) {
-        let visible = self.visible_models().len();
-        self.index = nav_page(self.index, visible, 1, NAV_PAGE_SIZE);
+        self.list_state.page_down(self.visible_count());
     }
 
     pub fn page_prev(&mut self) {
-        let visible = self.visible_models().len();
-        self.index = nav_page(self.index, visible, -1, NAV_PAGE_SIZE);
+        self.list_state.page_up(self.visible_count());
     }
 
     pub fn home(&mut self) {
-        self.index = 0;
+        self.list_state.move_home();
     }
 
     pub fn end(&mut self) {
-        self.index = self.visible_models().len().saturating_sub(1);
+        self.list_state.move_end(self.visible_count());
     }
 
     pub fn selected(&self) -> Option<ModelInfo> {
         let visible = self.visible_models();
-        let i = nav_clamp(self.index, visible.len());
+        let i = nav_clamp(self.list_state.selected_index, visible.len());
         visible.get(i).map(|m| (*m).clone())
     }
 
@@ -177,13 +297,13 @@ impl ModelPicker {
     /// may be shorter than the previous one).
     pub fn push_filter(&mut self, c: char) {
         self.filter.push(c);
-        self.index = 0;
+        self.list_state = SelectableListState::new(NAV_PAGE_SIZE * 2);
     }
 
     /// Pop a filter character and reset the selection.
     pub fn pop_filter(&mut self) {
         self.filter.pop();
-        self.index = 0;
+        self.list_state = SelectableListState::new(NAV_PAGE_SIZE * 2);
     }
 
     /// Models matching the filter, in list order.
@@ -1026,17 +1146,17 @@ mod tests {
             model_info("b", crate::providers::ModelSource::Discovered),
             model_info("c", crate::providers::ModelSource::Discovered),
         ]);
-        assert_eq!(picker.index, 0);
+        assert_eq!(picker.list_state.selected_index, 0);
         picker.next();
-        assert_eq!(picker.index, 1);
+        assert_eq!(picker.list_state.selected_index, 1);
         picker.next();
-        assert_eq!(picker.index, 2);
+        assert_eq!(picker.list_state.selected_index, 2);
         picker.next();
-        assert_eq!(picker.index, 0, "Down wraps to first");
+        assert_eq!(picker.list_state.selected_index, 0, "Down wraps to first");
         picker.prev();
-        assert_eq!(picker.index, 2, "Up wraps to last");
+        assert_eq!(picker.list_state.selected_index, 2, "Up wraps to last");
         picker.prev();
-        assert_eq!(picker.index, 1);
+        assert_eq!(picker.list_state.selected_index, 1);
     }
 
     #[test]
@@ -1048,9 +1168,9 @@ mod tests {
             model_info("c", crate::providers::ModelSource::Discovered),
         ]);
         picker.end();
-        assert_eq!(picker.index, 2);
+        assert_eq!(picker.list_state.selected_index, 2);
         picker.home();
-        assert_eq!(picker.index, 0);
+        assert_eq!(picker.list_state.selected_index, 0);
     }
 
     #[test]
@@ -1066,15 +1186,21 @@ mod tests {
             .collect();
         picker.set_models(models);
         picker.page_next();
-        assert_eq!(picker.index, NAV_PAGE_SIZE);
+        assert_eq!(picker.list_state.selected_index, NAV_PAGE_SIZE);
         picker.end();
         picker.page_next();
-        assert_eq!(picker.index, 19, "PageDown clamps at last");
+        assert_eq!(
+            picker.list_state.selected_index, 19,
+            "PageDown clamps at last"
+        );
         picker.page_prev();
-        assert_eq!(picker.index, 13);
+        assert_eq!(picker.list_state.selected_index, 13);
         picker.home();
         picker.page_prev();
-        assert_eq!(picker.index, 0, "PageUp clamps at first");
+        assert_eq!(
+            picker.list_state.selected_index, 0,
+            "PageUp clamps at first"
+        );
     }
 
     #[test]
@@ -1090,18 +1216,21 @@ mod tests {
         ]);
         picker.next();
         picker.next();
-        assert_eq!(picker.index, 2);
+        assert_eq!(picker.list_state.selected_index, 2);
         picker.push_filter('g');
         assert_eq!(picker.visible_models().len(), 2);
-        assert_eq!(picker.index, 0, "filter resets selection to the new window");
+        assert_eq!(
+            picker.list_state.selected_index, 0,
+            "filter resets selection to the new window"
+        );
         picker.next();
-        assert_eq!(picker.index, 1);
+        assert_eq!(picker.list_state.selected_index, 1);
         assert_eq!(
             picker.selected().map(|m| m.id),
             Some("gpt-4o-mini".to_string())
         );
         // Even a stale out-of-range index never selects nothing.
-        picker.index = 9;
+        picker.list_state.selected_index = 9;
         assert_eq!(
             picker.selected().map(|m| m.id),
             Some("gpt-4o-mini".to_string())
@@ -1114,7 +1243,7 @@ mod tests {
         picker.set_models(Vec::new());
         assert_eq!(picker.selected(), None);
         picker.next();
-        assert_eq!(picker.index, 0);
+        assert_eq!(picker.list_state.selected_index, 0);
     }
 
     #[test]

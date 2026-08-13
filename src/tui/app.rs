@@ -125,6 +125,14 @@ pub struct TuiApp {
     /// authority for the header mode label and the rail progress phase set;
     /// the UI never infers a mode from "a task is running".
     pub task_mode: crate::canonical_runtime::TaskMode,
+    /// A compact display marker shown when a multiline paste is active.
+    /// The raw text is preserved in `input`; this field only controls the
+    /// visual representation so large pastes stay readable.
+    pub paste_marker: Option<String>,
+    /// Mouse-based text selection state for copy in the chat viewport.
+    pub selection_start: Option<(u16, u16)>,
+    pub selection_end: Option<(u16, u16)>,
+    pub is_selecting: bool,
 }
 
 /// UI state for the provider management panel
@@ -132,7 +140,7 @@ pub struct TuiApp {
 pub struct ProviderPanel {
     pub open: bool,
     pub active_provider: Option<String>,
-    pub selected_provider_index: usize,
+    pub list_state: crate::tui::dashboard::SelectableListState,
     /// When set, the detail view for this provider is shown instead of the
     /// provider list.
     pub detail_provider: Option<String>,
@@ -145,7 +153,7 @@ impl ProviderPanel {
         ProviderPanel {
             open: false,
             active_provider: None,
-            selected_provider_index: 0,
+            list_state: crate::tui::dashboard::SelectableListState::new(10),
             detail_provider: None,
             health_results: Vec::new(),
             loading_health: false,
@@ -154,6 +162,12 @@ impl ProviderPanel {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    pub fn visible_count(&self) -> usize {
+        // Count is determined by the caller from the provider manager, not
+        // stored here, so we keep the list_state in sync externally.
+        0
     }
 }
 
@@ -274,6 +288,10 @@ impl TuiApp {
             workspace_path_display,
             git_branch,
             task_mode: crate::canonical_runtime::TaskMode::Assist,
+            paste_marker: None,
+            selection_start: None,
+            selection_end: None,
+            is_selecting: false,
         })
     }
 
@@ -414,6 +432,226 @@ impl TuiApp {
             }
         }
         false
+    }
+
+    // ─── Text selection ─────────────────────────────────────────────────
+
+    /// Whether a mouse-driven text selection is currently active in the chat.
+    pub fn has_selection(&self) -> bool {
+        self.selection_start.is_some() && self.selection_end.is_some()
+    }
+
+    /// Clear the active text selection.
+    pub fn clear_selection(&mut self) {
+        self.selection_start = None;
+        self.selection_end = None;
+        self.is_selecting = false;
+    }
+
+    /// Copy the selected chat text to the system clipboard.
+    /// Returns `true` on success, `false` if no selection or clipboard is unavailable.
+    pub fn copy_selection(&mut self) -> bool {
+        let text = self.extract_selection();
+        self.clear_selection();
+        if text.is_empty() {
+            return false;
+        }
+        self.copy_to_clipboard(&text)
+    }
+
+    /// Extract the plain-text content covered by the current mouse selection.
+    /// Coordinates are (row, col) in the chat viewport; rows are 0-based within
+    /// the rendered chat lines, columns are character positions.
+    pub fn extract_selection(&self) -> String {
+        let Some((r1, c1)) = self.selection_start else {
+            return String::new();
+        };
+        let Some((r2, c2)) = self.selection_end else {
+            return String::new();
+        };
+        // Build the virtual line buffer the same way render_chat does, then
+        // slice the requested rectangle out of it.
+        let lines = self.chat_lines_for_selection();
+        let mut out = String::new();
+        let start_row = usize::from(r1.min(r2));
+        let end_row = usize::from(r1.max(r2));
+        let start_col = usize::from(c1.min(c2));
+        let end_col = usize::from(c1.max(c2));
+        for (i, line) in lines.iter().enumerate() {
+            if i < start_row || i > end_row {
+                continue;
+            }
+            let chars: Vec<char> = line.chars().collect();
+            let row_start = if i == start_row { start_col } else { 0 };
+            let row_end = if i == end_row {
+                end_col.min(chars.len())
+            } else {
+                chars.len()
+            };
+            let segment: String = chars[row_start..row_end].iter().collect();
+            if !segment.is_empty() {
+                out.push_str(&segment);
+            }
+            if i < end_row {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Build the chat line buffer used for selection extraction. Mirrors
+    /// `render_chat` but returns raw (unwrapped) text lines.
+    fn chat_lines_for_selection(&self) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        let has_actions = !self.action_stream.groups.is_empty();
+        let has_console = self.has_console_content();
+
+        if self.dashboard.show_welcome && self.messages.is_empty() && !has_actions && !has_console {
+            lines.push("CodeBro".to_string());
+            lines.push(String::new());
+            lines.push("Ask me to inspect, modify, test, or review your project.".to_string());
+            lines.push(String::new());
+            lines.push(
+                "Type a task · / commands · // runtime · ! shell · Ctrl+P palette · ? help"
+                    .to_string(),
+            );
+            lines.push(String::new());
+            lines.push(
+                "Tab focuses an action group · Enter expands/collapses · Ctrl+O rail · Esc dismiss"
+                    .to_string(),
+            );
+            lines.push(String::new());
+        } else {
+            if let Some(ref err) = self.dashboard.last_error {
+                lines.push(format!("✗ {}", err));
+                lines.push(String::new());
+            }
+            let last_user = self
+                .messages
+                .iter()
+                .rposition(|m| m.role == MessageRole::User);
+            for (idx, msg) in self.messages.iter().enumerate() {
+                match msg.role {
+                    MessageRole::User => {
+                        lines.push("● You".to_string());
+                        for content_line in msg.content.lines() {
+                            lines.push(content_line.to_string());
+                        }
+                        lines.push(String::new());
+                        if let Some(groups) = &msg.sealed_actions {
+                            for group in groups.iter() {
+                                lines.push(format!("━"));
+                                lines.push(format!(
+                                    "» {} {}",
+                                    group.phase.emoji(),
+                                    if group.status.is_terminal() {
+                                        group.phase.label()
+                                    } else {
+                                        Self::phase_gerund_str(group.phase)
+                                    }
+                                ));
+                                if group.expanded {
+                                    for action in group.actions.iter() {
+                                        lines.push(format!(
+                                            "  {} {} {}",
+                                            action.status.glyph().glyph(),
+                                            action.kind.emoji(),
+                                            action.kind.label()
+                                        ));
+                                    }
+                                } else {
+                                    lines.push(format!("  └─ {}", group.summary_line()));
+                                }
+                                lines.push(String::new());
+                            }
+                        }
+                        if Some(idx) == last_user && !self.action_stream.groups.is_empty() {
+                            for line in self.live_action_lines() {
+                                lines.push(line);
+                            }
+                        }
+                    }
+                    MessageRole::Assistant => {
+                        lines.push("● CodeBro".to_string());
+                        for md_line in crate::tui::markdown::render_markdown(&msg.content, 200) {
+                            let text: String =
+                                md_line.spans.iter().map(|s| s.content.as_ref()).collect();
+                            lines.push(text);
+                        }
+                        lines.push(String::new());
+                    }
+                    MessageRole::System => {
+                        for content_line in msg.content.lines() {
+                            lines.push(content_line.to_string());
+                        }
+                        lines.push(String::new());
+                    }
+                }
+            }
+            if last_user.is_none() && !self.action_stream.groups.is_empty() {
+                for line in self.live_action_lines() {
+                    lines.push(line);
+                }
+            }
+            if self.dashboard.is_streaming && !self.dashboard.streaming_buffer.is_empty() {
+                lines.push(String::new());
+                lines.push("● CodeBro".to_string());
+                for md_line in
+                    crate::tui::markdown::render_markdown(&self.dashboard.streaming_buffer, 200)
+                {
+                    let text: String = md_line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    lines.push(text);
+                }
+                lines.push(String::new());
+            }
+        }
+        lines
+    }
+
+    fn live_action_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for group in &self.action_stream.groups {
+            out.push("━".to_string());
+            let phase_name = if group.status.is_terminal() {
+                group.phase.label()
+            } else {
+                Self::phase_gerund_str(group.phase)
+            };
+            out.push(format!(
+                "» {} {}  {}",
+                group.phase.emoji(),
+                phase_name,
+                group.status.glyph().glyph()
+            ));
+            if group.expanded {
+                for action in group.actions.iter() {
+                    out.push(format!(
+                        "  {} {} {}",
+                        action.status.glyph().glyph(),
+                        action.kind.emoji(),
+                        action.kind.label()
+                    ));
+                }
+            } else {
+                out.push(format!("  └─ {}", group.summary_line()));
+            }
+            out.push(String::new());
+        }
+        out
+    }
+
+    /// Phase gerund as a plain string for selection extraction.
+    fn phase_gerund_str(phase: crate::tui::theme::Phase) -> &'static str {
+        use crate::tui::theme::Phase;
+        match phase {
+            Phase::Research => "Researching",
+            Phase::Testing => "Testing",
+            Phase::Planning => "Planning",
+            Phase::Coding => "Coding",
+            Phase::Review => "Reviewing",
+            Phase::Verification => "Verifying",
+            Phase::Main => "Thinking",
+        }
     }
 
     /// Returns the full conversation as plain text (for copying / sessions).
@@ -958,8 +1196,15 @@ impl TuiApp {
     // ─── P5: Provider Management ─────────────────────────────────────────
 
     pub fn open_provider_manager(&mut self) {
-        self.provider_panel = ProviderPanel::new();
-        self.provider_panel.open = true;
+        let list_state = crate::tui::dashboard::SelectableListState::new(10);
+        self.provider_panel = ProviderPanel {
+            open: true,
+            active_provider: None,
+            list_state,
+            detail_provider: None,
+            health_results: Vec::new(),
+            loading_health: false,
+        };
         if let Some(ref pm) = self.provider_manager {
             self.provider_panel.active_provider = pm.active_provider().cloned();
             let active_index = pm
@@ -967,7 +1212,7 @@ impl TuiApp {
                 .iter()
                 .position(|id| Some(id) == pm.active_provider())
                 .unwrap_or(0);
-            self.provider_panel.selected_provider_index = active_index;
+            self.provider_panel.list_state.selected_index = active_index;
         }
     }
 
