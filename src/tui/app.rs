@@ -1,6 +1,6 @@
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 use crate::config::Config;
-use crate::tui::actions::ActionStream;
+use crate::tui::actions::{ActionStream, UiActionGroup};
 use crate::tui::console::{ConsoleStatus, PtyConsole};
 use crate::tui::dashboard::Dashboard;
 use anyhow::Result;
@@ -46,6 +46,16 @@ pub struct SecureInputState {
 pub struct Message {
     pub role: MessageRole,
     pub content: String,
+    /// Wall-clock timestamp for the message header (e.g. "14:32:01").
+    pub timestamp: String,
+    /// Action groups sealed onto this user turn when the next turn starts or
+    /// the task finishes. Skipped from session JSON (not serializable).
+    #[serde(skip)]
+    pub sealed_actions: Option<VecDeque<UiActionGroup>>,
+}
+
+fn format_message_timestamp() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
 pub struct TuiApp {
@@ -106,6 +116,10 @@ pub struct TuiApp {
     /// this is resolved here, outside the render path.
     pub workspace_root: std::path::PathBuf,
     pub workspace_name: String,
+    /// Absolute workspace path for the footer (cached at startup).
+    pub workspace_path_display: String,
+    /// Current git branch from `.git/HEAD` (cached at startup; empty if none).
+    pub git_branch: String,
 }
 
 /// UI state for the provider management panel
@@ -196,6 +210,8 @@ impl TuiApp {
             .and_then(|n| n.to_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| ".".to_string());
+        let workspace_path_display = workspace_root.display().to_string();
+        let git_branch = read_git_branch(&workspace_root).unwrap_or_default();
 
         Ok(TuiApp {
             messages: VecDeque::new(),
@@ -232,6 +248,8 @@ impl TuiApp {
             task_started_at: None,
             workspace_root,
             workspace_name,
+            workspace_path_display,
+            git_branch,
         })
     }
 
@@ -241,9 +259,34 @@ impl TuiApp {
         // message; the "new activity" indicator (driven by scroll_from_bottom)
         // signals new content instead.
         let was_at_bottom = self.scroll_from_bottom == 0;
-        self.messages.push_back(Message { role, content });
+        self.messages.push_back(Message {
+            role,
+            content,
+            timestamp: format_message_timestamp(),
+            sealed_actions: None,
+        });
         if was_at_bottom {
             self.scroll_to_bottom();
+        }
+    }
+
+    /// Seal the live action stream onto the most recent user message and start
+    /// a fresh stream so each turn owns its own timeline.
+    pub fn seal_actions_to_last_user(&mut self) {
+        if self.action_stream.groups.is_empty() {
+            return;
+        }
+        let groups = self.action_stream.take_groups();
+        if let Some(msg) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == MessageRole::User)
+        {
+            match &mut msg.sealed_actions {
+                Some(existing) => existing.extend(groups),
+                None => msg.sealed_actions = Some(groups),
+            }
         }
     }
 
@@ -707,6 +750,12 @@ impl TuiApp {
                     self.messages.push_back(Message {
                         role,
                         content: content.to_string(),
+                        timestamp: m
+                            .get("timestamp")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("--:--:--")
+                            .to_string(),
+                        sealed_actions: None,
                     });
                 }
             }
@@ -991,6 +1040,20 @@ impl TuiApp {
     }
 }
 
+/// Read the current branch from `.git/HEAD` without spawning a subprocess.
+fn read_git_branch(workspace_root: &std::path::Path) -> Option<String> {
+    let head_path = workspace_root.join(".git").join("HEAD");
+    let content = std::fs::read_to_string(head_path).ok()?;
+    let raw = content.trim();
+    if let Some(rest) = raw.strip_prefix("ref: refs/heads/") {
+        let branch = rest.trim();
+        if !branch.is_empty() {
+            return Some(branch.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,6 +1129,32 @@ mod tests {
     }
 
     // ─── F5: workspace identity is cached outside the render path ─────
+
+    #[test]
+    fn test_seal_actions_is_turn_scoped() {
+        use crate::agent::events::AgentEvent;
+        let mut app = make_app();
+        app.add_message(MessageRole::User, "first".to_string());
+        app.action_stream
+            .handle_event(&AgentEvent::ToolStarted {
+                tool: "read_file".to_string(),
+                args: "a.rs".to_string(),
+            });
+        app.action_stream.finalize_response(true);
+        assert!(!app.action_stream.groups.is_empty());
+        app.seal_actions_to_last_user();
+        assert!(app.action_stream.groups.is_empty());
+        let sealed = app
+            .messages
+            .back()
+            .and_then(|m| m.sealed_actions.as_ref())
+            .expect("sealed onto user turn");
+        assert!(!sealed.is_empty());
+        // Next turn starts clean.
+        app.add_message(MessageRole::User, "second".to_string());
+        assert!(app.action_stream.groups.is_empty());
+        assert!(app.messages.back().unwrap().sealed_actions.is_none());
+    }
 
     #[test]
     fn test_workspace_identity_cached_at_startup() {

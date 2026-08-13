@@ -23,6 +23,7 @@ pub struct Theme {
     pub yellow: Color,
     pub red: Color,
     pub orange: Color,
+    pub cyan: Color,
 }
 
 pub const THEME: Theme = Theme {
@@ -38,6 +39,7 @@ pub const THEME: Theme = Theme {
     yellow: Color::Rgb(0xd2, 0x99, 0x22),
     red: Color::Rgb(0xf8, 0x51, 0x49),
     orange: Color::Rgb(0xff, 0xa6, 0x57),
+    cyan: Color::Rgb(0x79, 0xc0, 0xff),
 };
 
 /// The five autonomous specialist phases plus the main/verification phases.
@@ -110,14 +112,18 @@ impl StatusGlyph {
 impl Theme {
     pub fn phase_color(&self, phase: Phase) -> Color {
         match phase {
-            Phase::Research => self.blue,
+            Phase::Research => self.cyan,
             Phase::Testing => self.green,
             Phase::Planning => self.yellow,
             Phase::Coding => self.purple,
             Phase::Review => self.orange,
             Phase::Verification => self.green,
-            Phase::Main => self.blue,
+            Phase::Main => self.purple,
         }
+    }
+
+    pub fn cyan(&self) -> Style {
+        Style::default().fg(self.cyan)
     }
 
     pub fn status_color(&self, glyph: StatusGlyph) -> Color {
