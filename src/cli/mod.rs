@@ -24,6 +24,9 @@ enum Commands {
 
     /// Run the interactive onboarding wizard.
     Onboard,
+
+    /// Run the OpenCode-derived TUI frontend (stdio mode).
+    Tui,
 }
 
 const FALLBACK_MODEL: &str = "gpt-4o";
@@ -144,6 +147,13 @@ pub async fn run() -> Result<()> {
         Some(Commands::Onboard) => {
             let config_dir = crate::config::Config::config_dir();
             run_onboarding_wizard(config_dir, &mut crate::config::Config::load()?).await?;
+        }
+        Some(Commands::Tui) => {
+            // Launch the TUI bridge in a separate task
+            let bridge = crate::tui_adapter::TuiBridge::new();
+            tokio::spawn(bridge.run());
+            // Keep the main task running
+            tokio::signal::ctrl_c().await?;
         }
     }
 

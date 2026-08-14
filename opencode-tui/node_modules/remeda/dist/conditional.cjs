@@ -1,0 +1,2 @@
+Object.defineProperty(exports,Symbol.toStringTag,{value:`Module`});const e=require("./purryOn-wBH_q-mO.cjs");function t(...t){return e.t(r,n,t)}function n(e,...t){for(let n of t){if(typeof n==`function`)return n(e);let[t,r]=n;if(t(e))return r(e)}throw Error(`conditional: data failed for all cases`)}function r(e){if(!Array.isArray(e))return!1;let[t,n,...r]=e;return typeof t==`function`&&t.length<=1&&typeof n==`function`&&n.length<=1&&r.length===0}exports.conditional=t;
+//# sourceMappingURL=conditional.cjs.map

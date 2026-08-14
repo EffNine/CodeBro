@@ -1,0 +1,2 @@
+Object.defineProperty(exports,Symbol.toStringTag,{value:`Module`});const e=require("./purry.cjs"),t=require("./isPlainObject.cjs");function n(...t){return e.purry(r,t)}function r(e,n){let i={...e,...n};for(let a in n)Object.hasOwn(e,a)&&t.isPlainObject(e[a])&&t.isPlainObject(n[a])&&(i[a]=r(e[a],n[a]));return i}exports.mergeDeep=n;
+//# sourceMappingURL=mergeDeep.cjs.map

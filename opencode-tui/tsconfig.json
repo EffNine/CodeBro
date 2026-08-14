@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "jsxImportSource": "@opentui/solid",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "strict": false,
+    "noImplicitAny": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "paths": {
+      "@opencode-ai/sdk/v2": ["./src/shims/sdk-v2.ts"],
+      "@opencode-ai/core/global": ["./src/shims/core-global.ts"],
+      "@opencode-ai/core/flag/flag": ["./src/shims/core-flag.ts"],
+      "@opencode-ai/core/installation/version": ["./src/shims/core-installation-version.ts"],
+      "@opencode-ai/core/util/glob": ["./src/shims/core-util-glob.ts"],
+      "@opencode-ai/core/util/flock": ["./src/shims/core-util-flock.ts"],
+      "@opencode-ai/core/util/which": ["./src/shims/core-util-which.ts"],
+      "@opencode-ai/plugin/tui": ["./src/shims/plugin-tui.ts"],
+      "@opencode-ai/ui/audio/*": ["./src/shims/ui-audio.d.ts"]
+    }
+  },
+  "include": ["src/**/*.tsx", "src/**/*.ts"],
+  "exclude": ["node_modules"]
+}

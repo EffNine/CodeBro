@@ -1,0 +1,2 @@
+Object.defineProperty(exports,Symbol.toStringTag,{value:`Module`});const e=require("./purry.cjs"),t=require("./utilityEvaluators-Cn_nNk4V.cjs"),n=require("./toSingle-B-2WPC_O.cjs");function r(...t){return e.purry(i,t,n.t(a))}const i=(e,t)=>e.find(t),a=e=>(n,r,i)=>e(n,r,i)?{done:!0,hasNext:!0,next:n}:t.t;exports.find=r;
+//# sourceMappingURL=find.cjs.map

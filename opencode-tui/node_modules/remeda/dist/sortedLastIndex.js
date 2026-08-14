@@ -1,0 +1,2 @@
+import{purry as e}from"./purry.js";import{t}from"./binarySearchCutoffIndex-CRPy-dOJ.js";function n(...t){return e(r,t)}const r=(e,n)=>t(e,e=>e<=n);export{n as sortedLastIndex};
+//# sourceMappingURL=sortedLastIndex.js.map

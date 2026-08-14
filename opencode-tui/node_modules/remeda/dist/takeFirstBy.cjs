@@ -1,0 +1,2 @@
+Object.defineProperty(exports,Symbol.toStringTag,{value:`Module`});const e=require("./heap-wTC6d937.cjs"),t=require("./purryOrderRules-9xJONRCt.cjs");function n(...e){return t.n(r,e)}function r(t,n,r){if(r<=0)return[];if(r>=t.length)return[...t];let i=t.slice(0,r);e.n(i,n);let a=t.slice(r);for(let t of a)e.t(i,n,t);return i}exports.takeFirstBy=n;
+//# sourceMappingURL=takeFirstBy.cjs.map

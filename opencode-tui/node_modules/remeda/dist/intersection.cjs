@@ -1,0 +1,2 @@
+Object.defineProperty(exports,Symbol.toStringTag,{value:`Module`});const e=require("./utilityEvaluators-Cn_nNk4V.cjs"),t=require("./purryFromLazy-mdjeRP1g.cjs");function n(...e){return t.t(r,e)}function r(t){if(t.length===0)return e.n;let n=new Map;for(let e of t)n.set(e,(n.get(e)??0)+1);return t=>{let r=n.get(t);return r===void 0||r===0?e.t:(r===1?n.delete(t):n.set(t,r-1),{hasNext:!0,next:t,done:n.size===0})}}exports.intersection=n;
+//# sourceMappingURL=intersection.cjs.map

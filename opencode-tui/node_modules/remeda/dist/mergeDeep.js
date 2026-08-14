@@ -1,0 +1,2 @@
+import{purry as e}from"./purry.js";import{isPlainObject as t}from"./isPlainObject.js";function n(...t){return e(r,t)}function r(e,n){let i={...e,...n};for(let a in n)Object.hasOwn(e,a)&&t(e[a])&&t(n[a])&&(i[a]=r(e[a],n[a]));return i}export{n as mergeDeep};
+//# sourceMappingURL=mergeDeep.js.map

@@ -1,0 +1,2 @@
+Object.defineProperty(exports,Symbol.toStringTag,{value:`Module`});const e=require("./purryOn-wBH_q-mO.cjs");function t(...t){return e.t(e=>typeof e==`number`,n,t)}function n(e,t,n,r=[]){let i=[...e];return i.splice(t,n,...r),i}exports.splice=t;
+//# sourceMappingURL=splice.cjs.map

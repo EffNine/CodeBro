@@ -1,0 +1,33 @@
+{
+  "name": "codebro-tui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "CodeBro terminal UI — fork of OpenCode TUI (MIT, Copyright (c) 2025 opencode)",
+  "scripts": {
+    "dev": "bun run src/index.tsx",
+    "build": "bun build src/index.tsx --target=bun --outfile=dist/codebro-tui.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opentui/core": "0.4.5",
+    "@opentui/keymap": "0.4.5",
+    "@opentui/solid": "0.4.5",
+    "solid-js": "^1.8.15",
+    "effect": "4.0.0-beta.83",
+    "fuzzysort": "3.1.0",
+    "clipboardy": "4.0.0",
+    "strip-ansi": "7.1.2",
+    "diff": "9.0.0",
+    "open": "10.1.2",
+    "opentui-spinner": "0.0.7",
+    "remeda": "^2.17.3"
+  },
+  "devDependencies": {
+    "@tsconfig/bun": "^1.0.9",
+    "@types/bun": "^1.3.13",
+    "@types/diff": "^5.0.0",
+    "typescript": "^5.0.0"
+  }
+}

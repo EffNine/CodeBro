@@ -45,6 +45,7 @@ mod testing;
 mod tests;
 mod tools;
 mod tui;
+mod tui_adapter;
 mod workflow_engine;
 mod workspace_discovery;
 mod workspace_runtime;

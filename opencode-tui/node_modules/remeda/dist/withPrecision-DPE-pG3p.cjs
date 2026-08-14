@@ -1,0 +1,2 @@
+const e=e=>(n,r)=>{if(r===0)return e(n);if(Math.abs(r)>15)throw RangeError(`precision must be between -15 and 15`);if(!Number.isSafeInteger(r))throw TypeError(`precision must be an integer: ${r.toString()}`);return Number.isNaN(n)||!Number.isFinite(n)?e(n):t(e(t(n,r)),-r)};function t(e,t){let[n,r]=e.toString().split(`e`,2),i=`${n}e${((r===void 0?0:Number(r))+t).toString()}`;return Number(i)}Object.defineProperty(exports,"t",{enumerable:!0,get:function(){return e}});
+//# sourceMappingURL=withPrecision-DPE-pG3p.cjs.map
