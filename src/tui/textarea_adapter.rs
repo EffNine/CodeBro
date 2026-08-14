@@ -134,7 +134,8 @@ impl InputAdapter {
     /// and this method is never invoked while it is active.
     pub fn handle_key(&mut self, key: KeyEvent, dashboard: &Dashboard) -> InputResult {
         // Autocomplete owns arrow / page / home / end / enter / esc while open.
-        // Characters and Backspace fall through so typing keeps filtering.
+        // Characters fall through so typing keeps filtering.
+        // Backspace and Delete are processed directly so text can be erased.
         if !dashboard.autocomplete.is_empty() {
             return match key.code {
                 KeyCode::Up
@@ -148,6 +149,16 @@ impl InputAdapter {
                 | KeyCode::Enter
                 | KeyCode::Esc
                 | KeyCode::Tab => InputResult::Consumed,
+                KeyCode::Backspace | KeyCode::Delete => {
+                    self.inner.input(key);
+                    InputResult::Consumed
+                }
+                // Ctrl+A selects all text while autocomplete is open.
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let len = self.inner.text().len();
+                    self.inner.set_selection(0, len);
+                    InputResult::Consumed
+                }
                 _ => InputResult::PassThrough,
             };
         }

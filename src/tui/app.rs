@@ -459,7 +459,9 @@ impl TuiApp {
             return false;
         }
         let ok = self.copy_to_clipboard(&text);
-        if !ok {
+        if ok {
+            self.dashboard.log("info", "Copied".to_string());
+        } else {
             self.dashboard
                 .log("info", "Clipboard unavailable".to_string());
         }

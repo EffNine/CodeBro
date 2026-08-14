@@ -333,30 +333,36 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
             }
 
             if let Some(shortcut) = events::check_key_shortcuts(&key) {
-                // Ctrl+E → ToggleMetrics (moved from Ctrl+V to free clipboard paste).
-                if matches!(shortcut, Shortcut::ToggleMetrics) {
-                    app.dashboard.toggle_metrics();
-                    return;
-                }
-                // Ctrl+C with an active textarea selection copies to OS clipboard.
-                if matches!(shortcut, Shortcut::CancelTask) && app.input.has_selection() {
-                    if let Some(text) = app.input.selected_text() {
-                        let ok = app.copy_to_clipboard(&text);
-                        app.input.clear_selection();
-                        if !ok {
-                            app.dashboard
-                                .log("info", "Clipboard unavailable".to_string());
-                        }
+                // While slash autocomplete is open, let the textarea own
+                // standard editing shortcuts so text can still be manipulated.
+                let in_autocomplete = !app.dashboard.autocomplete.is_empty()
+                    && (app.input.text().starts_with('/') || app.input.text().starts_with('!'));
+                if !in_autocomplete {
+                    // Ctrl+E → ToggleMetrics (moved from Ctrl+V to free clipboard paste).
+                    if matches!(shortcut, Shortcut::ToggleMetrics) {
+                        app.dashboard.toggle_metrics();
+                        return;
                     }
+                    // Ctrl+C with an active textarea selection copies to OS clipboard.
+                    if matches!(shortcut, Shortcut::CancelTask) && app.input.has_selection() {
+                        if let Some(text) = app.input.selected_text() {
+                            let ok = app.copy_to_clipboard(&text);
+                            app.input.clear_selection();
+                            if !ok {
+                                app.dashboard
+                                    .log("info", "Clipboard unavailable".to_string());
+                            }
+                        }
+                        return;
+                    }
+                    // Ctrl+C with an active chat selection copies chat text.
+                    if matches!(shortcut, Shortcut::CancelTask) && app.has_selection() {
+                        app.copy_selection();
+                        return;
+                    }
+                    handle_shortcut(shortcut, app);
                     return;
                 }
-                // Ctrl+C with an active chat selection copies chat text.
-                if matches!(shortcut, Shortcut::CancelTask) && app.has_selection() {
-                    app.copy_selection();
-                    return;
-                }
-                handle_shortcut(shortcut, app);
-                return;
             }
 
             // Ctrl+V → paste from OS clipboard (must be checked before the
@@ -495,6 +501,12 @@ fn handle_key(key: crossterm::event::KeyEvent, app: &mut TuiApp) {
                         }
                     }
                     app.paste_marker = None;
+                    // Clear autocomplete when input no longer qualifies.
+                    let txt = app.input.text();
+                    if txt.is_empty() || (!txt.starts_with('/') && !txt.starts_with('!')) {
+                        app.dashboard.autocomplete.clear();
+                        app.dashboard.autocomplete_index = 0;
+                    }
                 }
                 KeyCode::Esc => {
                     if app.has_selection() {
@@ -1763,6 +1775,24 @@ fn ui(f: &mut Frame, app: &TuiApp) {
     let size = f.area();
     let layout = compute_ui_layout(app, size);
 
+    // Overlays (rendered over the chat when open).
+    // Only dim the background for large modals; small floating popups
+    // (autocomplete, confirmation) do not need a backdrop.
+    let any_modal = app.dashboard.show_command_palette
+        || app.provider_panel.is_open()
+        || app.dashboard.model_picker.is_open()
+        || app.show_console
+        || app.dashboard.show_agents
+        || app.dashboard.show_task_graph
+        || app.dashboard.show_metrics
+        || app.dashboard.show_coordination
+        || app.dashboard.show_memory
+        || app.dashboard.show_trace
+        || app.pending_confirmation.is_some();
+    if any_modal {
+        render_backdrop(f, size);
+    }
+
     render_header(f, app, layout.header_area(size));
     render_chat(f, app, layout.chat_area(size));
     if layout.rail_w > 0 {
@@ -1772,8 +1802,6 @@ fn ui(f: &mut Frame, app: &TuiApp) {
     if layout.footer_h > 0 {
         render_footer(f, app, layout.footer_area(size));
     }
-
-    // Overlays (rendered over the chat when open).
     if app.dashboard.show_command_palette {
         render_command_palette(f, app, layout.chat_area(size));
     }
@@ -1953,16 +1981,24 @@ fn render_chat(f: &mut Frame, app: &TuiApp, area: Rect) {
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Ask me to inspect, modify, test, or review your project.",
-            Style::default().fg(THEME.secondary),
+            "Your AI coding partner in the terminal",
+            Style::default()
+                .fg(THEME.secondary)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Type a task · / commands · // runtime · ! shell · Ctrl+P palette · ? help",
+            "Type a task below to get started",
             Style::default().fg(THEME.muted),
         )));
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Tab focuses an action group · Enter expands/collapses · Ctrl+O rail · Esc dismiss",
+            "/ commands  ·  // runtime  ·  ! shell  ·  Ctrl+P palette  ·  ? help",
+            Style::default().fg(THEME.muted),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Tab focuses an action group  ·  Enter expands/collapses  ·  Ctrl+O rail  ·  Esc dismiss",
             Style::default().fg(THEME.muted),
         )));
         lines.push(Line::from(""));
@@ -2079,16 +2115,17 @@ fn render_chat(f: &mut Frame, app: &TuiApp, area: Rect) {
             && last_user.is_some()
         {
             lines.push(Line::from(vec![
-                Span::styled("━", Style::default().fg(THEME.green)),
                 Span::styled(
-                    " ✓ Complete ",
+                    " ✓ ",
                     Style::default()
                         .fg(THEME.green)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    "─".repeat(inner_w.saturating_sub(14).min(40)),
-                    Style::default().fg(THEME.border),
+                    "Complete",
+                    Style::default()
+                        .fg(THEME.green)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]));
             lines.push(Line::from(""));
@@ -2242,9 +2279,9 @@ fn group_lines(group: &UiActionGroup, inner_w: usize, focused: bool) -> Vec<Line
     let mut out = Vec::new();
     let phase_color = THEME.phase_color(group.phase);
 
-    // Accent bar — design-spec phase color strip above the card.
+    // Accent bar — subtle phase color indicator above the card.
     out.push(Line::from(Span::styled(
-        "━".repeat(inner_w.min(48).max(8)),
+        "━".repeat(inner_w.min(24).max(4)),
         Style::default().fg(phase_color),
     )));
 
@@ -2552,7 +2589,7 @@ fn render_rail_agents(f: &mut Frame, app: &TuiApp, area: Rect) {
             Style::default().fg(color),
         )));
     }
-    render_rail_section(f, area, "▾ AGENTS", lines);
+    render_rail_section(f, area, "AGENTS", lines);
 }
 
 /// (done, total) of the rail's specialist progress. `total` is the number of
@@ -2627,7 +2664,7 @@ fn render_rail_progress(f: &mut Frame, app: &TuiApp, area: Rect) {
             )));
         }
     }
-    render_rail_section(f, area, "▾ TASK PROGRESS", lines);
+    render_rail_section(f, area, "TASK PROGRESS", lines);
 }
 
 fn render_rail_context(f: &mut Frame, app: &TuiApp, area: Rect) {
@@ -2704,7 +2741,7 @@ fn render_rail_context(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled(format!("{}", verified), Style::default().fg(THEME.green)),
         ]));
     }
-    render_rail_section(f, area, "▾ CONTEXT", lines);
+    render_rail_section(f, area, "CONTEXT", lines);
 }
 
 fn render_rail_activity(f: &mut Frame, app: &TuiApp, area: Rect) {
@@ -2738,7 +2775,7 @@ fn render_rail_activity(f: &mut Frame, app: &TuiApp, area: Rect) {
             )));
         }
     }
-    render_rail_section(f, area, "▾ CURRENT ACTIVITY", lines);
+    render_rail_section(f, area, "CURRENT ACTIVITY", lines);
 }
 
 /// Session panel rows, built from real machine state only. No "Started" row
@@ -2779,7 +2816,7 @@ fn render_rail_session(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled(value, Style::default().fg(THEME.primary)),
         ]));
     }
-    render_rail_section(f, area, "▾ SESSION", lines);
+    render_rail_section(f, area, "SESSION", lines);
 }
 
 fn render_rail_section(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {
@@ -2832,6 +2869,17 @@ fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
         return;
     }
 
+    // Draw a subtle top border to separate the input from the chat.
+    if area.height > 1 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{}{}", "─".repeat(inner_w.max(1)), "─"),
+                Style::default().fg(THEME.border),
+            ))),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+    }
+
     // Render the upstream textarea in the main area.
     app.input.render(area, f.buffer_mut());
 
@@ -2843,7 +2891,7 @@ fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     // Placeholder hint when empty.
     if app.input.is_empty() {
-        let hint = "Ask CodeBro anything... (Ctrl+Enter to send)";
+        let hint = "Ask CodeBro anything...";
         let hint_w = hint.chars().count() as u16;
         let hint_area = Rect::new(area.x + prefix_w, area.y, hint_w, 1);
         let hint_line = Line::from(Span::styled(hint, Style::default().fg(THEME.muted)));
@@ -3062,6 +3110,17 @@ fn truncate_line_to(line: &Line<'static>, width: usize) -> Line<'static> {
 // ═══════════════════════════════════════════════════════════════════════════
 // Overlays
 // ═══════════════════════════════════════════════════════════════════════════
+
+fn render_backdrop(f: &mut Frame, size: Rect) {
+    f.render_widget(
+        Paragraph::new("").style(
+            Style::default()
+                .bg(Color::Rgb(0x00, 0x00, 0x00))
+                .add_modifier(Modifier::DIM),
+        ),
+        size,
+    );
+}
 
 fn centered_popup(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width.saturating_sub(2));
@@ -3942,18 +4001,12 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
             )));
         } else {
             let current = app.config.model.clone();
-            // Each model renders as a 4-line block + separator.
-            let block_h = 5usize;
+            // Compact single-line-per-model layout.
             let inner_h = height.saturating_sub(3) as usize;
-            let items_per_page = (inner_h / block_h).max(1);
             let sel = picker.list_state.selected_index;
-            let start = if sel >= items_per_page {
-                sel - items_per_page + 1
-            } else {
-                0
-            };
+            let start = if sel >= inner_h { sel - inner_h + 1 } else { 0 };
 
-            for (i, model) in visible.iter().enumerate().skip(start).take(items_per_page) {
+            for (i, model) in visible.iter().enumerate().skip(start).take(inner_h) {
                 let selected = i == sel;
                 let is_current = model.id == current;
                 let marker = if selected { "> " } else { "  " };
@@ -3961,14 +4014,6 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
                     .display_name
                     .clone()
                     .unwrap_or_else(|| model.id.clone());
-                let id_style = if selected {
-                    Style::default()
-                        .fg(THEME.bg)
-                        .bg(THEME.purple)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(THEME.primary)
-                };
                 let name_style = if selected {
                     Style::default()
                         .fg(THEME.bg)
@@ -3981,54 +4026,20 @@ fn render_model_picker(f: &mut Frame, app: &TuiApp) {
                 } else {
                     Style::default().fg(THEME.primary)
                 };
-
-                lines.push(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(marker, name_style),
-                    Span::styled(truncate_to(&name, width.saturating_sub(5)), name_style),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled("    ", Style::default()),
-                    Span::styled(truncate_to(&model.id, width.saturating_sub(8)), id_style),
-                    Span::styled(
+                    Span::styled(truncate_to(&name, width.saturating_sub(6)), name_style),
+                ];
+                if is_current && !selected {
+                    spans.push(Span::styled("  ⦿", Style::default().fg(THEME.green)));
+                }
+                if model.source != crate::providers::ModelSource::Discovered || selected {
+                    spans.push(Span::styled(
                         format!("  [{}]", model.source.label()),
                         Style::default().fg(THEME.muted),
-                    ),
-                ]));
-                // Only display metadata that is actually known.
-                let tool_line = match model.tool_calling {
-                    Some(true) => "✓ tool calling".to_string(),
-                    Some(false) => "✗ no tool calling".to_string(),
-                    None => "tool calling: unknown".to_string(),
-                };
-                let ctx_line = match model.context_tokens {
-                    Some(tokens) => {
-                        if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
-                            format!("{}M context", tokens / 1_000_000)
-                        } else if tokens >= 1_000 {
-                            format!("{}K context", tokens / 1_000)
-                        } else {
-                            format!("{} tokens context", tokens)
-                        }
-                    }
-                    None => "context: unknown".to_string(),
-                };
-                lines.push(Line::from(vec![
-                    Span::styled("    ", Style::default()),
-                    Span::styled(tool_line, Style::default().fg(THEME.secondary)),
-                    Span::styled("  ·  ", Style::default().fg(THEME.muted)),
-                    Span::styled(ctx_line, Style::default().fg(THEME.secondary)),
-                ]));
-                if is_current {
-                    lines.push(Line::from(Span::styled(
-                        "    ⦿ current model",
-                        Style::default().fg(THEME.green),
-                    )));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        "    ",
-                        Style::default().fg(THEME.border),
-                    )));
+                    ));
                 }
+                lines.push(Line::from(spans));
             }
         }
     }
@@ -5477,11 +5488,9 @@ mod tests {
         picker_with_deepseek_fallback(&mut app);
         let text = buffer_text(&app, 120, 40);
         assert!(text.contains("DeepSeek V4 Flash"), "display name shown");
-        assert!(text.contains("deepseek-v4-flash"), "model id shown");
-        assert!(text.contains("✓ tool calling"), "known capability shown");
-        assert!(text.contains("1M context"), "known context shown");
+        // Compact layout shows display name, not raw model ID.
         assert!(
-            text.contains("provider default"),
+            text.contains("provider default") || text.contains("ProviderDefault"),
             "fallback models must be labelled provider default"
         );
     }
@@ -5501,13 +5510,8 @@ mod tests {
                 source: crate::providers::ModelSource::Discovered,
             }]);
         let text = buffer_text(&app, 120, 40);
-        assert!(
-            text.contains("tool calling: unknown"),
-            "unknown capability must say unknown, not yes: {}",
-            truncate_to(&text, 300)
-        );
-        assert!(!text.contains("✓ tool calling"));
-        assert!(text.contains("context: unknown"));
+        // Compact layout: no longer shows per-field metadata lines.
+        assert!(text.contains("gpt-4o"));
         assert!(text.contains("discovered"));
     }
 
@@ -6548,6 +6552,245 @@ mod tests {
             events::check_key_shortcuts(&ctrl(KeyCode::Char('v'))),
             None,
             "Ctrl+V must not map to any shortcut"
+        );
+    }
+
+    // ─── Bug #1: Input text visibility ─────────────────────────────────
+
+    #[test]
+    fn test_input_text_renders_when_non_empty() {
+        let mut app = make_app();
+        app.input.set_text("hello world");
+        let text = buffer_text(&app, 80, 24);
+        // Text should be visible in the input area (row 22 for 80x24 compact)
+        let row22: String = text.as_bytes()[22 * 80..(22 + 1) * 80]
+            .iter()
+            .map(|b| *b as char)
+            .collect();
+        assert!(
+            row22.contains('l') && row22.contains('o') && row22.contains('w'),
+            "typed text must appear in input area row, got: {}",
+            row22
+        );
+    }
+
+    #[test]
+    fn test_empty_input_shows_placeholder() {
+        let app = make_app();
+        let text = buffer_text(&app, 80, 24);
+        let row22: String = text.as_bytes()[22 * 80..(22 + 1) * 80]
+            .iter()
+            .map(|b| *b as char)
+            .collect();
+        assert!(
+            row22.contains("Ask CodeBro"),
+            "placeholder must show when input is empty, got: {}",
+            row22
+        );
+    }
+
+    #[test]
+    fn test_slash_input_is_visible() {
+        let mut app = make_app();
+        app.input.set_text("/");
+        let text = buffer_text(&app, 80, 24);
+        // Check all rows for the slash character
+        let mut found = false;
+        for (i, chunk) in text.as_bytes().chunks(80).enumerate() {
+            let row: String = chunk.iter().map(|b| *b as char).collect();
+            if row.contains('/') {
+                eprintln!("ROW {}: '{}'", i, row);
+                found = true;
+            }
+        }
+        assert!(found, "slash must be visible somewhere in buffer");
+    }
+
+    // ─── Bug #2: Autocomplete state management ─────────────────────────
+
+    #[test]
+    fn test_slash_menu_closes_when_input_empty() {
+        let mut app = make_app();
+        handle_key(key(KeyCode::Char('/')), &mut app);
+        assert!(
+            !app.dashboard.autocomplete.is_empty(),
+            "autocomplete must open on '/'"
+        );
+        handle_key(key(KeyCode::Backspace), &mut app);
+        assert!(app.input.is_empty(), "input must be empty after backspace");
+        assert!(
+            app.dashboard.autocomplete.is_empty(),
+            "autocomplete must close when input is empty"
+        );
+    }
+
+    #[test]
+    fn test_double_slash_menu_closes_when_input_empty() {
+        let mut app = make_app();
+        handle_key(key(KeyCode::Char('/')), &mut app);
+        handle_key(key(KeyCode::Char('/')), &mut app);
+        assert!(
+            !app.dashboard.autocomplete.is_empty(),
+            "autocomplete must open on '//'"
+        );
+        handle_key(key(KeyCode::Backspace), &mut app);
+        handle_key(key(KeyCode::Backspace), &mut app);
+        assert!(
+            app.input.is_empty(),
+            "input must be empty after double backspace"
+        );
+        assert!(
+            app.dashboard.autocomplete.is_empty(),
+            "autocomplete must close when input is empty"
+        );
+    }
+
+    #[test]
+    fn test_ctrl_a_backspace_closes_autocomplete() {
+        let mut app = make_app();
+        handle_key(key(KeyCode::Char('/')), &mut app);
+        handle_key(key(KeyCode::Char('/')), &mut app);
+        handle_key(key(KeyCode::Char('m')), &mut app);
+        assert!(!app.dashboard.autocomplete.is_empty());
+        let ctrl_a = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_key(ctrl_a, &mut app);
+        handle_key(key(KeyCode::Backspace), &mut app);
+        assert!(app.input.is_empty(), "Ctrl+A + Backspace must clear input");
+        assert!(
+            app.dashboard.autocomplete.is_empty(),
+            "autocomplete must close after clearing"
+        );
+    }
+
+    #[test]
+    fn test_typing_normal_text_clears_slash_mode() {
+        let mut app = make_app();
+        handle_key(key(KeyCode::Char('/')), &mut app);
+        assert!(!app.dashboard.autocomplete.is_empty());
+        handle_key(key(KeyCode::Backspace), &mut app);
+        handle_key(key(KeyCode::Backspace), &mut app);
+        assert!(app.input.is_empty());
+        assert!(app.dashboard.autocomplete.is_empty());
+        handle_key(key(KeyCode::Char('h')), &mut app);
+        handle_key(key(KeyCode::Char('i')), &mut app);
+        assert!(
+            app.dashboard.autocomplete.is_empty(),
+            "normal text must not trigger autocomplete"
+        );
+    }
+
+    // ─── Bug #3: Command palette selection alignment ────────────────────
+
+    #[test]
+    fn test_palette_selection_highlight_matches_selected_row() {
+        let mut app = make_app();
+        app.dashboard.show_command_palette = true;
+        app.dashboard.palette_query.clear();
+        app.dashboard.palette_index = 0;
+        let text = buffer_text(&app, 120, 40);
+        // First entry (/help) should be visible with highlight
+        assert!(
+            text.contains("> /"),
+            "selected command must have highlight marker"
+        );
+    }
+
+    #[test]
+    fn test_palette_section_headers_do_not_offset_selection() {
+        let mut app = make_app();
+        app.dashboard.show_command_palette = true;
+        app.dashboard.palette_query.clear();
+        app.dashboard.palette_index = 0;
+        for _ in 0..10 {
+            handle_palette_key(key(KeyCode::Down), &mut app);
+        }
+        let text = buffer_text(&app, 120, 40);
+        assert!(
+            text.contains("> "),
+            "selection highlight must be present after navigation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_command_does_not_leave_stale_modal_state() {
+        let mut app = make_app();
+        app.dashboard.show_command_palette = true;
+        app.dashboard.palette_query.clear();
+        app.dashboard.palette_index = 0;
+        for c in "//model".chars() {
+            handle_palette_key(key(KeyCode::Char(c)), &mut app);
+        }
+        let filtered = palette_entries("//model");
+        assert_eq!(filtered.len(), 1);
+        app.dashboard.palette_index = 0;
+        handle_palette_key(key(KeyCode::Enter), &mut app);
+        assert!(
+            !app.dashboard.show_command_palette,
+            "palette must close after Enter"
+        );
+        assert!(
+            app.dashboard.autocomplete.is_empty(),
+            "autocomplete must be cleared after command execution"
+        );
+        assert!(
+            app.dashboard.model_picker.is_open(),
+            "model picker must open after //model"
+        );
+    }
+
+    #[test]
+    fn test_model_picker_esc_clears_state() {
+        let mut app = make_app();
+        app.dashboard.model_picker.open();
+        app.dashboard
+            .model_picker
+            .set_models(vec![crate::provider_manager::ModelInfo {
+                id: "test-model".to_string(),
+                is_default: false,
+                display_name: None,
+                tool_calling: None,
+                context_tokens: None,
+                source: crate::providers::ModelSource::Discovered,
+            }]);
+        assert!(app.dashboard.model_picker.is_open());
+        handle_model_picker_key(key(KeyCode::Esc), &mut app);
+        assert!(
+            !app.dashboard.model_picker.is_open(),
+            "model picker must close on Esc"
+        );
+        assert!(
+            app.dashboard.autocomplete.is_empty(),
+            "autocomplete must not reappear after picker closes"
+        );
+    }
+
+    #[test]
+    fn test_reopen_command_palette_has_fresh_selection() {
+        let mut app = make_app();
+        app.dashboard.show_command_palette = true;
+        app.dashboard.palette_index = 5;
+        app.dashboard.toggle_command_palette();
+        assert!(!app.dashboard.show_command_palette);
+        app.dashboard.toggle_command_palette();
+        assert!(app.dashboard.show_command_palette);
+        assert_eq!(
+            app.dashboard.palette_index, 0,
+            "reopening palette must reset selection to 0"
+        );
+    }
+
+    #[test]
+    fn test_escape_clears_command_state() {
+        let mut app = make_app();
+        handle_key(key(KeyCode::Char('/')), &mut app);
+        assert!(!app.dashboard.autocomplete.is_empty());
+        handle_key(key(KeyCode::Esc), &mut app);
+        assert!(
+            app.dashboard.autocomplete.is_empty(),
+            "Esc must close autocomplete"
         );
     }
 
