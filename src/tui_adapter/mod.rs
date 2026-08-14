@@ -10,3 +10,4 @@ pub mod handlers;
 pub mod protocol;
 
 pub use bridge::TuiBridge;
+pub use bridge::TuiState;

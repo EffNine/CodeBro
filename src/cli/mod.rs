@@ -13,6 +13,10 @@ pub struct Cli {
 
     #[arg(long, short, global = true)]
     config: Option<PathBuf>,
+
+    /// Internal flag: run as the stdio bridge process (called by the launcher).
+    #[arg(long, hide = true)]
+    bridge: bool,
 }
 
 #[derive(Subcommand)]
@@ -99,6 +103,11 @@ fn resolve_model(config: &mut crate::config::Config) {
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
 
+    // Internal bridge mode: run the stdio JSON bridge directly
+    if cli.bridge {
+        return run_bridge().await;
+    }
+
     match cli.command {
         Some(Commands::Chat) | None => {
             let mut config = crate::config::Config::load()?;
@@ -149,11 +158,9 @@ pub async fn run() -> Result<()> {
             run_onboarding_wizard(config_dir, &mut crate::config::Config::load()?).await?;
         }
         Some(Commands::Tui) => {
-            // Launch the TUI bridge in a separate task
-            let bridge = crate::tui_adapter::TuiBridge::new();
-            tokio::spawn(bridge.run());
-            // Keep the main task running
-            tokio::signal::ctrl_c().await?;
+            // Spawn the bridge and TUI via the launcher
+            let launcher = crate::launcher::Launcher::new()?;
+            launcher.run().await?;
         }
     }
 
@@ -279,5 +286,79 @@ async fn run_onboarding_wizard(
     println!("  Config saved to: {:?}", config_dir.join("config.toml"));
     println!("\n  Run `codebro` to start the TUI.\n");
 
+    Ok(())
+}
+
+/// Run the stdio JSON bridge in foreground (called with --bridge).
+async fn run_bridge() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
+
+    // Emit ready event on stderr immediately
+    eprintln!("ready");
+
+    let stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let state = std::sync::Arc::new(crate::tui_adapter::bridge::TuiState::default());
+
+    let mut reader = tokio::io::BufReader::new(stdin);
+    let mut line = String::new();
+    let (event_tx, mut event_rx) =
+        mpsc::unbounded_channel::<crate::tui_adapter::protocol::TuiEvent>();
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(event) = event_rx.recv() => {
+                let msg = serde_json::to_string(&event)?;
+                if let Err(e) = stdout.write_all(format!("{}\n", msg).as_bytes()).await {
+                    eprintln!("bridge event write error: {}", e);
+                    break;
+                }
+                if let Err(e) = stdout.flush().await {
+                    eprintln!("bridge event flush error: {}", e);
+                    break;
+                }
+            }
+            result = reader.read_line(&mut line) => {
+                match result {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Some(msg) =
+                            crate::tui_adapter::protocol::TuiMessage::parse(&line)
+                        {
+                            match msg {
+                                crate::tui_adapter::protocol::TuiMessage::Request(req) => {
+                                    let resp = crate::tui_adapter::handlers::handle_request(
+                                        req,
+                                        &state,
+                                        event_tx.clone(),
+                                    )
+                                    .await;
+                                    let msg = serde_json::to_string(&resp)?;
+                                    if let Err(e) =
+                                        stdout.write_all(format!("{}\n", msg).as_bytes()).await
+                                    {
+                                        eprintln!("bridge write error: {}", e);
+                                        break;
+                                    }
+                                    if let Err(e) = stdout.flush().await {
+                                        eprintln!("bridge flush error: {}", e);
+                                        break;
+                                    }
+                                }
+                                crate::tui_adapter::protocol::TuiMessage::Response(_)
+                                | crate::tui_adapter::protocol::TuiMessage::Event(_) => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("bridge read error: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
