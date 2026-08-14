@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 use crate::config::Config;
+use crate::tui::abstractions::{ModalState, ScrollbackState, SelectionModel};
 use crate::tui::actions::{ActionStream, UiActionGroup};
 use crate::tui::console::{ConsoleStatus, PtyConsole};
 use crate::tui::dashboard::Dashboard;
@@ -64,8 +65,6 @@ pub struct TuiApp {
     pub messages: VecDeque<Message>,
     pub input: InputAdapter,
     pub is_loading: bool,
-    /// Lines scrolled up from the bottom of the conversation (0 = at bottom).
-    pub scroll_from_bottom: usize,
     pub config: Config,
     pub should_quit: bool,
     pub should_clear: bool,
@@ -108,6 +107,8 @@ pub struct TuiApp {
     pub rail_visible: bool,
     /// Whether the live PTY console overlay is open (Ctrl+K / `//console`).
     pub show_console: bool,
+    /// Current active modal state for priority-based key handling.
+    pub current_modal: ModalState,
     /// When the app session started (real wall clock for the session panel).
     pub session_started_at: Instant,
     /// When the current task started (for the session duration).
@@ -126,17 +127,13 @@ pub struct TuiApp {
     /// authority for the header mode label and the rail progress phase set;
     /// the UI never infers a mode from "a task is running".
     pub task_mode: crate::canonical_runtime::TaskMode,
-    /// A compact display marker shown when a multiline paste is active.
-    /// The raw text is preserved in `input`; this field only controls the
-    /// visual representation so large pastes stay readable.
     pub paste_marker: Option<String>,
     /// Mouse-based text selection state for copy in the chat viewport.
-    pub selection_start: Option<(u16, u16)>,
-    pub selection_end: Option<(u16, u16)>,
-    pub is_selecting: bool,
+    pub selection: SelectionModel,
     /// Current terminal viewport size, updated on every resize event.
-    /// Used to determine whether mouse events land in the input area.
     pub terminal_size: Option<Rect>,
+    /// Chat scrollback state (follow/detach, offset, total lines).
+    pub scrollback: ScrollbackState,
 }
 
 /// UI state for the provider management panel
@@ -150,6 +147,8 @@ pub struct ProviderPanel {
     pub detail_provider: Option<String>,
     pub health_results: Vec<(String, crate::provider_manager::HealthStatus, Option<u64>)>,
     pub loading_health: bool,
+    /// Text filter for searching providers.
+    pub filter: String,
 }
 
 impl ProviderPanel {
@@ -161,6 +160,7 @@ impl ProviderPanel {
             detail_provider: None,
             health_results: Vec::new(),
             loading_health: false,
+            filter: String::new(),
         }
     }
 
@@ -258,7 +258,6 @@ impl TuiApp {
             messages: VecDeque::new(),
             input: InputAdapter::new(),
             is_loading: false,
-            scroll_from_bottom: 0,
             config,
             should_quit: false,
             should_clear: false,
@@ -284,6 +283,7 @@ impl TuiApp {
             action_stream: ActionStream::new(),
             rail_visible: true,
             show_console: false,
+            current_modal: ModalState::None,
             session_started_at: Instant::now(),
             task_started_at: None,
             workspace_root,
@@ -292,19 +292,18 @@ impl TuiApp {
             git_branch,
             task_mode: crate::canonical_runtime::TaskMode::Assist,
             paste_marker: None,
-            selection_start: None,
-            selection_end: None,
-            is_selecting: false,
+            selection: SelectionModel::new(),
             terminal_size: None,
+            scrollback: ScrollbackState::new(),
         })
     }
 
     pub fn add_message(&mut self, role: MessageRole, content: String) {
         // Only auto-follow when the user was already at the bottom. A user who
         // scrolled upward must never have their viewport yanked by a new
-        // message; the "new activity" indicator (driven by scroll_from_bottom)
+        // message; the "new activity" indicator (driven by scrollback)
         // signals new content instead.
-        let was_at_bottom = self.scroll_from_bottom == 0;
+        let was_at_bottom = self.scrollback.offset_from_bottom == 0;
         self.messages.push_back(Message {
             role,
             content,
@@ -337,20 +336,20 @@ impl TuiApp {
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        self.scroll_from_bottom = 0;
+        self.scrollback.follow();
     }
 
     pub fn scroll_up(&mut self) {
-        self.scroll_from_bottom += 1;
+        self.scrollback.scroll_up(1);
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(1);
+        self.scrollback.scroll_down(1);
     }
 
     pub fn clear_screen(&mut self) {
         self.messages.clear();
-        self.scroll_from_bottom = 0;
+        self.scrollback.follow();
         self.action_stream.clear();
     }
 
@@ -384,9 +383,9 @@ impl TuiApp {
     /// `lines > 0` means the user scrolled up (see older content).
     pub fn mouse_scroll(&mut self, lines: isize) {
         if lines > 0 {
-            self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(lines as usize);
+            self.scrollback.scroll_up(lines as usize);
         } else {
-            self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub((-lines) as usize);
+            self.scrollback.scroll_down((-lines) as usize);
         }
     }
 
@@ -443,14 +442,12 @@ impl TuiApp {
 
     /// Whether a mouse-driven text selection is currently active in the chat.
     pub fn has_selection(&self) -> bool {
-        self.selection_start.is_some() && self.selection_end.is_some()
+        self.selection.is_active()
     }
 
     /// Clear the active text selection.
     pub fn clear_selection(&mut self) {
-        self.selection_start = None;
-        self.selection_end = None;
-        self.is_selecting = false;
+        self.selection.clear();
     }
 
     /// Copy the selected chat text to the system clipboard.
@@ -473,40 +470,8 @@ impl TuiApp {
     /// Coordinates are (row, col) in the chat viewport; rows are 0-based within
     /// the rendered chat lines, columns are character positions.
     pub fn extract_selection(&self) -> String {
-        let Some((r1, c1)) = self.selection_start else {
-            return String::new();
-        };
-        let Some((r2, c2)) = self.selection_end else {
-            return String::new();
-        };
-        // Build the virtual line buffer the same way render_chat does, then
-        // slice the requested rectangle out of it.
         let lines = self.chat_lines_for_selection();
-        let mut out = String::new();
-        let start_row = usize::from(r1.min(r2));
-        let end_row = usize::from(r1.max(r2));
-        let start_col = usize::from(c1.min(c2));
-        let end_col = usize::from(c1.max(c2));
-        for (i, line) in lines.iter().enumerate() {
-            if i < start_row || i > end_row {
-                continue;
-            }
-            let chars: Vec<char> = line.chars().collect();
-            let row_start = if i == start_row { start_col } else { 0 };
-            let row_end = if i == end_row {
-                end_col.min(chars.len())
-            } else {
-                chars.len()
-            };
-            let segment: String = chars[row_start..row_end].iter().collect();
-            if !segment.is_empty() {
-                out.push_str(&segment);
-            }
-            if i < end_row {
-                out.push('\n');
-            }
-        }
-        out
+        self.selection.range.extract(&lines)
     }
 
     /// Build the chat line buffer used for selection extraction. Mirrors
@@ -1103,10 +1068,14 @@ impl TuiApp {
 
     pub fn open_settings(&mut self) {
         self.settings_panel.open();
+        self.current_modal = ModalState::Settings;
     }
 
     pub fn close_settings(&mut self) {
         self.settings_panel.close();
+        if self.current_modal == ModalState::Settings {
+            self.current_modal = ModalState::None;
+        }
     }
 
     pub fn toggle_settings(&mut self) {
@@ -1159,6 +1128,24 @@ impl TuiApp {
         }
     }
 
+    // ─── Modal state management ─────────────────────────────────────────────
+
+    /// Set the current modal state. Use this when opening/closing overlays
+    /// so key dispatch follows a single priority chain.
+    pub fn set_modal(&mut self, modal: ModalState) {
+        self.current_modal = modal;
+    }
+
+    /// Clear all modal state (returns to chat input).
+    pub fn clear_modal(&mut self) {
+        self.current_modal = ModalState::None;
+    }
+
+    /// Get the currently active modal for rendering decisions.
+    pub fn current_modal(&self) -> &ModalState {
+        &self.current_modal
+    }
+
     // ─── P5: Provider Management ─────────────────────────────────────────
 
     pub fn open_provider_manager(&mut self) {
@@ -1170,7 +1157,9 @@ impl TuiApp {
             detail_provider: None,
             health_results: Vec::new(),
             loading_health: false,
+            filter: String::new(),
         };
+        self.current_modal = ModalState::ProviderPicker;
         if let Some(ref pm) = self.provider_manager {
             self.provider_panel.active_provider = pm.active_provider().cloned();
             let active_index = pm
@@ -1185,6 +1174,9 @@ impl TuiApp {
     pub fn close_provider_manager(&mut self) {
         self.provider_panel.open = false;
         self.provider_panel.detail_provider = None;
+        if self.current_modal == ModalState::ProviderPicker {
+            self.current_modal = ModalState::None;
+        }
     }
 
     pub fn toggle_provider_manager(&mut self) {
@@ -1428,10 +1420,10 @@ mod tests {
         for i in 0..20 {
             app.add_message(MessageRole::Assistant, format!("line {}", i));
         }
-        assert_eq!(app.scroll_from_bottom, 0, "already at bottom");
+        assert_eq!(app.scrollback.offset_from_bottom, 0, "already at bottom");
         app.add_message(MessageRole::Assistant, "new at bottom".to_string());
         assert_eq!(
-            app.scroll_from_bottom, 0,
+            app.scrollback.offset_from_bottom, 0,
             "at bottom + new message must stay following bottom"
         );
     }
@@ -1445,11 +1437,11 @@ mod tests {
         app.scroll_up();
         app.scroll_up();
         app.scroll_up();
-        let detached = app.scroll_from_bottom;
+        let detached = app.scrollback.offset_from_bottom;
         assert!(detached > 0, "viewport detached");
         app.add_message(MessageRole::Assistant, "new while detached".to_string());
         assert_eq!(
-            app.scroll_from_bottom, detached,
+            app.scrollback.offset_from_bottom, detached,
             "scrolled-up viewport must not be yanked by a new message"
         );
     }
@@ -1461,13 +1453,13 @@ mod tests {
             app.add_message(MessageRole::Assistant, format!("line {}", i));
         }
         app.scroll_up();
-        let detached = app.scroll_from_bottom;
+        let detached = app.scrollback.offset_from_bottom;
         app.action_stream.handle_event(&AgentEvent::ToolStarted {
             tool: "read_file".to_string(),
             args: "a.rs".to_string(),
         });
         assert!(
-            app.scroll_from_bottom > 0,
+            app.scrollback.offset_from_bottom > 0,
             "detached viewport remains detached under new activity"
         );
         assert!(app.action_stream.has_live_activity());
@@ -1481,9 +1473,12 @@ mod tests {
             app.add_message(MessageRole::Assistant, format!("line {}", i));
         }
         app.scroll_up();
-        assert!(app.scroll_from_bottom > 0);
+        assert!(app.scrollback.offset_from_bottom > 0);
         app.scroll_to_bottom();
-        assert_eq!(app.scroll_from_bottom, 0, "End returns to live view");
+        assert_eq!(
+            app.scrollback.offset_from_bottom, 0,
+            "End returns to live view"
+        );
     }
 
     // ─── F5: workspace identity is cached outside the render path ─────

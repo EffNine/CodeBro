@@ -2486,13 +2486,13 @@ fn test_panel_toggle_state() {
 fn test_conversation_scroll_state() {
     let mut app = crate::tui::TuiApp::new().expect("app");
     app.add_message(crate::tui::app::MessageRole::User, "hello".to_string());
-    assert_eq!(app.scroll_from_bottom, 0);
+    assert_eq!(app.scrollback.offset_from_bottom, 0);
     app.scroll_up();
-    assert_eq!(app.scroll_from_bottom, 1);
+    assert_eq!(app.scrollback.offset_from_bottom, 1);
     app.scroll_down();
-    assert_eq!(app.scroll_from_bottom, 0);
+    assert_eq!(app.scrollback.offset_from_bottom, 0);
     app.scroll_down();
-    assert_eq!(app.scroll_from_bottom, 0);
+    assert_eq!(app.scrollback.offset_from_bottom, 0);
 }
 
 #[test]
@@ -3278,9 +3278,9 @@ fn test_input_shift_enter_newline() {
 fn test_mouse_scroll() {
     let mut app = crate::tui::TuiApp::new().expect("app");
     app.mouse_scroll(3);
-    assert_eq!(app.scroll_from_bottom, 3);
+    assert_eq!(app.scrollback.offset_from_bottom, 3);
     app.mouse_scroll(-2);
-    assert_eq!(app.scroll_from_bottom, 1);
+    assert_eq!(app.scrollback.offset_from_bottom, 1);
 }
 
 #[test]

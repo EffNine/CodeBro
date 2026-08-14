@@ -221,6 +221,8 @@ pub struct ModelPicker {
     pub loading: bool,
     pub error: Option<String>,
     pub filter: String,
+    /// Provider filter for the provider picker.
+    pub provider_filter: String,
 }
 
 impl ModelPicker {
@@ -232,6 +234,7 @@ impl ModelPicker {
             loading: false,
             error: None,
             filter: String::new(),
+            provider_filter: String::new(),
         }
     }
 
@@ -241,6 +244,7 @@ impl ModelPicker {
         self.list_state = SelectableListState::new(NAV_PAGE_SIZE * 2);
         self.error = None;
         self.filter.clear();
+        self.provider_filter.clear();
     }
 
     pub fn close(&mut self) {
