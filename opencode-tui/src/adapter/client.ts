@@ -251,6 +251,7 @@ export function createOpencodeClient(cfg?: { baseUrl?: string; directory?: strin
         async summarize(i: string) { return req("session.summarize", { id: i }) },
         async shell(i: string, c: string) { return req("session.shell", { id: i, command: c }) },
         async command(i: string, t: string) { return req("session.command", { id: i, text: t }) },
+        async prompt(_p: any) { return req<any>("session.command", { sessionID: _p.sessionID, text: _p.parts?.find((x: any) => x.type === "text")?.text ?? "" }).then(d => ({ data: d })) },
         async children(i: string) { return req<any[]>("session.children", { id: i }).then(d => ({ data: d ?? [] })) },
         async permission(i: string) { return req<any[]>("session.permission", { id: i }).then(d => ({ data: d ?? [] })) },
         async question(i: string) { return req<any[]>("session.question", { id: i }).then(d => ({ data: d ?? [] })) },
