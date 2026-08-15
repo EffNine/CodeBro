@@ -2,9 +2,39 @@
 
 Your AI coding partner in the terminal.
 
-CodeBro is a lightweight Claude Code inspired terminal coding agent built with Rust. It allows developers to chat with AI models, understand repositories, inspect code, modify files, execute commands, review changes, and maintain coding sessions.
+CodeBro is a **terminal-native engineering runtime** built with Rust: persistent
+engineering context (facts, memory, project identity) plus guarded code
+operations, exposed to AI coding agents over the **Model Context Protocol
+(MCP)**. Battle-tested agent frontends — Claude Code, OpenCode, Codex, Cursor,
+Goose — connect to `codebro serve` and get project-wide facts and a guarded
+mutation path without re-discovering the codebase every session.
+
+It also ships a chat **TUI** (frozen — kept as one possible client, no longer
+the strategic center; see [`docs/design/MCP_SERVER.md`](docs/design/MCP_SERVER.md)).
 
 ## Features
+
+### Engineering Runtime (MCP-first)
+
+- **MCP server** (`codebro serve`): exposes the engineering runtime over
+  stdio — `workspace_context`, `engineering_facts`, `engineering_memory`,
+  `apply_change`, `record_memory`, `delete_memory`
+- **Fact store** (`codebro init`): scans the workspace with tree-sitter and
+  freezes a validated model (modules, symbols, tests, build targets,
+  dependencies from `Cargo.toml`) into `.codebro/facts.json`
+- **Diagnostics** (`codebro doctor`): health checks for identity, facts,
+  memory and git state with scriptable exit codes (0 ok / 1 warn / 2 error)
+- **Engineering memory**: record/update/delete decisions and constraints,
+  resolved by task relevance with confidence — secret-redacted before
+  storage; persists across sessions (anti-amnesia)
+- **Guarded mutations** (`apply_change`): single-file edits through the
+  change engine — workspace boundary, no blind overwrites, stale-content
+  refusal; the agent is told never to bypass a rejected guard
+- **Auto-detection**: server instructions direct agents to consult CodeBro
+  for project-wide facts before grepping — no prompt hints required
+  (verified end-to-end with OpenCode, see `docs/design/MCP_SERVER.md` §10)
+
+### TUI & Agent (frozen)
 
 - **AI Chat**: Interactive chat interface in the terminal
 - **Streaming Responses**: Real-time token streaming from AI providers
@@ -82,6 +112,49 @@ codebro/
 
 > The legacy `src/context/` and `src/prompt/` modules were removed in ADR-012.
 > See the current canonical architecture in `docs/architecture/`.
+
+### MCP Architecture (current)
+
+```
+              ┌─────────────────┐
+              │  Claude Code    │
+              │  OpenCode       │
+              │  Codex          │
+              │  Cursor         │
+              └────────┬────────┘
+                       │
+                       │ MCP (stdio)
+                       ▼
+              ┌─────────────────┐
+              │     codebro     │
+              │  `codebro serve`│
+              ├─────────────────┤
+              │ Engineering     │
+              │ Runtime         │
+              ├─────────────────┤
+              │ project_identity│
+              │ fact_store      │
+              │ engineering_    │
+              │   memory        │
+              │ change engine   │
+              │ permissions     │
+              └─────────────────┘
+                       │
+                       ▼
+                 Repository
+```
+
+Control plane (CLI):
+
+```text
+codebro init    scan workspace → .codebro/facts.json (modules, symbols,
+                tests, build targets, dependencies)
+codebro serve   MCP server over stdio (6 tools)
+codebro doctor  diagnostics: identity/facts/memory/git, exit 0|1|2
+codebro         chat TUI (frozen)
+```
+
+Full design: [`docs/design/MCP_SERVER.md`](docs/design/MCP_SERVER.md).
 
 ### Agent Workflow
 
@@ -299,6 +372,32 @@ export CODEBRO_MODEL="gpt-4o"
 
 ## Usage
 
+### Engineering runtime (recommended)
+
+```bash
+# 1. Populate the fact store for a workspace
+codebro init --root /path/to/project        # or cd into the project and run `codebro init`
+
+# 2. Check the runtime state (exit code 0 ok / 1 warn / 2 error)
+codebro doctor --root /path/to/project
+
+# 3. Serve the engineering runtime over MCP stdio
+codebro serve --root /path/to/project
+```
+
+Connect a host agent (e.g. OpenCode):
+
+```bash
+opencode mcp add codebro -- \
+  /path/to/codebro/target/release/codebro serve --root /path/to/project
+```
+
+The agent then auto-consults CodeBro for project facts (symbols, modules,
+tests, dependencies), recorded decisions, and guarded edits — no prompt
+hints required. See [`docs/design/MCP_SERVER.md`](docs/design/MCP_SERVER.md) §8.
+
+### Chat TUI (frozen)
+
 ```bash
 codebro
 ```
@@ -357,40 +456,26 @@ codebro/
 ├── src/
 │   ├── main.rs              # Entry point
 │   ├── error.rs             # Error types and recovery
-│   ├── cli/                 # CLI parsing
-│   │   └── mod.rs
-│   ├── tui/                 # Terminal UI
-│   │   ├── mod.rs
-│   │   ├── app.rs           # App state
-│   │   ├── events.rs        # Event loop
-│   │   └── ui.rs            # Rendering
-│   ├── agent/               # Agent core
-│   │   ├── mod.rs
-│   │   ├── agent.rs         # Agent orchestration
-│   │   ├── planner.rs       # Task planning
-│   │   └── memory.rs        # Session memory
+│   ├── cli/                 # CLI parsing (chat, init, serve, doctor, ...)
+│   ├── mcp/                 # MCP server: 6 tools over stdio
+│   ├── init/                # Fact-store population (codebro init)
+│   ├── doctor/              # Diagnostics (codebro doctor)
+│   ├── engineering_facts/   # Canonical facts model (P10.5.0)
+│   ├── fact_store/          # Immutable indexed fact store + validation
+│   ├── engineering_memory/  # Decision/constraint memory runtime
+│   ├── project_identity/    # Project identity runtime
+│   ├── coding/              # ChangeEngine: guarded mutation seam
+│   │   └── permissions.rs   #   prepare/apply, workspace boundary
+│   ├── intelligence/        # Tree-sitter parser platform
+│   ├── tui/                 # Terminal UI (frozen)
+│   ├── agent/               # Agent core (frozen)
 │   ├── providers/           # LLM providers
-│   │   ├── mod.rs
-│   │   ├── provider.rs      # Provider trait
-│   │   └── openai.rs        # OpenAI implementation
-│   ├── tools/               # Tool system
-│   │   ├── mod.rs           # Tool trait
-│   │   ├── filesystem.rs    # File operations
-│   │   ├── shell.rs         # Shell commands
-│   │   ├── git.rs           # Git operations
-│   │   └── patch.rs         # Patch engine
-│   ├── indexer/             # Repository indexer
-│   │   ├── mod.rs
-│   │   └── scanner.rs       # File indexing
+│   ├── tools/               # Tool system (filesystem, shell, git, patch)
 │   ├── scanner/             # Project scanner
-│   │   ├── mod.rs
-│   │   └── project.rs       # Project detection
 │   ├── dispatcher/          # Tool dispatcher
-│   │   ├── mod.rs
-│   │   └── registry.rs      # Tool registry
 │   └── config/              # Configuration
-│       └── mod.rs
-└── tests.rs                 # Integration tests
+└── docs/
+    └── design/MCP_SERVER.md # MCP architecture + verified OpenCode tests
 ```
 
 > The legacy `src/context/` (context builder) and `src/prompt/` (prompt

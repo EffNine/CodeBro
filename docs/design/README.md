@@ -38,6 +38,14 @@ This directory contains the complete architectural blueprint for the Adaptive De
 
 ---
 
+## Implemented Specifications (current)
+
+| Document | Status | Summary |
+|----------|--------|---------|
+| [MCP_SERVER.md](./MCP_SERVER.md) | **Implemented** | Engineering runtime as an MCP server (`codebro serve`/`init`/`doctor`, 6 tools); verified end-to-end with OpenCode incl. A/B comparison (§9) and auto-detection tests (§10) |
+
+---
+
 ## Deliverables
 
 | Document | Description |
