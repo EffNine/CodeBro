@@ -4,11 +4,12 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "CodeBro terminal UI — fork of OpenCode TUI (MIT, Copyright (c) 2025 opencode)",
+  "description": "CodeBro terminal UI \u2014 fork of OpenCode TUI (MIT, Copyright (c) 2025 opencode)",
   "scripts": {
     "dev": "bun run src/index.tsx",
     "build": "bun build src/index.tsx --target=bun --outfile=dist/codebro-tui.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "postinstall": "node scripts/patch-solid.js"
   },
   "dependencies": {
     "@opentui/core": "0.4.5",

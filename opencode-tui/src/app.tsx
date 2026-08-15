@@ -188,28 +188,22 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
   const exit = { epilogue: undefined as string | undefined, reason: undefined as unknown }
   const result = yield* Effect.scoped(
     Effect.gen(function* () {
-      const renderer = yield* Effect.acquireRelease(
-        Effect.tryPromise({
-          try: () =>
-            createCliRenderer({
-              externalOutputMode: "passthrough",
-              targetFps: 60,
-              gatherStats: false,
-              exitOnCtrlC: false,
-              useKittyKeyboard: {},
-              autoFocus: false,
-              openConsoleOnError: false,
-              useMouse: !Flag.OPENCODE_DISABLE_MOUSE && input.config.mouse,
-              consoleOptions: {
-                keyBindings: [{ name: "y", ctrl: true, action: "copy-selection" }],
-              },
-            }),
-          catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+      const renderer = yield* Effect.promise(() =>
+        createCliRenderer({
+          externalOutputMode: "passthrough",
+          targetFps: 60,
+          gatherStats: false,
+          exitOnCtrlC: false,
+          useKittyKeyboard: {},
+          autoFocus: false,
+          openConsoleOnError: false,
+          useMouse: !Flag.OPENCODE_DISABLE_MOUSE && input.config.mouse,
+          consoleOptions: {
+            keyBindings: [{ name: "y", ctrl: true, action: "copy-selection" }],
+          },
+        }).catch((error) => {
+          throw error instanceof Error ? error : new Error(String(error))
         }),
-        (renderer) =>
-          Effect.sync(() => {
-            destroyRenderer(renderer)
-          }),
       )
       win32DisableProcessedInput()
       const keymap = createDefaultOpenTuiKeymap(renderer)

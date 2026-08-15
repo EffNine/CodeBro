@@ -5,7 +5,7 @@
 import { Context, Layer, Effect } from "effect"
 
 export class Service extends Context.Service<Service, GlobalInterface>()(
-  "@codebro/Global",
+  "@opencode/Global",
 ) {}
 
 export interface GlobalInterface {

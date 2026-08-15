@@ -3,9 +3,10 @@
 //! Lifecycle:
 //!   1. Spawn bridge process (`codebro --bridge`)
 //!   2. Wait for `ready` on bridge stderr
-//!   3. Spawn TUI (`bun run src/index.tsx`) with stdio cross-wired to bridge
-//!   4. Forward signals and manage graceful shutdown
-//!   5. Kill both children on exit
+//!   3. Spawn TUI (`bun run --conditions browser src/main.tsx`) with stdio cross-wired to bridge
+//!   4. Forward TUI stderr to launcher stderr for visibility
+//!   5. Manage graceful shutdown
+//!   6. Kill both children on exit
 
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
 /// Resolved paths for the launcher.
@@ -162,6 +164,7 @@ impl Launcher {
 
         // Spawn bridge
         let mut bridge = self.spawn_bridge()?;
+        eprintln!("[launcher] bridge spawned (pid={})", bridge.child.id());
 
         // Wait for ready event on bridge stderr
         let bridge_stderr = bridge
@@ -173,11 +176,22 @@ impl Launcher {
         if !ready {
             bail!("Bridge failed to become ready within timeout");
         }
+        eprintln!("[launcher] bridge ready");
 
         // Spawn TUI with cross-wired stdio:
-        //   TUI stdin  <- bridge stdout
-        //   TUI stdout -> bridge stdin
-        let tui = self.spawn_tui(&mut bridge)?;
+        //   TUI stdin  <- bridge stdout (protocol requests from TUI)
+        //   TUI stdout -> bridge stdin (protocol responses from bridge)
+        //   TUI stderr -> launcher stderr (errors/diagnostics visible to user)
+        let mut tui = self.spawn_tui(&mut bridge)?;
+        eprintln!("[launcher] tui spawned (pid={})", tui.child.id());
+
+        // Capture TUI stderr and forward to launcher stderr
+        let tui_stderr = tui
+            .child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to take TUI stderr"))?;
+        Self::forward_stderr(tui_stderr);
 
         // Wait for either child to exit, or Ctrl+C
         let ctrl_c = tokio::signal::ctrl_c();
@@ -187,8 +201,7 @@ impl Launcher {
         let (bridge_tx, mut bridge_rx) = oneshot::channel::<std::process::ExitStatus>();
         let (tui_tx, mut tui_rx) = oneshot::channel::<std::process::ExitStatus>();
 
-        // Spawn waiters in background (child.wait() is sync, so block_in_place)
-        // We take ownership of the children here; bridge/tui are consumed.
+        // Spawn waiters in background (child.wait() is sync)
         let mut bridge_child = bridge.child;
         let mut tui_child = tui.child;
 
@@ -211,11 +224,11 @@ impl Launcher {
                 status = &mut bridge_rx => {
                     match status {
                         Ok(s) => {
-                            eprintln!("[launcher] Bridge exited with status: {:?}", s);
+                            eprintln!("[launcher] bridge exited with status: {:?}", s);
                             break;
                         }
                         Err(_) => {
-                            eprintln!("[launcher] Bridge exit channel closed");
+                            eprintln!("[launcher] bridge exit channel closed");
                             break;
                         }
                     }
@@ -224,14 +237,14 @@ impl Launcher {
                     match status {
                         Ok(s) => {
                             if s.success() {
-                                eprintln!("[launcher] TUI exited cleanly");
+                                eprintln!("[launcher] tui exited cleanly");
                             } else {
-                                eprintln!("[launcher] TUI exited with code: {:?}", s.code());
+                                eprintln!("[launcher] tui exited with code: {:?}", s.code());
                             }
                             break;
                         }
                         Err(_) => {
-                            eprintln!("[launcher] TUI exit channel closed");
+                            eprintln!("[launcher] tui exit channel closed");
                             break;
                         }
                     }
@@ -239,8 +252,8 @@ impl Launcher {
             }
         }
 
-        // Graceful shutdown — children are already dropped/consumed above
-        eprintln!("[launcher] Shutdown complete");
+        // Graceful shutdown — children are already consumed above
+        eprintln!("[launcher] shutdown complete");
         Ok(())
     }
 
@@ -276,7 +289,6 @@ impl Launcher {
                     Ok(_) => {
                         let trimmed = line.trim().to_lowercase();
                         if trimmed.contains("ready") {
-                            eprintln!("[launcher] Bridge is ready");
                             let _ = tx.send(true);
                             return;
                         }
@@ -287,7 +299,6 @@ impl Launcher {
                     }
                 }
                 if start.elapsed() > timeout_dur {
-                    eprintln!("[launcher] Timeout waiting for bridge ready");
                     let _ = tx.send(false);
                     return;
                 }
@@ -318,28 +329,43 @@ impl Launcher {
             .arg("src/main.tsx")
             .current_dir(&self.paths.tui_root)
             .stdin(Stdio::from(bridge_stdout))
-            .stdout(Stdio::piped())
+            .stdout(Stdio::from(bridge_stdin))
             .stderr(Stdio::piped())
             .spawn()?;
 
         Ok(ChildHandle { child, name: "tui" })
     }
 
-    async fn shutdown(bridge: &mut ChildHandle, tui: &mut ChildHandle) {
-        eprintln!("[launcher] Shutting down children...");
+    /// Forward TUI stderr to launcher stderr in a background task.
+    fn forward_stderr(stderr: impl Read + Send + 'static) {
+        tokio::task::spawn_blocking(move || {
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        eprint!("{}", line);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 
-        // Give children a moment to notice exit and clean up
+    async fn shutdown(bridge: &mut ChildHandle, tui: &mut ChildHandle) {
+        eprintln!("[launcher] shutting down children...");
+
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // Force kill if still running
         let _ = bridge.kill();
         let _ = tui.kill();
 
-        // Final wait
         let _ = bridge.child.try_wait();
         let _ = tui.child.try_wait();
 
-        eprintln!("[launcher] Shutdown complete");
+        eprintln!("[launcher] shutdown complete");
     }
 }
 
