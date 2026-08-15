@@ -192,11 +192,10 @@ fn target_label(id: &crate::engineering_facts::FactId) -> String {
 
 /// Score a record against the (lower-cased) query.
 ///
-/// - exact name match: 100
-/// - name prefix: 80
-/// - name substring: 60
-/// - path substring: 30
-/// - signature substring: 15
+/// The query is split into whitespace-separated tokens; the best-matching
+/// token scores the record (exact name 100, prefix 80, substring 60, path
+/// 30, summary 15), so "breaker Stats Allow" matches symbols named Stats
+/// or Allow as well as the package's breaker symbols.
 fn score_fact(record: &FactRecord, query: &str) -> i32 {
     if query.is_empty() {
         // No query: everything is a match at base relevance, so the caller
@@ -204,26 +203,29 @@ fn score_fact(record: &FactRecord, query: &str) -> i32 {
         return 1;
     }
     let name = record.name.to_lowercase();
-    if name == query {
-        return 100;
-    }
-    if name.starts_with(query) {
-        return 80;
-    }
-    if name.contains(query) {
-        return 60;
-    }
-    if let Some(path) = record.path.as_deref() {
-        if path.to_lowercase().contains(query) {
-            return 30;
+    let path = record.path.as_deref().unwrap_or("").to_lowercase();
+    let summary = record.summary.as_deref().unwrap_or("").to_lowercase();
+
+    let mut best = 0;
+    for token in query.split_whitespace() {
+        let mut score = 0;
+        if name == token {
+            score = 100;
+        } else if name.starts_with(token) {
+            score = 80;
+        } else if name.contains(token) {
+            score = 60;
+        } else if path.contains(token) {
+            score = 30;
+        } else if summary.contains(token) {
+            score = 15;
+        }
+        best = best.max(score);
+        if best == 100 {
+            break;
         }
     }
-    if let Some(summary) = record.summary.as_deref() {
-        if summary.to_lowercase().contains(query) {
-            return 15;
-        }
-    }
-    0
+    best
 }
 
 #[cfg(test)]

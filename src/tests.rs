@@ -1141,6 +1141,14 @@ func greet(name string) string {
 type Person struct {
     Name string
 }
+
+func (p *Person) FullName() string {
+    return p.Name
+}
+
+func (p Person) Age() int {
+    return 0
+}
 "#;
 
     let result = crate::intelligence::parser::parse_source("go", source, "test.go")
@@ -1149,6 +1157,26 @@ type Person struct {
     assert!(!result.symbols.is_empty());
     let symbol_names: Vec<String> = result.symbols.iter().map(|s| s.name.clone()).collect();
     assert!(symbol_names.contains(&"greet".to_string()));
+    // Go methods must be extracted with their real names (field_identifier),
+    // not garbage like "bool"/"string"/"unknown".
+    assert!(
+        symbol_names.contains(&"FullName".to_string()),
+        "method FullName missing from {symbol_names:?}"
+    );
+    assert!(
+        symbol_names.contains(&"Age".to_string()),
+        "method Age missing from {symbol_names:?}"
+    );
+    let methods: Vec<&crate::intelligence::parser::ParsedSymbol> = result
+        .symbols
+        .iter()
+        .filter(|s| matches!(s.kind, crate::intelligence::parser::SymbolKind::Method))
+        .collect();
+    assert_eq!(methods.len(), 2, "expected 2 methods, got {methods:?}");
+    assert!(
+        methods.iter().all(|m| m.name != "unknown"),
+        "no method may be named unknown: {methods:?}"
+    );
 }
 
 #[test]

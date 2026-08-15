@@ -170,7 +170,6 @@ impl CodeParser {
                 self.extract_symbols(child, source, file_path, result, parent)?;
             }
         }
-
         Ok(())
     }
 
@@ -714,6 +713,59 @@ impl CodeParser {
                     column_start: node.start_position().column as u32,
                     column_end: node.end_position().column as u32,
                     parent: parent.map(|s| s.to_string()),
+                    visibility: None,
+                    signature: self.extract_signature(node, source),
+                    doc_comment: self.extract_doc_comment(node, source),
+                });
+            }
+            "method_declaration" => {
+                // Go methods: `func (b *Breaker) Stats() ...`. The method
+                // name is a `field_identifier` (not `identifier`), and the
+                // receiver type is the parent context.
+                let name = self
+                    .get_node_by_kind(node, "field_identifier")
+                    .and_then(|n| self.node_name(n, source))
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                // Receiver type from the first parameter list: (b *Breaker).
+                let receiver = self
+                    .get_node_by_kind(node, "parameter_list")
+                    .and_then(|pl| {
+                        (0..pl.child_count()).find_map(|i| {
+                            let c = pl.child(i)?;
+                            if c.kind() == "parameter_declaration" {
+                                Some(c)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .and_then(|pd| {
+                        (0..pd.child_count()).find_map(|i| {
+                            let c = pd.child(i)?;
+                            if c.kind() == "pointer_type" || c.kind() == "type_identifier" {
+                                Some(self.node_text(c, source))
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .unwrap_or_default();
+
+                result.symbols.push(ParsedSymbol {
+                    name: name.clone(),
+                    kind: SymbolKind::Method,
+                    language: "go".to_string(),
+                    file: file_name.to_string(),
+                    line_start: self.line_to_u32(node.start_position()),
+                    line_end: self.line_to_u32(node.end_position()),
+                    column_start: node.start_position().column as u32,
+                    column_end: node.end_position().column as u32,
+                    parent: Some(if receiver.is_empty() {
+                        name.clone()
+                    } else {
+                        receiver
+                    }),
                     visibility: None,
                     signature: self.extract_signature(node, source),
                     doc_comment: self.extract_doc_comment(node, source),
