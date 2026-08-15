@@ -11,6 +11,7 @@ mod coding;
 mod config;
 mod credentials;
 mod dispatcher;
+mod doctor;
 mod engineering_context;
 mod engineering_facts;
 mod engineering_memory;

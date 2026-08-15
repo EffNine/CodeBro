@@ -38,6 +38,13 @@ enum Commands {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+
+    /// Diagnose the engineering-runtime state of the workspace.
+    Doctor {
+        /// Workspace root to check; defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
 }
 
 const FALLBACK_MODEL: &str = "gpt-4o";
@@ -172,6 +179,14 @@ pub async fn run() -> Result<()> {
                 None => std::env::current_dir()?,
             };
             crate::init::run(&workspace_root)?;
+        }
+        Some(Commands::Doctor { root }) => {
+            let workspace_root = match root {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let code = crate::doctor::run(&workspace_root)?;
+            std::process::exit(code);
         }
     }
 
