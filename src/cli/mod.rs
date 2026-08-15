@@ -24,6 +24,13 @@ enum Commands {
 
     /// Run the interactive onboarding wizard.
     Onboard,
+
+    /// Run the engineering runtime as an MCP server over stdio.
+    Serve {
+        /// Workspace root to serve; defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
 }
 
 const FALLBACK_MODEL: &str = "gpt-4o";
@@ -144,6 +151,13 @@ pub async fn run() -> Result<()> {
         Some(Commands::Onboard) => {
             let config_dir = crate::config::Config::config_dir();
             run_onboarding_wizard(config_dir, &mut crate::config::Config::load()?).await?;
+        }
+        Some(Commands::Serve { root }) => {
+            let workspace_root = match root {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            crate::mcp::serve(workspace_root).await?;
         }
     }
 

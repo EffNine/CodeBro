@@ -37,6 +37,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 portable-pty = "0.9.0"
 ansi-to-tui = "4.1.0"
 libc = "0.2.189"
+rmcp = { version = "3.1.2", features = ["transport-io"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
