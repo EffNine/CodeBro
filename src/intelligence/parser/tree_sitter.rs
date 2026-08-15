@@ -189,6 +189,21 @@ impl CodeParser {
         }
     }
 
+    /// Resolve a declaration's name. Most grammars name declarations via
+    /// `identifier`; Rust (and TypeScript) type declarations use
+    /// `type_identifier` instead, so fall back to it when the primary kind
+    /// is absent. `get_node_by_kind` searches direct children only, which
+    /// keeps field/variable names out of type-name lookups.
+    fn name_of(&self, node: Node, source: &str, kind: &str) -> String {
+        self.get_node_by_kind(node, kind)
+            .and_then(|n| self.node_name(n, source))
+            .unwrap_or_else(|| {
+                self.get_node_by_kind(node, "type_identifier")
+                    .and_then(|n| self.node_name(n, source))
+                    .unwrap_or_else(|| "unknown".to_string())
+            })
+    }
+
     fn get_node_by_kind<'a>(&self, node: Node<'a>, kind: &str) -> Option<Node<'a>> {
         if node.kind() == kind {
             return Some(node);
@@ -239,14 +254,17 @@ impl CodeParser {
         result: &mut ParseResult,
         parent: Option<&str>,
     ) -> Result<()> {
+        // Skip unnamed nodes (keywords, punctuation, operators). Without this,
+        // the keyword children of item nodes (e.g. `struct`, `fn`, `impl`)
+        // match the item arms below and produce duplicate "unknown" symbols.
+        if !node.is_named() {
+            return Ok(());
+        }
         let kind = node.kind();
 
         match kind {
             "fn" | "function_item" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 let sig = self.extract_signature(node, source);
 
@@ -272,10 +290,7 @@ impl CodeParser {
                 });
             }
             "struct" | "struct_item" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 let visibility = self.visibility_from_modifiers(node, source);
 
@@ -295,10 +310,7 @@ impl CodeParser {
                 });
             }
             "enum" | "enum_item" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 let visibility = self.visibility_from_modifiers(node, source);
 
@@ -318,10 +330,7 @@ impl CodeParser {
                 });
             }
             "trait" | "trait_item" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 let visibility = self.visibility_from_modifiers(node, source);
 
@@ -341,10 +350,7 @@ impl CodeParser {
                 });
             }
             "impl" | "impl_item" => {
-                let name_node = self.get_node_by_kind(node, "type");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "type_identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -362,10 +368,7 @@ impl CodeParser {
                 });
             }
             "type" | "type_alias" | "type_item" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -383,10 +386,7 @@ impl CodeParser {
                 });
             }
             "macro" | "macro_item" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -404,10 +404,7 @@ impl CodeParser {
                 });
             }
             "mod" | "mod_item" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -446,10 +443,7 @@ impl CodeParser {
 
         match kind {
             "function_definition" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 let sig = self.extract_signature(node, source);
 
@@ -469,10 +463,7 @@ impl CodeParser {
                 });
             }
             "class_definition" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -515,10 +506,7 @@ impl CodeParser {
 
         match kind {
             "function_declaration" | "function_expression" | "arrow_function" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "anonymous".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 let sig = self.extract_signature(node, source);
 
@@ -538,10 +526,7 @@ impl CodeParser {
                 });
             }
             "class_declaration" | "class_expression" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -559,10 +544,7 @@ impl CodeParser {
                 });
             }
             "method_definition" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -605,10 +587,7 @@ impl CodeParser {
 
         match kind {
             "function_declaration" | "function_expression" | "arrow_function" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "anonymous".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -626,10 +605,7 @@ impl CodeParser {
                 });
             }
             "class_declaration" | "class_expression" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -647,10 +623,7 @@ impl CodeParser {
                 });
             }
             "method_definition" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -668,10 +641,7 @@ impl CodeParser {
                 });
             }
             "interface_declaration" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -697,10 +667,7 @@ impl CodeParser {
                 result.exports.push(text);
             }
             "type_alias_declaration" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -735,10 +702,7 @@ impl CodeParser {
 
         match kind {
             "function_declaration" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -787,10 +751,7 @@ impl CodeParser {
                 }
             }
             "method_declaration" => {
-                let name_node = self.get_node_by_kind(node, "identifier");
-                let name = name_node
-                    .and_then(|n| self.node_name(n, source))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = self.name_of(node, source, "identifier");
 
                 result.symbols.push(ParsedSymbol {
                     name,

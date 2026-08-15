@@ -122,13 +122,28 @@ pub fn run(workspace_root: &Path) -> Result<i32> {
                     let store = crate::fact_store::FactStore::from_model(&model);
                     let validation = crate::fact_store::validation::FactValidation::validate(&store);
                     let counts = store.collection().counts();
+                    let mut breakdown = String::new();
+                    for rule in crate::fact_store::validation::FactValidationRule::ALL {
+                        let n = validation.count_by_rule(rule);
+                        if n > 0 {
+                            if !breakdown.is_empty() {
+                                breakdown.push_str(", ");
+                            }
+                            breakdown.push_str(&format!("{}={n}", rule.as_str()));
+                        }
+                    }
                     let detail = format!(
-                        "{} facts ({} modules, {} symbols, {} tests) — validation: {} issues",
+                        "{} facts ({} modules, {} symbols, {} tests) — validation: {} issues{}",
                         counts.total,
                         counts.modules,
                         counts.symbols,
                         counts.tests,
-                        validation.issue_count()
+                        validation.issue_count(),
+                        if breakdown.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{breakdown}]")
+                        }
                     );
                     if validation.passed() {
                         checks.push(Check::pass("facts", detail));

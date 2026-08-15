@@ -90,11 +90,18 @@ pub fn run(workspace_root: &Path) -> Result<()> {
 
         for sym in parsed.symbols {
             let kind = map_symbol_kind(&sym.kind);
-            let mut sf = SymbolFact::new(
-                SymbolId::new(format!("sym::{}::{}", rel, sym.name)),
-                sym.name.clone(),
-                kind,
+            // Uniqueness: same name can appear multiple times per file
+            // (e.g. method `new` on many structs, or a struct and its impl
+            // block). Disambiguate with kind + line so every symbol gets a
+            // stable, unique id without changing the source-level identity.
+            let sym_id = format!(
+                "sym::{}::{}_{}@{}",
+                rel,
+                sym.name,
+                kind.as_str(),
+                sym.line_start
             );
+            let mut sf = SymbolFact::new(SymbolId::new(sym_id), sym.name.clone(), kind);
             sf.module = Some(mid.clone());
             sf.visibility = map_visibility(sym.visibility.as_deref());
             sf.signature = sym.signature.clone();
@@ -120,11 +127,17 @@ pub fn run(workspace_root: &Path) -> Result<()> {
                 && matches!(sym.kind, crate::intelligence::parser::SymbolKind::Function);
             if looks_like_test_file || looks_like_test_fn {
                 let mut tf = TestFact::new(
-                    TestId::new(format!("test::{}::{}", rel, sym.name)),
+                    TestId::new(format!(
+                        "test::{}::{}_{}@{}",
+                        rel, sym.name, kind.as_str(), sym.line_start
+                    )),
                     sym.name.clone(),
                 );
                 tf.target = Some(crate::engineering_facts::FactId::Symbol(SymbolId::new(
-                    format!("sym::{}::{}", rel, sym.name),
+                    format!(
+                        "sym::{}::{}_{}@{}",
+                        rel, sym.name, kind.as_str(), sym.line_start
+                    ),
                 )));
                 tf.location = Some(
                     SourceLocation::new()
@@ -211,7 +224,7 @@ fn discover_packages(
         .unwrap_or_else(|| "root".to_string());
     let id = PackageId::new(format!("pkg::{name}"));
     let mut fallback_target = BuildTargetFact::new(
-        BuildTargetId::new(format!("build::{name}")),
+        BuildTargetId::new(format!("build::bin::{name}")),
         name.clone(),
         BuildTargetKind::Binary,
     );
@@ -256,7 +269,7 @@ fn parse_cargo_package(
             .unwrap_or(&name)
             .to_string();
         let mut t = BuildTargetFact::new(
-            BuildTargetId::new(format!("build::{lib_name}")),
+            BuildTargetId::new(format!("build::lib::{lib_name}")),
             lib_name,
             BuildTargetKind::Library,
         );
@@ -265,10 +278,14 @@ fn parse_cargo_package(
         targets.push(t);
     }
 
-    // Binary targets: [[bin]] or implicit src/main.rs.
-    if root.join("src/main.rs").exists() {
+    // Binary targets: [[bin]] entries, or the implicit src/main.rs binary
+    // only when no explicit [[bin]] section exists (Cargo infers main.rs as
+    // a binary named after the package when [[bin]] is absent; when it is
+    // present, the explicit entries are authoritative).
+    let explicit_bins = value.get("bin").and_then(|b| b.as_array());
+    if root.join("src/main.rs").exists() && explicit_bins.is_none() {
         let mut t = BuildTargetFact::new(
-            BuildTargetId::new(format!("build::{name}")),
+            BuildTargetId::new(format!("build::bin::{name}")),
             name.clone(),
             BuildTargetKind::Binary,
         );
@@ -276,7 +293,7 @@ fn parse_cargo_package(
         t.language = Some("rust".to_string());
         targets.push(t);
     }
-    if let Some(bins) = value.get("bin").and_then(|b| b.as_array()) {
+    if let Some(bins) = explicit_bins {
         for bin in bins {
             let bin_name = bin
                 .get("name")
@@ -284,7 +301,7 @@ fn parse_cargo_package(
                 .unwrap_or(&name)
                 .to_string();
             let mut t = BuildTargetFact::new(
-                BuildTargetId::new(format!("build::{bin_name}")),
+                BuildTargetId::new(format!("build::bin::{bin_name}")),
                 bin_name,
                 BuildTargetKind::Binary,
             );
@@ -303,7 +320,7 @@ fn parse_cargo_package(
                 .unwrap_or("test")
                 .to_string();
             let mut bt = BuildTargetFact::new(
-                BuildTargetId::new(format!("build::{test_name}")),
+                BuildTargetId::new(format!("build::test::{test_name}")),
                 test_name,
                 BuildTargetKind::Test,
             );
@@ -316,7 +333,7 @@ fn parse_cargo_package(
     if targets.is_empty() {
         // Unknown target shape: still register the package with a generic target.
         let mut t = BuildTargetFact::new(
-            BuildTargetId::new(format!("build::{name}")),
+            BuildTargetId::new(format!("build::bin::{name}")),
             name.clone(),
             BuildTargetKind::Unknown,
         );
