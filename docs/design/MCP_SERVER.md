@@ -320,3 +320,64 @@ the product targets.
   grepping."
 - Consider a benchmark harness (see advisor's 90-day plan: measure
   context-error reduction across ≥10 tasks).
+
+---
+
+## 10. Auto-detection verification (2026-08-15)
+
+After the directive `ServerInfo.instructions` landed (see §9.4 → done),
+re-ran the scenarios **without any mention of codebro in the prompts** to
+verify the agent consults CodeBro by itself.
+
+### 10.1 Cross-module impact map
+
+Prompt: *"I'm about to modify the change engine. Which modules reference
+ChangeEngine? Give me a map of what I'd be touching."*
+
+Result — exact dependency map: `src/coding/permissions.rs` (owner),
+`src/coding/mod.rs` (re-export), `src/mcp/mod.rs:216` (the **only external
+consumer**), plus a per-file symbol count of the whole `coding` module
+(208 symbols across 6 files). No other module imports `ChangeEngine`.
+
+### 10.2 Change planning
+
+Prompt: *"I want to add a new MCP tool `check_memory_count`. Produce a
+precise change plan."*
+
+Tool calls (agent-initiated): `codebro_workspace_context` →
+`codebro_engineering_memory` → `codebro_engineering_facts(symbol)`.
+
+Result: a correct, minimal plan — **one file** (`src/mcp/mod.rs`), a
+read-only tool following the existing `#[tool]` pattern, tolerant
+`memory.load()`, `entry_count()` on the snapshot. No speculative edits.
+
+### 10.3 Memory recording
+
+Prompt: *"I want this constraint remembered: all file mutations must go
+through ChangeEngine, never raw writes."*
+
+Agent called `codebro_record_memory` itself with rich metadata:
+confidence 0.95, importance 0.9, tags `[architecture, change-engine,
+constraint, file-mutations]`, source `colleague-informed`. Entry verified
+persisted to `.codebro/engineering_memory.json`.
+
+### 10.4 Anti-amnesia (fresh session)
+
+Prompt (in a **new, empty session**): *"Is there anything in this
+project's recorded engineering context I should know before writing
+files?"*
+
+Agent called `codebro_engineering_memory` first, **retrieved the
+constraint recorded in the previous session**, and connected it to
+action: "use `codebro_apply_change` rather than raw writes". This is the
+persistent-context scenario the product targets: knowledge survives
+across sessions without being re-stated.
+
+### 10.5 Conclusion
+
+- **Auto-detection works**: in all four scenarios the agent consulted
+  CodeBro tools before (or alongside) grep — no prompt hints required.
+- **Memory lifecycle is closed**: record (10.3) → persist → retrieve in a
+  fresh session (10.4) — the anti-amnesia loop is functional end-to-end.
+- Facts store used by the agent grew with dependency facts (33
+  dependencies from Cargo.toml, validation still 0 issues).

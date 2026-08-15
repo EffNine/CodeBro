@@ -5,9 +5,9 @@
 //! `.codebro/facts.json`. The MCP server (`codebro serve`) reads this file;
 //! without it, `engineering_facts` returns an empty store.
 //!
-//! Scope (MVP): workspace, packages, modules, symbols, tests and build
-//! targets. Dependencies, relationships, references, diagnostics and
-//! architecture rules are follow-up milestones.
+//! Scope: workspace, packages, modules, symbols, tests, build targets and
+//! package dependencies (from Cargo.toml). Relationships, references,
+//! diagnostics and architecture rules are follow-up milestones.
 
 use std::path::{Path, PathBuf};
 
@@ -15,9 +15,9 @@ use anyhow::{Context, Result};
 use walkdir::WalkDir;
 
 use crate::engineering_facts::{
-    BuildTargetFact, BuildTargetId, BuildTargetKind, FactsBuilder, ModuleFact, ModuleId,
-    PackageFact, PackageId, SymbolFact, SymbolId, SymbolKind, TestFact, TestId, Visibility,
-    WorkspaceFact, WorkspaceId,
+    BuildTargetFact, BuildTargetId, BuildTargetKind, DependencyFact, DependencyId,
+    DependencyKind, FactsBuilder, FactId, ModuleFact, ModuleId, PackageFact, PackageId,
+    SymbolFact, SymbolId, SymbolKind, TestFact, TestId, Visibility, WorkspaceFact, WorkspaceId,
 };
 use crate::engineering_facts::{
     FactsModel,
@@ -154,6 +154,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     }
 
     // ── Assemble package/workspace references ────────────────────────
+    let mut external_crates: Vec<DiscoveredPackage> = Vec::new();
     for pkg in &packages {
         let mut pf = PackageFact::new(pkg.id.clone(), pkg.name.clone());
         pf.workspace = Some(ws_id.clone());
@@ -166,7 +167,49 @@ pub fn run(workspace_root: &Path) -> Result<()> {
             .collect();
         pf.build_targets = targets;
         builder.add_package(pf);
+
+        // Dependency links: source = this package, target = an external
+        // crate package fact (created below so endpoints resolve).
+        for dep in &pkg.dependencies {
+            let target_id = PackageId::new(format!("pkg::{crate}::external", crate = dep.name));
+            let dep_id = DependencyId::new(format!(
+                "dep::{}->{}",
+                pkg.name,
+                dep.name
+            ));
+            let mut df = DependencyFact::new(
+                dep_id,
+                FactId::Package(pkg.id.clone()),
+                FactId::Package(target_id.clone()),
+            );
+            df.kind = dep.kind;
+            df.version_constraint = dep.version.clone();
+            builder.add_dependency(df);
+
+            external_crates.push(DiscoveredPackage {
+                id: target_id,
+                name: dep.name.clone(),
+                version: dep.version.clone(),
+                language: "unknown".to_string(),
+                path: root.join("."),
+                dependencies: Vec::new(),
+            });
+        }
     }
+    // External crate stubs: package facts so dependency endpoints resolve
+    // and the graph is queryable. Workspace = None (they are not part of
+    // this project).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ext in &external_crates {
+        if !seen.insert(ext.id.as_str().to_string()) {
+            continue;
+        }
+        let mut ef = PackageFact::new(ext.id.clone(), ext.name.clone());
+        ef.language = Some("unknown".to_string());
+        ef.version = ext.version.clone();
+        builder.add_package(ef);
+    }
+
     for bt in &build_targets {
         builder.add_build_target(bt.clone());
     }
@@ -190,9 +233,17 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     println!("  symbols:     {}", counts.symbols);
     println!("  tests:       {}", counts.tests);
     println!("  build targets: {}", counts.build_targets);
+    println!("  dependencies: {}", counts.dependencies);
     println!("  facts file:  {}", out.display());
 
     Ok(())
+}
+
+/// A single declared dependency (crate name + version constraint + kind).
+struct DiscoveredDependency {
+    name: String,
+    version: Option<String>,
+    kind: DependencyKind,
 }
 
 /// A lightweight package descriptor produced by manifest discovery.
@@ -202,6 +253,7 @@ struct DiscoveredPackage {
     version: Option<String>,
     language: String,
     path: PathBuf,
+    dependencies: Vec<DiscoveredDependency>,
 }
 
 /// Read `Cargo.toml` for the workspace root; fall back to a single
@@ -237,6 +289,7 @@ fn discover_packages(
             version: None,
             language: "unknown".to_string(),
             path: root.to_path_buf(),
+            dependencies: Vec::new(),
         }],
         vec![fallback_target],
     )
@@ -342,6 +395,42 @@ fn parse_cargo_package(
         targets.push(t);
     }
 
+    // ── Dependencies ──────────────────────────────────────────────────
+    // [dependencies] + [dev-dependencies] + [build-dependencies].
+    let mut dependencies: Vec<DiscoveredDependency> = Vec::new();
+    for (section, kind) in [
+        ("dependencies", DependencyKind::Direct),
+        ("dev-dependencies", DependencyKind::Dev),
+        ("build-dependencies", DependencyKind::Build),
+    ] {
+        let Some(table) = value.get(section).and_then(|v| v.as_table()) else {
+            continue;
+        };
+        for (dep_name, dep_value) in table {
+            // Simple form: `serde = "1"` or `serde = { version = "1", optional = true }`.
+            let (version, optional) = match dep_value {
+                toml::Value::String(v) => (Some(v.clone()), false),
+                toml::Value::Table(t) => (
+                    t.get("version").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    t.get("optional")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                ),
+                _ => (None, false),
+            };
+            let effective_kind = if optional {
+                DependencyKind::Optional
+            } else {
+                kind
+            };
+            dependencies.push(DiscoveredDependency {
+                name: dep_name.clone(),
+                version,
+                kind: effective_kind,
+            });
+        }
+    }
+
     Some((
         DiscoveredPackage {
             id,
@@ -349,6 +438,7 @@ fn parse_cargo_package(
             version,
             language: "rust".to_string(),
             path: root.to_path_buf(),
+            dependencies,
         },
         targets,
     ))

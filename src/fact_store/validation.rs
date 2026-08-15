@@ -234,7 +234,10 @@ impl FactValidation {
         // 5. Orphan records — a collection record scoped by no reverse
         //    index. Workspaces are the root container and are exempt;
         //    dependency facts carry no scope projection in the model (no
-        //    location and no owner field), so they are exempt too.
+        //    location and no owner field), so they are exempt too; and
+        //    external (workspace-less) package facts — e.g. third-party
+        //    crates referenced by dependency links — are external entities
+        //    that are intentionally not scoped inside this workspace.
         let mut scoped: HashSet<FactId> = HashSet::new();
         for reverse in [
             index.reverse_workspace(),
@@ -247,7 +250,10 @@ impl FactValidation {
             }
         }
         for fact in collection.iter() {
-            if matches!(fact, FactRef::Workspace(_) | FactRef::Dependency(_)) {
+            let is_external_package = matches!(fact, FactRef::Package(p) if p.workspace.is_none());
+            if matches!(fact, FactRef::Workspace(_) | FactRef::Dependency(_))
+                || is_external_package
+            {
                 continue;
             }
             let id = fact_id_of(&fact);
