@@ -226,6 +226,118 @@ impl CodeBroMcpServer {
             result,
         )]))
     }
+
+    // ── Tool 5: record engineering memory (guarded write) ─────────────
+
+    /// Record or update an engineering memory entry. Values are
+    /// secret-redacted before storage; the entry is persisted to
+    /// `.codebro/engineering_memory.json`.
+    #[tool(description = "Record or update an engineering memory entry (decision, constraint, context). Values are secret-redacted before storage. Pass the same key to update an existing entry. Persisted to .codebro/engineering_memory.json.")]
+    async fn record_memory(
+        &self,
+        Parameters(args): Parameters<RecordMemoryArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let key = args.key.trim();
+        if key.is_empty() {
+            return Err(McpError::invalid_params("key must not be empty", None));
+        }
+        if args.value.trim().is_empty() {
+            return Err(McpError::invalid_params("value must not be empty", None));
+        }
+        const MAX_VALUE_LEN: usize = 64 * 1024;
+        if args.value.len() > MAX_VALUE_LEN {
+            return Err(McpError::invalid_params(
+                format!("value exceeds {MAX_VALUE_LEN} bytes"),
+                None,
+            ));
+        }
+
+        // Hardening: redact secrets before anything touches storage.
+        let value = crate::tools::shell::redact_secrets_public(&args.value);
+
+        let mut tags = args.tags.clone();
+        tags.sort();
+        tags.dedup();
+
+        let mut metadata =
+            crate::engineering_memory::types::EngineeringMemoryMetadata::new()
+                .with_confidence(args.confidence.clamp(0.0, 1.0))
+                .with_importance(args.importance.clamp(0.0, 1.0));
+        for tag in &tags {
+            metadata = metadata.with_tag(tag);
+        }
+        if let Some(source) = args.source.as_deref() {
+            metadata = metadata.with_source(source);
+        }
+
+        let identity = crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
+        let mut memory =
+            crate::engineering_memory::EngineeringMemoryRuntime::new(&self.workspace_root, identity);
+        let _ = memory.load();
+
+        // Deterministic id from the key: upsert semantics.
+        let id = format!("mem::{key}");
+        let exists = memory.snapshot().iter().any(|e| e.id == id);
+
+        if exists {
+            memory
+                .update(&id, value)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        } else {
+            let entry = crate::engineering_memory::types::EngineeringMemoryEntry::new(
+                id.clone(),
+                key,
+                value,
+            )
+            .with_metadata(metadata);
+            memory
+                .record(entry)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        }
+        memory
+            .persist()
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let action = if exists { "updated" } else { "recorded" };
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            format!("memory {action}: {key}"),
+        )]))
+    }
+
+    // ── Tool 6: delete engineering memory (guarded write) ─────────────
+
+    /// Delete an engineering memory entry by its exact key.
+    #[tool(description = "Delete an engineering memory entry by its exact key. Persisted to .codebro/engineering_memory.json.")]
+    async fn delete_memory(
+        &self,
+        Parameters(args): Parameters<DeleteMemoryArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let key = args.key.trim();
+        if key.is_empty() {
+            return Err(McpError::invalid_params("key must not be empty", None));
+        }
+        let id = format!("mem::{key}");
+
+        let identity = crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
+        let mut memory =
+            crate::engineering_memory::EngineeringMemoryRuntime::new(&self.workspace_root, identity);
+        let _ = memory.load();
+
+        let exists = memory.snapshot().iter().any(|e| e.id == id);
+        if !exists {
+            return Err(McpError::invalid_params(format!("no entry for key '{key}'"), None));
+        }
+        memory
+            .delete(&id)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        memory
+            .persist()
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            format!("memory deleted: {key}"),
+        )]))
+    }
 }
 
 /// Argument schema for `engineering_facts`.
@@ -258,6 +370,38 @@ pub struct ChangeArgs {
     pub old: String,
     /// Replacement text.
     pub new: String,
+}
+
+/// Argument schema for `record_memory`.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RecordMemoryArgs {
+    /// Stable key for this memory entry (e.g. "architecture:change-engine").
+    pub key: String,
+    /// Full memory value: the decision, constraint or context.
+    pub value: String,
+    /// Associative tags for filtering; sorted and de-duplicated server-side.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Confidence score in [0.0, 1.0]; clamped server-side. Default 0.5.
+    #[serde(default = "default_half")]
+    pub confidence: f64,
+    /// Importance score in [0.0, 1.0]; clamped server-side. Default 0.5.
+    #[serde(default = "default_half")]
+    pub importance: f64,
+    /// Optional provenance source (e.g. "sprint-31-review").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// Argument schema for `delete_memory`.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DeleteMemoryArgs {
+    /// Exact key of the entry to delete.
+    pub key: String,
+}
+
+fn default_half() -> f64 {
+    0.5
 }
 
 #[tool_handler]
