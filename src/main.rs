@@ -20,6 +20,7 @@ mod fact_store;
 mod integration_pipeline;
 mod intelligence;
 mod intent_engine;
+mod init;
 mod mcp;
 mod memory_runtime;
 mod metrics;

@@ -31,6 +31,13 @@ enum Commands {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+
+    /// Scan the workspace and populate .codebro/facts.json.
+    Init {
+        /// Workspace root to scan; defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
 }
 
 const FALLBACK_MODEL: &str = "gpt-4o";
@@ -158,6 +165,13 @@ pub async fn run() -> Result<()> {
                 None => std::env::current_dir()?,
             };
             crate::mcp::serve(workspace_root).await?;
+        }
+        Some(Commands::Init { root }) => {
+            let workspace_root = match root {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            crate::init::run(&workspace_root)?;
         }
     }
 
