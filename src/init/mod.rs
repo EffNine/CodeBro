@@ -15,14 +15,14 @@ use anyhow::{Context, Result};
 use walkdir::WalkDir;
 
 use crate::engineering_facts::{
-    BuildTargetFact, BuildTargetId, BuildTargetKind, DependencyFact, DependencyId,
-    DependencyKind, FactsBuilder, FactId, ModuleFact, ModuleId, PackageFact, PackageId,
-    SymbolFact, SymbolId, SymbolKind, TestFact, TestId, Visibility, WorkspaceFact, WorkspaceId,
-};
-use crate::engineering_facts::{
-    FactsModel,
     location::{Position, SourceLocation, Span},
     metadata::FactMetadataBuilder,
+    FactsModel,
+};
+use crate::engineering_facts::{
+    BuildTargetFact, BuildTargetId, BuildTargetKind, DependencyFact, DependencyId, DependencyKind,
+    FactId, FactsBuilder, ModuleFact, ModuleId, PackageFact, PackageId, SymbolFact, SymbolId,
+    SymbolKind, TestFact, TestId, Visibility, WorkspaceFact, WorkspaceId,
 };
 
 /// Run the population pipeline for a workspace root and persist the model.
@@ -108,6 +108,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
             sf.location = SourceLocation::new()
                 .with_workspace(ws_id.clone())
                 .with_file(rel.clone())
+                .with_point(sym.line_start, sym.column_start)
                 .with_span(Span::new(
                     Position::new(sym.line_start, sym.column_start),
                     Position::new(sym.line_end, sym.column_end),
@@ -129,14 +130,20 @@ pub fn run(workspace_root: &Path) -> Result<()> {
                 let mut tf = TestFact::new(
                     TestId::new(format!(
                         "test::{}::{}_{}@{}",
-                        rel, sym.name, kind.as_str(), sym.line_start
+                        rel,
+                        sym.name,
+                        kind.as_str(),
+                        sym.line_start
                     )),
                     sym.name.clone(),
                 );
                 tf.target = Some(crate::engineering_facts::FactId::Symbol(SymbolId::new(
                     format!(
                         "sym::{}::{}_{}@{}",
-                        rel, sym.name, kind.as_str(), sym.line_start
+                        rel,
+                        sym.name,
+                        kind.as_str(),
+                        sym.line_start
                     ),
                 )));
                 tf.location = Some(
@@ -172,11 +179,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         // crate package fact (created below so endpoints resolve).
         for dep in &pkg.dependencies {
             let target_id = PackageId::new(format!("pkg::{crate}::external", crate = dep.name));
-            let dep_id = DependencyId::new(format!(
-                "dep::{}->{}",
-                pkg.name,
-                dep.name
-            ));
+            let dep_id = DependencyId::new(format!("dep::{}->{}", pkg.name, dep.name));
             let mut df = DependencyFact::new(
                 dep_id,
                 FactId::Package(pkg.id.clone()),
@@ -411,10 +414,10 @@ fn parse_cargo_package(
             let (version, optional) = match dep_value {
                 toml::Value::String(v) => (Some(v.clone()), false),
                 toml::Value::Table(t) => (
-                    t.get("version").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    t.get("optional")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
+                    t.get("version")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    t.get("optional").and_then(|v| v.as_bool()).unwrap_or(false),
                 ),
                 _ => (None, false),
             };
@@ -478,7 +481,11 @@ fn discover_source_files(root: &Path) -> Vec<PathBuf> {
         if !entry.file_type().is_file() {
             continue;
         }
-        let ext = entry.path().extension().and_then(|e| e.to_str()).unwrap_or("");
+        let ext = entry
+            .path()
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
         if crate::intelligence::parser::languages::language_from_extension(ext).is_some() {
             out.push(entry.path().to_path_buf());
         }

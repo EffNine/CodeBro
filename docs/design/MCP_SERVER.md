@@ -45,6 +45,30 @@ selection, UX, execution strategy.
 CodeBro owns: project truth, engineering state, persistent context, guarded
 mutations, policy, verification boundaries.
 
+### 2.1 Trust model: verified facts vs agent-recorded memory
+
+CodeBro deliberately keeps **three distinct classes of information** and the
+MCP surfaces never blur them:
+
+| Class | Source | Trust | Surface |
+|---|---|---|---|
+| **Verified facts** | `codebro init` (tree-sitter scan of real source) | High — deterministic, provenance-carrying, validated (0-issue store) | `engineering_facts`, `workspace_context` |
+| **Engineering decisions** | Human-authored identity/constraints | Medium-high — declared intent | `workspace_context` (identity), `record_memory` with explicit source |
+| **Agent-recorded context** | Agents calling `record_memory` | **Low — unverified beliefs** with self-declared confidence | `engineering_memory` (confidence score shown), `memory_stats` |
+
+Consequences:
+
+- `engineering_memory` content is **agent-recorded context, not verified
+  engineering truth**. Responses carry the self-declared `confidence`, plus
+  `source`/`tags` provenance so the host agent can judge trustworthiness.
+- `record_memory` accepts arbitrary agent text; it is **never** promoted to
+  the verified fact store. There is no promotion path in this phase.
+- Server instructions tell agents to treat memory as contextual, and the
+  fact store as verified.
+- This phase does **not** introduce a governance system; the distinction is
+  preserved structurally (separate stores, separate tools, provenance on
+  memory) and documented here.
+
 ---
 
 ## 3. Architecture
@@ -96,23 +120,41 @@ counts.
 
 ### 4.2 `engineering_facts`
 
-Queries the verified fact store, optionally filtered by kind
-(`workspace | module | package | symbol | test | build_target | dependency |
-relationship | reference | diagnostic | architecture_rule`).
+**Semantic retrieval** over the verified fact store. Arguments:
 
-Returns per-kind counts and matching fact ids.
+- `query` (required): symbol/module/test name, name fragment, or path
+  fragment, matched case-insensitively.
+- `kind` (optional): filter by fact kind.
+- `path` (optional): path substring filter.
+- `limit` (optional): defaults to 10, capped at 50.
 
-**Use:** answer "what modules/packages/symbols exist", "which architecture
-rules constrain this change".
+Returns **actual fact records** (kind, name, path, line, summary,
+provenance) ranked deterministically — not raw ids. Matching: exact name >
+name prefix > name substring > path substring > signature substring.
+
+**Use:** "where is X defined", "what functions/structs exist", "which
+module owns Y". This replaces the earlier id/count-only behavior which
+caused agents to fall back to their own Glob/Grep/Read tools.
 
 ### 4.3 `engineering_memory`
 
 Resolves engineering memory entries for a task query
 (`task_keywords`, `active_file_tags`), ranked deterministically with
-confidence scores and budget enforcement.
+confidence scores, budget enforcement, and enriched provenance (`source`,
+`tags`) projected from the persisted snapshot.
 
 **Use:** "what decisions constrained this area before", "how was this
-implemented previously".
+implemented previously". Content is agent-recorded context — see §2.1
+trust model; never treat it as verified truth.
+
+### 4.3b `memory_stats`
+
+Read-only statistics about the engineering memory store: `entry_count`,
+`total_budget`, `entries_with_source`, `avg_confidence`,
+`oldest/newest_created_at`, and tag distribution.
+
+**Use:** judge whether engineering memory holds meaningful state before
+relying on it (e.g. "is memory empty or fresh?").
 
 ### 4.4 `apply_change`
 

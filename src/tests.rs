@@ -1952,11 +1952,6 @@ fn test_agent_event_history() {
     assert!(history.is_empty() == false);
 }
 
-
-
-
-
-
 // ===== v0.6.6 Real Usage Hardening Tests =====
 
 #[test]
@@ -2114,22 +2109,7 @@ fn test_recovery_escalation_flow() {
     assert!(stats.escalated >= 1);
 }
 
-
-
-
-
-
 // ===== TUI Usability Tests =====
-
-
-
-
-
-
-
-
-
-
 
 #[test]
 fn test_session_persistence_never_contains_secrets() {
@@ -2159,7 +2139,6 @@ fn test_session_persistence_never_contains_secrets() {
     );
 }
 
-
 #[test]
 fn test_read_file_tool_redacts_secrets() {
     let dir = tempdir().unwrap();
@@ -2180,10 +2159,6 @@ fn test_read_file_tool_redacts_secrets() {
         result
     );
 }
-
-
-
-
 
 // ===== v0.7.2 TUI Agent Execution Wiring Tests =====
 
@@ -2325,8 +2300,6 @@ async fn test_coordinator_failure_routes_to_recovery() {
         "recovery should emit a coordination log"
     );
 }
-
-
 
 #[tokio::test]
 async fn test_coordinator_report_contains_all_phases() {
@@ -2543,17 +2516,7 @@ fn picker_model(id: &str) -> crate::provider_manager::ModelInfo {
     }
 }
 
-
-
-
-
 // ===== Multi-line input & paste tests =====
-
-
-
-
-
-
 
 #[test]
 fn test_apply_approve_rollback_on_verify_failure() {
@@ -2595,7 +2558,6 @@ fn test_shell_timeout_enforced() {
         err
     );
 }
-
 
 #[test]
 fn test_apply_approved_only_after_explicit_call() {

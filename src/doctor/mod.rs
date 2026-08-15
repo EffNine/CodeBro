@@ -75,10 +75,7 @@ pub fn run(workspace_root: &Path) -> Result<i32> {
 
     // ── 2. .codebro directory ─────────────────────────────────────────
     if codebro_dir.is_dir() {
-        checks.push(Check::pass(
-            ".codebro",
-            "runtime state directory exists",
-        ));
+        checks.push(Check::pass(".codebro", "runtime state directory exists"));
     } else {
         checks.push(Check::warn(
             ".codebro",
@@ -116,48 +113,46 @@ pub fn run(workspace_root: &Path) -> Result<i32> {
     // ── 4. Fact store ─────────────────────────────────────────────────
     let facts_path = codebro_dir.join("facts.json");
     match std::fs::read(&facts_path) {
-        Ok(bytes) => {
-            match serde_json::from_slice::<crate::engineering_facts::FactsModel>(&bytes) {
-                Ok(model) => {
-                    let store = crate::fact_store::FactStore::from_model(&model);
-                    let validation = crate::fact_store::validation::FactValidation::validate(&store);
-                    let counts = store.collection().counts();
-                    let mut breakdown = String::new();
-                    for rule in crate::fact_store::validation::FactValidationRule::ALL {
-                        let n = validation.count_by_rule(rule);
-                        if n > 0 {
-                            if !breakdown.is_empty() {
-                                breakdown.push_str(", ");
-                            }
-                            breakdown.push_str(&format!("{}={n}", rule.as_str()));
+        Ok(bytes) => match serde_json::from_slice::<crate::engineering_facts::FactsModel>(&bytes) {
+            Ok(model) => {
+                let store = crate::fact_store::FactStore::from_model(&model);
+                let validation = crate::fact_store::validation::FactValidation::validate(&store);
+                let counts = store.collection().counts();
+                let mut breakdown = String::new();
+                for rule in crate::fact_store::validation::FactValidationRule::ALL {
+                    let n = validation.count_by_rule(rule);
+                    if n > 0 {
+                        if !breakdown.is_empty() {
+                            breakdown.push_str(", ");
                         }
-                    }
-                    let detail = format!(
-                        "{} facts ({} modules, {} symbols, {} tests) — validation: {} issues{}",
-                        counts.total,
-                        counts.modules,
-                        counts.symbols,
-                        counts.tests,
-                        validation.issue_count(),
-                        if breakdown.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" [{breakdown}]")
-                        }
-                    );
-                    if validation.passed() {
-                        checks.push(Check::pass("facts", detail));
-                    } else {
-                        checks.push(Check::warn("facts", detail));
-                        warnings += 1;
+                        breakdown.push_str(&format!("{}={n}", rule.as_str()));
                     }
                 }
-                Err(e) => {
-                    checks.push(Check::fail("facts", format!("unparseable: {e}")));
-                    errors += 1;
+                let detail = format!(
+                    "{} facts ({} modules, {} symbols, {} tests) — validation: {} issues{}",
+                    counts.total,
+                    counts.modules,
+                    counts.symbols,
+                    counts.tests,
+                    validation.issue_count(),
+                    if breakdown.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{breakdown}]")
+                    }
+                );
+                if validation.passed() {
+                    checks.push(Check::pass("facts", detail));
+                } else {
+                    checks.push(Check::warn("facts", detail));
+                    warnings += 1;
                 }
             }
-        }
+            Err(e) => {
+                checks.push(Check::fail("facts", format!("unparseable: {e}")));
+                errors += 1;
+            }
+        },
         Err(_) => {
             checks.push(Check::warn("facts", "absent — run `codebro init`"));
             warnings += 1;
@@ -166,12 +161,9 @@ pub fn run(workspace_root: &Path) -> Result<i32> {
 
     // ── 5. Engineering memory ─────────────────────────────────────────
     let memory_path = codebro_dir.join("engineering_memory.json");
-    let identity_for_memory =
-        crate::project_identity::ProjectIdentityRuntime::new(&root);
-    let mut memory = crate::engineering_memory::EngineeringMemoryRuntime::new(
-        &root,
-        identity_for_memory,
-    );
+    let identity_for_memory = crate::project_identity::ProjectIdentityRuntime::new(&root);
+    let mut memory =
+        crate::engineering_memory::EngineeringMemoryRuntime::new(&root, identity_for_memory);
     match memory.load() {
         Ok(count) => {
             checks.push(Check::pass(
@@ -200,16 +192,11 @@ pub fn run(workspace_root: &Path) -> Result<i32> {
         .output();
     match git_status {
         Ok(out) if out.status.success() => {
-            let dirty = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .count();
+            let dirty = String::from_utf8_lossy(&out.stdout).lines().count();
             if dirty == 0 {
                 checks.push(Check::pass("git", "working tree clean"));
             } else {
-                checks.push(Check::warn(
-                    "git",
-                    format!("{dirty} uncommitted path(s)"),
-                ));
+                checks.push(Check::warn("git", format!("{dirty} uncommitted path(s)")));
                 warnings += 1;
             }
         }
@@ -223,7 +210,11 @@ pub fn run(workspace_root: &Path) -> Result<i32> {
     for check in &checks {
         let (icon, status) = if check.ok {
             ("✓", "ok")
-        } else if check.detail.as_deref().is_some_and(|d| d.starts_with("ERROR")) {
+        } else if check
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.starts_with("ERROR"))
+        {
             ("✗", "error")
         } else {
             ("!", "warn")

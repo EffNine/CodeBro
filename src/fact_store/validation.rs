@@ -251,8 +251,7 @@ impl FactValidation {
         }
         for fact in collection.iter() {
             let is_external_package = matches!(fact, FactRef::Package(p) if p.workspace.is_none());
-            if matches!(fact, FactRef::Workspace(_) | FactRef::Dependency(_))
-                || is_external_package
+            if matches!(fact, FactRef::Workspace(_) | FactRef::Dependency(_)) || is_external_package
             {
                 continue;
             }

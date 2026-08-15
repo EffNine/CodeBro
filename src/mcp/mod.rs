@@ -12,6 +12,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod facts;
+
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
@@ -44,11 +46,15 @@ impl CodeBroMcpServer {
 
     /// Load the project identity for the workspace, tolerating absence.
     fn identity_snapshot(&self) -> (bool, Option<crate::project_identity::ProjectIdentity>) {
-        let mut identity = crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
+        let mut identity =
+            crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
         match identity.load() {
             Ok(_) => (true, Some(identity.snapshot())),
             Err(e) => {
-                tracing::debug!("no project identity for {}: {e}", self.workspace_root.display());
+                tracing::debug!(
+                    "no project identity for {}: {e}",
+                    self.workspace_root.display()
+                );
                 (false, None)
             }
         }
@@ -59,13 +65,15 @@ impl CodeBroMcpServer {
     fn fact_store(&self) -> crate::fact_store::FactStore {
         let path = self.workspace_root.join(".codebro/facts.json");
         match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<crate::engineering_facts::FactsModel>(&bytes) {
-                Ok(model) => crate::fact_store::FactStore::from_model(&model),
-                Err(e) => {
-                    tracing::warn!("ignoring unparseable {}: {e}", path.display());
-                    crate::fact_store::FactStore::empty()
+            Ok(bytes) => {
+                match serde_json::from_slice::<crate::engineering_facts::FactsModel>(&bytes) {
+                    Ok(model) => crate::fact_store::FactStore::from_model(&model),
+                    Err(e) => {
+                        tracing::warn!("ignoring unparseable {}: {e}", path.display());
+                        crate::fact_store::FactStore::empty()
+                    }
                 }
-            },
+            }
             Err(_) => crate::fact_store::FactStore::empty(),
         }
     }
@@ -75,7 +83,9 @@ impl CodeBroMcpServer {
     /// Return the workspace context: project identity, workspace root and
     /// the state of the engineering runtime for this project. Call this
     /// first to understand what project the agent is operating in.
-    #[tool(description = "Return the workspace context: project identity, workspace root, and engineering runtime state. Call this first to orient the agent in the project.")]
+    #[tool(
+        description = "Return the workspace context: project identity, workspace root, and engineering runtime state. Call this first to orient the agent in the project."
+    )]
     async fn workspace_context(&self) -> Result<CallToolResult, McpError> {
         let (identity_loaded, identity) = self.identity_snapshot();
         let store = self.fact_store();
@@ -107,11 +117,14 @@ impl CodeBroMcpServer {
         )]))
     }
 
-    // ── Tool 2: engineering facts ─────────────────────────────────────
+    // ── Tool 2: engineering facts (semantic retrieval) ───────────────
 
-    /// Query verified engineering facts about the project (modules,
-    /// packages, symbols, tests, dependencies, architecture rules).
-    #[tool(description = "Query verified engineering facts about the project: modules, packages, symbols, tests, dependencies, architecture rules. Optionally filter by fact kind.")]
+    /// Search verified engineering facts semantically: symbols, modules,
+    /// tests, packages, build targets, dependencies. Returns compact fact
+    /// records with names, paths, locations and provenance — not raw ids.
+    #[tool(
+        description = "Search verified engineering facts about the project: symbols, modules, tests, packages, build targets, dependencies. Provide a query (symbol/module name or path fragment); optionally filter by kind and path. Returns compact fact records with locations and provenance."
+    )]
     async fn engineering_facts(
         &self,
         Parameters(args): Parameters<FactsArgs>,
@@ -147,27 +160,31 @@ impl CodeBroMcpServer {
             }
         };
 
-        let ids = kind
-            .map(|k| store.query().by_kind(k).to_vec())
-            .unwrap_or_default();
+        let facts = crate::mcp::facts::search(
+            &store,
+            &crate::mcp::facts::FactSearch {
+                query: &args.query,
+                kind,
+                path: args.path.as_deref(),
+                limit: args.limit.unwrap_or(crate::mcp::facts::DEFAULT_LIMIT),
+            },
+        );
 
         let payload = json!({
-            "counts": {
-                "workspaces": counts.workspaces,
+            "store": {
                 "modules": counts.modules,
-                "packages": counts.packages,
                 "symbols": counts.symbols,
                 "tests": counts.tests,
-                "build_targets": counts.build_targets,
+                "packages": counts.packages,
                 "dependencies": counts.dependencies,
-                "relationships": counts.relationships,
-                "references": counts.references,
-                "diagnostics": counts.diagnostics,
-                "architecture_rules": counts.architecture_rules,
+                "build_targets": counts.build_targets,
                 "total": counts.total,
             },
+            "query": args.query,
             "kind": args.kind,
-            "matching_ids": ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "path": args.path,
+            "returned": facts.len(),
+            "facts": facts,
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -180,19 +197,44 @@ impl CodeBroMcpServer {
 
     /// Resolve engineering memory (decisions, constraints, prior context)
     /// relevant to a task query.
-    #[tool(description = "Resolve relevant engineering memory for a task: recorded decisions, constraints, and prior implementation context with confidence scores. Pass task keywords to retrieve the most relevant entries.")]
+    #[tool(
+        description = "Resolve relevant engineering memory for a task: recorded decisions, constraints, and prior implementation context with confidence scores, source and tags. Pass task keywords to retrieve the most relevant entries."
+    )]
     async fn engineering_memory(
         &self,
         Parameters(args): Parameters<MemoryArgs>,
     ) -> Result<CallToolResult, McpError> {
         let identity = crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
-        let mut memory =
-            crate::engineering_memory::EngineeringMemoryRuntime::new(&self.workspace_root, identity);
+        let mut memory = crate::engineering_memory::EngineeringMemoryRuntime::new(
+            &self.workspace_root,
+            identity,
+        );
         let _ = memory.load(); // absent store is not an error for a read query
 
         let context = memory.resolve_for_task(&args.task_keywords, &args.active_file_tags);
+
+        // Enrich resolved entries with provenance (source + tags) from the
+        // persisted snapshot so agents can judge trustworthiness. This is a
+        // read-side projection only — the memory system is untouched.
+        let snapshot = memory.snapshot();
+        let entries: Vec<serde_json::Value> = context
+            .entries
+            .iter()
+            .map(|entry| {
+                let src = snapshot.iter().find(|s| s.key == entry.key);
+                json!({
+                    "key": entry.key,
+                    "value": entry.value,
+                    "confidence": entry.confidence,
+                    "tier": entry.tier,
+                    "source": src.and_then(|s| s.metadata.source.clone()),
+                    "tags": src.map(|s| s.metadata.tags.clone()).unwrap_or_default(),
+                })
+            })
+            .collect();
+
         let payload = json!({
-            "entries": context.entries,
+            "entries": entries,
             "budget_remaining": context.budget_remaining,
         });
 
@@ -207,13 +249,16 @@ impl CodeBroMcpServer {
     /// Apply a guarded change to a workspace file through the change
     /// engine: path-boundary enforcement, plan awareness, stale-content
     /// protection and audit. No blind overwrites.
-    #[tool(description = "Apply a guarded change to a single workspace file through the change engine. Provide the exact old text to replace (or empty old to create a new file). Enforces workspace boundary and refuses stale or ambiguous edits.")]
+    #[tool(
+        description = "Apply a guarded change to a single workspace file through the change engine. Provide the exact old text to replace (or empty old to create a new file). Enforces workspace boundary and refuses stale or ambiguous edits."
+    )]
     async fn apply_change(
         &self,
         Parameters(args): Parameters<ChangeArgs>,
     ) -> Result<CallToolResult, McpError> {
         // Plan-less, non-strict engine: boundary + staleness enforcement only.
-        let engine = crate::coding::permissions::ChangeEngine::new(&self.workspace_root, &[], false);
+        let engine =
+            crate::coding::permissions::ChangeEngine::new(&self.workspace_root, &[], false);
 
         let prepared = engine
             .prepare(&args.path, &args.old, &args.new)
@@ -222,9 +267,7 @@ impl CodeBroMcpServer {
             .apply(&prepared)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            result,
-        )]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
     }
 
     // ── Tool 5: record engineering memory (guarded write) ─────────────
@@ -232,7 +275,9 @@ impl CodeBroMcpServer {
     /// Record or update an engineering memory entry. Values are
     /// secret-redacted before storage; the entry is persisted to
     /// `.codebro/engineering_memory.json`.
-    #[tool(description = "Record or update an engineering memory entry (decision, constraint, context). Values are secret-redacted before storage. Pass the same key to update an existing entry. Persisted to .codebro/engineering_memory.json.")]
+    #[tool(
+        description = "Record or update an engineering memory entry (decision, constraint, context). Values are secret-redacted before storage. Pass the same key to update an existing entry. Persisted to .codebro/engineering_memory.json."
+    )]
     async fn record_memory(
         &self,
         Parameters(args): Parameters<RecordMemoryArgs>,
@@ -259,10 +304,9 @@ impl CodeBroMcpServer {
         tags.sort();
         tags.dedup();
 
-        let mut metadata =
-            crate::engineering_memory::types::EngineeringMemoryMetadata::new()
-                .with_confidence(args.confidence.clamp(0.0, 1.0))
-                .with_importance(args.importance.clamp(0.0, 1.0));
+        let mut metadata = crate::engineering_memory::types::EngineeringMemoryMetadata::new()
+            .with_confidence(args.confidence.clamp(0.0, 1.0))
+            .with_importance(args.importance.clamp(0.0, 1.0));
         for tag in &tags {
             metadata = metadata.with_tag(tag);
         }
@@ -271,8 +315,10 @@ impl CodeBroMcpServer {
         }
 
         let identity = crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
-        let mut memory =
-            crate::engineering_memory::EngineeringMemoryRuntime::new(&self.workspace_root, identity);
+        let mut memory = crate::engineering_memory::EngineeringMemoryRuntime::new(
+            &self.workspace_root,
+            identity,
+        );
         let _ = memory.load();
 
         // Deterministic id from the key: upsert semantics.
@@ -299,15 +345,17 @@ impl CodeBroMcpServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let action = if exists { "updated" } else { "recorded" };
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            format!("memory {action}: {key}"),
-        )]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "memory {action}: {key}"
+        ))]))
     }
 
     // ── Tool 6: delete engineering memory (guarded write) ─────────────
 
     /// Delete an engineering memory entry by its exact key.
-    #[tool(description = "Delete an engineering memory entry by its exact key. Persisted to .codebro/engineering_memory.json.")]
+    #[tool(
+        description = "Delete an engineering memory entry by its exact key. Persisted to .codebro/engineering_memory.json."
+    )]
     async fn delete_memory(
         &self,
         Parameters(args): Parameters<DeleteMemoryArgs>,
@@ -319,13 +367,18 @@ impl CodeBroMcpServer {
         let id = format!("mem::{key}");
 
         let identity = crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
-        let mut memory =
-            crate::engineering_memory::EngineeringMemoryRuntime::new(&self.workspace_root, identity);
+        let mut memory = crate::engineering_memory::EngineeringMemoryRuntime::new(
+            &self.workspace_root,
+            identity,
+        );
         let _ = memory.load();
 
         let exists = memory.snapshot().iter().any(|e| e.id == id);
         if !exists {
-            return Err(McpError::invalid_params(format!("no entry for key '{key}'"), None));
+            return Err(McpError::invalid_params(
+                format!("no entry for key '{key}'"),
+                None,
+            ));
         }
         memory
             .delete(&id)
@@ -334,8 +387,67 @@ impl CodeBroMcpServer {
             .persist()
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "memory deleted: {key}"
+        ))]))
+    }
+
+    // ── Tool 7: memory statistics ─────────────────────────────────────
+
+    /// Return read-only statistics about the engineering memory store:
+    /// entry count, configured token budget, tag distribution, average
+    /// confidence, and oldest/newest entry timestamps.
+    #[tool(
+        description = "Return read-only statistics about the engineering memory store: number of entries, total token budget, tag distribution, average confidence, and oldest/newest entry timestamps. Call this to judge whether engineering memory holds meaningful state before relying on it."
+    )]
+    async fn memory_stats(&self) -> Result<CallToolResult, McpError> {
+        let identity = crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
+        let mut memory = crate::engineering_memory::EngineeringMemoryRuntime::new(
+            &self.workspace_root,
+            identity,
+        );
+        let _ = memory.load(); // absent store is not an error for a read query
+
+        let total_budget = crate::engineering_memory::resolver::DEFAULT_TOKEN_BUDGET;
+        let entries = memory.snapshot();
+
+        // Tag distribution (deterministic: sorted).
+        let mut tag_counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut confidence_sum = 0.0f64;
+        let mut oldest: Option<u64> = None;
+        let mut newest: Option<u64> = None;
+        let mut with_source = 0usize;
+        for e in &entries {
+            confidence_sum += e.metadata.confidence;
+            for tag in &e.metadata.tags {
+                *tag_counts.entry(tag.clone()).or_insert(0) += 1;
+            }
+            if e.metadata.source.is_some() {
+                with_source += 1;
+            }
+            oldest = Some(oldest.map_or(e.created_at, |o: u64| o.min(e.created_at)));
+            newest = Some(newest.map_or(e.created_at, |n: u64| n.max(e.created_at)));
+        }
+        let avg_confidence = if entries.is_empty() {
+            0.0
+        } else {
+            confidence_sum / entries.len() as f64
+        };
+
+        let payload = json!({
+            "entry_count": entries.len(),
+            "total_budget": total_budget,
+            "entries_with_source": with_source,
+            "avg_confidence": (avg_confidence * 100.0).round() / 100.0,
+            "oldest_created_at": oldest,
+            "newest_created_at": newest,
+            "tags": tag_counts,
+        });
+
         Ok(CallToolResult::success(vec![ContentBlock::text(
-            format!("memory deleted: {key}"),
+            serde_json::to_string_pretty(&payload)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
         )]))
     }
 }
@@ -343,11 +455,20 @@ impl CodeBroMcpServer {
 /// Argument schema for `engineering_facts`.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FactsArgs {
+    /// Required query: a symbol/module/test name, a name fragment, or a
+    /// path fragment (matched case-insensitively).
+    pub query: String,
     /// Optional fact kind filter: workspace, module, package, symbol,
     /// test, build_target, dependency, relationship, reference,
     /// diagnostic, architecture_rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Optional path substring filter (e.g. "coding/permissions").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Maximum results returned; defaults to 10, capped at 50.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
 }
 
 /// Argument schema for `engineering_memory`.
@@ -408,33 +529,40 @@ fn default_half() -> f64 {
 impl rmcp::ServerHandler for CodeBroMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "You are connected to CodeBro, the authoritative engineering-runtime for THIS \
+            "You are connected to CodeBro, the engineering context & memory layer for THIS \
              workspace. It maintains a verified fact store (symbols, modules, packages, tests, \
-             build targets), project identity, and persistent engineering memory.\n\
+             build targets, dependencies), project identity, and persistent engineering memory \
+             recorded by agents.\n\
              \n\
-             WHEN TO USE CODEBRO (before reaching for grep/glob/read):\n\
-             - Any question about project-wide scope: \"how many symbols/tests/modules\", \"what \
-               functions/structs exist\", \"list symbol ids\", \"which module owns X\" -> call \
-               codebro_workspace_context or codebro_engineering_facts FIRST. The fact store is \
-               complete and exact; grepping under-counts and can lead you to fabricate.\n\
+             WHEN TO USE CODEBRO:\n\
              - Session start or unfamiliar project -> call codebro_workspace_context once to \
                orient yourself (project identity + fact counts).\n\
+             - Any question about project-wide scope: \"how many symbols/tests/modules\", \"what \
+               functions/structs exist\", \"where is X defined\", \"which module owns Y\" -> call \
+               codebro_engineering_facts with a query (e.g. query=\"ChangeEngine\", \
+               kind=\"symbol\", path=\"coding\"). It returns actual fact records with locations, \
+               not raw ids. Prefer it over grepping when you need verified, project-wide answers.\n\
              - \"How was X implemented before\", \"what decisions constrain this area\" -> call \
                codebro_engineering_memory with task keywords.\n\
+             - Before trusting memory, call codebro_memory_stats to check whether the store holds \
+               meaningful state (entry count, confidence, recency).\n\
              - After learning a durable decision or constraint -> record it with \
                codebro_record_memory so future sessions are not amnesic (key like \
                'architecture:area', tags, confidence).\n\
+             - Remove stale/wrong entries with codebro_delete_memory by exact key.\n\
              \n\
-             WRITE PATH:\n\
-             - For guarded single-file edits, prefer codebro_apply_change: it enforces the \
-               workspace boundary and refuses stale/ambiguous edits. To create a file pass \
-               old=\"\".\n\
+             WRITE PATH (OPTIONAL):\n\
+             - codebro_apply_change is an optional guarded mutation API for controlled/autonomous \
+               workflows. Use your native editing tools for normal coding edits. If you do use \
+               apply_change, it enforces the workspace boundary and refuses stale/ambiguous \
+               edits; create files with old=\"\".\n\
              \n\
              HARD RULES:\n\
              - Never invent symbol names, ids, counts or file locations. If codebro returns \
                empty results, state that facts/memory are empty rather than guessing.\n\
-             - If a codebro tool rejects an edit (e.g. stale content), read the error, adapt, \
-               and retry — do not bypass the guard with a raw filesystem write.",
+             - Treat engineering_memory content as agent-recorded context (with confidence \
+               scores), not as verified engineering truth; engineering_facts are the verified \
+               store.",
         )
     }
 }
@@ -454,3 +582,220 @@ pub async fn serve(workspace_root: PathBuf) -> anyhow::Result<()> {
 /// extensions (e.g. a live workspace session).
 #[allow(dead_code)]
 type SharedServer = Arc<CodeBroMcpServer>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::ServerHandler;
+
+    /// Regression test for the P0.1 tool-description defect: an agent
+    /// (or a human) once wrote the full user task into a `#[tool(description)]
+    /// attribute. Tool descriptions must be short, static, and free of any
+    /// prompt/task phrasing so they are useful to LLMs selecting tools.
+    #[test]
+    fn tool_descriptions_are_static_concise_and_prompt_free() {
+        let server = CodeBroMcpServer::new(PathBuf::from("/tmp/unused-root"));
+
+        let expected = [
+            "workspace_context",
+            "engineering_facts",
+            "engineering_memory",
+            "apply_change",
+            "record_memory",
+            "delete_memory",
+            "memory_stats",
+        ];
+
+        for name in expected {
+            let tool = server
+                .get_tool(name)
+                .unwrap_or_else(|| panic!("tool {name} missing from tool handler"));
+            let desc = tool
+                .description
+                .as_deref()
+                .unwrap_or_else(|| panic!("tool {name} has no description"));
+
+            // 1. Static: must be a borrowed (compile-time) string, never a
+            //    dynamically constructed string (e.g. built from a prompt).
+            assert!(
+                matches!(tool.description, Some(std::borrow::Cow::Borrowed(_))),
+                "tool {name}: description must be a static &'static str, not dynamic"
+            );
+
+            // 2. Concise: LLMs select tools from descriptions; keep them tight.
+            assert!(
+                desc.len() <= 300,
+                "tool {name}: description too long ({desc} chars): {desc}"
+            );
+
+            // 3. Prompt-free: must not contain task/prompt phrasing.
+            let lower = desc.to_lowercase();
+            for banned in [
+                "report what you did",
+                "step by step",
+                "then record",
+                "study the existing",
+                "add a new",
+                "follow the exact same",
+                "make the change",
+            ] {
+                assert!(
+                    !lower.contains(banned),
+                    "tool {name}: description contains prompt-like text: {banned}"
+                );
+            }
+        }
+    }
+
+    /// Every registered tool must be callable via the router (the macro
+    /// generates a route per `#[tool]` method; this catches tools that are
+    /// declared but not routed).
+    #[test]
+    fn all_tools_have_router_entries() {
+        let server = CodeBroMcpServer::new(PathBuf::from("/tmp/unused-root"));
+        for expected in [
+            "workspace_context",
+            "engineering_facts",
+            "engineering_memory",
+            "apply_change",
+            "record_memory",
+            "delete_memory",
+            "memory_stats",
+        ] {
+            assert!(
+                server.get_tool(expected).is_some(),
+                "tool {expected} missing from tool handler"
+            );
+        }
+    }
+
+    /// P0.3: `memory_stats` must report meaningful state — entry count,
+    /// budget, confidence, tags — and degrade gracefully when empty.
+    #[tokio::test]
+    async fn memory_stats_reports_meaningful_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = CodeBroMcpServer::new(dir.path().to_path_buf());
+
+        // Empty store: entry_count 0, budget present, no tags.
+        let empty = call_tool_text(&server, "memory_stats", json!({})).await;
+        let v: serde_json::Value = serde_json::from_str(&empty).expect("valid json");
+        assert_eq!(v["entry_count"], 0);
+        assert_eq!(v["total_budget"], 500);
+        assert_eq!(v["tags"], serde_json::json!({}));
+
+        // Record one entry, then stats must reflect it.
+        call_tool_text(
+            &server,
+            "record_memory",
+            json!({
+                "key": "architecture:test",
+                "value": "Test decision",
+                "tags": ["architecture", "test"],
+                "confidence": 0.8,
+            }),
+        )
+        .await;
+        let after = call_tool_text(&server, "memory_stats", json!({})).await;
+        let v: serde_json::Value = serde_json::from_str(&after).expect("valid json");
+        assert_eq!(v["entry_count"], 1);
+        assert_eq!(v["avg_confidence"], 0.8);
+        assert_eq!(v["tags"]["architecture"], 1);
+        assert_eq!(v["tags"]["test"], 1);
+        assert!(v["oldest_created_at"].is_u64());
+        assert!(v["newest_created_at"].is_u64());
+    }
+
+    /// P0.2: `engineering_facts` returns actual fact records (with name,
+    /// path, provenance) — not raw ids — and honours query/kind/path/limit.
+    #[tokio::test]
+    async fn engineering_facts_returns_records_not_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = CodeBroMcpServer::new(dir.path().to_path_buf());
+
+        let out = call_tool_text(
+            &server,
+            "engineering_facts",
+            json!({"query": "zzz-no-such", "limit": 5}),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        // Empty store: no facts, but the shape must be present.
+        assert_eq!(v["returned"], 0);
+        assert!(v["facts"].is_array());
+        assert!(v["store"].is_object());
+
+        // Invalid kind must be rejected, not silently ignored.
+        let err = call_tool_err(
+            &server,
+            "engineering_facts",
+            json!({"query": "x", "kind": "bogus"}),
+        )
+        .await;
+        assert!(err.to_string().contains("unknown fact kind"));
+    }
+
+    /// Helper: call a tool method directly (the tool methods are private
+    /// but visible to the module's own tests) and return its text content.
+    async fn call_tool_text(
+        server: &CodeBroMcpServer,
+        name: &str,
+        args: serde_json::Value,
+    ) -> String {
+        let result = call_tool(server, name, args).await;
+        result.expect("tool call succeeds")
+    }
+
+    async fn call_tool_err(
+        server: &CodeBroMcpServer,
+        name: &str,
+        args: serde_json::Value,
+    ) -> String {
+        let result = call_tool(server, name, args).await;
+        result.expect_err("tool call must fail")
+    }
+
+    /// Drive the tool methods directly with their `Parameters` wrappers.
+    async fn call_tool(
+        server: &CodeBroMcpServer,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<String, String> {
+        let result = match name {
+            "memory_stats" => {
+                let r = server.memory_stats().await.map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "record_memory" => {
+                let p: RecordMemoryArgs =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .record_memory(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "engineering_facts" => {
+                let p: FactsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .engineering_facts(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            other => return Err(format!("test helper: unsupported tool {other}")),
+        };
+        Ok(result)
+    }
+
+    fn text_of(result: CallToolResult) -> String {
+        result
+            .content
+            .into_iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
