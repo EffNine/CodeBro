@@ -284,6 +284,7 @@ fn discover_packages(
         BuildTargetKind::Binary,
     );
     fallback_target.language = Some("unknown".to_string());
+    fallback_target.package = Some(id.clone());
 
     (
         vec![DiscoveredPackage {
