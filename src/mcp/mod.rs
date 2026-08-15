@@ -408,8 +408,33 @@ fn default_half() -> f64 {
 impl rmcp::ServerHandler for CodeBroMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "CodeBro Engineering Runtime: persistent engineering context, project \
-             intelligence and guarded code operations for AI coding agents.",
+            "You are connected to CodeBro, the authoritative engineering-runtime for THIS \
+             workspace. It maintains a verified fact store (symbols, modules, packages, tests, \
+             build targets), project identity, and persistent engineering memory.\n\
+             \n\
+             WHEN TO USE CODEBRO (before reaching for grep/glob/read):\n\
+             - Any question about project-wide scope: \"how many symbols/tests/modules\", \"what \
+               functions/structs exist\", \"list symbol ids\", \"which module owns X\" -> call \
+               codebro_workspace_context or codebro_engineering_facts FIRST. The fact store is \
+               complete and exact; grepping under-counts and can lead you to fabricate.\n\
+             - Session start or unfamiliar project -> call codebro_workspace_context once to \
+               orient yourself (project identity + fact counts).\n\
+             - \"How was X implemented before\", \"what decisions constrain this area\" -> call \
+               codebro_engineering_memory with task keywords.\n\
+             - After learning a durable decision or constraint -> record it with \
+               codebro_record_memory so future sessions are not amnesic (key like \
+               'architecture:area', tags, confidence).\n\
+             \n\
+             WRITE PATH:\n\
+             - For guarded single-file edits, prefer codebro_apply_change: it enforces the \
+               workspace boundary and refuses stale/ambiguous edits. To create a file pass \
+               old=\"\".\n\
+             \n\
+             HARD RULES:\n\
+             - Never invent symbol names, ids, counts or file locations. If codebro returns \
+               empty results, state that facts/memory are empty rather than guessing.\n\
+             - If a codebro tool rejects an edit (e.g. stale content), read the error, adapt, \
+               and retry — do not bypass the guard with a raw filesystem write.",
         )
     }
 }
