@@ -16,8 +16,8 @@ server** so that battle-tested agent frontends — Claude Code, OpenCode, Codex,
 Cursor, Goose — can act as the interface while CodeBro owns project truth,
 persistent engineering context and guarded mutations.
 
-The TUI is **frozen** (not deleted): it remains one possible client, but is no
-longer the strategic center of the product.
+The legacy chat TUI was moved to the `tui-legacy` branch and is out of scope
+for this design.
 
 ---
 

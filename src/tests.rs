@@ -1952,90 +1952,10 @@ fn test_agent_event_history() {
     assert!(history.is_empty() == false);
 }
 
-#[test]
-fn test_dashboard_streaming_chunks() {
-    let mut dashboard = crate::tui::dashboard::Dashboard::new();
-    dashboard.handle_event(crate::agent::events::AgentEvent::StreamChunk {
-        content: "I analysed the repository...".to_string(),
-    });
-    dashboard.handle_event(crate::agent::events::AgentEvent::StreamChunk {
-        content: "Found auth module".to_string(),
-    });
-    assert!(dashboard.is_streaming);
-    assert_eq!(
-        dashboard.streaming_buffer,
-        "I analysed the repository...Found auth module"
-    );
-}
 
-#[test]
-fn test_dashboard_task_graph() {
-    let mut dashboard = crate::tui::dashboard::Dashboard::new();
-    let mut graph = crate::agent::TaskGraph::new("Refactor auth");
-    graph.add_task("Research", "research", vec![]);
-    dashboard.set_task_graph(graph);
-    assert!(dashboard.task_graph.is_some());
-    let entries = dashboard.graph_entries();
-    assert!(!entries.is_empty());
-}
 
-#[test]
-fn test_dashboard_tool_views() {
-    let mut dashboard = crate::tui::dashboard::Dashboard::new();
-    dashboard.handle_event(crate::agent::events::AgentEvent::ToolStarted {
-        tool: "cargo_test".to_string(),
-        args: "cargo test".to_string(),
-    });
-    dashboard.handle_event(crate::agent::events::AgentEvent::ToolStarted {
-        tool: "edit_file".to_string(),
-        args: "modify auth.rs".to_string(),
-    });
-    assert_eq!(dashboard.active_tools.len(), 2);
-    assert!(dashboard
-        .active_tools
-        .iter()
-        .any(|t| t.name == "cargo_test"));
-}
 
-#[test]
-fn test_dashboard_memory_skill_notifications() {
-    let mut dashboard = crate::tui::dashboard::Dashboard::new();
-    dashboard.handle_event(crate::agent::events::AgentEvent::MemoryUpdated {
-        summary: "Project uses repository pattern".to_string(),
-    });
-    dashboard.handle_event(crate::agent::events::AgentEvent::SkillUpdated {
-        skill: "rust-api-feature".to_string(),
-        confidence_before: 0.82,
-        confidence_after: 0.89,
-    });
 
-    assert_eq!(dashboard.memory_notifications.len(), 1);
-    assert_eq!(dashboard.skill_notifications.len(), 1);
-    let skill = &dashboard.skill_notifications[0];
-    assert_eq!(skill.skill, "rust-api-feature");
-    assert_eq!(skill.confidence_before, 0.82);
-    assert_eq!(skill.confidence_after, 0.89);
-}
-
-#[test]
-fn test_dashboard_agent_panel_state() {
-    let mut dashboard = crate::tui::dashboard::Dashboard::new();
-    dashboard.handle_event(crate::agent::events::AgentEvent::AgentStatusChanged {
-        agent: "coding".to_string(),
-        status: crate::agent::AgentStatus::Executing,
-    });
-    dashboard.handle_event(crate::agent::events::AgentEvent::AgentProgress {
-        agent: "coding".to_string(),
-        progress: 0.65,
-        action: "Applying patch to auth.rs".to_string(),
-    });
-
-    let entries = dashboard.agent_entries();
-    let coding = entries.iter().find(|e| e.name == "coding").unwrap();
-    assert_eq!(coding.status, crate::agent::AgentStatus::Executing);
-    assert_eq!(coding.progress, 0.65);
-    assert_eq!(coding.action.as_deref(), Some("Applying patch to auth.rs"));
-}
 
 // ===== v0.6.6 Real Usage Hardening Tests =====
 
@@ -2194,175 +2114,22 @@ fn test_recovery_escalation_flow() {
     assert!(stats.escalated >= 1);
 }
 
-#[test]
-fn test_diff_rendering() {
-    let diff = crate::tui::diff_view::FileDiff::parse("auth.rs", "old line", "new line");
-    let rendered = crate::tui::diff_view::render_diff_lines(&diff, 40);
-    assert_eq!(rendered.len(), 2);
-    assert_eq!(rendered[0].0, '-');
-    assert_eq!(rendered[1].0, '+');
-}
 
-#[test]
-fn test_diff_review_session() {
-    let mut session = crate::tui::diff_view::DiffReviewSession::new();
-    session.add_diff(crate::tui::diff_view::FileDiff::parse("a.rs", "old", "new"));
-    session.add_diff(crate::tui::diff_view::FileDiff::parse("b.rs", "x", "y"));
 
-    session
-        .apply_action(crate::tui::diff_view::DiffAction::Accept)
-        .unwrap();
-    session.next();
-    session
-        .apply_action(crate::tui::diff_view::DiffAction::Reject)
-        .unwrap();
 
-    assert_eq!(session.accepted_count(), 1);
-    assert_eq!(session.rejected_count(), 1);
-    assert!(session.all_reviewed());
-}
 
-#[test]
-fn test_command_palette_state() {
-    let mut dashboard = crate::tui::dashboard::Dashboard::new();
-    assert!(!dashboard.show_command_palette);
-    dashboard.toggle_command_palette();
-    assert!(dashboard.show_command_palette);
-    dashboard.toggle_command_palette();
-    assert!(!dashboard.show_command_palette);
-}
-
-#[test]
-fn test_metrics_panel_state() {
-    let mut dashboard = crate::tui::dashboard::Dashboard::new();
-    assert!(!dashboard.show_metrics);
-    dashboard.toggle_metrics();
-    assert!(dashboard.show_metrics);
-}
-
-#[test]
-fn test_dashboard_metrics_field() {
-    let mut dashboard = crate::tui::dashboard::Dashboard::new();
-    assert!(dashboard.metrics.is_none());
-    dashboard.metrics = Some(crate::metrics::TaskMetrics::new("Test"));
-    assert!(dashboard.metrics.is_some());
-    assert_eq!(dashboard.metrics.as_ref().unwrap().task, "Test");
-}
 
 // ===== TUI Usability Tests =====
 
-#[test]
-fn test_input_insert_at_cursor() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.insert_char('h');
-    app.insert_char('i');
-    assert_eq!(app.input, "hi");
-    assert_eq!(app.input_cursor, 2);
-}
 
-#[test]
-fn test_input_insert_in_middle() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.input = "helo".to_string();
-    app.input_cursor = 3;
-    app.insert_char('l');
-    assert_eq!(app.input, "hello");
-    assert_eq!(app.input_cursor, 4);
-}
 
-#[test]
-fn test_input_backspace_at_end() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.input = "hello".to_string();
-    app.input_cursor = 5;
-    app.backspace();
-    assert_eq!(app.input, "hell");
-    assert_eq!(app.input_cursor, 4);
-}
 
-#[test]
-fn test_input_backspace_in_middle() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.input = "hllo".to_string();
-    app.input_cursor = 2;
-    app.backspace();
-    assert_eq!(app.input, "hlo");
-    assert_eq!(app.input_cursor, 1);
-}
 
-#[test]
-fn test_input_backspace_at_start_noop() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.input = "hi".to_string();
-    app.input_cursor = 0;
-    app.backspace();
-    assert_eq!(app.input, "hi");
-}
 
-#[test]
-fn test_input_cursor_movement() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.input = "hello".to_string();
-    app.input_cursor = 5;
-    app.cursor_left();
-    assert_eq!(app.input_cursor, 4);
-    app.cursor_left();
-    assert_eq!(app.input_cursor, 3);
-    app.cursor_right();
-    assert_eq!(app.input_cursor, 4);
-    app.cursor_home();
-    assert_eq!(app.input_cursor, 0);
-    app.cursor_end();
-    assert_eq!(app.input_cursor, 5);
-}
 
-#[test]
-fn test_input_cursor_bounds() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.input = "hi".to_string();
-    app.input_cursor = 0;
-    app.cursor_left();
-    assert_eq!(app.input_cursor, 0);
-    app.input_cursor = 2;
-    app.cursor_right();
-    assert_eq!(app.input_cursor, 2);
-}
 
-#[test]
-fn test_input_history_navigation() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.push_history("first".to_string());
-    app.push_history("second".to_string());
 
-    app.history_previous();
-    assert_eq!(app.input, "second");
-    app.history_previous();
-    assert_eq!(app.input, "first");
-    app.history_next();
-    assert_eq!(app.input, "second");
-    app.history_next();
-    assert_eq!(app.input, "");
-}
 
-#[test]
-fn test_input_history_dedup() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.push_history("same".to_string());
-    app.push_history("same".to_string());
-    assert_eq!(app.input_history.len(), 1);
-}
-
-#[test]
-fn test_input_history_redacts_secrets() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    let secret = "sk-input-history-secret-1234567890abcdef";
-    app.push_history(format!("!curl -H \"Authorization: Bearer {}\"", secret));
-    assert!(
-        app.input_history.iter().all(|h| !h.contains(secret)),
-        "secret must never be stored in input history: {:?}",
-        app.input_history
-    );
-}
 
 #[test]
 fn test_session_persistence_never_contains_secrets() {
@@ -2392,38 +2159,6 @@ fn test_session_persistence_never_contains_secrets() {
     );
 }
 
-#[test]
-fn test_export_never_contains_api_key_or_secrets() {
-    let config = Config {
-        provider: "openai".to_string(),
-        base_url: "https://api.openai.com/v1".to_string(),
-        model: "gpt-4o".to_string(),
-        api_key: Some("sk-export-secret-1234567890abcdef".to_string()),
-    };
-    let mut app = crate::tui::TuiApp::new_with_config(config).expect("app");
-    let secret = "sk-export-secret-1234567890abcdef";
-    // A command echo is redacted before it becomes a message (see
-    // run_command_task in ui.rs).
-    app.add_message(
-        crate::tui::app::MessageRole::System,
-        crate::tools::shell::redact_secrets_public(&format!(
-            "[shell] curl -H \"Authorization: Bearer {}\"",
-            secret
-        )),
-    );
-    let dir = tempdir().unwrap();
-    let out_path = dir.path().join("export.json");
-    let out = app
-        .export_state(&out_path.to_string_lossy())
-        .expect("export_state");
-    let raw = fs::read_to_string(&out).unwrap();
-    assert!(!raw.contains(secret), "export leaked the API key: {}", raw);
-    // The config export surface must never carry the in-memory api_key.
-    assert!(
-        !raw.contains("sk-export-secret"),
-        "exported config must not include the api_key value"
-    );
-}
 
 #[test]
 fn test_read_file_tool_redacts_secrets() {
@@ -2446,63 +2181,9 @@ fn test_read_file_tool_redacts_secrets() {
     );
 }
 
-#[test]
-fn test_panel_toggle_state() {
-    let mut dashboard = crate::tui::dashboard::Dashboard::new();
-    // Default view is task-focused: agent panels are overlays, not fixtures.
-    assert!(!dashboard.show_agents);
-    dashboard.toggle_agents();
-    assert!(dashboard.show_agents);
-    dashboard.toggle_agents();
-    assert!(!dashboard.show_agents);
 
-    assert!(!dashboard.show_metrics);
-    dashboard.toggle_metrics();
-    assert!(dashboard.show_metrics);
 
-    assert!(!dashboard.show_coordination);
-    dashboard.toggle_coordination();
-    assert!(dashboard.show_coordination);
 
-    assert!(!dashboard.show_command_palette);
-    dashboard.toggle_command_palette();
-    assert!(dashboard.show_command_palette);
-}
-
-#[test]
-fn test_conversation_scroll_state() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.add_message(crate::tui::app::MessageRole::User, "hello".to_string());
-    assert_eq!(app.scroll_from_bottom, 0);
-    app.scroll_up();
-    assert_eq!(app.scroll_from_bottom, 1);
-    app.scroll_down();
-    assert_eq!(app.scroll_from_bottom, 0);
-    app.scroll_down();
-    assert_eq!(app.scroll_from_bottom, 0);
-}
-
-#[test]
-fn test_animation_time_based_tick() {
-    let mut anim = crate::tui::animation::AnimationState::new();
-    anim.start_activity(crate::tui::animation::ActivityType::Thinking);
-    // Immediately after starting, tick should not advance (not due yet).
-    anim.last_tick = std::time::Instant::now() - std::time::Duration::from_millis(200);
-    let advanced = anim.tick_if_due();
-    assert!(advanced);
-    let advanced = anim.tick_if_due();
-    assert!(!advanced);
-}
-
-#[test]
-fn test_animation_stops_when_idle() {
-    let mut anim = crate::tui::animation::AnimationState::new();
-    assert!(!anim.is_active());
-    let advanced = anim.tick_if_due();
-    assert!(!advanced);
-    anim.stop_activity();
-    assert!(!anim.is_active());
-}
 
 // ===== v0.7.2 TUI Agent Execution Wiring Tests =====
 
@@ -2645,84 +2326,7 @@ async fn test_coordinator_failure_routes_to_recovery() {
     );
 }
 
-#[tokio::test]
-async fn test_tui_dashboard_consumes_pipeline_events() {
-    let mut coordinator = crate::agent::AgentCoordinator::new(6);
-    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let ev = events.clone();
-    let emit = move |e: crate::agent::AgentEvent| ev.lock().unwrap().push(e);
 
-    let _ = coordinator
-        .run_task("refactor the authentication module", None, &emit)
-        .await;
-
-    let events = events.lock().unwrap();
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    for event in events.iter() {
-        app.handle_agent_event(event.clone());
-    }
-
-    // Research agent should be marked Completed in the dashboard monitor.
-    let research = app
-        .dashboard
-        .status_monitor
-        .get("research")
-        .expect("research agent registered");
-    assert_eq!(research.status, crate::agent::AgentStatus::Completed);
-
-    // TaskGraph should be populated for Ctrl+G.
-    let graph = app.dashboard.task_graph.as_ref().expect("task graph set");
-    assert!(!graph.nodes.is_empty(), "task graph should have nodes");
-    let has_completed = graph
-        .nodes
-        .values()
-        .any(|n| n.status == crate::agent::TaskStatus::Completed);
-    assert!(has_completed, "at least one task should be completed");
-
-    // Coordination messages should appear in recent_messages.
-    assert!(
-        !app.dashboard.recent_messages.is_empty(),
-        "coordination messages should be recorded"
-    );
-}
-
-#[tokio::test]
-async fn test_tui_dashboard_complex_routing_updates_agents() {
-    let mut coordinator = crate::agent::AgentCoordinator::new(6);
-    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let ev = events.clone();
-    let emit = move |e: crate::agent::AgentEvent| ev.lock().unwrap().push(e);
-
-    let _ = coordinator
-        .run_task(
-            "refactor the authentication system to use middleware",
-            None,
-            &emit,
-        )
-        .await;
-
-    let events = events.lock().unwrap();
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    for event in events.iter() {
-        app.handle_agent_event(event.clone());
-    }
-
-    // All five agents should have reached a terminal state.
-    for agent in ["research", "planning", "coding", "testing", "review"] {
-        let state = app
-            .dashboard
-            .status_monitor
-            .get(agent)
-            .unwrap_or_else(|| panic!("{} agent registered", agent));
-        assert!(
-            state.status == crate::agent::AgentStatus::Completed
-                || state.status == crate::agent::AgentStatus::Failed,
-            "{} should be terminal, got {:?}",
-            agent,
-            state.status
-        );
-    }
-}
 
 #[tokio::test]
 async fn test_coordinator_report_contains_all_phases() {
@@ -2939,145 +2543,17 @@ fn picker_model(id: &str) -> crate::provider_manager::ModelInfo {
     }
 }
 
-#[test]
-fn test_model_picker_open_close() {
-    let mut picker = crate::tui::dashboard::ModelPicker::new();
-    assert!(!picker.is_open());
-    picker.open();
-    assert!(picker.is_open());
-    assert!(picker.loading);
-    picker.close();
-    assert!(!picker.is_open());
-}
 
-#[test]
-fn test_model_picker_set_models_and_navigate() {
-    let mut picker = crate::tui::dashboard::ModelPicker::new();
-    picker.set_models(vec![
-        picker_model("a"),
-        picker_model("b"),
-        picker_model("c"),
-    ]);
-    assert_eq!(picker.count(), 3);
-    assert_eq!(picker.selected().map(|m| m.id), Some("a".to_string()));
-    picker.next();
-    assert_eq!(picker.selected().map(|m| m.id), Some("b".to_string()));
-    picker.next();
-    assert_eq!(picker.selected().map(|m| m.id), Some("c".to_string()));
-    // wraps around
-    picker.next();
-    assert_eq!(picker.selected().map(|m| m.id), Some("a".to_string()));
-    // prev wraps backwards
-    picker.prev();
-    assert_eq!(picker.selected().map(|m| m.id), Some("c".to_string()));
-}
 
-#[test]
-fn test_model_picker_filter() {
-    let mut picker = crate::tui::dashboard::ModelPicker::new();
-    picker.set_models(vec![
-        picker_model("deepseek/deepseek-v4-pro"),
-        picker_model("qwen3-coder-plus"),
-        picker_model("gpt-4o"),
-    ]);
-    picker.filter = "qwen".to_string();
-    let visible: Vec<&str> = picker
-        .visible_models()
-        .iter()
-        .map(|m| m.id.as_str())
-        .collect();
-    assert_eq!(visible, vec!["qwen3-coder-plus"]);
-    picker.filter = "deepseek".to_string();
-    let visible: Vec<&str> = picker
-        .visible_models()
-        .iter()
-        .map(|m| m.id.as_str())
-        .collect();
-    assert_eq!(visible, vec!["deepseek/deepseek-v4-pro"]);
-}
 
-#[test]
-fn test_model_picker_filter_empty_shows_all() {
-    let mut picker = crate::tui::dashboard::ModelPicker::new();
-    picker.set_models(vec![picker_model("x"), picker_model("y")]);
-    assert_eq!(picker.visible_models().len(), 2);
-}
 
 // ===== Multi-line input & paste tests =====
 
-#[test]
-fn test_input_insert_text_multiline() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.insert_text("line one\nline two");
-    assert_eq!(app.input, "line one\nline two");
-    assert_eq!(app.input_cursor, "line one\nline two".len());
-}
 
-#[test]
-fn test_input_insert_text_at_cursor() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.input = "ab".to_string();
-    app.input_cursor = 1;
-    app.insert_text("XX");
-    assert_eq!(app.input, "aXXb");
-    assert_eq!(app.input_cursor, 3);
-}
 
-#[test]
-fn test_input_cursor_line_col() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.input = "aaa\nbb\nc".to_string();
-    app.input_cursor = "aaa\nb".len(); // on line 2, col 1
-    let (line, col) = app.input_cursor_line_col();
-    assert_eq!((line, col), (1, 1));
-}
 
-#[test]
-fn test_input_shift_enter_newline() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.insert_char('a');
-    app.insert_char('\n');
-    app.insert_char('b');
-    assert_eq!(app.input, "a\nb");
-    assert_eq!(app.input_cursor_line_col(), (1, 1));
-}
 
-#[test]
-fn test_mouse_scroll() {
-    let mut app = crate::tui::TuiApp::new().expect("app");
-    app.mouse_scroll(3);
-    assert_eq!(app.scroll_from_bottom, 3);
-    app.mouse_scroll(-2);
-    assert_eq!(app.scroll_from_bottom, 1);
-}
 
-#[test]
-fn test_apply_approve_workflow() {
-    use crate::tools::ChangePlan;
-    use crate::tui::TuiApp;
-    use std::fs;
-    use std::path::PathBuf;
-
-    let dir = tempfile::tempdir().unwrap();
-    let file_path = dir.path().join("test.rs");
-    fs::write(&file_path, "fn old() {}\n").unwrap();
-
-    // Step 1: Create a change plan (simulates /apply)
-    let plan = ChangePlan::propose(&file_path, "fn new() {}\n").unwrap();
-    assert!(!plan.is_applied());
-    assert!(plan.preview().contains("-fn old()"));
-    assert!(plan.preview().contains("+fn new()"));
-
-    // Step 2: Apply the plan (simulates /approve)
-    let mut plan = plan;
-    let result = plan.apply().unwrap();
-    assert!(result.contains("applied"));
-    assert!(plan.is_applied());
-
-    // Verify file was modified
-    let content = fs::read_to_string(&file_path).unwrap();
-    assert_eq!(content, "fn new() {}\n");
-}
 
 #[test]
 fn test_apply_approve_rollback_on_verify_failure() {
@@ -3120,32 +2596,6 @@ fn test_shell_timeout_enforced() {
     );
 }
 
-#[test]
-fn test_dashboard_error_handling() {
-    use crate::agent::events::AgentEvent;
-    use crate::tui::dashboard::Dashboard;
-
-    let mut dashboard = Dashboard::new();
-
-    // Simulate an agent failure
-    dashboard.handle_event(AgentEvent::AgentFailed {
-        agent: "main".to_string(),
-        error: "connection timeout after 60s".to_string(),
-    });
-
-    // Error should be stored
-    assert!(dashboard.last_error.is_some());
-    assert_eq!(
-        dashboard.last_error.as_deref(),
-        Some("connection timeout after 60s")
-    );
-
-    // Error should be clearable
-    let cleared = dashboard.clear_error();
-    assert!(cleared.is_some());
-    assert_eq!(cleared.unwrap(), "connection timeout after 60s");
-    assert!(dashboard.last_error.is_none());
-}
 
 #[test]
 fn test_apply_approved_only_after_explicit_call() {
