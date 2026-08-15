@@ -763,6 +763,108 @@ mod tests {
         assert!(err.to_string().contains("unknown fact kind"));
     }
 
+    /// Memory lifecycle: record -> resolve -> stats -> delete. Proves the
+    /// write path is round-trippable and delete removes the entry.
+    #[tokio::test]
+    async fn memory_lifecycle_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = CodeBroMcpServer::new(dir.path().to_path_buf());
+
+        // Record.
+        call_tool_text(
+            &server,
+            "record_memory",
+            json!({"key": "arch:lifecycle", "value": "decision", "tags": ["arch"], "confidence": 0.7}),
+        )
+        .await;
+
+        // Resolve with the key as keyword.
+        let resolved = call_tool_text(
+            &server,
+            "engineering_memory",
+            json!({"task_keywords": ["arch:lifecycle"]}),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&resolved).expect("valid json");
+        assert_eq!(v["entries"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(v["entries"][0]["key"], "arch:lifecycle");
+        assert_eq!(v["entries"][0]["confidence"], 0.7);
+        assert_eq!(v["entries"][0]["tags"][0], "arch");
+
+        // Stats reflect the entry.
+        let stats = call_tool_text(&server, "memory_stats", json!({})).await;
+        let v: serde_json::Value = serde_json::from_str(&stats).expect("valid json");
+        assert_eq!(v["entry_count"], 1);
+
+        // Delete, then resolve must be empty.
+        call_tool_text(&server, "delete_memory", json!({"key": "arch:lifecycle"})).await;
+        let resolved = call_tool_text(
+            &server,
+            "engineering_memory",
+            json!({"task_keywords": ["arch:lifecycle"]}),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&resolved).expect("valid json");
+        assert_eq!(v["entries"].as_array().map(|a| a.len()), Some(0));
+
+        // Deleting a missing key must error.
+        let err = call_tool_err(&server, "delete_memory", json!({"key": "nope"})).await;
+        assert!(err.contains("no entry"));
+    }
+
+    /// apply_change must reject traversal and stale content while allowing
+    /// a correct edit — the guard is the point.
+    #[tokio::test]
+    async fn apply_change_guards_are_enforced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("demo.txt");
+        std::fs::write(&file, "hello world").expect("write");
+
+        let server = CodeBroMcpServer::new(dir.path().to_path_buf());
+
+        // Path traversal must be rejected.
+        let err = call_tool_err(
+            &server,
+            "apply_change",
+            json!({"path": "../../etc/passwd", "old": "x", "new": "y"}),
+        )
+        .await;
+        assert!(err.contains("path boundary") || err.contains("traversal"));
+
+        // Stale content must be rejected.
+        let err = call_tool_err(
+            &server,
+            "apply_change",
+            json!({"path": "demo.txt", "old": "not present", "new": "y"}),
+        )
+        .await;
+        assert!(err.contains("stale"));
+
+        // Correct edit succeeds and modifies the file.
+        call_tool_text(
+            &server,
+            "apply_change",
+            json!({"path": "demo.txt", "old": "hello world", "new": "hello codebro"}),
+        )
+        .await;
+        let content = std::fs::read_to_string(&file).expect("read");
+        assert_eq!(content.trim(), "hello codebro");
+    }
+
+    /// workspace_context must always return a parseable orientation payload,
+    /// even for an empty/uninitialized workspace.
+    #[tokio::test]
+    async fn workspace_context_orientates_empty_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = CodeBroMcpServer::new(dir.path().to_path_buf());
+
+        let out = call_tool_text(&server, "workspace_context", json!({})).await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert!(v["workspace_root"].is_string());
+        assert!(v["fact_counts"].is_object());
+        assert_eq!(v["fact_counts"]["total"], 0);
+    }
+
     /// Helper: call a tool method directly (the tool methods are private
     /// but visible to the module's own tests) and return its text content.
     async fn call_tool_text(
@@ -807,6 +909,38 @@ mod tests {
                 let p: FactsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
                 let r = server
                     .engineering_facts(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "engineering_memory" => {
+                let p: MemoryArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .engineering_memory(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "delete_memory" => {
+                let p: DeleteMemoryArgs =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .delete_memory(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "apply_change" => {
+                let p: ChangeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .apply_change(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "workspace_context" => {
+                let r = server
+                    .workspace_context()
                     .await
                     .map_err(|e| e.to_string())?;
                 text_of(r)
