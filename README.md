@@ -24,7 +24,7 @@ the codebase and re-learning decisions every session.
 
 - **`workspace_context`** — orient: project identity, workspace root, fact
   store counts. Compact "where am I" answer.
-- **`engineering_facts`** — semantic retrieval over the verified fact store
+- **`engineering_facts`** — relevance-ranked fact retrieval over the verified fact store
   (symbols, modules, tests, packages, build targets, dependencies). Query
   by name/path fragment, filter by kind/path, returns **fact records with
   locations and provenance** (not raw ids).
@@ -58,7 +58,8 @@ See [`docs/design/MCP_SERVER.md`](docs/design/MCP_SERVER.md) §2.1.
 
 - **`codebro init`** — scan workspace → validated fact store
   (`.codebro/facts.json`): modules, symbols, tests, build targets,
-  dependencies from `Cargo.toml`, using tree-sitter.
+  dependencies from `Cargo.toml` (Rust) or `go.mod` (Go), using
+  tree-sitter.
 - **`codebro doctor`** — diagnostics: identity/facts/memory/git, scriptable
   exit codes (0 ok / 1 warn / 2 error).
 - **`codebro serve`** — the MCP server over stdio.
@@ -114,7 +115,7 @@ codebro list-models   list models from the configured provider
 | Tool | Read/Write | Purpose |
 |---|---|---|
 | `workspace_context` | read | Orient: identity, root, fact counts |
-| `engineering_facts` | read | Semantic fact retrieval (query/kind/path, records with locations) |
+| `engineering_facts` | read | Relevance-ranked fact retrieval (query/kind/path, records with locations) |
 | `engineering_memory` | read | Resolve recorded decisions/constraints by keywords |
 | `memory_stats` | read | Memory state: counts, confidence, recency, tags |
 | `record_memory` | write | Upsert a memory entry (secret-redacted) |

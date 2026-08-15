@@ -125,7 +125,8 @@ counts.
 
 ### 4.2 `engineering_facts`
 
-**Semantic retrieval** over the verified fact store. Arguments:
+**Relevance-ranked fact retrieval** over the verified fact store
+(deterministic lexical matching — not embedding/vector search). Arguments:
 
 - `query` (required): symbol/module/test name, name fragment, or path
   fragment, matched case-insensitively.
@@ -166,13 +167,22 @@ relying on it (e.g. "is memory empty or fresh?").
 Applies a guarded single-file change through the change engine. Arguments:
 `path`, `old` (exact existing text; empty to create), `new`.
 
-Enforced: workspace path boundary, no blind overwrite, unique non-empty `old`
-match, stale-content refusal between prepare and apply.
+Enforced (and only these, matching the implementation):
+- workspace path boundary (lexical `..`/absolute check **and** symlink-escape
+  canonicalization)
+- no blind overwrite: `old` must be non-empty for existing files
+- unique replacement: an `old` text occurring more than once is rejected as
+  ambiguous
+- stale-content protection between prepare and apply
+
+The engine is plan-less and non-strict by design in this phase — no plan
+adherence is claimed because no plan is supplied.
 
 **Use:** optional guarded mutation API for controlled/autonomous workflows.
 Host agents use their native editing tools for normal coding edits — see §2
-positioning. There is no second mutation path: `apply_change` routes
-exclusively through `ChangeEngine::prepare` → `apply`.
+positioning. There is exactly one mutation path: `apply_change` routes
+exclusively through `ChangeEngine::prepare` → `apply`; the MCP layer contains
+no raw filesystem writes.
 
 ### 4.5 `record_memory`
 
@@ -448,4 +458,6 @@ across sessions without being re-stated.
 - **Memory lifecycle is closed**: record (10.3) → persist → retrieve in a
   fresh session (10.4) — the anti-amnesia loop is functional end-to-end.
 - Facts store used by the agent grew with dependency facts (33
-  dependencies from Cargo.toml, validation still 0 issues).
+  dependencies from Cargo.toml, validation still 0 issues). Dependency
+  discovery since also supports Go `go.mod` (verified on Conductor:
+  39 deps — 8 direct, 31 transitive).

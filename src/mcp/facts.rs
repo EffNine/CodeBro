@@ -1,4 +1,4 @@
-//! Semantic retrieval over the fact store for the `engineering_facts` MCP
+//! Relevance-ranked retrieval over the fact store for the `engineering_facts` MCP
 //! tool (P0.2).
 //!
 //! Search is a deterministic, allocation-light projection over the existing
@@ -69,7 +69,10 @@ pub struct FactSearch<'a> {
     pub limit: usize,
 }
 
-/// Run a deterministic semantic search over the fact store.
+/// Run a deterministic, relevance-ranked search over the fact store.
+///
+/// This is lexical string matching (exact/prefix/substring/path/signature)
+/// with a stable sort — NOT embedding/vector search.
 ///
 /// Returns an error when the query is empty and no kind/path filter is
 /// given: an unfiltered empty query would enumerate the whole store
@@ -453,5 +456,41 @@ mod tests {
     fn span_and_point_sanity() {
         let _ = Position::new(1, 0);
         let _ = Span::new(Position::new(1, 0), Position::new(2, 0));
+    }
+
+    #[test]
+    fn summary_signature_matching() {
+        let store = sample_store();
+        // "pub struct" appears only in ChangeEngine's signature summary.
+        let results = search_all(&store, "pub struct");
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.name == "ChangeEngine"));
+        // Ranked below name matches, but present.
+        let by_score =
+            results[0].name == "ChangeEngine" || results.iter().any(|r| r.name == "ChangeEngine");
+        assert!(by_score);
+    }
+
+    #[test]
+    fn multi_word_query_matches_any_token() {
+        let store = sample_store();
+        // "prepare ChangeEngine" matches both prepare (name) and
+        // ChangeEngine (name) — tokenized scoring.
+        let results = search_all(&store, "prepare ChangeEngine");
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"prepare"));
+        assert!(names.contains(&"ChangeEngine"));
+    }
+
+    #[test]
+    fn path_fragment_matching() {
+        let store = sample_store();
+        // A path fragment that is not part of any symbol name still matches
+        // via the path score (30).
+        let results = search_all(&store, "permissions.rs");
+        assert!(!results.is_empty());
+        assert!(results
+            .iter()
+            .all(|r| r.path.as_deref().unwrap_or("").contains("permissions.rs")));
     }
 }

@@ -138,7 +138,7 @@ impl CodeBroMcpServer {
         )]))
     }
 
-    // ── Tool 2: engineering facts (semantic retrieval) ───────────────
+    // ── Tool 2: engineering facts (relevance-ranked retrieval) ────────
 
     /// Search verified engineering facts semantically: symbols, modules,
     /// tests, packages, build targets, dependencies. Returns compact fact
@@ -375,8 +375,11 @@ impl CodeBroMcpServer {
         let exists = memory.snapshot().iter().any(|e| e.id == id);
 
         if exists {
+            // Full logical update: value AND metadata (confidence,
+            // importance, tags, source) — not just the value. id/key/
+            // created_at are preserved by update_with_metadata.
             memory
-                .update(&id, value)
+                .update_with_metadata(&id, value, metadata)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         } else {
             let entry = crate::engineering_memory::types::EngineeringMemoryEntry::new(
@@ -832,6 +835,99 @@ mod tests {
         assert!(err.contains("no entry"));
     }
 
+    /// P1.1 regression: record_memory on an existing key must update the
+    /// FULL logical entry — value AND confidence/importance/tags/source —
+    /// not just the value. Verified against the persisted file after
+    /// reload.
+    #[tokio::test]
+    async fn record_memory_updates_full_metadata_on_existing_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = CodeBroMcpServer::new(dir.path().to_path_buf());
+
+        // 1. Create entry with initial metadata.
+        call_tool_text(
+            &server,
+            "record_memory",
+            json!({
+                "key": "arch:gateway",
+                "value": "v1",
+                "confidence": 0.5,
+                "importance": 0.4,
+                "tags": ["a"],
+                "source": "init",
+            }),
+        )
+        .await;
+
+        // 2. Update the SAME key with new value + new metadata.
+        call_tool_text(
+            &server,
+            "record_memory",
+            json!({
+                "key": "arch:gateway",
+                "value": "v2",
+                "confidence": 0.9,
+                "importance": 0.8,
+                "tags": ["b", "c"],
+                "source": "review",
+            }),
+        )
+        .await;
+
+        // 3-7. Verify every field changed via engineering_memory.
+        let resolved = call_tool_text(
+            &server,
+            "engineering_memory",
+            json!({"task_keywords": ["arch:gateway"]}),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&resolved).expect("valid json");
+        assert_eq!(v["entries"].as_array().map(|a| a.len()), Some(1));
+        let e = &v["entries"][0];
+        assert_eq!(e["value"], "v2", "value must be updated");
+        assert_eq!(e["confidence"], 0.9, "confidence must be updated");
+        assert_eq!(e["source"], "review", "source must be updated");
+        let tags: Vec<String> = e["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            tags,
+            vec!["b".to_string(), "c".to_string()],
+            "tags must be updated"
+        );
+
+        // 8. Persistence after reload: a fresh server reads the same state.
+        let server2 = CodeBroMcpServer::new(dir.path().to_path_buf());
+        let resolved = call_tool_text(
+            &server2,
+            "engineering_memory",
+            json!({"task_keywords": ["arch:gateway"]}),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&resolved).expect("valid json");
+        assert_eq!(v["entries"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(v["entries"][0]["value"], "v2");
+        assert_eq!(v["entries"][0]["confidence"], 0.9);
+        assert_eq!(v["entries"][0]["source"], "review");
+        // Importance is not projected into the resolved view; verify it
+        // directly on disk.
+        let raw = std::fs::read_to_string(dir.path().join(".codebro/engineering_memory.json"))
+            .expect("memory file");
+        let rawv: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        let stored = &rawv["entries"][0];
+        assert_eq!(
+            stored["metadata"]["importance"], 0.8,
+            "importance must be updated"
+        );
+        assert_eq!(stored["metadata"]["confidence"], 0.9);
+        assert_eq!(stored["metadata"]["source"], "review");
+        assert_eq!(stored["metadata"]["tags"], json!(["b", "c"]));
+        assert_eq!(stored["value"], "v2");
+    }
+
     /// apply_change must reject traversal and stale content while allowing
     /// a correct edit — the guard is the point.
     #[tokio::test]
@@ -869,6 +965,16 @@ mod tests {
         .await;
         let content = std::fs::read_to_string(&file).expect("read");
         assert_eq!(content.trim(), "hello codebro");
+
+        // Ambiguous old-text (occurs more than once) must be rejected.
+        std::fs::write(&file, "dup\ndup\n").expect("write ambiguous file");
+        let err = call_tool_err(
+            &server,
+            "apply_change",
+            json!({"path": "demo.txt", "old": "dup", "new": "x"}),
+        )
+        .await;
+        assert!(err.contains("ambiguous"), "got: {err}");
 
         // Symlink escaping the workspace root must be denied, and the
         // external target must remain untouched.

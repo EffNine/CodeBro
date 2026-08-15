@@ -199,6 +199,27 @@ impl<P: ProjectIdentityProvider + Clone> EngineeringMemoryRuntime<P> {
         Ok(())
     }
 
+    /// Update an existing entry's value AND its full metadata
+    /// (confidence, importance, tags, source). id, key, and created_at are
+    /// preserved so the entry keeps its deterministic identity.
+    pub fn update_with_metadata(
+        &mut self,
+        id: &str,
+        new_value: impl Into<String>,
+        metadata: EngineeringMemoryMetadata,
+    ) -> Result<(), EngineeringMemoryError> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| EngineeringMemoryError::Generic(format!("entry not found: {}", id)))?;
+        entry.value = new_value.into();
+        entry.metadata = metadata;
+        entry.record_access();
+        self.sync_to_runtime();
+        Ok(())
+    }
+
     // ── Delete ───────────────────────────────────────────────────────────
 
     /// Delete an entry by id.
