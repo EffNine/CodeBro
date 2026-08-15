@@ -849,6 +849,26 @@ mod tests {
         .await;
         let content = std::fs::read_to_string(&file).expect("read");
         assert_eq!(content.trim(), "hello codebro");
+
+        // Symlink escaping the workspace root must be denied, and the
+        // external target must remain untouched.
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let external = outside.path().join("target.txt");
+        std::fs::write(&external, "precious").expect("write external");
+        let link = dir.path().join("evil-link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &link).expect("symlink");
+        let err = call_tool_err(
+            &server,
+            "apply_change",
+            json!({"path": "evil-link.txt", "old": "precious", "new": "HACKED"}),
+        )
+        .await;
+        assert!(err.contains("symlink escape"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&external).expect("read external"),
+            "precious"
+        );
     }
 
     /// workspace_context must always return a parseable orientation payload,

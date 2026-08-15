@@ -517,6 +517,46 @@ fn resolve_path(workspace_root: &Path, argument: &str) -> crate::error::Result<P
             trimmed
         )));
     }
+    // Resolve symlinks: a link inside the root may point outside it (or a
+    // parent path may be a link). Verify the CANONICAL target still lives
+    // under the canonical workspace root, so writes cannot escape via
+    // symlink. For a not-yet-existing file (create path) we canonicalize
+    // the parent directory instead, which still catches a symlinked parent
+    // escaping the root.
+    //
+    // Canonicalize the workspace root once (e.g. macOS /var -> /private/var)
+    // and compare canonicalized targets against it, so a workspace behind a
+    // symlink does not false-positive.
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_candidate = candidate
+        .canonicalize()
+        .ok()
+        .or_else(|| {
+            // Create path: the file does not exist yet; canonicalize the
+            // nearest existing ancestor so a symlinked parent is resolved,
+            // then re-append the missing tail.
+            let mut existing = candidate.as_path();
+            let mut tail: Vec<std::ffi::OsString> = Vec::new();
+            while !existing.exists() {
+                if let Some(name) = existing.file_name() {
+                    tail.push(name.to_os_string());
+                }
+                existing = existing.parent().unwrap_or(existing);
+            }
+            existing
+                .canonicalize()
+                .ok()
+                .map(|base| tail.into_iter().rev().fold(base, |p, n| p.join(n)))
+        })
+        .unwrap_or_else(|| candidate.clone());
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(crate::error::CodeBroError::Permission(format!(
+            "symlink escape denied: '{}' resolves outside the workspace root",
+            trimmed
+        )));
+    }
     Ok(candidate)
 }
 
