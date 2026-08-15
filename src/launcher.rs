@@ -208,13 +208,33 @@ impl Launcher {
                     eprintln!("[launcher] Ctrl+C received, shutting down...");
                     break;
                 }
-                _ = &mut bridge_rx => {
-                    eprintln!("[launcher] Bridge exited");
-                    break;
+                status = &mut bridge_rx => {
+                    match status {
+                        Ok(s) => {
+                            eprintln!("[launcher] Bridge exited with status: {:?}", s);
+                            break;
+                        }
+                        Err(_) => {
+                            eprintln!("[launcher] Bridge exit channel closed");
+                            break;
+                        }
+                    }
                 }
-                _ = &mut tui_rx => {
-                    eprintln!("[launcher] TUI exited");
-                    break;
+                status = &mut tui_rx => {
+                    match status {
+                        Ok(s) => {
+                            if s.success() {
+                                eprintln!("[launcher] TUI exited cleanly");
+                            } else {
+                                eprintln!("[launcher] TUI exited with code: {:?}", s.code());
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            eprintln!("[launcher] TUI exit channel closed");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -293,11 +313,13 @@ impl Launcher {
 
         let child = std::process::Command::new(&self.paths.bun_bin)
             .arg("run")
-            .arg("src/index.tsx")
+            .arg("--conditions")
+            .arg("browser")
+            .arg("src/main.tsx")
             .current_dir(&self.paths.tui_root)
             .stdin(Stdio::from(bridge_stdout))
-            .stdout(Stdio::from(bridge_stdin))
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?;
 
         Ok(ChildHandle { child, name: "tui" })
