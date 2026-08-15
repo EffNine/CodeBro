@@ -235,7 +235,8 @@ opencode run --auto "What is this workspace? Use codebro_workspace_context."
 ### 8.4 Verified behaviour (2026-08-15)
 
 - Agent discovers and calls `codebro_workspace_context` and reports the
-  fact counts (27,209 facts on the codebro repo itself).
+  fact counts (14,470 facts on the codebro repo itself, after dedup
+  fixes — see §9).
 - Agent calls `codebro_engineering_facts` filtered by kind.
 - Agent records memory via `codebro_record_memory`; entry persisted and
   resolvable in later sessions.
@@ -252,3 +253,70 @@ opencode run --auto "What is this workspace? Use codebro_workspace_context."
 | Tool call fails with `-32602` | Argument validation error — read the message; e.g. creating a file requires `old=""` |
 | `未提供令牌` / auth errors | Provider API key missing in the environment (`AGNES_API_KEY` etc.) |
 | `doctor` reports fact validation issues | `codebro init` again; deterministic rebuild keeps the store consistent |
+
+---
+
+## 9. A/B comparison: with vs without CodeBro
+
+Methodology (2026-08-15): the same prompt, the same model
+(`agnes-2.5-flash` in OpenCode 1.18.16), **separate fresh sessions**, on
+the codebro repo itself. The "without" session ran with the codebro MCP
+server removed from the OpenCode global config; the "with" session had it
+registered. Both sessions auto-approved permissions.
+
+### 9.1 Test 1 — qualitative (architecture questions)
+
+Prompt: *"Where is the guarded file-mutation prepare/apply seam? Is there
+workspace-boundary enforcement? Which module owns the canonical mutation
+path?"*
+
+| | ✅ With CodeBro | ❌ Without CodeBro |
+|---|---|---|
+| File identified | `src/coding/permissions.rs` | `src/coding/permissions.rs` |
+| Key struct | `ChangeEngine` (line 202) | `ChangeEngine` (line 202) |
+| Boundary enforcement | `resolve_path` (line 491) | `resolve_path` (line 491) |
+| Method used | grep/read (MCP tools **not** preferred) | grep/read |
+
+**Conclusion:** for plain "where is X" questions, a capable agent answers
+equally well with grep — CodeBro adds no measurable value here.
+
+### 9.2 Test 2 — quantitative (whole-project facts)
+
+Prompt: *"Report the total number of symbols, tests, and modules, and give
+3 example symbol ids."* Ground truth comes from the facts store.
+
+| Metric | ✅ With CodeBro | ❌ Without CodeBro | Ground truth |
+|---|---|---|---|
+| Symbols | **10,514** (exact, from facts store) | 4,227 ❌ (counted only `pub fn/struct/enum` — missed private items and methods) | 10,514 |
+| Tests | **3,602** (exact) | 2,799 ❌ (counted only `#[test]` attrs — missed helpers) | 3,602 |
+| Modules | **351** (exact) | 559 ❌ (counted `mod` declarations, not source files — wrong definition) | 351 |
+| Example symbol ids | Real ids from the store | **Constructed from a guessed pattern** ⚠️ (agent invented `sym::…::FactId::new@142` from the id format, not from data) | store ids |
+| Tool calls | 1 MCP call (`codebro_workspace_context`) | 5+ grep/glob (missed the target) | — |
+
+**Conclusion:** for whole-project factual questions, CodeBro is
+materially better: exact counts vs under-counts, and real identifiers vs
+invented ones (hallucination risk). This is the differentiating scenario
+the product targets.
+
+### 9.3 Key findings
+
+1. **Quantitative questions expose CodeBro's value; qualitative ones do
+   not.** An agent can grep its way to "where is the seam" but cannot
+   cheaply and correctly answer "how many symbols / list real ids" — it
+   under-counts or fabricates. CodeBro's facts store answers exactly.
+2. **Agents do not auto-prefer MCP tools.** In Test 1 the agent with
+   CodeBro available still chose grep. Value only materialised when the
+   prompt instructed the tool. Implication: strengthen the server's
+   `instructions` field and/or prompt guidance so agents consult CodeBro
+   for project facts by default.
+3. **`codebro doctor` and the MCP server agree** (14,470 facts, 0
+   validation issues), confirming the store is the single source of truth.
+
+### 9.4 Follow-ups from this test
+
+- Make `ServerInfo.instructions` more directive: "for any question about
+  project-wide symbols, modules, tests or decisions, prefer
+  `codebro_engineering_facts` / `codebro_workspace_context` before
+  grepping."
+- Consider a benchmark harness (see advisor's 90-day plan: measure
+  context-error reduction across ≥10 tasks).
