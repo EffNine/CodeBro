@@ -1,6 +1,6 @@
 [package]
 name = "codebro"
-version = "0.1.0"
+version = "0.7.0-mcp-rc1"
 edition = "2021"
 description = "Your AI coding partner in the terminal"
 license = "MIT"
