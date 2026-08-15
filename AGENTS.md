@@ -5,7 +5,7 @@
 - **Language / toolchain:** Rust, edition 2021, single `[[bin]]` crate (`codebro`). No library target.
 - **Positioning:** Engineering context & memory layer for AI coding agents, exposed as an MCP server.
 - **Entry point:** `src/main.rs` → `cli::run()` → dispatches to `serve`, `init`, `doctor`, or `list-models`.
-- **Tests:** `cargo test` (~2910 tests, ~25 s). Run focused: `cargo test <module_name>`.
+- **Tests:** `cargo test`. Run focused: `cargo test <module_name>`. Test counts evolve — trust the current output rather than hardcoding numbers.
 - **Build:** `cargo build --release && cargo install --path .`
 - **CLI commands:** `codebro serve --root <path>`, `codebro init --root <path>`, `codebro doctor --root <path>`, `codebro list-models`.
 - **Config:** Optional `~/.codebro/config.toml` (provider, base_url, model, api_key). Env vars honoured: `CODEBRO_API_KEY`, `CODEBRO_BASE_URL`, `CODEBRO_MODEL`.
@@ -84,7 +84,7 @@ The server exposes exactly 7 tools over stdio (`rmcp` transport). MCP handlers a
 | `workspace_context` | read | Compact workspace orientation: project identity, workspace root, fact-store counts. Call first to understand the project. |
 | `engineering_facts` | read | Relevance-ranked fact retrieval over verified facts (symbols, modules, tests, packages, build targets, dependencies). Supports `query`, `kind`, `path`, `limit` filters. Returns compact fact records with locations and provenance (not raw ids). Zero-result responses include deterministic recovery hints. |
 | `engineering_memory` | read | Resolve persistent engineering memory (decisions, constraints, prior context) by task keywords. Entries carry confidence, source, and tags so the agent can judge trustworthiness. Memory is bounded by the resolver's entry/token budget. |
-| `memory_stats` | read | Read-only statistics about the engineering memory store: entry count, total token budget, tag distribution, average confidence, oldest/newest timestamps. |
+| `memory_stats` | read | Read-only statistics about the engineering memory store: entry count, configured token budget, tag distribution, average confidence, oldest/newest timestamps. |
 | `record_memory` | write | Upsert a persistent engineering memory entry. Values are secret-redacted before storage. Updating an existing key updates the full logical entry (value AND confidence, importance, tags, source). Keys are capped at 256 chars; values at 64 KB; tags at 32 entries, 64 chars each. |
 | `delete_memory` | write | Delete an engineering memory entry by exact key. **Requires `confirm=true`** — omitting it is a no-op. Prevents accidental or speculative deletion. Deleting a missing key errors. |
 | `apply_change` | write *(optional)* | Guarded single-file mutation through the ChangeEngine. Enforces workspace boundary, refuses stale or ambiguous edits. For new files pass `old=""`. Agents should use their native editing tools for normal coding edits; this is available for controlled/autonomous workflows. |
@@ -173,7 +173,7 @@ The ChangeEngine (`src/coding/permissions.rs`) is the **only** mutation seam for
 - **No blind overwrite:** Existing files require a non-empty `old` text. Passing `old=""` for an existing file is rejected.
 - **Ambiguous replacement rejection:** If `old` occurs more than once in the file, the change is denied — the caller must supply more context for a unique match.
 - **Stale-content protection:** The prepare phase reads current content; apply refuses if the file changed between prepare and apply.
-- **Plan adherence (strict mode):** When `strict=true`, changes to files not in the plan are denied.
+- **Plan adherence (strict mode):** The ChangeEngine supports strict plan adherence — when `strict=true`, changes to files not in the plan are denied. The current MCP `apply_change` handler uses the plan-less/non-strict path, so plan adherence is not enforced by the MCP tool itself.
 - **Controlled file creation:** New files use a dedicated creation path (PatchEngine cannot reconstruct from a non-existent base). Creation still goes through the prepare/apply seam and is subject to staleness checks.
 
 For normal coding edits, agents should use their native editing tools. `apply_change` is optional and intended for controlled/autonomous workflows.
@@ -209,7 +209,7 @@ cargo test doctor
 ### Known issues
 
 - `cargo clippy -- -D warnings` fails on a pre-existing unreachable pattern at `src/intelligence/parser/tree_sitter.rs:813`. This is a known cosmetic warning, not a correctness issue.
-- The full test suite reports ~2910 tests. Some modules have ignored tests.
+- Some modules have ignored tests. Run `cargo test` and trust the output.
 
 ### Conventions
 
@@ -227,8 +227,9 @@ cargo test doctor
 - `Cargo.toml` — package metadata, dependencies, version.
 - `docs/design/` — current design documentation.
 - `docs/ADR/` — Architecture Decision Records.
-- `.codebro/` — runtime state (facts, memory, identity). **Do not delete or rewrite this directory** — it is the project's persistent state.
+- `.codebro/` — runtime state (facts, memory, identity). Do not delete or rewrite casually; use CodeBro runtime commands (`codebro init`, `codebro doctor`, MCP tools) for intentional state changes.
 - `CHANGELOG.md` — authoritative change history.
+- `Cargo.lock` — committed dependency lockfile.
 
 ### Generated / runtime state (do not commit)
 
@@ -236,7 +237,6 @@ cargo test doctor
 - `.codebro/engineering_memory.json` — produced by `record_memory`.
 - `.codebro/project_identity.json` — produced by project identity runtime.
 - `target/` — build artifacts.
-- `Cargo.lock` — locked dependencies (committed).
 
 ### Destructive operations to avoid
 
@@ -281,7 +281,7 @@ AGENTS.md is an operational guide, not a duplicate of ADRs or design docs. When 
 ## Release discipline
 
 - **Current version:** `v0.7.0-mcp-rc1` (see `Cargo.toml` and tag `v0.7.0-mcp-rc1`).
-- **Current commit:** `ef8b9a3` on `origin/main`.
+- **Release commit:** `ef8b9a3` — this is the v0.7.0-mcp-rc1 release commit. `origin/main` may contain post-RC1 commits.
 - The RC1 tag must not be modified or moved.
 - Future changes after RC1 use new commits and new tags.
 - Release build: `cargo build --release` produces `target/release/codebro`.
