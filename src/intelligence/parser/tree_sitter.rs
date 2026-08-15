@@ -772,16 +772,24 @@ impl CodeParser {
                 });
             }
             "type_declaration" => {
-                let type_spec = self.get_node_by_kind(node, "type_spec");
-                if let Some(ts) = type_spec {
-                    let name_node = self.get_node_by_kind(ts, "identifier");
-                    let name = name_node
-                        .and_then(|n| self.node_name(n, source))
-                        .unwrap_or_else(|| "unknown".to_string());
+                // `type X struct{...}` / `type X interface{...}` / `type X int32`
+                // are `type_spec`; `type X = Y` is a dedicated `type_alias`
+                // node in tree-sitter-go. Handle both.
+                let ts = self
+                    .get_node_by_kind(node, "type_spec")
+                    .or_else(|| self.get_node_by_kind(node, "type_alias"));
+                if let Some(ts) = ts {
+                    // Go names type declarations via `type_identifier`, not
+                    // `identifier`; `name_of` falls back to it so structs,
+                    // interfaces, aliases and defined types keep real names.
+                    let name = self.name_of(ts, source, "identifier");
 
                     let type_node = self.get_node_by_kind(ts, "struct_type");
+                    let iface_node = self.get_node_by_kind(ts, "interface_type");
                     let kind = if type_node.is_some() {
                         SymbolKind::Struct
+                    } else if iface_node.is_some() {
+                        SymbolKind::Interface
                     } else {
                         SymbolKind::TypeAlias
                     };
@@ -876,26 +884,49 @@ impl CodeParser {
         Ok(())
     }
 
+    /// Extract a clean, syntactically recognizable declaration signature.
+    ///
+    /// The signature is the source text from the declaration start up to the
+    /// start of its body (block / statement_block / compound_statement), or up
+    /// to the `=>` for arrow functions. Cutting at the AST body boundary keeps
+    /// the signature readable instead of replaying every descendant node's text
+    /// (which produced garbled output like `func (m *mockProvider) ( m
+    /// *mockProvider)`).
     fn extract_signature(&self, node: Node, source: &str) -> Option<String> {
-        let mut sig_parts = Vec::new();
-        self.collect_signature_text(node, source, &mut sig_parts);
-        if sig_parts.is_empty() {
-            None
-        } else {
-            Some(sig_parts.join(" "))
-        }
-    }
-
-    fn collect_signature_text(&self, node: Node, source: &str, parts: &mut Vec<String>) {
-        let text = self.node_text(node, source).trim().to_string();
-        if !text.is_empty() && text.len() < 200 {
-            parts.push(text);
-        }
+        let mut end = node.end_byte();
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
-                self.collect_signature_text(child, source, parts);
+                match child.kind() {
+                    "block" | "statement_block" | "compound_statement" | "body" => {
+                        end = child.start_byte();
+                        break;
+                    }
+                    "=>" => {
+                        end = child.end_byte();
+                        break;
+                    }
+                    _ => {}
+                }
             }
         }
+
+        let raw = &source[node.start_byte()..end];
+        // Collapse whitespace runs (incl. newlines in multi-line parameter
+        // lists) to single spaces for a compact, LLM-friendly signature.
+        let sig: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let sig = sig.trim().to_string();
+        if sig.is_empty() {
+            return None;
+        }
+
+        // Safety cap for declarations without a body node (e.g. large arrow
+        // function expression bodies): keep a bounded, deterministic prefix.
+        const MAX_SIGNATURE_CHARS: usize = 512;
+        if sig.len() > MAX_SIGNATURE_CHARS {
+            let cut = sig.floor_char_boundary(MAX_SIGNATURE_CHARS);
+            return Some(format!("{} …", &sig[..cut]));
+        }
+        Some(sig)
     }
 
     fn extract_doc_comment(&self, node: Node, source: &str) -> Option<String> {

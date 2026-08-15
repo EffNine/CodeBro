@@ -478,6 +478,45 @@ mod tests {
     }
 
     #[test]
+    fn test_oversized_entry_persists_and_stays_discoverable() {
+        // P1.3 regression: an oversized entry must survive persist → reload →
+        // resolve and remain discoverable (bounded) in a fresh runtime.
+        let (mut runtime, _tmp) = setup();
+        let long_value = "canonical decision: ".to_string() + &"x".repeat(2900);
+        runtime
+            .record(make_entry(
+                "e1",
+                "architecture:mutation-boundary",
+                &long_value,
+            ))
+            .unwrap();
+        runtime.persist().expect("persist");
+
+        // Fresh runtime: reload from disk, then resolve with exact keywords.
+        let mut identity = ProjectIdentityRuntime::new(_tmp.path());
+        let _ = identity.load().expect("load identity");
+        let mut reload = EngineeringMemoryRuntime::new(_tmp.path(), identity);
+        let count = reload.load().expect("reload");
+        assert_eq!(count, 1, "oversized entry must survive reload");
+
+        let ctx = reload.resolve_for_task(&["architecture:mutation-boundary".to_string()], &[]);
+        assert_eq!(
+            ctx.entries.len(),
+            1,
+            "oversized entry must resolve after reload"
+        );
+        let got = &ctx.entries[0];
+        assert_eq!(got.key, "architecture:mutation-boundary");
+        assert_eq!(got.confidence, 0.9);
+        assert!(
+            got.value
+                .ends_with(crate::engineering_memory::resolver::TRUNCATION_MARKER),
+            "recovered oversized entry must be explicitly truncated"
+        );
+        assert!(got.value.starts_with("canonical decision: "));
+    }
+
+    #[test]
     fn test_load_wrong_project_rejected() {
         let (mut runtime, _tmp) = setup();
         // Write a file for a different project.

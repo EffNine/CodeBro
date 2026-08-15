@@ -493,4 +493,85 @@ mod tests {
             .iter()
             .all(|r| r.path.as_deref().unwrap_or("").contains("permissions.rs")));
     }
+
+    /// Go-flavored store mirroring the P1.3 fixtures: a `Breaker` type plus
+    /// its methods, as produced by the fixed Go parser.
+    fn go_store() -> FactStore {
+        let ws_id = WorkspaceId::new("ws::go");
+        let mut builder = FactsBuilder::new();
+        builder.add_workspace(WorkspaceFact::new(ws_id.clone(), "go-proj"));
+
+        let mut m = ModuleFact::new(
+            ModuleId::new("mod::internal/breaker/breaker.go"),
+            "internal::breaker::breaker.go",
+        );
+        m.path = Some("internal/breaker/breaker.go".to_string());
+        builder.add_module(m);
+
+        let mut breaker =
+            SymbolFact::new(SymbolId::new("sym::Breaker"), "Breaker", SymbolKind::Struct);
+        breaker.location = SourceLocation::new()
+            .with_file("internal/breaker/breaker.go")
+            .with_point(64, 0);
+        breaker.signature = Some("type Breaker struct".to_string());
+        builder.add_symbol(breaker);
+
+        let mut allow = SymbolFact::new(SymbolId::new("sym::Allow"), "Allow", SymbolKind::Method);
+        allow.location = SourceLocation::new()
+            .with_file("internal/breaker/breaker.go")
+            .with_point(98, 0);
+        allow.signature = Some("func (b *Breaker) Allow() Result".to_string());
+        builder.add_symbol(allow);
+
+        let mut stats = SymbolFact::new(SymbolId::new("sym::Stats"), "Stats", SymbolKind::Method);
+        stats.location = SourceLocation::new()
+            .with_file("internal/breaker/breaker.go")
+            .with_point(178, 0);
+        stats.signature = Some("func (b *Breaker) Stats() BreakerStats".to_string());
+        builder.add_symbol(stats);
+
+        FactStore::build(builder.build())
+    }
+
+    #[test]
+    fn go_multi_word_query_finds_type_and_methods() {
+        // P1.3 fixture: "breaker Stats Allow" must surface the Breaker type and
+        // its Stats/Allow methods from the Go fact store.
+        let store = go_store();
+        let results = search_all(&store, "breaker Stats Allow");
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"Breaker"),
+            "Breaker type must be found, got {names:?}"
+        );
+        assert!(names.contains(&"Stats"));
+        assert!(names.contains(&"Allow"));
+        // All three targeted Go facts surface at the top of the ranking
+        // (exact-name tokens score equally; deterministic order thereafter).
+        let top: std::collections::HashSet<&str> =
+            results.iter().take(3).map(|r| r.name.as_str()).collect();
+        assert_eq!(top.len(), 3);
+        assert!(top.contains("Breaker") && top.contains("Stats") && top.contains("Allow"));
+    }
+
+    #[test]
+    fn go_type_query_returns_real_name() {
+        // P1.3 regression: the Breaker TYPE must be discoverable by name (it
+        // used to be stored as "unknown" by the Go parser).
+        let store = go_store();
+        let results = search_all(&store, "Breaker");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].name, "Breaker");
+        assert_eq!(results[0].kind, "symbol");
+        assert_eq!(
+            results[0].path.as_deref(),
+            Some("internal/breaker/breaker.go")
+        );
+        // Method signatures are clean and LLM-recognizable.
+        let stats = results.iter().find(|r| r.name == "Stats").unwrap();
+        assert_eq!(
+            stats.summary.as_deref(),
+            Some("func (b *Breaker) Stats() BreakerStats")
+        );
+    }
 }

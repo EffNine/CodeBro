@@ -1180,6 +1180,171 @@ func (p Person) Age() int {
 }
 
 #[test]
+fn test_parser_go_types_keep_real_names() {
+    // P1.3 regression: Go type declarations were emitted with name "unknown"
+    // because the extractor looked for an `identifier` node, but Go uses
+    // `type_identifier`. Structs, interfaces, aliases and defined types must
+    // keep their real names and be classified by the existing fact model.
+    use crate::intelligence::parser::SymbolKind as K;
+
+    let source = r#"
+package main
+
+type Breaker struct {
+    mu   sync.Mutex
+    state State
+}
+
+type Config struct {
+    FailureThreshold int
+}
+
+type Notifier interface {
+    Notify(msg string) error
+}
+
+type Code = int
+
+type Status int32
+"#;
+
+    let result = crate::intelligence::parser::parse_source("go", source, "types.go")
+        .expect("Go parsing should work");
+
+    let symbols = &result.symbols;
+    assert!(
+        !symbols.iter().any(|s| s.name == "unknown"),
+        "no Go type may be named unknown: {:?}",
+        symbols
+            .iter()
+            .map(|s| (s.name.clone(), format!("{:?}", s.kind)))
+            .collect::<Vec<_>>()
+    );
+
+    let by_name = |n: &str| symbols.iter().filter(|s| s.name == n).collect::<Vec<_>>();
+
+    let breaker = by_name("Breaker");
+    assert_eq!(breaker.len(), 1, "Breaker must be extracted exactly once");
+    assert!(matches!(breaker[0].kind, K::Struct));
+    assert_eq!(breaker[0].line_start, 4, "Breaker source line preserved");
+
+    let config = by_name("Config");
+    assert_eq!(config.len(), 1);
+    assert!(matches!(config[0].kind, K::Struct));
+
+    let notifier = by_name("Notifier");
+    assert_eq!(
+        notifier.len(),
+        1,
+        "interface must be extracted with its name"
+    );
+    assert!(matches!(notifier[0].kind, K::Interface));
+
+    // `type Code = int` is an alias; `type Status int32` is a defined type.
+    // Both fit the existing TypeAlias fact-model bucket.
+    assert_eq!(by_name("Code").len(), 1);
+    assert!(matches!(by_name("Code")[0].kind, K::TypeAlias));
+    assert_eq!(by_name("Status").len(), 1);
+    assert!(matches!(by_name("Status")[0].kind, K::TypeAlias));
+}
+
+#[test]
+fn test_parser_go_signatures_are_clean() {
+    // P1.3 regression: Go signatures were garbled by token replay
+    // (`func (m *mockProvider) ( m *mockProvider`). Signatures must be clean,
+    // syntactically recognizable declaration prefixes.
+    use crate::intelligence::parser::SymbolKind as K;
+
+    let source = r#"
+package breaker
+
+func New(cfg Config) *Breaker {
+    return &Breaker{cfg: cfg}
+}
+
+func (b *Breaker) Allow() Result {
+    return ResultAllowed
+}
+
+func (b *Breaker) Stats() BreakerStats {
+    return BreakerStats{}
+}
+
+func (b *Breaker) Record(ok bool, err error) (State, error) {
+    return StateClosed, nil
+}
+
+func (b Breaker) WithCallback(fn func(State)) Breaker {
+    return b
+}
+
+func Map[T any](items []T, fn func(T) bool) []T {
+    return items
+}
+"#;
+
+    let result = crate::intelligence::parser::parse_source("go", source, "breaker.go")
+        .expect("Go parsing should work");
+
+    let signature_of = |name: &str| {
+        result
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.signature.clone())
+            .unwrap_or_else(|| panic!("no signature for {name}"))
+    };
+
+    // Constructor returning pointer.
+    let new_sig = signature_of("New");
+    assert_eq!(new_sig, "func New(cfg Config) *Breaker");
+    assert!(
+        result
+            .symbols
+            .iter()
+            .find(|s| s.name == "New")
+            .is_some_and(|s| matches!(s.kind, K::Function)),
+        "New must be a Function"
+    );
+
+    // Zero-argument method (pointer receiver).
+    assert_eq!(signature_of("Allow"), "func (b *Breaker) Allow() Result");
+    assert_eq!(
+        signature_of("Stats"),
+        "func (b *Breaker) Stats() BreakerStats"
+    );
+
+    // Method with arguments and multiple return values.
+    assert_eq!(
+        signature_of("Record"),
+        "func (b *Breaker) Record(ok bool, err error) (State, error)"
+    );
+
+    // Value receiver.
+    assert_eq!(
+        signature_of("WithCallback"),
+        "func (b Breaker) WithCallback(fn func(State)) Breaker"
+    );
+
+    // Generic function with a callback argument.
+    assert_eq!(
+        signature_of("Map"),
+        "func Map[T any](items []T, fn func(T) bool) []T"
+    );
+
+    // No signature may contain the token-replay garble.
+    for s in &result.symbols {
+        if let Some(sig) = &s.signature {
+            assert!(
+                !sig.contains("( b *Breaker b *Breaker"),
+                "garbled signature for {}: {sig}",
+                s.name
+            );
+        }
+    }
+}
+
+#[test]
 fn test_indexer_symbol_storage() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("test_index.db");
