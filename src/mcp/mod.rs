@@ -169,7 +169,8 @@ impl CodeBroMcpServer {
                 path: args.path.as_deref(),
                 limit: args.limit.unwrap_or(crate::mcp::facts::DEFAULT_LIMIT),
             },
-        );
+        )
+        .map_err(|e| McpError::invalid_params(e, None))?;
 
         let payload = json!({
             "store": {
@@ -287,6 +288,13 @@ impl CodeBroMcpServer {
         if key.is_empty() {
             return Err(McpError::invalid_params("key must not be empty", None));
         }
+        const MAX_KEY_LEN: usize = 256;
+        if key.len() > MAX_KEY_LEN {
+            return Err(McpError::invalid_params(
+                format!("key exceeds {MAX_KEY_LEN} characters"),
+                None,
+            ));
+        }
         if args.value.trim().is_empty() {
             return Err(McpError::invalid_params("value must not be empty", None));
         }
@@ -300,6 +308,26 @@ impl CodeBroMcpServer {
 
         // Hardening: redact secrets before anything touches storage.
         let value = crate::tools::shell::redact_secrets_public(&args.value);
+
+        // Tag bounds: prevent unbounded tag lists bloating the store.
+        const MAX_TAGS: usize = 32;
+        const MAX_TAG_LEN: usize = 64;
+        if args.tags.len() > MAX_TAGS {
+            return Err(McpError::invalid_params(
+                format!("tags exceed {MAX_TAGS} entries"),
+                None,
+            ));
+        }
+        if args
+            .tags
+            .iter()
+            .any(|t| t.len() > MAX_TAG_LEN || t.trim().is_empty())
+        {
+            return Err(McpError::invalid_params(
+                format!("each tag must be 1-{MAX_TAG_LEN} characters"),
+                None,
+            ));
+        }
 
         let mut tags = args.tags.clone();
         tags.sort();

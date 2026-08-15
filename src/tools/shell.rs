@@ -431,8 +431,9 @@ fn redact_secrets(s: &str) -> String {
     // obvious key=value secrets. This is the single secret-redaction authority
     // for tool output, PTY streaming, shell history, and session persistence.
     let patterns: &[&str] = &[
-        // OpenAI-style keys: sk-...
-        r"(?i)sk-[A-Za-z0-9_-]{16,}",
+        // OpenAI-style keys: sk-... (8+ chars — real keys are much longer,
+        // but keep the floor low so short sample keys are still caught).
+        r"(?i)sk-[A-Za-z0-9_-]{8,}",
         // Bearer tokens.
         r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{20,}",
         // api_key=..., api-key "value", apikey: value
@@ -444,8 +445,13 @@ fn redact_secrets(s: &str) -> String {
         r"(?i)\bglpat-[A-Za-z0-9_\-]{16,}\b",
         // Slack tokens.
         r"(?i)\bxox[baprs]-[A-Za-z0-9-]{8,}\b",
-        // password/passwd/secret/token/pwd = <value>
-        r#"(?i)(?:password|passwd|secret|token|pwd)["'=:\s]+[A-Za-z0-9._~+/=-]{8,}"#,
+        // password/passwd/secret/token/pwd/pw followed by an assignment
+        // separator (=, :, quote) then a value (4+ chars). Deliberately no
+        // bare whitespace separator: that would false-positive on ordinary
+        // prose like "password policy is 8 chars".
+        r#"(?i)(?:password|passwd|secret|token|pwd|pw)["'=:]\s*[A-Za-z0-9._~+/=-]{4,}"#,
+        // CLI flag style: --token <value>, --password <value>, -p <value>
+        r#"(?i)(?:--?(?:password|passwd|secret|token|pwd|pw|api[-_]?key))\s+[A-Za-z0-9._~+/=-]{4,}"#,
         // URLs with embedded credentials: scheme://user:pass@host
         r"(?i)://[A-Za-z0-9._~%+-]+:[^/@\s:]+@",
     ];
@@ -899,6 +905,10 @@ mod tests {
             !redact_secrets("git clone https://user:secretpassword123@github.com/x/y.git")
                 .contains("secretpassword123")
         );
+        // Short sample keys (>= 8 chars) and pw= / secret= inline values.
+        assert!(!redact_secrets("api_key=sk-abc12345").contains("sk-abc12345"));
+        assert!(!redact_secrets("pw=secret123").contains("secret123"));
+        assert!(!redact_secrets("passwd=hunter2hunter2").contains("hunter2hunter2"));
         // Ordinary prose must survive redaction intact.
         assert!(redact_secrets("the build passed cleanly").contains("the build passed cleanly"));
         assert!(redact_secrets("password policy is 8 chars").contains("password policy is 8 chars"));

@@ -70,8 +70,16 @@ pub struct FactSearch<'a> {
 }
 
 /// Run a deterministic semantic search over the fact store.
-pub fn search(store: &FactStore, params: &FactSearch<'_>) -> Vec<FactRecord> {
+///
+/// Returns an error when the query is empty and no kind/path filter is
+/// given: an unfiltered empty query would enumerate the whole store
+/// without meaning, which is ambiguous for agents.
+pub fn search(store: &FactStore, params: &FactSearch<'_>) -> Result<Vec<FactRecord>, String> {
     let query = params.query.trim().to_lowercase();
+    let has_filter = params.kind.is_some() || params.path.is_some();
+    if query.is_empty() && !has_filter {
+        return Err("query is required (or provide a kind/path filter to enumerate)".to_string());
+    }
     let path_filter = params.path.map(|p| p.to_lowercase());
     let limit = params.limit.clamp(1, MAX_LIMIT);
 
@@ -110,7 +118,7 @@ pub fn search(store: &FactStore, params: &FactSearch<'_>) -> Vec<FactRecord> {
     for r in &mut results {
         r.score = 0;
     }
-    results
+    Ok(results)
 }
 
 /// Extract a searchable record from a fact reference, or None for kinds
@@ -286,6 +294,7 @@ mod tests {
                 limit: DEFAULT_LIMIT,
             },
         )
+        .expect("search succeeds")
     }
 
     #[test]
@@ -321,7 +330,8 @@ mod tests {
                 path: None,
                 limit: DEFAULT_LIMIT,
             },
-        );
+        )
+        .expect("kind filter makes empty query valid");
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.kind == "symbol"));
     }
@@ -337,7 +347,8 @@ mod tests {
                 path: Some("coding/permissions"),
                 limit: DEFAULT_LIMIT,
             },
-        );
+        )
+        .expect("path filter makes empty query valid");
         assert_eq!(results.len(), 2); // ChangeEngine + prepare
         assert!(results.iter().all(|r| r
             .path
@@ -352,24 +363,59 @@ mod tests {
         let results = search(
             &store,
             &FactSearch {
-                query: "",
+                query: "engine",
                 kind: None,
                 path: None,
                 limit: 1,
             },
-        );
+        )
+        .expect("search succeeds");
         assert_eq!(results.len(), 1);
         // Clamped from absurdly high value.
         let results = search(
             &store,
             &FactSearch {
-                query: "",
+                query: "engine",
                 kind: None,
                 path: None,
                 limit: 10_000,
             },
-        );
+        )
+        .expect("search succeeds");
         assert!(results.len() <= MAX_LIMIT);
+    }
+
+    #[test]
+    fn empty_query_without_filter_is_rejected() {
+        let store = sample_store();
+        let err = search(
+            &store,
+            &FactSearch {
+                query: "",
+                kind: None,
+                path: None,
+                limit: DEFAULT_LIMIT,
+            },
+        )
+        .expect_err("empty query without filter must error");
+        assert!(err.contains("query is required"));
+    }
+
+    #[test]
+    fn empty_query_with_filter_enumerates() {
+        let store = sample_store();
+        let results = search(
+            &store,
+            &FactSearch {
+                query: "",
+                kind: Some(FactKind::Symbol),
+                path: None,
+                limit: DEFAULT_LIMIT,
+            },
+        )
+        .expect("kind filter makes empty query valid");
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| r.kind == "symbol"));
     }
 
     #[test]

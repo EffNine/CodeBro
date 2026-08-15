@@ -1840,7 +1840,6 @@ fn test_experience_recommended_tools() {
     assert_eq!(tools[0], "edit_file");
 }
 
-
 #[test]
 fn test_agent_status_idle_default() {
     let state = crate::agent::status::AgentState::new("research");
@@ -2108,7 +2107,6 @@ fn test_recovery_escalation_flow() {
     assert!(stats.escalated >= 1);
 }
 
-
 #[test]
 fn test_session_persistence_never_contains_secrets() {
     let dir = tempdir().unwrap();
@@ -2157,7 +2155,6 @@ fn test_read_file_tool_redacts_secrets() {
         result
     );
 }
-
 
 use crate::agent::subagent::{SubAgentCapability, SubAgentContext, SubAgentResult};
 
