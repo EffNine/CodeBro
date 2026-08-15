@@ -1,10 +1,10 @@
-//! CodeBro Engineering Runtime — MCP server interface.
+//! CodeBro Engineering Context — MCP server interface.
 //!
-//! Exposes the engineering runtime (project identity, verified facts,
-//! engineering memory, guarded change application) over the Model Context
+//! Exposes the engineering context layer (project identity, verified facts,
+//! engineering memory, optional guarded changes) over the Model Context
 //! Protocol so that battle-tested agents — Claude Code, OpenCode, Codex,
 //! Cursor, Goose — can act as the frontend while CodeBro owns project
-//! truth, persistent engineering context and guarded mutations.
+//! truth and persistent engineering context.
 //!
 //! Run with `codebro serve` (stdio transport). See `docs/design/MCP_SERVER.md`
 //! for the roadmap.
@@ -24,7 +24,8 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-/// The CodeBro MCP server: a stateless router over the engineering runtime.
+/// The CodeBro MCP server: a stateless router over the engineering context
+/// layer.
 ///
 /// Every tool call constructs a fresh view of the runtime from the workspace
 /// root, so the server holds no mutable state and can be shared freely.

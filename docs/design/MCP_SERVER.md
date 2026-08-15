@@ -11,10 +11,11 @@
 
 ## 1. Purpose
 
-CodeBro exposes its engineering runtime as a **Model Context Protocol (MCP)
-server** so that battle-tested agent frontends — Claude Code, OpenCode, Codex,
-Cursor, Goose — can act as the interface while CodeBro owns project truth,
-persistent engineering context and guarded mutations.
+CodeBro exposes its engineering context layer as a **Model Context Protocol
+(MCP) server** so that battle-tested agent frontends — Claude Code, OpenCode,
+Codex, Cursor, Goose — can act as the interface while CodeBro owns project
+truth and persistent engineering context (plus an optional guarded mutation
+API for controlled workflows).
 
 The legacy chat TUI was moved to the `tui-legacy` branch and is out of scope
 for this design.
@@ -23,8 +24,9 @@ for this design.
 
 ## 2. Positioning
 
-CodeBro is **not** "another bag of MCP tools" (filesystem / shell / git /
-memory). Those are commodity capabilities the host agent already provides.
+CodeBro is an **engineering context & memory layer**. It is **not** "another
+bag of MCP tools" (filesystem / shell / git / memory) — those are commodity
+capabilities the host agent already provides.
 
 The differentiated surfaces are:
 
@@ -32,18 +34,19 @@ The differentiated surfaces are:
   language, frameworks, build system, constraints and architecture — without
   re-discovering it per session.
 - **Engineering facts** — verified, provenance-carrying facts (modules,
-  packages, symbols, tests, dependencies, architecture rules) queried
-  deterministically.
+  packages, symbols, tests, dependencies, architecture rules) retrieved
+  semantically with locations.
 - **Engineering memory** — recorded decisions, constraints and prior context
-  resolved by task relevance with confidence scoring.
-- **Guarded change application** — mutations routed through the change engine:
-  workspace boundary, plan awareness, stale-content protection, audit. No
-  blind overwrites.
+  resolved by task relevance with confidence, source and tags.
+- **Guarded change application** *(optional)* — mutations routed through the
+  change engine for controlled/autonomous workflows: workspace boundary, plan
+  awareness, stale-content protection, audit. Agents use their native editing
+  tools for normal edits; `apply_change` is not mandatory.
 
 The host agent owns: model, conversation, agent loop, planning, tool
 selection, UX, execution strategy.
 CodeBro owns: project truth, engineering state, persistent context, guarded
-mutations, policy, verification boundaries.
+mutations (optional), policy, verification boundaries.
 
 ### 2.1 Trust model: verified facts vs agent-recorded memory
 
@@ -156,7 +159,7 @@ Read-only statistics about the engineering memory store: `entry_count`,
 **Use:** judge whether engineering memory holds meaningful state before
 relying on it (e.g. "is memory empty or fresh?").
 
-### 4.4 `apply_change`
+### 4.4 `apply_change` *(optional)*
 
 Applies a guarded single-file change through the change engine. Arguments:
 `path`, `old` (exact existing text; empty to create), `new`.
@@ -164,9 +167,10 @@ Applies a guarded single-file change through the change engine. Arguments:
 Enforced: workspace path boundary, no blind overwrite, unique non-empty `old`
 match, stale-content refusal between prepare and apply.
 
-**Use:** the only mutation surface CodeBro offers initially — deliberately
-narrower than the host agent's own shell/filesystem tools, to prove
-*safety and context* rather than raw capability.
+**Use:** optional guarded mutation API for controlled/autonomous workflows.
+Host agents use their native editing tools for normal coding edits — see §2
+positioning. There is no second mutation path: `apply_change` routes
+exclusively through `ChangeEngine::prepare` → `apply`.
 
 ### 4.5 `record_memory`
 
@@ -192,12 +196,13 @@ keys. Persists to `.codebro/engineering_memory.json`.
 
 ---
 
-## 5. Explicit non-goals (initial scope)
+## 5. Explicit non-goals
 
 - **No arbitrary shell execution** through CodeBro. Host agents already own
   shell; CodeBro must not become "another shell wrapper".
-- **No read/search/git tools initially** — commodity capabilities already
-  present in every host agent.
+- **No filesystem/shell/git read tools** — commodity capabilities already
+  present in every host agent. (Note: `engineering_facts` is a *fact*
+  search over the verified store, not a source-file search tool.)
 - **No MCP *client* support yet** (the P6 `MCP_LIFECYCLE` direction is
   deferred until the server proves valuable).
 - **No resource/prompt surfaces yet** — tools only, minimal surface.
@@ -226,8 +231,8 @@ keys. Persists to `.codebro/engineering_memory.json`.
 - Whether `apply_change` should grow plan-awareness arguments (planned file
   list, strict mode) for cross-file changes.
 - Optional SSE/HTTP transport for remote use (deferred).
-- Fact store size: 27k facts ≈ 35 MB JSON. Consider compacting or moving
-  the store to SQLite (already a dependency).
+- Fact store size: ~24 MB JSON for ~13.6k facts. Consider compacting or
+  moving the store to SQLite (already a dependency).
 
 ---
 

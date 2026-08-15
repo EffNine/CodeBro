@@ -5,7 +5,7 @@ Engineering governance, planning, and reporting documents for CodeBro.
 ## Start here
 
 - **[design/MCP_SERVER.md](design/MCP_SERVER.md)** — the current product:
-  the engineering runtime exposed as an MCP server (`codebro serve` /
+  the engineering context layer exposed as an MCP server (`codebro serve` /
   `codebro init` / `codebro doctor`), verified end-to-end with OpenCode
   (A/B comparison + auto-detection tests)
 

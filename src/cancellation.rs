@@ -1,6 +1,6 @@
 //! Cooperative task cancellation.
 //!
-//! A `CancellationToken` is a cheap, shared flag that the TUI flips when
+//! A `CancellationToken` is a cheap, shared flag that a caller flips when
 //! the user presses `Ctrl+C`. Long-running work (LLM streaming, PTY
 //! processes, verification) polls `is_cancelled()` between steps and stops
 //! promptly. This is the single cancellation authority for a task; it is

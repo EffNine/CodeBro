@@ -1840,7 +1840,6 @@ fn test_experience_recommended_tools() {
     assert_eq!(tools[0], "edit_file");
 }
 
-// ===== v0.6.5 TUI Agent Command Center Tests =====
 
 #[test]
 fn test_agent_status_idle_default() {
@@ -2109,7 +2108,6 @@ fn test_recovery_escalation_flow() {
     assert!(stats.escalated >= 1);
 }
 
-// ===== TUI Usability Tests =====
 
 #[test]
 fn test_session_persistence_never_contains_secrets() {
@@ -2160,7 +2158,6 @@ fn test_read_file_tool_redacts_secrets() {
     );
 }
 
-// ===== v0.7.2 TUI Agent Execution Wiring Tests =====
 
 use crate::agent::subagent::{SubAgentCapability, SubAgentContext, SubAgentResult};
 
@@ -9562,12 +9559,12 @@ mod p55_validation {
     }
 
     #[test]
-    fn test_vision_tui_accessible() {
+    fn test_vision_settings_summary_accessible() {
         // Settings should be manageable without file editing
         let config = Config::default_test();
         let sm = crate::settings::SettingsManager::new(config, PathBuf::from("/tmp"));
 
-        // Should be able to get summary (TUI display)
+        // Should be able to get a settings summary
         let summary = sm.summary();
         assert!(!summary.is_empty());
     }
