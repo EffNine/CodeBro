@@ -529,3 +529,68 @@ fn map_visibility(vis: Option<&str>) -> Visibility {
         _ => Visibility::Unknown,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_empty_dir_produces_valid_model() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path()).unwrap();
+        let facts = dir.path().join(".codebro/facts.json");
+        assert!(facts.exists());
+        let model: FactsModel =
+            serde_json::from_str(&std::fs::read_to_string(facts).unwrap()).unwrap();
+        // Fallback package + build target, no modules/symbols.
+        assert_eq!(model.workspaces().len(), 1);
+        assert_eq!(model.packages().len(), 1);
+        assert_eq!(model.symbols().len(), 0);
+    }
+
+    #[test]
+    fn init_scans_rust_files_into_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "pub struct Config { pub name: String }\npub fn main() {}\n#[test]\nfn test_x() {}\n",
+        )
+        .unwrap();
+        run(dir.path()).unwrap();
+        let facts = dir.path().join(".codebro/facts.json");
+        let model: FactsModel =
+            serde_json::from_str(&std::fs::read_to_string(facts).unwrap()).unwrap();
+        assert!(
+            model.symbols().len() >= 2,
+            "expected symbols, got {}",
+            model.symbols().len()
+        );
+        let names: Vec<&str> = model.symbols().iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Config"));
+        assert!(names.contains(&"main"));
+        // Test detection heuristic picks test_x.
+        assert!(model.tests().len() >= 1);
+    }
+
+    #[test]
+    fn init_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "pub fn a() {}\npub fn b() {}\n",
+        )
+        .unwrap();
+        run(dir.path()).unwrap();
+        let first = std::fs::read(dir.path().join(".codebro/facts.json")).unwrap();
+        run(dir.path()).unwrap();
+        let second = std::fs::read(dir.path().join(".codebro/facts.json")).unwrap();
+        assert_eq!(first, second, "re-init must be byte-identical");
+    }
+}

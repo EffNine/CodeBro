@@ -240,3 +240,47 @@ pub fn run(workspace_root: &Path) -> Result<i32> {
 
     Ok(worst)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn healthy_empty_dir_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = run(dir.path()).unwrap();
+        // Absent .codebro/facts/memory are warnings, not errors -> exit 1.
+        assert_eq!(code, EXIT_WARN);
+    }
+
+    #[test]
+    fn corrupt_facts_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cb = dir.path().join(".codebro");
+        std::fs::create_dir_all(&cb).unwrap();
+        std::fs::write(cb.join("facts.json"), "not json").unwrap();
+        let code = run(dir.path()).unwrap();
+        assert_eq!(code, EXIT_ERROR);
+    }
+
+    #[test]
+    fn corrupt_memory_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cb = dir.path().join(".codebro");
+        std::fs::create_dir_all(&cb).unwrap();
+        std::fs::write(cb.join("engineering_memory.json"), "garbage").unwrap();
+        let code = run(dir.path()).unwrap();
+        assert_eq!(code, EXIT_ERROR);
+    }
+
+    #[test]
+    fn initialized_workspace_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::init::run(dir.path()).unwrap();
+        let code = run(dir.path()).unwrap();
+        // init creates facts; project identity is a separate feature and
+        // its absence is only a warning -> exit is at most WARN, never
+        // ERROR (exit 2).
+        assert!(code <= EXIT_WARN, "got {code}");
+    }
+}

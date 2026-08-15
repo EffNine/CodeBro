@@ -224,6 +224,25 @@ keys. Persists to `.codebro/engineering_memory.json`.
 
 ---
 
+## 6.1 Security properties (verified by tests)
+
+| Property | Mechanism | Verified |
+|---|---|---|
+| Path traversal (`..`, absolute outside root) | lexical component check + `starts_with(root)` | ✗ rejected |
+| **Symlink escape** (link inside root → outside) | canonicalize target (or nearest existing ancestor for create paths) and compare against canonicalized root; macOS `/var`→`/private/var` handled | ✗ rejected, external target untouched |
+| Blind overwrite | unique non-empty `old` match required | ✗ rejected |
+| Stale content between prepare/apply | snapshot comparison at apply time | ✗ rejected |
+| Secret leakage to disk | `redact_secrets_public` authority: `sk-`/`ghp_`/`glpat`/`xox`/`bearer`/`api_key`/`password=`/`token`/URL-credentials/`--flag` styles | ✗ `[REDACTED]` on disk |
+| Memory write bounds | key ≤256 chars, value ≤64 KiB, ≤32 tags of ≤64 chars, confidence/importance clamped | ✗ rejected |
+| Fact query bounds | limit clamped 1..50, empty query rejected (or must carry a kind/path filter) | ✗ rejected |
+| Determinism | fact search + memory resolution sort stably | ✓ |
+
+The change engine is the **only** mutation path (`apply_change` routes
+exclusively through `ChangeEngine::prepare → apply`; no raw writes in the
+MCP layer), and `record_memory` is the only memory write surface.
+
+---
+
 ## 7. Open questions / follow-ups
 
 - Engineering-memory **recording from the agent loop**: `record_memory` is
