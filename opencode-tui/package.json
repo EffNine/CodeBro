@@ -9,11 +9,11 @@
     "dev": "bun run src/index.tsx",
     "build": "bun build src/index.tsx --target=bun --outfile=dist/codebro-tui.js",
     "typecheck": "tsc --noEmit",
-    "postinstall": "node scripts/patch-solid.js"
+    "postinstall": "node scripts/patch-solid.cjs"
   },
   "dependencies": {
     "@opentui/core": "0.4.5",
-    "@opentui/core-linux-x64": "^0.5.3",
+    "@opentui/core-linux-x64": "0.4.5",
     "@opentui/keymap": "0.4.5",
     "@opentui/solid": "0.4.5",
     "clipboardy": "4.0.0",
@@ -23,7 +23,7 @@
     "open": "10.1.2",
     "opentui-spinner": "0.0.7",
     "remeda": "^2.17.3",
-    "solid-js": "^1.8.15",
+    "solid-js": "1.9.10",
     "strip-ansi": "7.1.2"
   },
   "devDependencies": {
