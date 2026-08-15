@@ -259,8 +259,8 @@ struct DiscoveredPackage {
     dependencies: Vec<DiscoveredDependency>,
 }
 
-/// Read `Cargo.toml` for the workspace root; fall back to a single
-/// root-level package when no manifest is found.
+/// Read `Cargo.toml` (Rust) or `go.mod` (Go) for the workspace root; fall
+/// back to a single root-level package when no manifest is found.
 fn discover_packages(
     root: &Path,
     ws_id: &WorkspaceId,
@@ -268,6 +268,12 @@ fn discover_packages(
     let cargo = root.join("Cargo.toml");
     if cargo.exists() {
         if let Some((pkg, targets)) = parse_cargo_package(root, ws_id) {
+            return (vec![pkg], targets);
+        }
+    }
+    let go_mod = root.join("go.mod");
+    if go_mod.exists() {
+        if let Some((pkg, targets)) = parse_go_package(root, ws_id) {
             return (vec![pkg], targets);
         }
     }
@@ -448,6 +454,72 @@ fn parse_cargo_package(
     ))
 }
 
+/// Parse a Go `go.mod` into a package plus a single binary target and its
+/// dependencies. Direct and `// indirect` requires are distinguished.
+fn parse_go_package(
+    root: &Path,
+    _ws_id: &WorkspaceId,
+) -> Option<(DiscoveredPackage, Vec<BuildTargetFact>)> {
+    let text = std::fs::read_to_string(root.join("go.mod")).ok()?;
+    let module = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("module "))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .map(|s| s.to_string())?;
+    let name = module.rsplit('/').next().unwrap_or(&module).to_string();
+    let id = PackageId::new(format!("pkg::{name}"));
+
+    let mut target = BuildTargetFact::new(
+        BuildTargetId::new(format!("build::bin::{name}")),
+        name.clone(),
+        BuildTargetKind::Binary,
+    );
+    target.package = Some(id.clone());
+    target.language = Some("go".to_string());
+
+    // Dependencies: lines inside `require (` blocks, `name version [// indirect]`.
+    let mut dependencies: Vec<DiscoveredDependency> = Vec::new();
+    let mut in_require = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "require (" {
+            in_require = true;
+            continue;
+        }
+        if in_require && trimmed == ")" {
+            in_require = false;
+            continue;
+        }
+        if in_require && !trimmed.is_empty() && !trimmed.starts_with("//") {
+            let mut parts = trimmed.split_whitespace();
+            if let (Some(dep), Some(_ver)) = (parts.next(), parts.next()) {
+                let indirect = trimmed.contains("// indirect");
+                dependencies.push(DiscoveredDependency {
+                    name: dep.to_string(),
+                    version: None,
+                    kind: if indirect {
+                        DependencyKind::Transitive
+                    } else {
+                        DependencyKind::Direct
+                    },
+                });
+            }
+        }
+    }
+
+    Some((
+        DiscoveredPackage {
+            id,
+            name,
+            version: None,
+            language: "go".to_string(),
+            path: root.to_path_buf(),
+            dependencies,
+        },
+        vec![target],
+    ))
+}
+
 /// Find the first package whose root path prefixes `file`.
 fn package_for_path<'a>(
     root: &Path,
@@ -562,8 +634,10 @@ mod tests {
             "pub struct Config { pub name: String }\npub fn main() {}\n#[test]\nfn test_x() {}\n",
         )
         .unwrap();
-        run(dir.path()).unwrap();
+        let r = run(dir.path());
+        assert!(r.is_ok(), "run failed: {r:?}");
         let facts = dir.path().join(".codebro/facts.json");
+        assert!(facts.exists(), "facts.json missing: {:?}", dir.path());
         let model: FactsModel =
             serde_json::from_str(&std::fs::read_to_string(facts).unwrap()).unwrap();
         assert!(
@@ -592,5 +666,59 @@ mod tests {
         run(dir.path()).unwrap();
         let second = std::fs::read(dir.path().join(".codebro/facts.json")).unwrap();
         assert_eq!(first, second, "re-init must be byte-identical");
+    }
+}
+
+#[cfg(test)]
+mod go_tests {
+    use super::*;
+
+    #[test]
+    fn parse_go_mod_extracts_direct_and_indirect() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module github.com/example/myapp\n\ngo 1.21\n\nrequire (\n\tgithub.com/fiber v1.0.0\n\tgithub.com/uuid v1.6.0 // indirect\n)\n",
+        )
+        .unwrap();
+        let (pkg, targets) = discover_packages(dir.path(), &WorkspaceId::new("ws::x"));
+        assert_eq!(pkg.len(), 1);
+        assert_eq!(pkg[0].name, "myapp");
+        assert_eq!(pkg[0].language, "go");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].language.as_deref(), Some("go"));
+
+        let deps = &pkg[0].dependencies;
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].name, "github.com/fiber");
+        assert_eq!(deps[0].kind, DependencyKind::Direct);
+        assert_eq!(deps[1].name, "github.com/uuid");
+        assert_eq!(deps[1].kind, DependencyKind::Transitive);
+    }
+
+    #[test]
+    fn go_mod_roundtrip_produces_valid_store() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module github.com/example/app\n\ngo 1.21\n\nrequire (\n\tgithub.com/x v1.0.0\n)\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("internal/breaker")).unwrap();
+        std::fs::write(
+            dir.path().join("internal/breaker/breaker.go"),
+            "package breaker\ntype Breaker struct{}\nfunc (b *Breaker) Allow() bool { return true }\n",
+        )
+        .unwrap();
+        let r = run(dir.path());
+        assert!(r.is_ok(), "run failed: {r:?}");
+        let facts = dir.path().join(".codebro/facts.json");
+        assert!(facts.exists(), "facts.json missing: {:?}", dir.path());
+        let model: FactsModel =
+            serde_json::from_str(&std::fs::read_to_string(facts).unwrap()).unwrap();
+        assert_eq!(model.dependencies().len(), 1);
+        assert_eq!(model.symbols().len(), 2); // Breaker + Allow method
+        let names: Vec<&str> = model.symbols().iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Allow"));
     }
 }
