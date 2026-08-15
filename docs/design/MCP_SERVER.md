@@ -126,6 +126,28 @@ match, stale-content refusal between prepare and apply.
 narrower than the host agent's own shell/filesystem tools, to prove
 *safety and context* rather than raw capability.
 
+### 4.5 `record_memory`
+
+Records or updates an engineering memory entry (decision, constraint,
+context). Arguments: `key` (stable identifier), `value`, optional `tags`,
+`confidence`/`importance` (clamped to [0,1]), optional `source`.
+
+Enforced: non-empty key/value, 64 KiB value bound, tags sorted +
+de-duplicated, deterministic upsert id from the key, and **secret
+redaction** through `redact_secrets_public` before anything touches
+storage. Persists to `.codebro/engineering_memory.json`.
+
+**Use:** let the agent persist what it learned so the next session is not
+amnestic — the project's *memory write path*.
+
+### 4.6 `delete_memory`
+
+Deletes an engineering memory entry by its exact `key`. Rejects unknown
+keys. Persists to `.codebro/engineering_memory.json`.
+
+**Use:** remove stale or wrong entries; completes the memory lifecycle
+(create/read/update/delete).
+
 ---
 
 ## 5. Explicit non-goals (initial scope)
@@ -142,21 +164,91 @@ narrower than the host agent's own shell/filesystem tools, to prove
 
 ## 6. MVP acceptance criteria
 
-- [ ] `codebro serve` starts over stdio and negotiates with an MCP client.
-- [ ] All four tools above return deterministic, schema-valid responses.
-- [ ] `apply_change` refuses out-of-workspace paths, blind overwrites and
+- [x] `codebro serve` starts over stdio and negotiates with an MCP client.
+- [x] All tools above return deterministic, schema-valid responses.
+- [x] `apply_change` refuses out-of-workspace paths, blind overwrites and
       stale content.
-- [ ] Works with **at least two** host agents (OpenCode, Claude Code).
-- [ ] Zero security regressions: no new secret-leak paths; existing
-      redaction authority is respected.
+- [x] Works with **at least one** host agent (OpenCode 1.18 + agnes model —
+      verified end-to-end, see §8).
+- [x] Zero security regressions: no new secret-leak paths; existing
+      redaction authority is respected (verified: secret stored as
+      `[REDACTED]` on disk).
+- [ ] Works with a second host agent (Claude Code).
 
 ---
 
 ## 7. Open questions / follow-ups
 
-- Fact-store **population pipeline** (`codebro init`: static analysis →
-  `FactsModel` → `.codebro/facts.json`). The server reads facts if present;
-  population is the next milestone.
+- Engineering-memory **recording from the agent loop**: `record_memory` is
+  exposed; teaching the host agent *when* to record is prompt/agent work.
 - Whether `apply_change` should grow plan-awareness arguments (planned file
   list, strict mode) for cross-file changes.
 - Optional SSE/HTTP transport for remote use (deferred).
+- Fact store size: 27k facts ≈ 35 MB JSON. Consider compacting or moving
+  the store to SQLite (already a dependency).
+
+---
+
+## 8. Connecting OpenCode
+
+Verified end-to-end with OpenCode 1.18 and the `agnes-2.5-flash` model.
+
+### 8.1 Prerequisites
+
+1. Build codebro: `cargo build --release`
+2. (Optional but recommended) Populate facts:
+   `codebro init` from the target workspace
+3. Verify the runtime: `codebro doctor` — healthy or warnings only
+
+### 8.2 Register the MCP server
+
+```bash
+opencode mcp add codebro -- \
+  /path/to/codebro/target/release/codebro serve --root /path/to/workspace
+```
+
+Confirm it connected:
+
+```bash
+opencode mcp list
+# ●  ✓ codebro  connected
+```
+
+### 8.3 Use it
+
+```bash
+cd /path/to/workspace
+opencode
+```
+
+The tools appear to the agent prefixed with the server name:
+`codebro_workspace_context`, `codebro_engineering_facts`,
+`codebro_engineering_memory`, `codebro_apply_change`,
+`codebro_record_memory`, `codebro_delete_memory`.
+
+For a one-shot non-interactive run with all approvals auto-granted:
+
+```bash
+opencode run --auto "What is this workspace? Use codebro_workspace_context."
+```
+
+### 8.4 Verified behaviour (2026-08-15)
+
+- Agent discovers and calls `codebro_workspace_context` and reports the
+  fact counts (27,209 facts on the codebro repo itself).
+- Agent calls `codebro_engineering_facts` filtered by kind.
+- Agent records memory via `codebro_record_memory`; entry persisted and
+  resolvable in later sessions.
+- Agent attempts to create a file with a non-empty `old`; `apply_change`
+  **refuses** with an actionable error; the agent self-corrects to
+  `old=""` and the guarded change succeeds.
+- All test artifacts cleaned afterwards; no secrets stored.
+
+### 8.5 Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `opencode mcp list` shows server, tools missing in session | Restart the opencode session; MCP tools are loaded at session start |
+| Tool call fails with `-32602` | Argument validation error — read the message; e.g. creating a file requires `old=""` |
+| `未提供令牌` / auth errors | Provider API key missing in the environment (`AGNES_API_KEY` etc.) |
+| `doctor` reports fact validation issues | `codebro init` again; deterministic rebuild keeps the store consistent |
