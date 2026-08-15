@@ -24,15 +24,19 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-/// The CodeBro MCP server: a stateless router over the engineering context
-/// layer.
+/// The CodeBro MCP server: a router over the engineering context layer.
 ///
-/// Every tool call constructs a fresh view of the runtime from the workspace
-/// root, so the server holds no mutable state and can be shared freely.
+/// The fact store is immutable once built, so it is cached per server
+/// process (loaded once, reused across calls) with a modification-time
+/// check so a concurrent `codebro init` is picked up. Everything else is
+/// constructed fresh per call.
 #[derive(Clone)]
 pub struct CodeBroMcpServer {
     workspace_root: PathBuf,
     tool_router: ToolRouter<Self>,
+    facts_cache: Arc<
+        std::sync::Mutex<Option<(Option<std::time::SystemTime>, crate::fact_store::FactStore)>>,
+    >,
 }
 
 #[tool_router]
@@ -42,6 +46,7 @@ impl CodeBroMcpServer {
         Self {
             workspace_root,
             tool_router: Self::tool_router(),
+            facts_cache: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -63,9 +68,22 @@ impl CodeBroMcpServer {
 
     /// Build the fact store for the workspace. Facts are frozen models;
     /// a persisted `.codebro/facts.json` is restored if present.
+    ///
+    /// The store is cached per server process (immutable once built) and
+    /// refreshed only when the file's mtime changes — a concurrent
+    /// `codebro init` is picked up, but a steady-state agent session does
+    /// not re-parse a 20+ MB JSON file on every tool call.
     fn fact_store(&self) -> crate::fact_store::FactStore {
         let path = self.workspace_root.join(".codebro/facts.json");
-        match std::fs::read(&path) {
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+
+        let mut guard = self.facts_cache.lock().expect("facts cache lock");
+        if let Some((cached_mtime, store)) = guard.as_ref() {
+            if *cached_mtime == mtime {
+                return store.clone();
+            }
+        }
+        let store = match std::fs::read(&path) {
             Ok(bytes) => {
                 match serde_json::from_slice::<crate::engineering_facts::FactsModel>(&bytes) {
                     Ok(model) => crate::fact_store::FactStore::from_model(&model),
@@ -76,7 +94,9 @@ impl CodeBroMcpServer {
                 }
             }
             Err(_) => crate::fact_store::FactStore::empty(),
-        }
+        };
+        *guard = Some((mtime, store.clone()));
+        store
     }
 
     // ── Tool 1: workspace context ─────────────────────────────────────

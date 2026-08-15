@@ -105,9 +105,11 @@ Consequences:
                  Repository
 ```
 
-Transport: **stdio** (one server process per host agent session). The server
-is stateless between calls: each tool call constructs a fresh view of the
-runtime from the workspace root.
+Transport: **stdio** (one server process per host agent session). Each tool
+call constructs a fresh view of the runtime from the workspace root. The
+immutable fact store is cached per process (with an mtime check so a
+concurrent `codebro init` is picked up), avoiding a 20+ MB JSON re-parse on
+every call (~8× faster steady-state).
 
 ---
 
