@@ -79,6 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - 2026-08-06
 
+> **Note:** This section documents the TUI-era release (pre-MCP). The current release is v0.7.0-mcp-rc1 on the MCP-first `main` branch.
+
+
 ### Added
 - **P6 Foundation Platform**
   - Preference Engine: Persistent, schema-versioned preference storage with atomic writes and rollback
@@ -272,12 +275,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[1.0.0]: https://github.com/afnanrudy/codebro/releases/tag/v1.0.0
-[0.7.0]: https://github.com/afnanrudy/codebro/releases/tag/v0.7.0
-[0.6.5]: https://github.com/afnanrudy/codebro/releases/tag/v0.6.5
-[0.6.0]: https://github.com/afnanrudy/codebro/releases/tag/v0.6.0
-[0.5.0]: https://github.com/afnanrudy/codebro/releases/tag/v0.5.0
-[0.4.0]: https://github.com/afnanrudy/codebro/releases/tag/v0.4.0
-[0.3.0]: https://github.com/afnanrudy/codebro/releases/tag/v0.3.0
-[0.2.0]: https://github.com/afnanrudy/codebro/releases/tag/v0.2.0
-[0.1.0]: https://github.com/afnanrudy/codebro/releases/tag/v0.1.0
+[1.0.0]: https://github.com/EffNine/CodeBro/releases/tag/v1.0.0
+[0.7.0]: https://github.com/EffNine/CodeBro/releases/tag/v0.7.0
+[0.6.5]: https://github.com/EffNine/CodeBro/releases/tag/v0.6.5
+[0.6.0]: https://github.com/EffNine/CodeBro/releases/tag/v0.6.0
+[0.5.0]: https://github.com/EffNine/CodeBro/releases/tag/v0.5.0
+[0.4.0]: https://github.com/EffNine/CodeBro/releases/tag/v0.4.0
+[0.3.0]: https://github.com/EffNine/CodeBro/releases/tag/v0.3.0
+[0.2.0]: https://github.com/EffNine/CodeBro/releases/tag/v0.2.0
+[0.1.0]: https://github.com/EffNine/CodeBro/releases/tag/v0.1.0
