@@ -99,7 +99,7 @@ codebro list-models # List models from configured provider
 
 ---
 
-*Current public release: v0.7.0-mcp-rc1 (release candidate).*
+*Current public release: v0.7.0-mcp-rc2 (release candidate).*
 
 The former chat TUI is preserved on the `tui-legacy` branch; the current
 `main` branch is MCP-first.

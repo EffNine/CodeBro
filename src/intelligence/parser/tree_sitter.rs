@@ -75,6 +75,38 @@ pub struct ParseResult {
     pub imports: Vec<String>,
     pub exports: Vec<String>,
     pub errors: Vec<String>,
+    /// AST-derived call expressions: caller location + resolved callee name.
+    pub calls: Vec<ParseCall>,
+    /// AST-derived import targets with structured path info.
+    pub import_targets: Vec<ParseImport>,
+}
+
+/// A call expression found in the AST.
+#[derive(Debug, Clone)]
+pub struct ParseCall {
+    /// The module-relative file path of the caller.
+    pub caller_file: String,
+    /// The symbol name of the function containing this call.
+    pub caller_symbol: Option<String>,
+    /// Line number (1-based) of the call expression.
+    pub line_start: u32,
+    /// The callee identifier text extracted from the AST.
+    pub callee_name: String,
+    /// Whether the callee name could be resolved to a known symbol pattern.
+    pub is_qualified: bool,
+}
+
+/// A structured import target extracted from an import/use statement.
+#[derive(Debug, Clone)]
+pub struct ParseImport {
+    /// The module-relative file path.
+    pub file: String,
+    /// Line number (1-based).
+    pub line_start: u32,
+    /// The import path as a dot-separated string (e.g. "std::collections::HashMap").
+    pub path: String,
+    /// For Rust `use` statements: the local alias if present, else None.
+    pub alias: Option<String>,
 }
 
 pub struct CodeParser {
@@ -111,6 +143,8 @@ impl CodeParser {
             imports: Vec::new(),
             exports: Vec::new(),
             errors: Vec::new(),
+            calls: Vec::new(),
+            import_targets: Vec::new(),
         };
 
         let root = tree.root_node();
@@ -130,6 +164,8 @@ impl CodeParser {
             imports: Vec::new(),
             exports: Vec::new(),
             errors: Vec::new(),
+            calls: Vec::new(),
+            import_targets: Vec::new(),
         };
 
         let root = tree.root_node();
@@ -423,6 +459,19 @@ impl CodeParser {
             "use" | "use_item" => {
                 let text = self.node_text(node, source);
                 result.imports.push(text);
+                // Also extract a structured import target for relationship
+                // building. Parse the path from the use statement.
+                if let Some(path) = self.parse_use_path(node, source) {
+                    result.import_targets.push(ParseImport {
+                        file: file_name.to_string(),
+                        line_start: self.line_to_u32(node.start_position()),
+                        path,
+                        alias: None,
+                    });
+                }
+            }
+            "call_expression" => {
+                self.extract_call(node, source, file_name, result, parent);
             }
             _ => {}
         }
@@ -877,6 +926,18 @@ impl CodeParser {
             "import_declaration" => {
                 let text = self.node_text(node, source);
                 result.imports.push(text);
+                // Parse structured import targets.
+                if let Some((path, alias)) = self.parse_go_import(node, source) {
+                    result.import_targets.push(ParseImport {
+                        file: file_name.to_string(),
+                        line_start: self.line_to_u32(node.start_position()),
+                        path,
+                        alias,
+                    });
+                }
+            }
+            "call_expression" => {
+                self.extract_call(node, source, file_name, result, parent);
             }
             _ => {}
         }
@@ -963,6 +1024,119 @@ impl CodeParser {
 
     pub fn language_name(&self) -> &str {
         &self.language_name
+    }
+
+    /// Extract a call expression from the AST. Populates `result.calls`
+    /// with the callee identifier and location. Only handles simple
+    /// identifier calls and qualified selector calls where the final
+    /// segment is an identifier.
+    fn extract_call(
+        &mut self,
+        node: Node,
+        source: &str,
+        file_name: &str,
+        result: &mut ParseResult,
+        parent: Option<&str>,
+    ) {
+        // The callee is the first child of a call_expression.
+        let Some(callee) = node.child(0) else {
+            return;
+        };
+        let callee_name = self.extract_callee_name(callee, source);
+        if callee_name.is_empty() {
+            return;
+        }
+        let is_qualified = matches!(
+            callee.kind(),
+            "field_expression" | "selector_expression" | "qualified_identifier"
+        );
+        result.calls.push(ParseCall {
+            caller_file: file_name.to_string(),
+            caller_symbol: parent.map(|s| s.to_string()),
+            line_start: self.line_to_u32(node.start_position()),
+            callee_name,
+            is_qualified,
+        });
+    }
+
+    /// Walk a callee node tree and return the final identifier text.
+    fn extract_callee_name(&self, node: Node, source: &str) -> String {
+        match node.kind() {
+            "identifier" | "field_identifier" => {
+                self.node_name(node, source).unwrap_or_default()
+            }
+            "field_expression" | "selector_expression" => {
+                // For qualified calls like `pkg::func()` or `obj.method()`,
+                // the final child is the actual callee name.
+                let last = node.child(node.child_count().saturating_sub(1));
+                last.map(|n| self.extract_callee_name(n, source)).unwrap_or_default()
+            }
+            "qualified_identifier" => {
+                // Rust qualified path: take the last identifier segment.
+                let last = node.child(node.child_count().saturating_sub(1));
+                last.map(|n| self.extract_callee_name(n, source)).unwrap_or_default()
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Parse a Rust `use` statement into a dot-separated path.
+    /// Returns None for complex patterns (e.g. `use foo::{bar, baz}`).
+    fn parse_use_path(&self, node: Node, source: &str) -> Option<String> {
+        // A use_item has children like: "use" keyword, then the path.
+        // The path is typically a single `use_path` child.
+        let use_path = node
+            .children(&mut node.walk())
+            .find(|c| c.kind() == "use_path" || c.kind() == "scoped_use_path");
+        let path_node = use_path?;
+        // Collect identifier children in order.
+        let mut parts = Vec::new();
+        for child in path_node.children(&mut path_node.walk()) {
+            if child.kind() == "identifier" || child.kind() == "type_identifier" {
+                if let Some(text) = self.node_name(child, source) {
+                    parts.push(text);
+                }
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("."))
+        }
+    }
+
+    /// Parse a Go import declaration into a path + optional alias.
+    fn parse_go_import(&self, node: Node, source: &str) -> Option<(String, Option<String>)> {
+        // An import_declaration contains one or more import_spec children.
+        // We only handle single-spec imports here (not grouped blocks).
+        let spec = node.child(0)?;
+        if spec.kind() != "import_spec" {
+            return None;
+        }
+        // import_spec: [alias?] basic_lit
+        let mut alias: Option<String> = None;
+        let mut path = String::new();
+        for child in spec.children(&mut spec.walk()) {
+            match child.kind() {
+                "identifier" => {
+                    if let Some(name) = self.node_name(child, source) {
+                        alias = Some(name);
+                    }
+                }
+                "basic_lit" => {
+                    if let Some(text) = self.node_name(child, source) {
+                        // Strip surrounding quotes.
+                        path = text.trim_matches('"').to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if path.is_empty() {
+            None
+        } else {
+            Some((path, alias))
+        }
     }
 }
 

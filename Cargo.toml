@@ -1,6 +1,6 @@
 [package]
 name = "codebro"
-version = "0.7.0-mcp-rc1"
+version = "0.7.0-mcp-rc2"
 edition = "2021"
 description = "Your AI coding partner in the terminal"
 license = "MIT"
@@ -23,6 +23,7 @@ futures = "0.3"
 dirs = "5"
 async-trait = "0.1"
 tempfile = "3"
+sha2 = "0.10"
 regex = "1"
 tree-sitter = "0.20"
 tree-sitter-rust = "0.20"
@@ -37,6 +38,10 @@ rmcp = { version = "3.1.2", features = ["transport-io"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+[features]
+default = []
+opensandbox-integration = []
 
 [[bin]]
 name = "codebro"

@@ -19,10 +19,12 @@ pub const EXIT_WARN: i32 = 1;
 /// Exit code when errors are present.
 pub const EXIT_ERROR: i32 = 2;
 
-struct Check {
-    name: String,
-    ok: bool,
-    detail: Option<String>,
+/// A single diagnostic check result from the doctor.
+#[derive(Debug, Clone)]
+pub struct Check {
+    pub name: String,
+    pub ok: bool,
+    pub detail: Option<String>,
 }
 
 impl Check {
@@ -51,15 +53,26 @@ impl Check {
     }
 }
 
-/// Run diagnostics for a workspace root; returns the scriptable exit code.
+/// Run diagnostics for a workspace root; returns the scriptable exit code
+/// plus the structured check results. CLI callers use this to print output
+/// and then exit with the returned code.
 pub fn run(workspace_root: &Path) -> Result<i32> {
     let root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let codebro_dir = root.join(".codebro");
+    let (code, checks) = report(workspace_root)?;
+    print_report(&checks, code, &root);
+    Ok(code)
+}
 
-    println!("codebro doctor — {}", root.display());
-    println!();
+/// Run diagnostics and return the exit code plus the raw check results.
+/// This is the machine-readable path used by the MCP `repository_health`
+/// adapter; it does NOT print anything.
+pub fn report(workspace_root: &Path) -> Result<(i32, Vec<Check>)> {
+    let root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let codebro_dir = root.join(".codebro");
 
     let mut checks: Vec<Check> = Vec::new();
     let mut errors = 0usize;
@@ -205,9 +218,35 @@ pub fn run(workspace_root: &Path) -> Result<i32> {
         }
     }
 
-    // ── Report ────────────────────────────────────────────────────────
+    let _ = (errors, warnings);
+    Ok((compute_exit_code(&checks), checks))
+}
+
+/// Compute the overall exit code from the collected checks.
+fn compute_exit_code(checks: &[Check]) -> i32 {
     let mut worst: i32 = EXIT_HEALTHY;
-    for check in &checks {
+    for check in checks {
+        if !check.ok {
+            let status = if check
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("ERROR"))
+            {
+                EXIT_ERROR
+            } else {
+                EXIT_WARN
+            };
+            worst = worst.max(status);
+        }
+    }
+    worst
+}
+
+/// Print the human-readable report (used by the CLI).
+fn print_report(checks: &[Check], worst: i32, root: &Path) {
+    println!("codebro doctor — {}", root.display());
+    println!();
+    for check in checks {
         let (icon, status) = if check.ok {
             ("✓", "ok")
         } else if check
@@ -219,26 +258,19 @@ pub fn run(workspace_root: &Path) -> Result<i32> {
         } else {
             ("!", "warn")
         };
-        if status == "error" {
-            worst = worst.max(EXIT_ERROR);
-        } else if status == "warn" {
-            worst = worst.max(EXIT_WARN);
-        }
         println!("  {icon} {:<18} {}", check.name, status);
         if let Some(detail) = &check.detail {
             println!("      {detail}");
         }
     }
-
     println!();
+    let errors = checks.iter().filter(|c| !c.ok && c.detail.as_deref().is_some_and(|d| d.starts_with("ERROR"))).count();
+    let warnings = checks.iter().filter(|c| !c.ok && !c.detail.as_deref().is_some_and(|d| d.starts_with("ERROR"))).count();
     match worst {
         EXIT_HEALTHY => println!("  All checks passed."),
         EXIT_WARN => println!("  {errors} error(s), {warnings} warning(s)."),
         _ => println!("  {errors} error(s), {warnings} warning(s). Run `codebro init` to repair."),
     }
-    let _ = (errors, warnings);
-
-    Ok(worst)
 }
 
 #[cfg(test)]

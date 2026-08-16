@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.7.0-mcp-rc2] - 2026-08-17
+
+> **Status:** Release candidate for real-world agent dogfooding and stabilization.
+
+### Added
+- **M1: Engineering Memory Trust** — Trust scores on memory entries computed from confidence, importance, and freshness. `engineering_memory` responses include per-entry `trust` metadata. `memory_stats` reports average trust. Backward-compatible: existing entries without freshness data use `unknown` freshness status.
+- **M2: Change Invalidation Advisory** — `apply_change` now returns `needs_reindex` advisory when source files in the fact store are affected. Impacted fact IDs are correlation metadata (not independently verified causal evidence). `impact_analyze` provides structural relationship edges (callers, importers, references) for context.
+- **M3: Lightweight Evidence Chaining** — `impact_analyze` returns directed relationship edges with provenance metadata. Evidence chain: `engineering_facts` → `impact_analyze` → `apply_change` → invalidation advisory → `reindex` → fresh FactStore → `sandbox_test`/`sandbox_build` → `VerificationResult`.
+- **M4: MCP Reindex Trigger** — `reindex` tool performs full fact-store regeneration via the existing `codebro init` pipeline. Returns `status`, `fact_counts`, `generation_repo_state`, `validation`, and `duration_ms`. This is a full rebuild, not incremental indexing.
+- **M5: Repository Health MCP Tool** — `repository_health` exposes the existing `codebro doctor` capability as MCP tool #14. Read-only; returns structured JSON with `exit_code`, `status`, `checks`, and `summary`. Delegates directly to the existing doctor runtime without adding new checks, auto-repair, or orchestration. All 6 existing doctor checks (workspace_root, .codebro, project_identity, facts, engineering_memory, git) preserved with exact semantics and exit-code values (0=healthy, 1=warn, 2=error).
+
+### Summary
+- **14 MCP tools** (exact count preserved from RC1 + M5 addition)
+- **3140 tests passing**, 0 failed, 11 ignored
+- **MCP-first architecture** — host agent owns planning/orchestration; CodeBro owns engineering truth/infrastructure
+- **Stabilization / dogfooding phase** — M6 has NOT started
 
 ### Security
 - **Sprint 28 hardening** — credential lifecycle and execution integrity:
@@ -32,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deadlocks on large output; output stays bounded; timeouts terminate the
   whole process group; PTY/stream thread-creation failures are surfaced as
   errors instead of silently dropped.
+
+## [Unreleased]
 
 ### Removed
 - **Sprint 25 — Architecture Consolidation (ADR-012)**
@@ -79,7 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - 2026-08-06
 
-> **Note:** This section documents the TUI-era release (pre-MCP). The current release is v0.7.0-mcp-rc1 on the MCP-first `main` branch.
+> **Note:** This section documents the TUI-era release (pre-MCP). The current release is v0.7.0-mcp-rc2 on the MCP-first `main` branch.
 
 
 ### Added
@@ -276,6 +293,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 [1.0.0]: https://github.com/EffNine/CodeBro/releases/tag/v1.0.0
+[0.7.0-mcp-rc2]: https://github.com/EffNine/CodeBro/releases/tag/v0.7.0-mcp-rc2
+[0.7.0-mcp-rc1]: https://github.com/EffNine/CodeBro/releases/tag/v0.7.0-mcp-rc1
 [0.7.0]: https://github.com/EffNine/CodeBro/releases/tag/v0.7.0
 [0.6.5]: https://github.com/EffNine/CodeBro/releases/tag/v0.6.5
 [0.6.0]: https://github.com/EffNine/CodeBro/releases/tag/v0.6.0

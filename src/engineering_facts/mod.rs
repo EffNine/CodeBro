@@ -90,6 +90,8 @@ pub use crate::engineering_facts::visibility::Visibility;
 
 use serde::{Deserialize, Serialize};
 
+use crate::sandbox::RepoState;
+
 /// A typed, borrowed reference to a fact inside a `FactsModel`.
 #[derive(Debug)]
 pub enum FactRef<'a> {
@@ -141,6 +143,10 @@ pub struct FactsModel {
     references: Vec<ReferenceFact>,
     diagnostics: Vec<DiagnosticFact>,
     architecture_rules: Vec<ArchitectureRuleFact>,
+    /// Repository state at the time facts were generated. Used for
+    /// freshness comparison against the current repository state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation_repo_state: Option<RepoState>,
 }
 
 impl Default for FactsModel {
@@ -164,6 +170,7 @@ impl FactsModel {
             references: Vec::new(),
             diagnostics: Vec::new(),
             architecture_rules: Vec::new(),
+            generation_repo_state: None,
         }
     }
 
@@ -373,6 +380,17 @@ impl FactsModel {
     pub fn validate(&self) -> ValidationReport {
         FactsValidator::validate(self)
     }
+
+    /// Generation-time repository state, if captured during init.
+    pub fn generation_repo_state(&self) -> Option<&RepoState> {
+        self.generation_repo_state.as_ref()
+    }
+
+    /// Set the generation-time repository state.
+    pub fn with_generation_repo_state(mut self, state: RepoState) -> Self {
+        self.generation_repo_state = Some(state);
+        self
+    }
 }
 
 /// A mutable, absorbing builder that freezes into an immutable `FactsModel`.
@@ -393,6 +411,7 @@ pub struct FactsBuilder {
     references: Vec<ReferenceFact>,
     diagnostics: Vec<DiagnosticFact>,
     architecture_rules: Vec<ArchitectureRuleFact>,
+    generation_repo_state: Option<RepoState>,
 }
 
 impl FactsBuilder {
@@ -455,6 +474,12 @@ impl FactsBuilder {
         self
     }
 
+    /// Set the generation-time repository state.
+    pub fn with_generation_repo_state(mut self, state: RepoState) -> Self {
+        self.generation_repo_state = Some(state);
+        self
+    }
+
     /// Freeze into an immutable, id-sorted `FactsModel`.
     pub fn build(self) -> FactsModel {
         fn sort_by_id<T>(v: &mut Vec<T>)
@@ -476,6 +501,7 @@ impl FactsBuilder {
             references: self.references,
             diagnostics: self.diagnostics,
             architecture_rules: self.architecture_rules,
+            generation_repo_state: self.generation_repo_state,
         };
         sort_by_id(&mut model.workspaces);
         sort_by_id(&mut model.modules);

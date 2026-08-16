@@ -11,8 +11,8 @@ use anyhow::Result;
 
 // Re-export concrete types
 pub use tree_sitter::{
-    create_parser, parse_file, parse_source, CodeParser as TreeSitterParser, ParseResult,
-    ParsedSymbol, SymbolKind, SymbolKind as ParserSymbolKind,
+    create_parser, parse_file, parse_source, CodeParser as TreeSitterParser, ParseCall,
+    ParseImport, ParseResult, ParsedSymbol, SymbolKind, SymbolKind as ParserSymbolKind,
 };
 
 // =========================================================================

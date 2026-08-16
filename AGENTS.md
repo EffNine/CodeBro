@@ -9,6 +9,7 @@
 - **Build:** `cargo build --release && cargo install --path .`
 - **CLI commands:** `codebro serve --root <path>`, `codebro init --root <path>`, `codebro doctor --root <path>`, `codebro list-models`.
 - **Config:** Optional `~/.codebro/config.toml` (provider, base_url, model, api_key). Env vars honoured: `CODEBRO_API_KEY`, `CODEBRO_BASE_URL`, `CODEBRO_MODEL`.
+- **Sandbox config:** `OPEN_SANDBOX_URL` activates the OpenSandbox backend (lifecycle API: create sandbox → SSE command → delete). Optional: `OPEN_SANDBOX_API_KEY`, `OPEN_SANDBOX_TIMEOUT_SECS`, `OPEN_SANDBOX_MAX_OUTPUT_BYTES`, `OPEN_SANDBOX_IMAGE`, `OPEN_SANDBOX_RESOURCE_CPU`, `OPEN_SANDBOX_RESOURCE_MEMORY`. When configured but unavailable, execution fails closed — no silent Local fallback.
 - **Project state:** `.codebro/` directory inside the workspace root (facts.json, engineering_memory.json, project_identity.json, metadata.json). Not part of the source tree; ignored by git.
 
 ## Product identity
@@ -16,6 +17,7 @@
 CodeBro is:
 - Persistent engineering context and memory for AI coding agents.
 - An MCP server that answers "where am I, what are this project's verified facts, and what do we know from prior sessions."
+- An isolated execution runtime with policy-gated command execution via sandbox tools.
 
 CodeBro is NOT:
 - A replacement coding agent.
@@ -26,7 +28,7 @@ CodeBro is NOT:
 - A vector database or embedding service.
 
 The host agent owns: model, conversation, planning, tool selection, native Read/Grep/Edit tools, execution strategy, UX.
-CodeBro owns: project/workspace identity, structured engineering facts, persistent engineering memory, optional guarded mutation.
+CodeBro owns: project/workspace identity, structured engineering facts, persistent engineering memory, optional guarded mutation, sandbox execution.
 
 ## Canonical architecture
 
@@ -36,8 +38,9 @@ Core subsystem directories (all under `src/`):
 
 | Directory | Role |
 |-----------|------|
-| `mcp/` | MCP server: 7 tools over stdio (the public interface) |
+| `mcp/` | MCP server: 14 tools over stdio (the public interface) |
 | `mcp/facts.rs` | Deterministic relevance-ranked fact retrieval engine |
+| `sandbox/` | Sandbox execution abstraction (trait + local + OpenSandbox backends + VerificationResult contracts) |
 | `init/` | Fact-store population pipeline (`codebro init`) |
 | `doctor/` | Diagnostics (`codebro doctor`) |
 | `engineering_facts/` | Canonical facts model (symbols, modules, packages, tests, build targets, dependencies, relationships, references, diagnostics, architecture rules) |
@@ -75,7 +78,7 @@ Core subsystem directories (all under `src/`):
 
 ## MCP contract
 
-The server exposes exactly 7 tools over stdio (`rmcp` transport). MCP handlers are thin adapters — they do not duplicate business logic; they construct runtime instances and delegate.
+The server exposes exactly 14 tools over stdio (`rmcp` transport). MCP handlers are thin adapters — they do not duplicate business logic; they construct runtime instances and delegate.
 
 ### Tool inventory
 
@@ -88,6 +91,13 @@ The server exposes exactly 7 tools over stdio (`rmcp` transport). MCP handlers a
 | `record_memory` | write | Upsert a persistent engineering memory entry. Values are secret-redacted before storage. Updating an existing key updates the full logical entry (value AND confidence, importance, tags, source). Keys are capped at 256 chars; values at 64 KB; tags at 32 entries, 64 chars each. |
 | `delete_memory` | write | Delete an engineering memory entry by exact key. **Requires `confirm=true`** — omitting it is a no-op. Prevents accidental or speculative deletion. Deleting a missing key errors. |
 | `apply_change` | write *(optional)* | Guarded single-file mutation through the ChangeEngine. Enforces workspace boundary, refuses stale or ambiguous edits. For new files pass `old=""`. Agents should use their native editing tools for normal coding edits; this is available for controlled/autonomous workflows. |
+| `sandbox_exec` | write | Execute a command in an isolated sandbox. Returns structured evidence with provenance: `exit_code`, `stdout`, `stderr`, `duration_ms`, `success`, `timeout`, `denied`, `execution_id`, `timestamp`, `repo_identity`, `repo_state`, `sandbox_capabilities`, `reproducibility`, `resolved_command`. Only read-only build/test/lint commands are permitted. Secret-redacted output. |
+| `sandbox_test` | write | Run the project's tests with structured verification. Auto-detects project type (cargo → `cargo test`, go → `go test`, npm → `npm test`). Returns `execution` + `verification` (pass/fail + violations). Execution evidence includes provenance envelope. Optional `expected_exit_code` and `expected_success` contracts. |
+| `sandbox_build` | write | Build/check the project with structured verification. Auto-detects project type (cargo → `cargo check`, go → `go build`, npm → `npm run build`). Returns `execution` + `verification`. Execution evidence includes provenance envelope. |
+| `sandbox_status` | read | Return sandbox runtime status: `backend` (local/opensandbox), `mode`, `available`, and formal `capabilities` descriptor. Call before sandbox tools to understand execution guarantees (isolation level, filesystem scope, network access, timeouts). Also returns `opensandbox_configured` to distinguish explicit config from default local. |
+| `impact_analyze` | read | Structural impact analysis: given a symbol, file, module, or package, returns directed relationship edges (callers, importers, references), related tests, owning module/package, and provenance metadata. Descriptive evidence only — no risk scores or prescriptions. |
+| `reindex` | write | Perform a full engineering fact reindex: regenerate `.codebro/facts.json` by re-scanning the entire workspace via the existing `codebro init` pipeline. Use after source changes when `apply_change.needs_reindex=true`. Returns `status`, `fact_counts`, `generation_repo_state`, `validation`, and `duration_ms`. This is a full rebuild, not incremental. |
+| `repository_health` | read | Return a structured read-only health report for the CodeBro workspace (exit code, status, per-check results, summary). Delegates to the existing `codebro doctor` implementation. Checks: workspace_root, .codebro, project_identity, facts, engineering_memory, git. |
 
 Full design: [`docs/design/MCP_SERVER.md`](docs/design/MCP_SERVER.md).
 
@@ -102,6 +112,11 @@ The `ServerInfo.instructions` field (embedded in `#[tool_handler]`) tells connec
 `codebro init` scans the workspace with tree-sitter parsers and freezes results into `.codebro/facts.json`. Supported languages (verified in `src/init/mod.rs`):
 - Rust (via `Cargo.toml` manifest + tree-sitter-rust)
 - Go (via `go.mod` manifest + tree-sitter-go)
+
+The init pipeline also builds cross-module **relationship facts** and **reference facts**:
+- **Verified edges** — AST-derived from actual `call_expression` nodes (Rust/Go) and `use`/`import` statements. Tagged `provenance=verified`.
+- **Heuristic edges** — symbol name + kind co-occurrence across modules when no AST evidence exists. Tagged `provenance=heuristic` in metadata.
+- Deduplication: verified edges win over heuristic duplicates for the same `(source, target, kind)` tuple.
 
 Other tree-sitter parsers are available (Python, JavaScript, TypeScript) but `init` currently only auto-detects Rust and Go manifests.
 
@@ -280,10 +295,10 @@ AGENTS.md is an operational guide, not a duplicate of ADRs or design docs. When 
 
 ## Release discipline
 
-- **Current version:** `v0.7.0-mcp-rc1` (see `Cargo.toml` and tag `v0.7.0-mcp-rc1`).
-- **Release commit:** `ef8b9a3` — this is the v0.7.0-mcp-rc1 release commit. `origin/main` may contain post-RC1 commits.
-- The RC1 tag must not be modified or moved.
-- Future changes after RC1 use new commits and new tags.
+- **Current version:** `v0.7.0-mcp-rc2` (see `Cargo.toml` and tag `v0.7.0-mcp-rc2`).
+- **Release commit:** TBD — this will be the v0.7.0-mcp-rc2 release commit. `origin/main` may contain post-RC2 commits.
+- The RC2 tag must not be modified or moved.
+- Future changes after RC2 use new commits and new tags.
 - Release build: `cargo build --release` produces `target/release/codebro`.
 
 ## Legacy TUI

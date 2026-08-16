@@ -5,9 +5,9 @@
 //! `.codebro/facts.json`. The MCP server (`codebro serve`) reads this file;
 //! without it, `engineering_facts` returns an empty store.
 //!
-//! Scope: workspace, packages, modules, symbols, tests, build targets and
-//! package dependencies (from Cargo.toml). Relationships, references,
-//! diagnostics and architecture rules are follow-up milestones.
+//! Scope: workspace, packages, modules, symbols, tests, build targets,
+//! package dependencies (from Cargo.toml), and cross-module relationship
+//! facts inferred from symbol name co-occurrence.
 
 use std::path::{Path, PathBuf};
 
@@ -51,6 +51,11 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     let files = discover_source_files(&root);
 
     // ── Modules & symbols ────────────────────────────────────────────
+    let mut collected_modules: Vec<ModuleFact> = Vec::new();
+    let mut collected_symbols: Vec<SymbolFact> = Vec::new();
+    // Collect AST-derived calls and imports per file for relationship building.
+    let mut all_calls: Vec<crate::intelligence::parser::ParseCall> = Vec::new();
+    let mut all_imports: Vec<crate::intelligence::parser::ParseImport> = Vec::new();
     for file in &files {
         let rel = file
             .strip_prefix(&root)
@@ -82,7 +87,8 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         mf.location = SourceLocation::new()
             .with_workspace(ws_id.clone())
             .with_file(rel.clone());
-        builder.add_module(mf);
+        builder.add_module(mf.clone());
+        collected_modules.push(mf);
 
         // Parse symbols with the existing tree-sitter parser.
         let parsed = crate::intelligence::parser::tree_sitter::parse_file(language, file, &source)
@@ -119,7 +125,12 @@ pub fn run(workspace_root: &Path) -> Result<()> {
                     .language(language)
                     .build();
             }
-            builder.add_symbol(sf);
+            builder.add_symbol(sf.clone());
+            collected_symbols.push(sf);
+
+            // Collect AST calls and imports from this file.
+            all_calls.extend(parsed.calls.iter().cloned());
+            all_imports.extend(parsed.import_targets.iter().cloned());
 
             // Test detection (heuristic MVP): function/method names that
             // look like tests, or files whose path mentions "test".
@@ -219,7 +230,27 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     ws.packages = packages.iter().map(|p| p.id.clone()).collect();
     builder.add_workspace(ws);
 
+    // ── Build cross-module relationship facts ────────────────────────
+    let rel_count = crate::impact::relationships::build_relationships(
+        &mut builder,
+        &collected_modules,
+        &collected_symbols,
+        &all_calls,
+        &all_imports,
+    );
+    if rel_count > 0 {
+        println!("  relationships: {rel_count}");
+    }
+
+    // Capture generation-time repository state for freshness comparison.
+    let gen_state = crate::sandbox::RepoState::capture(&root);
+
     let model: FactsModel = builder.build();
+    let model = if let Some(state) = gen_state {
+        model.with_generation_repo_state(state)
+    } else {
+        model
+    };
 
     // ── Persist ──────────────────────────────────────────────────────
     let codebro_dir = root.join(".codebro");
@@ -237,6 +268,8 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     println!("  tests:       {}", counts.tests);
     println!("  build targets: {}", counts.build_targets);
     println!("  dependencies: {}", counts.dependencies);
+    println!("  relationships: {}", counts.relationships);
+    println!("  references:    {}", counts.references);
     println!("  facts file:  {}", out.display());
 
     Ok(())
@@ -666,6 +699,78 @@ mod tests {
         run(dir.path()).unwrap();
         let second = std::fs::read(dir.path().join(".codebro/facts.json")).unwrap();
         assert_eq!(first, second, "re-init must be byte-identical");
+    }
+
+    #[test]
+    fn generation_repo_state_captured_before_fact_generation() {
+        // Regression test: generation_repo_state must represent the repo
+        // state at the time facts are generated, not after serialization.
+        // The invariant is: capture R0 -> generate facts from R0 -> store R0 -> serialize.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"timing-test\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "pub fn hello() -> i32 { 42 }\n",
+        )
+        .unwrap();
+
+        // Initialize a git repo so RepoState::capture succeeds.
+        std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["init"])
+            .output()
+            .expect("git init succeeded");
+        std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["config", "user.email", "test@test.com"])
+            .output()
+            .expect("git config succeeded");
+        std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["config", "user.name", "Test"])
+            .output()
+            .expect("git config succeeded");
+        std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["add", "."])
+            .output()
+            .expect("git add succeeded");
+        std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["commit", "-m", "initial"])
+            .output()
+            .expect("git commit succeeded");
+
+        // Capture the repo state BEFORE running init.
+        let pre_capture = crate::sandbox::RepoState::capture(&dir.path().to_path_buf());
+        assert!(
+            pre_capture.is_some(),
+            "capture must succeed in a git repo"
+        );
+        let pre_state = pre_capture.unwrap();
+
+        run(dir.path()).unwrap();
+
+        // Load the model from the serialized facts.json.
+        let facts = dir.path().join(".codebro/facts.json");
+        let model: FactsModel =
+            serde_json::from_str(&std::fs::read_to_string(facts).unwrap()).unwrap();
+
+        // The generation_repo_state must be Some and match the pre-generation capture.
+        let gen_state = model.generation_repo_state().expect("generation_repo_state must be set");
+        assert_eq!(
+            gen_state.working_tree_hash, pre_state.working_tree_hash,
+            "generation_repo_state must reflect pre-generation repo state"
+        );
+        assert_eq!(
+            gen_state.commit_sha, pre_state.commit_sha,
+            "generation_repo_state must reflect pre-generation commit SHA"
+        );
     }
 }
 
