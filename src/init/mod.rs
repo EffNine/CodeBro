@@ -242,6 +242,15 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         println!("  relationships: {rel_count}");
     }
 
+    // Drop intermediate collected data early — the builder now owns
+    // all the facts. Keeping these vectors alive during serialization
+    // would duplicate the symbol/call/import data in RAM.
+    drop(collected_modules);
+    drop(collected_symbols);
+    drop(all_calls);
+    drop(all_imports);
+    drop(files);
+
     // Capture generation-time repository state for freshness comparison.
     let gen_state = crate::sandbox::RepoState::capture(&root);
 
@@ -256,8 +265,8 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     let codebro_dir = root.join(".codebro");
     std::fs::create_dir_all(&codebro_dir).context("create .codebro directory")?;
     let out = codebro_dir.join("facts.json");
-    let json = serde_json::to_string_pretty(&model).context("serialize facts model")?;
-    std::fs::write(&out, json).context("write .codebro/facts.json")?;
+    let file = std::fs::File::create(&out).context("create facts.json")?;
+    serde_json::to_writer_pretty(file, &model).context("serialize facts model")?;
 
     let counts = model.counts();
     println!("codebro init complete");

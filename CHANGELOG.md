@@ -47,6 +47,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deadlocks on large output; output stays bounded; timeouts terminate the
   whole process group; PTY/stream thread-creation failures are surfaced as
   errors instead of silently dropped.
+- **`codebro init` memory scaling** — eliminated O(n²) combinatorial explosion
+  in heuristic reference/relationship generation (`src/impact/relationships.rs`).
+  Heuristic edges are now bounded to symbol pairs whose modules already share
+  a verified AST-derived relationship (call or import), preventing common-name
+  collision blowups (e.g. `new`, `tests`, `fmt`). Added early drop of
+  intermediate collected vectors (`collected_modules`, `collected_symbols`,
+  `all_calls`, `all_imports`, `files`) before serialization. Replaced
+  `serde_json::to_string_pretty()` + `write()` with streaming
+  `serde_json::to_writer_pretty()` to avoid a full second copy of the model
+  in RAM during JSON generation. Before/after on the CodeBro repo (348 source
+  files): peak RSS 1,294 MB → 753 MB (−42%); facts.json 216 MB → 13.6 MB
+  (−94%); references 292,474 → 0; relationships 88,593 → 6,014. Atlas
+  (36 Rust files): peak RSS 29 MB → 22 MB; facts.json 216 KB → 909 KB.
+  All 3140 tests passing; determinism verified.
 
 ## [Unreleased]
 
