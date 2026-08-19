@@ -19,8 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **M5: Repository Health MCP Tool** — `repository_health` exposes the existing `codebro doctor` capability as MCP tool #14. Read-only; returns structured JSON with `exit_code`, `status`, `checks`, and `summary`. Delegates directly to the existing doctor runtime without adding new checks, auto-repair, or orchestration. All 6 existing doctor checks (workspace_root, .codebro, project_identity, facts, engineering_memory, git) preserved with exact semantics and exit-code values (0=healthy, 1=warn, 2=error).
 
 ### Summary
-- **14 MCP tools** (exact count preserved from RC1 + M5 addition)
-- **3140 tests passing**, 0 failed, 11 ignored
+- **15 MCP tools** (exact count: RC2 had 14 + M5 addition of `repository_health` + this release's `consult`)
+- **3186 tests passing**, 0 failed, 11 ignored
 - **MCP-first architecture** — host agent owns planning/orchestration; CodeBro owns engineering truth/infrastructure
 - **Stabilization / dogfooding phase** — M6 has NOT started
 
@@ -64,7 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Conductor consultant provider** — `ConductorProvider` (`src/consultant/providers/conductor.rs`) is now the primary and only supported consultant runtime. CodeBro calls Conductor's OpenAI-compatible `POST /v1/chat/completions` endpoint with `Authorization: Bearer <CONDUCTOR_API_KEY>`. Configuration via `CONDUCTOR_API_KEY`, `CONDUCTOR_BASE_URL` (default `http://127.0.0.1:8080`), and `CONDUCTOR_MODEL` env vars (or the secure credential store). CLI: `codebro consult --provider conductor --mode <mode> "question"`. MCP tool: `consult` (tool #15). Mode mapping: `architecture→agentic`, `debugging→coding`, `code_review→coding`, `planning→planning`, `research→reasoning`, `second_opinion→reasoning`.
+- **MCP `consult` tool (tool #15)** — Ask an AI consultant (Conductor gateway) for opinions. Supports `provider` (`auto` | `conductor`), `mode`, `question`, optional `context`, `files`, `include_git_diff`, `include_project_context`, `max_answer_length`. Project context and git diff are injected automatically when requested.
+- **CLI `codebro consult`** — Same capability as the MCP tool from the terminal.
+- **CLI `codebro auth status`** — Shows authentication status for registered consultant providers.
+- **Sprint 29 — Consultant architecture** — `src/consultant/` module with `ConsultantProvider` trait, `ConsultantRouter`, shared `build_prompt`/`truncate_answer`, type-safe mode/provider enums.
+
 ### Removed
+- **Browser-based consultant providers removed** — Firefox WebExtension bridge, extension bridge server, and bridge daemon are removed. The ChatGPT extension provider, legacy Playwright-based ChatGPT provider, and browser-profile-based Claude/DeepSeek stub providers are removed. `codebro bridge start/stop/status` CLI commands are removed. `codebro auth login/logout` browser flows are removed. Supported consultant runtime is now API-first via Conductor only.
 - **Sprint 25 — Architecture Consolidation (ADR-012)**
   - Removed legacy `src/context/` (v0.3 context builder) — superseded by `engineering_context` + `assembly`.
   - Removed legacy `src/prompt/` (v0.3 prompt assembly) — zero consumers; superseded by `prompt_builder`.

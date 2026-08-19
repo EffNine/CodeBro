@@ -104,7 +104,9 @@ impl fmt::Display for ClaimId {
 /// Every claim carries exactly one `SourceKind` indicating what produced it.
 /// The kind is used by the trust computation and by freshness resolvers to
 /// decide which semantics apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     /// Produced by a deterministic static-analysis pass (e.g. tree-sitter
@@ -269,8 +271,8 @@ impl PartialEq for Provenance {
             && self.workspace_root == other.workspace_root
             && self.execution_id == other.execution_id
             && self.metadata == other.metadata
-            // repo_identity and repo_state are excluded from equality
-            // because they don't implement PartialEq in the sandbox module.
+        // repo_identity and repo_state are excluded from equality
+        // because they don't implement PartialEq in the sandbox module.
     }
 }
 
@@ -479,11 +481,7 @@ pub const TRUST_AGENT_DECLARED: f64 = 0.30;
 /// caller before invoking this function.
 ///
 /// Returns a score in [0.0, 1.0].
-pub fn compute_trust(
-    source_kind: &SourceKind,
-    confidence: f64,
-    freshness: FreshnessStatus,
-) -> f64 {
+pub fn compute_trust(source_kind: &SourceKind, confidence: f64, freshness: FreshnessStatus) -> f64 {
     let base = match source_kind {
         SourceKind::StaticAnalysis => TRUST_STATIC_ANALYSIS,
         SourceKind::Execution => TRUST_EXECUTION,
@@ -506,8 +504,7 @@ pub fn compute_trust(
     };
 
     // Small bonus for complete provenance (has timestamp + workspace).
-    (base * freshness_factor * confidence_factor)
-        .clamp(0.0, 1.0)
+    (base * freshness_factor * confidence_factor).clamp(0.0, 1.0)
 }
 
 // ── Freshness resolver interface ───────────────────────────────────────────
@@ -605,9 +602,7 @@ mod tests {
             source_kind: SourceKind::StaticAnalysis,
             source_tool: Some("codebro-init".to_string()),
             generator_version: Some("0.7.0".to_string()),
-            observed_at: Some(
-                DateTime::<Utc>::from_timestamp(1700000000, 0).unwrap(),
-            ),
+            observed_at: Some(DateTime::<Utc>::from_timestamp(1700000000, 0).unwrap()),
             workspace_root: Some("/workspace".to_string()),
             repo_identity: Some(crate::sandbox::RepoIdentity {
                 project_id: "abc123".to_string(),
@@ -714,9 +709,7 @@ mod tests {
     fn provenance_is_complete_when_has_kind_and_timestamp() {
         let p = Provenance {
             source_kind: SourceKind::Execution,
-            observed_at: Some(
-                DateTime::<Utc>::from_timestamp(1700000000, 0).unwrap(),
-            ),
+            observed_at: Some(DateTime::<Utc>::from_timestamp(1700000000, 0).unwrap()),
             ..Default::default()
         };
         // is_complete requires non-default kind OR observed_at.
@@ -865,9 +858,7 @@ mod tests {
     fn trust_execution_high() {
         let p = Provenance {
             source_kind: SourceKind::Execution,
-            observed_at: Some(
-                DateTime::<Utc>::from_timestamp(1700000000, 0).unwrap(),
-            ),
+            observed_at: Some(DateTime::<Utc>::from_timestamp(1700000000, 0).unwrap()),
             workspace_root: Some("/workspace".to_string()),
             repo_identity: Some(crate::sandbox::RepoIdentity {
                 project_id: "p".to_string(),
@@ -893,7 +884,10 @@ mod tests {
         let freshness = resolve_freshness_from_provenance(&p);
         let t = compute_trust(&SourceKind::AgentDeclared, 0.3, freshness);
         // Base 0.3 * confidence 0.3 = 0.09.
-        assert!(t < 0.2, "expected low trust for agent_declared with low confidence, got {t}");
+        assert!(
+            t < 0.2,
+            "expected low trust for agent_declared with low confidence, got {t}"
+        );
     }
 
     #[test]
@@ -902,7 +896,10 @@ mod tests {
         let freshness = resolve_freshness_from_provenance(&p);
         let t_low = compute_trust(&SourceKind::AgentDeclared, 0.2, freshness);
         let t_high = compute_trust(&SourceKind::AgentDeclared, 0.9, freshness);
-        assert!(t_high > t_low, "higher confidence should yield higher trust for agent_declared");
+        assert!(
+            t_high > t_low,
+            "higher confidence should yield higher trust for agent_declared"
+        );
     }
 
     #[test]
@@ -912,10 +909,16 @@ mod tests {
         let t = compute_trust(&SourceKind::HumanDeclared, 0.1, freshness);
         // Human-declared gets base 0.7 regardless of confidence.
         // Confidence is NOT a direct multiplier here.
-        assert!(t > 0.5, "human_declared should have moderate base trust, got {t}");
+        assert!(
+            t > 0.5,
+            "human_declared should have moderate base trust, got {t}"
+        );
         // Even with zero confidence, human authority remains.
         let t_zero_conf = compute_trust(&SourceKind::HumanDeclared, 0.0, freshness);
-        assert!(t_zero_conf > 0.5, "human_declared trust should not collapse at zero confidence");
+        assert!(
+            t_zero_conf > 0.5,
+            "human_declared trust should not collapse at zero confidence"
+        );
     }
 
     #[test]
@@ -925,8 +928,10 @@ mod tests {
 
         let t_stale = compute_trust(&SourceKind::StaticAnalysis, 0.5, FreshnessStatus::Stale);
 
-        assert!(t_fresh > t_stale,
-            "fresh claim should trust more than stale: fresh={t_fresh}, stale={t_stale}");
+        assert!(
+            t_fresh > t_stale,
+            "fresh claim should trust more than stale: fresh={t_fresh}, stale={t_stale}"
+        );
     }
 
     #[test]
@@ -958,8 +963,14 @@ mod tests {
     fn confidence_and_trust_are_distinct() {
         // A human-declared claim with low confidence still has moderate trust.
         let trust = compute_trust(&SourceKind::HumanDeclared, 0.1, FreshnessStatus::Unknown);
-        assert_ne!(trust, 0.1, "trust must not equal confidence for human_declared");
-        assert!(trust > 0.1, "trust should exceed low confidence for human authority");
+        assert_ne!(
+            trust, 0.1,
+            "trust must not equal confidence for human_declared"
+        );
+        assert!(
+            trust > 0.1,
+            "trust should exceed low confidence for human authority"
+        );
     }
 
     #[test]
@@ -984,7 +995,8 @@ mod tests {
     fn default_resolver_returns_unknown_without_repo_state() {
         let env: ClaimEnvelope<()> = ClaimEnvelope::new(
             "claim::fresh",
-            "s", "p",
+            "s",
+            "p",
             SourceKind::StaticAnalysis,
             Provenance::new(SourceKind::StaticAnalysis),
             (),
@@ -1005,13 +1017,8 @@ mod tests {
         // The current dir may be a git repo, so we can't assert Unknown here.
         // Instead verify the resolver runs without panicking and returns
         // a valid status.
-        let env: ClaimEnvelope<()> = ClaimEnvelope::new(
-            "claim::fresh",
-            "s", "p",
-            SourceKind::StaticAnalysis,
-            p,
-            (),
-        );
+        let env: ClaimEnvelope<()> =
+            ClaimEnvelope::new("claim::fresh", "s", "p", SourceKind::StaticAnalysis, p, ());
         let status = env.resolve_freshness();
         assert!(matches!(
             status,
@@ -1033,7 +1040,9 @@ mod tests {
         }
         let resolver = StaticAnalysisResolver;
         let env: ClaimEnvelope<()> = ClaimEnvelope::new(
-            "claim::sa", "s", "p",
+            "claim::sa",
+            "s",
+            "p",
             SourceKind::StaticAnalysis,
             Provenance::new(SourceKind::StaticAnalysis),
             (),
@@ -1064,24 +1073,16 @@ mod tests {
         let resolver = ExecutionResolver;
         let mut p = Provenance::new(SourceKind::Execution);
         p.execution_id = Some("exec-42".to_string());
-        let env: ClaimEnvelope<()> = ClaimEnvelope::new(
-            "claim::exec", "s", "p",
-            SourceKind::Execution,
-            p,
-            (),
-        );
+        let env: ClaimEnvelope<()> =
+            ClaimEnvelope::new("claim::exec", "s", "p", SourceKind::Execution, p, ());
         assert_eq!(
             resolver.resolve(&env, std::path::Path::new("/tmp")),
             FreshnessStatus::Fresh
         );
 
         let p2 = Provenance::new(SourceKind::Execution);
-        let env2: ClaimEnvelope<()> = ClaimEnvelope::new(
-            "claim::exec2", "s", "p",
-            SourceKind::Execution,
-            p2,
-            (),
-        );
+        let env2: ClaimEnvelope<()> =
+            ClaimEnvelope::new("claim::exec2", "s", "p", SourceKind::Execution, p2, ());
         assert_eq!(
             resolver.resolve(&env2, std::path::Path::new("/tmp")),
             FreshnessStatus::Unknown
@@ -1096,9 +1097,7 @@ mod tests {
             source_kind: SourceKind::StaticAnalysis,
             source_tool: Some("codebro-init".to_string()),
             generator_version: Some("0.7.0".to_string()),
-            observed_at: Some(
-                DateTime::<Utc>::from_timestamp(1700000000, 0).unwrap(),
-            ),
+            observed_at: Some(DateTime::<Utc>::from_timestamp(1700000000, 0).unwrap()),
             workspace_root: Some("/workspace".to_string()),
             repo_identity: Some(crate::sandbox::RepoIdentity {
                 project_id: "proj".to_string(),
@@ -1131,8 +1130,7 @@ mod tests {
 
     #[test]
     fn full_pipeline_agent_declared_claim() {
-        let p = Provenance::new(SourceKind::AgentDeclared)
-            .with_source_tool("codebro-agent");
+        let p = Provenance::new(SourceKind::AgentDeclared).with_source_tool("codebro-agent");
         let env: ClaimEnvelope<String> = ClaimEnvelope::new(
             "claim::hypothesis",
             "bug_root_cause",
@@ -1146,7 +1144,11 @@ mod tests {
         assert_eq!(env.source_kind, SourceKind::AgentDeclared);
         assert_eq!(env.confidence, 0.4);
         // Trust should be low because agent_declared base is 0.3 * 0.4 confidence
-        assert!(env.trust() < 0.2, "agent claim with low confidence should have low trust, got {}", env.trust());
+        assert!(
+            env.trust() < 0.2,
+            "agent claim with low confidence should have low trust, got {}",
+            env.trust()
+        );
     }
 
     #[test]
@@ -1166,6 +1168,10 @@ mod tests {
 
         assert_eq!(env.source_kind, SourceKind::HumanDeclared);
         // Trust should remain moderate despite low confidence
-        assert!(env.trust() > 0.5, "human authority should maintain moderate trust, got {}", env.trust());
+        assert!(
+            env.trust() > 0.5,
+            "human authority should maintain moderate trust, got {}",
+            env.trust()
+        );
     }
 }

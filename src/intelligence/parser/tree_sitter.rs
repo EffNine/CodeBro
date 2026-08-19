@@ -859,24 +859,6 @@ impl CodeParser {
                     });
                 }
             }
-            "method_declaration" => {
-                let name = self.name_of(node, source, "identifier");
-
-                result.symbols.push(ParsedSymbol {
-                    name,
-                    kind: SymbolKind::Method,
-                    language: "go".to_string(),
-                    file: file_name.to_string(),
-                    line_start: self.line_to_u32(node.start_position()),
-                    line_end: self.line_to_u32(node.end_position()),
-                    column_start: node.start_position().column as u32,
-                    column_end: node.end_position().column as u32,
-                    parent: parent.map(|s| s.to_string()),
-                    visibility: None,
-                    signature: self.extract_signature(node, source),
-                    doc_comment: self.extract_doc_comment(node, source),
-                });
-            }
             "interface_type" => {
                 let name_node = self.get_node_by_kind(node, "identifier");
                 if let Some(name_node) = name_node {
@@ -1062,19 +1044,19 @@ impl CodeParser {
     /// Walk a callee node tree and return the final identifier text.
     fn extract_callee_name(&self, node: Node, source: &str) -> String {
         match node.kind() {
-            "identifier" | "field_identifier" => {
-                self.node_name(node, source).unwrap_or_default()
-            }
+            "identifier" | "field_identifier" => self.node_name(node, source).unwrap_or_default(),
             "field_expression" | "selector_expression" => {
                 // For qualified calls like `pkg::func()` or `obj.method()`,
                 // the final child is the actual callee name.
                 let last = node.child(node.child_count().saturating_sub(1));
-                last.map(|n| self.extract_callee_name(n, source)).unwrap_or_default()
+                last.map(|n| self.extract_callee_name(n, source))
+                    .unwrap_or_default()
             }
             "qualified_identifier" => {
                 // Rust qualified path: take the last identifier segment.
                 let last = node.child(node.child_count().saturating_sub(1));
-                last.map(|n| self.extract_callee_name(n, source)).unwrap_or_default()
+                last.map(|n| self.extract_callee_name(n, source))
+                    .unwrap_or_default()
             }
             _ => String::new(),
         }

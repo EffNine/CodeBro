@@ -11,23 +11,32 @@ by maintaining verified facts and recorded memory that persist between sessions.
       OpenCode · Claude Code · Codex · Cursor
                       │
                      MCP
-                      ▼
-                ┌───────────┐
-                │  CodeBro  │
-                ├───────────┤
-                │ Facts     │
-                │ Memory    │
-                │ Identity  │
-                │ Guarded   │
-                │ Changes   │
-                └─────┬─────┘
-                      │
-                      ▼
-                  Repository
+                       ▼
+                 ┌───────────┐
+                 │  CodeBro  │
+                 ├───────────┤
+                 │ Facts     │
+                 │ Memory    │
+                 │ Identity  │
+                 │ Guarded   │
+                 │ Changes   │
+                 │ Consultant│
+                 └─────┬─────┘
+                       │
+              ConsultantProvider
+                       │
+                       ▼
+                 Conductor
+              (HTTP + Bearer key)
+                       │
+              routing / scoring / health
+                       │
+                       ▼
+                Upstream providers
 ```
 
 **Host agent owns:** reasoning, planning, tool selection, execution strategy, UX.
-**CodeBro owns:** project identity, verified project facts, persistent engineering memory, optional guarded mutations.
+**CodeBro owns:** project identity, verified project facts, persistent engineering memory, optional guarded mutations, and consultant queries via Conductor.
 
 CodeBro is **not**:
 - a replacement coding agent
@@ -50,6 +59,8 @@ codebro doctor
 opencode mcp add codebro -- "$(which codebro) serve"
 ```
 
+For a complete Conductor setup guide, see [`docs/CONDUCTOR_HOWTO.md`](docs/CONDUCTOR_HOWTO.md).
+
 ## What CodeBro Provides
 
 | Surface | Tool | Purpose |
@@ -61,6 +72,7 @@ opencode mcp add codebro -- "$(which codebro) serve"
 | Write | `record_memory` | Upsert a persistent memory entry (secret-redacted) |
 | Write | `delete_memory` | Delete a memory entry by exact key |
 | Write | `apply_change` *(optional)* | Guarded single-file mutation via ChangeEngine |
+| Read/Write | `consult` | Ask Conductor for opinions (architecture, debugging, code review, planning, research, second opinion) |
 
 ## Trust Model
 
@@ -88,11 +100,14 @@ codebro init       # Scan workspace → .codebro/facts.json
 codebro doctor     # Diagnostics (exit 0 ok / 1 warn / 2 error)
 codebro serve      # MCP server over stdio
 codebro list-models # List models from configured provider
+codebro consult    # Ask Conductor a question directly
+codebro auth status # Check consultant provider auth
 ```
 
 ## Links
 
 - [MCP Server Design](docs/design/MCP_SERVER.md)
+- [Conductor Setup HOWTO](docs/CONDUCTOR_HOWTO.md)
 - [Architecture Decision Records](docs/ADR/)
 - [Changelog](CHANGELOG.md)
 - [License](LICENSE)

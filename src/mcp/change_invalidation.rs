@@ -52,18 +52,13 @@ impl InvalidationAdvisory {
     /// For newly-created files the affected lists may be empty;
     /// `needs_reindex` is still true because new symbols will not appear until
     /// re-indexing.
-    pub fn analyze(
-        store: &FactStore,
-        changed_path: &str,
-        created: bool,
-    ) -> Self {
+    pub fn analyze(store: &FactStore, changed_path: &str, created: bool) -> Self {
         let norm = normalize_path(changed_path);
         let collection = store.collection();
 
         // Collect unique affected symbol IDs.
         let mut sym_ids: Vec<String> = Vec::new();
-        let mut sym_set: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
+        let mut sym_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for sym in collection.symbols() {
             if let Some(ref loc_file) = sym.location.file {
                 if normalize_path(loc_file) == norm {
@@ -77,8 +72,7 @@ impl InvalidationAdvisory {
 
         // Collect unique affected module IDs.
         let mut mod_ids: Vec<String> = Vec::new();
-        let mut mod_set: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
+        let mut mod_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for modf in collection.modules() {
             let file_match = modf
                 .location
@@ -101,8 +95,7 @@ impl InvalidationAdvisory {
 
         // Collect all fact IDs touched by matching symbols or modules.
         let mut fact_ids: Vec<String> = Vec::new();
-        let mut fact_set: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut fact_set: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Symbols themselves are facts.
         for sid in &sym_ids {
@@ -235,11 +228,9 @@ impl InvalidationAdvisory {
 
         let recommendation = if created {
             if sym_ids.is_empty() {
-                "Run codebro init to register new symbols from this file."
-                    .to_string()
+                "Run codebro init to register new symbols from this file.".to_string()
             } else {
-                "Run codebro init to register new symbols and refresh affected facts."
-                    .to_string()
+                "Run codebro init to register new symbols and refresh affected facts.".to_string()
             }
         } else if sym_ids.is_empty() && mod_ids.is_empty() {
             String::new()
@@ -273,16 +264,13 @@ fn normalize_path(p: &str) -> String {
 mod tests {
     use super::*;
     use crate::engineering_facts::{
-        FactsBuilder, ModuleFact, ModuleId, RelationshipFact, RelationshipId,
-        RelationshipKind, SourceLocation, Span, SymbolFact, SymbolId, SymbolKind,
-        TestFact, TestId, WorkspaceFact, WorkspaceId,
+        FactsBuilder, ModuleFact, ModuleId, RelationshipFact, RelationshipId, RelationshipKind,
+        SourceLocation, Span, SymbolFact, SymbolId, SymbolKind, TestFact, TestId, WorkspaceFact,
+        WorkspaceId,
     };
     use crate::fact_store::FactStore;
 
-    fn make_store_with_symbols_in_file(
-        file_path: &str,
-        symbol_names: &[&str],
-    ) -> FactStore {
+    fn make_store_with_symbols_in_file(file_path: &str, symbol_names: &[&str]) -> FactStore {
         let ws_id = WorkspaceId::new("ws::m2");
         let mut builder = FactsBuilder::new();
         builder.add_workspace(WorkspaceFact::new(ws_id.clone(), "m2"));
@@ -295,7 +283,11 @@ mod tests {
 
         for (i, name) in symbol_names.iter().enumerate() {
             let sym_id = format!("sym::{file_path}::{name}_{i}");
-            let mut sf = SymbolFact::new(SymbolId::new(sym_id), name.to_string(), SymbolKind::Function);
+            let mut sf = SymbolFact::new(
+                SymbolId::new(sym_id),
+                name.to_string(),
+                SymbolKind::Function,
+            );
             sf.location = SourceLocation::new()
                 .with_file(file_path)
                 .with_point((i + 1) as u32, 0);
@@ -369,11 +361,16 @@ mod tests {
         // filesystems (Linux). A change to one must not report the other.
         let store = make_store_with_symbols_in_file("src/Foo.rs", &["Bar"]);
         let adv = InvalidationAdvisory::analyze(&store, "src/foo.rs", false);
-        assert!(adv.affected_symbols.is_empty(),
-            "src/foo.rs must not match src/Foo.rs (case-sensitive)");
+        assert!(
+            adv.affected_symbols.is_empty(),
+            "src/foo.rs must not match src/Foo.rs (case-sensitive)"
+        );
         let adv_upper = InvalidationAdvisory::analyze(&store, "src/Foo.rs", false);
-        assert_eq!(adv_upper.affected_symbols.len(), 1,
-            "src/Foo.rs must match itself");
+        assert_eq!(
+            adv_upper.affected_symbols.len(),
+            1,
+            "src/Foo.rs must match itself"
+        );
     }
 
     #[test]
@@ -405,11 +402,7 @@ mod tests {
     fn detects_relationship_when_changed_file_contains_source_symbol() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/a.rs"),
-            "pub fn foo() -> i32 { 42 }",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "pub fn foo() -> i32 { 42 }").unwrap();
         std::fs::write(
             dir.path().join("src/b.rs"),
             "use super::foo;\npub fn bar() -> i32 { foo() }",
@@ -418,8 +411,7 @@ mod tests {
         crate::init::run(dir.path()).expect("init");
 
         let model: crate::engineering_facts::FactsModel = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(".codebro/facts.json"))
-                .expect("facts.json"),
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).expect("facts.json"),
         )
         .expect("valid facts");
         let store = FactStore::from_model(&model);
@@ -443,11 +435,7 @@ mod tests {
     fn detects_relationship_when_changed_file_contains_target_symbol() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/a.rs"),
-            "pub fn foo() -> i32 { 42 }",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "pub fn foo() -> i32 { 42 }").unwrap();
         std::fs::write(
             dir.path().join("src/b.rs"),
             "use super::foo;\npub fn bar() -> i32 { foo() }",
@@ -456,8 +444,7 @@ mod tests {
         crate::init::run(dir.path()).expect("init");
 
         let model: crate::engineering_facts::FactsModel = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(".codebro/facts.json"))
-                .expect("facts.json"),
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).expect("facts.json"),
         )
         .expect("valid facts");
         let store = FactStore::from_model(&model);
@@ -478,11 +465,7 @@ mod tests {
     fn detects_reference_through_resolved_fact() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/a.rs"),
-            "pub fn foo() -> i32 { 42 }",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "pub fn foo() -> i32 { 42 }").unwrap();
         std::fs::write(
             dir.path().join("src/b.rs"),
             "use super::foo;\npub fn bar() -> i32 { foo() }",
@@ -491,8 +474,7 @@ mod tests {
         crate::init::run(dir.path()).expect("init");
 
         let model: crate::engineering_facts::FactsModel = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(".codebro/facts.json"))
-                .expect("facts.json"),
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).expect("facts.json"),
         )
         .expect("valid facts");
         let store = FactStore::from_model(&model);
@@ -524,8 +506,7 @@ mod tests {
         crate::init::run(dir.path()).expect("init");
 
         let model: crate::engineering_facts::FactsModel = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(".codebro/facts.json"))
-                .expect("facts.json"),
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).expect("facts.json"),
         )
         .expect("valid facts");
         let store = FactStore::from_model(&model);
@@ -560,8 +541,7 @@ mod tests {
         crate::init::run(dir.path()).expect("init");
 
         let model: crate::engineering_facts::FactsModel = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(".codebro/facts.json"))
-                .expect("facts.json"),
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).expect("facts.json"),
         )
         .expect("valid facts");
         let store = FactStore::from_model(&model);
@@ -588,8 +568,7 @@ mod tests {
         crate::init::run(dir.path()).expect("init");
 
         let model: crate::engineering_facts::FactsModel = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(".codebro/facts.json"))
-                .expect("facts.json"),
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).expect("facts.json"),
         )
         .expect("valid facts");
         let store = FactStore::from_model(&model);

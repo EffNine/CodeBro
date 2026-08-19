@@ -313,7 +313,10 @@ impl VerificationResult {
         } else if execution.denied {
             format!(
                 "Execution denied: {}",
-                execution.denied_reason.as_deref().unwrap_or("policy violation")
+                execution
+                    .denied_reason
+                    .as_deref()
+                    .unwrap_or("policy violation")
             )
         } else if execution.timeout {
             format!(
@@ -385,10 +388,7 @@ impl VerificationResult {
         // treat non-zero as a failure violation (common default).
         if expected_success.is_none() && expected_exit_code.is_none() {
             if !execution.success {
-                violations.push(format!(
-                    "non-zero exit: {}",
-                    execution.exit_code
-                ));
+                violations.push(format!("non-zero exit: {}", execution.exit_code));
             }
         }
 
@@ -451,10 +451,7 @@ impl VerificationResult {
         // treat non-zero as a failure violation (common default).
         if expected_success.is_none() && expected_exit_code.is_none() {
             if !execution.success {
-                violations.push(format!(
-                    "non-zero exit: {}",
-                    execution.exit_code
-                ));
+                violations.push(format!("non-zero exit: {}", execution.exit_code));
             }
         }
 
@@ -566,7 +563,9 @@ impl RepoState {
             .output()
             .ok()?;
         let working_tree_dirty = !dirty_output.status.success()
-            || !String::from_utf8_lossy(&dirty_output.stdout).trim().is_empty();
+            || !String::from_utf8_lossy(&dirty_output.stdout)
+                .trim()
+                .is_empty();
 
         // Compute a deterministic hash of working-tree state.
         // Strategy: hash(sorted tracked files + diff + untracked).
@@ -1006,7 +1005,8 @@ impl SandboxRuntime {
                             cancelled: false,
                             denied: true,
                             denied_reason: Some(
-                                "OpenSandbox backend unavailable; not falling back to local".to_string(),
+                                "OpenSandbox backend unavailable; not falling back to local"
+                                    .to_string(),
                             ),
                             backend: "opensandbox".to_string(),
                             mode: SandboxMode::OpenSandbox.to_string(),
@@ -1044,9 +1044,7 @@ impl SandboxRuntime {
                         timeout: false,
                         cancelled: false,
                         denied: true,
-                        denied_reason: Some(
-                            "OpenSandbox backend not configured".to_string(),
-                        ),
+                        denied_reason: Some("OpenSandbox backend not configured".to_string()),
                         backend: "opensandbox".to_string(),
                         mode: SandboxMode::OpenSandbox.to_string(),
                         execution_id: uuid::Uuid::new_v4().to_string(),
@@ -1065,11 +1063,7 @@ impl SandboxRuntime {
 
     /// Enrich an execution result with provenance metadata (repo identity,
     /// repo state, capabilities, execution ID, timestamp).
-    fn enrich_with_provenance(
-        &self,
-        workspace_root: &PathBuf,
-        result: &mut ExecutionResult,
-    ) {
+    fn enrich_with_provenance(&self, workspace_root: &PathBuf, result: &mut ExecutionResult) {
         result.execution_id = uuid::Uuid::new_v4().to_string();
         result.timestamp = Some(chrono::Utc::now().to_rfc3339());
         result.requested_command = result.command.clone();
@@ -1122,12 +1116,11 @@ impl SandboxRuntime {
     pub fn capabilities(&self) -> SandboxCapabilities {
         match self.mode {
             SandboxMode::Local => self.local.capabilities(),
-            SandboxMode::OpenSandbox => {
-                self.opensandbox
-                    .as_ref()
-                    .map(|b| b.capabilities())
-                    .unwrap_or(SandboxCapabilities::opensandbox())
-            }
+            SandboxMode::OpenSandbox => self
+                .opensandbox
+                .as_ref()
+                .map(|b| b.capabilities())
+                .unwrap_or(SandboxCapabilities::opensandbox()),
         }
     }
 
@@ -1162,7 +1155,8 @@ mod tests {
 
     #[test]
     fn test_execution_result_denied() {
-        let r = ExecutionResult::denied("rm -rf /", "/workspace", "denied by policy", HashMap::new());
+        let r =
+            ExecutionResult::denied("rm -rf /", "/workspace", "denied by policy", HashMap::new());
         assert!(!r.success);
         assert_eq!(r.exit_code, -1);
         assert!(r.denied);
@@ -1247,8 +1241,7 @@ mod tests {
             false,
             HashMap::new(),
         );
-        let v =
-            VerificationResult::from_execution_with_expectations(exec, Some(0), Some(true));
+        let v = VerificationResult::from_execution_with_expectations(exec, Some(0), Some(true));
         assert!(v.verified);
         assert!(v.violations.is_empty());
     }
@@ -1266,8 +1259,7 @@ mod tests {
             false,
             HashMap::new(),
         );
-        let v =
-            VerificationResult::from_execution_with_expectations(exec, Some(0), Some(true));
+        let v = VerificationResult::from_execution_with_expectations(exec, Some(0), Some(true));
         assert!(!v.verified);
         assert_eq!(v.violations.len(), 2);
         assert!(v.violations[0].contains("expected success=true"));
@@ -1276,12 +1268,8 @@ mod tests {
 
     #[test]
     fn test_verification_result_denied_command() {
-        let exec = ExecutionResult::denied(
-            "rm -rf /",
-            "/workspace",
-            "denied by policy",
-            HashMap::new(),
-        );
+        let exec =
+            ExecutionResult::denied("rm -rf /", "/workspace", "denied by policy", HashMap::new());
         let v = VerificationResult::from_execution(exec);
         assert!(!v.verified);
         assert!(v.summary.contains("denied"));
@@ -1362,7 +1350,10 @@ mod tests {
 
     #[test]
     fn test_reproducibility_display() {
-        assert_eq!(format!("{}", Reproducibility::Deterministic), "deterministic");
+        assert_eq!(
+            format!("{}", Reproducibility::Deterministic),
+            "deterministic"
+        );
         assert_eq!(
             format!("{}", Reproducibility::LikelyDeterministic),
             "likely_deterministic"
@@ -1722,12 +1713,8 @@ mod tests {
             HashMap::new(),
         );
         let ids = vec!["sym::x".to_string()];
-        let v = VerificationResult::from_execution_with_impacted_fact_ids(
-            exec,
-            None,
-            None,
-            Some(ids),
-        );
+        let v =
+            VerificationResult::from_execution_with_impacted_fact_ids(exec, None, None, Some(ids));
         let json = serde_json::to_string(&v).expect("serializes");
         assert!(json.contains("impacted_fact_ids"));
         assert!(json.contains("sym::x"));

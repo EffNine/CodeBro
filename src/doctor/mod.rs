@@ -264,8 +264,14 @@ fn print_report(checks: &[Check], worst: i32, root: &Path) {
         }
     }
     println!();
-    let errors = checks.iter().filter(|c| !c.ok && c.detail.as_deref().is_some_and(|d| d.starts_with("ERROR"))).count();
-    let warnings = checks.iter().filter(|c| !c.ok && !c.detail.as_deref().is_some_and(|d| d.starts_with("ERROR"))).count();
+    let errors = checks
+        .iter()
+        .filter(|c| !c.ok && c.detail.as_deref().is_some_and(|d| d.starts_with("ERROR")))
+        .count();
+    let warnings = checks
+        .iter()
+        .filter(|c| !c.ok && !c.detail.as_deref().is_some_and(|d| d.starts_with("ERROR")))
+        .count();
     match worst {
         EXIT_HEALTHY => println!("  All checks passed."),
         EXIT_WARN => println!("  {errors} error(s), {warnings} warning(s)."),

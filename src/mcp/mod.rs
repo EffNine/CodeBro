@@ -57,7 +57,10 @@ impl CodeBroMcpServer {
     }
 
     /// Create a server with an explicit sandbox runtime (for tests).
-    pub fn with_sandbox_runtime(workspace_root: PathBuf, runtime: crate::sandbox::SandboxRuntime) -> Self {
+    pub fn with_sandbox_runtime(
+        workspace_root: PathBuf,
+        runtime: crate::sandbox::SandboxRuntime,
+    ) -> Self {
         Self {
             workspace_root,
             tool_router: Self::tool_router(),
@@ -313,8 +316,11 @@ impl CodeBroMcpServer {
             .iter()
             .map(|entry| {
                 let src = snapshot.iter().find(|s| s.key == entry.key);
-                let trust =
-                    Some(compute_trust(&SourceKind::AgentDeclared, entry.confidence, FreshnessStatus::Unknown));
+                let trust = Some(compute_trust(
+                    &SourceKind::AgentDeclared,
+                    entry.confidence,
+                    FreshnessStatus::Unknown,
+                ));
                 json!({
                     "key": entry.key,
                     "value": entry.value,
@@ -573,7 +579,11 @@ impl CodeBroMcpServer {
         let mut with_source = 0usize;
         for e in &entries {
             confidence_sum += e.metadata.confidence;
-            trust_sum += compute_trust(&SourceKind::AgentDeclared, e.metadata.confidence, FreshnessStatus::Unknown);
+            trust_sum += compute_trust(
+                &SourceKind::AgentDeclared,
+                e.metadata.confidence,
+                FreshnessStatus::Unknown,
+            );
             for tag in &e.metadata.tags {
                 *tag_counts.entry(tag.clone()).or_insert(0) += 1;
             }
@@ -635,8 +645,11 @@ impl CodeBroMcpServer {
             policy: None,
             metadata: args.metadata,
         };
-        let policy = crate::sandbox::SandboxPolicy::new().with_timeout(args.timeout.unwrap_or(120) as u64);
-        let result = self.sandbox_runtime.execute(&self.workspace_root, cmd, &policy);
+        let policy =
+            crate::sandbox::SandboxPolicy::new().with_timeout(args.timeout.unwrap_or(120) as u64);
+        let result = self
+            .sandbox_runtime
+            .execute(&self.workspace_root, cmd, &policy);
         let payload = serde_json::to_string_pretty(&result)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
@@ -661,14 +674,18 @@ impl CodeBroMcpServer {
             policy: None,
             metadata: args.metadata,
         };
-        let policy = crate::sandbox::SandboxPolicy::new().with_timeout(args.timeout.unwrap_or(120) as u64);
-        let execution = self.sandbox_runtime.execute(&self.workspace_root, cmd, &policy);
-        let verification = crate::sandbox::VerificationResult::from_execution_with_impacted_fact_ids(
-            execution,
-            args.expected_exit_code,
-            args.expected_success,
-            args.affected_fact_ids,
-        );
+        let policy =
+            crate::sandbox::SandboxPolicy::new().with_timeout(args.timeout.unwrap_or(120) as u64);
+        let execution = self
+            .sandbox_runtime
+            .execute(&self.workspace_root, cmd, &policy);
+        let verification =
+            crate::sandbox::VerificationResult::from_execution_with_impacted_fact_ids(
+                execution,
+                args.expected_exit_code,
+                args.expected_success,
+                args.affected_fact_ids,
+            );
         let mut verification_obj = serde_json::Map::new();
         verification_obj.insert("verified".to_string(), json!(verification.verified));
         verification_obj.insert("summary".to_string(), json!(verification.summary));
@@ -705,14 +722,18 @@ impl CodeBroMcpServer {
             policy: None,
             metadata: args.metadata,
         };
-        let policy = crate::sandbox::SandboxPolicy::new().with_timeout(args.timeout.unwrap_or(120) as u64);
-        let execution = self.sandbox_runtime.execute(&self.workspace_root, cmd, &policy);
-        let verification = crate::sandbox::VerificationResult::from_execution_with_impacted_fact_ids(
-            execution,
-            args.expected_exit_code,
-            args.expected_success,
-            args.affected_fact_ids,
-        );
+        let policy =
+            crate::sandbox::SandboxPolicy::new().with_timeout(args.timeout.unwrap_or(120) as u64);
+        let execution = self
+            .sandbox_runtime
+            .execute(&self.workspace_root, cmd, &policy);
+        let verification =
+            crate::sandbox::VerificationResult::from_execution_with_impacted_fact_ids(
+                execution,
+                args.expected_exit_code,
+                args.expected_success,
+                args.affected_fact_ids,
+            );
         let mut verification_obj = serde_json::Map::new();
         verification_obj.insert("verified".to_string(), json!(verification.verified));
         verification_obj.insert("summary".to_string(), json!(verification.summary));
@@ -782,22 +803,21 @@ impl CodeBroMcpServer {
                     }
                 }
             }
-            Some("file") => {
-                crate::impact::ImpactTarget::File(args.target.clone())
-            }
+            Some("file") => crate::impact::ImpactTarget::File(args.target.clone()),
             Some("module") => {
-                let mod_id =
-                    crate::engineering_facts::ModuleId::new(args.target.clone());
+                let mod_id = crate::engineering_facts::ModuleId::new(args.target.clone());
                 crate::impact::ImpactTarget::Module(mod_id)
             }
             Some("package") => {
-                let pkg_id =
-                    crate::engineering_facts::PackageId::new(args.target.clone());
+                let pkg_id = crate::engineering_facts::PackageId::new(args.target.clone());
                 crate::impact::ImpactTarget::Package(pkg_id)
             }
             other => {
                 return Err(McpError::invalid_params(
-                    format!("unknown target_type '{:?}' — use symbol, file, module, or package", other),
+                    format!(
+                        "unknown target_type '{:?}' — use symbol, file, module, or package",
+                        other
+                    ),
                     None,
                 ))
             }
@@ -842,10 +862,7 @@ impl CodeBroMcpServer {
                 // Invalidate the mtime-based fact store cache so the next
                 // call reloads the freshly written .codebro/facts.json.
                 {
-                    let mut guard = self
-                        .facts_cache
-                        .lock()
-                        .expect("facts cache lock");
+                    let mut guard = self.facts_cache.lock().expect("facts cache lock");
                     *guard = None;
                 }
 
@@ -913,10 +930,8 @@ impl CodeBroMcpServer {
         description = "Return a structured read-only health report for the CodeBro workspace: exit code, status (healthy/warn/error), per-check results and summary. Delegates to the existing doctor implementation."
     )]
     async fn repository_health(&self) -> Result<CallToolResult, McpError> {
-        let (code, checks) =
-            crate::doctor::report(&self.workspace_root).map_err(|e| {
-                McpError::internal_error(e.to_string(), None)
-            })?;
+        let (code, checks) = crate::doctor::report(&self.workspace_root)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let status = match code {
             crate::doctor::EXIT_ERROR => "error",
@@ -965,6 +980,129 @@ impl CodeBroMcpServer {
             "status": status,
             "checks": checks_out,
             "summary": summary,
+        });
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&payload)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        )]))
+    }
+
+    // ── Tool 15: consultant ───────────────────────────────────────────
+
+    /// Ask an AI consultant (Conductor gateway) for opinions on architecture,
+    /// debugging, code review, planning, research, or second opinions.
+    /// CodeBro engineering context (facts, memory, git diff) can be attached
+    /// so the consultant answers with project-awareness.
+    #[tool(
+        description = "Ask an AI consultant (Conductor) for opinions on architecture, debugging, code review, planning, research, or second opinions. Supports provider selection, mode shaping, and automatic injection of CodeBro engineering context (facts, memory, git diff)."
+    )]
+    async fn consult(
+        &self,
+        Parameters(args): Parameters<ConsultArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // Validate question is non-empty.
+        if args.question.trim().is_empty() {
+            return Err(McpError::invalid_params("question must not be empty", None));
+        }
+
+        // Parse provider choice.
+        let provider_choice = match args.provider.as_deref() {
+            None | Some("auto") => crate::consultant::types::ConsultantProvider::Auto,
+            Some("conductor") => crate::consultant::types::ConsultantProvider::Conductor,
+            Some(other) => {
+                return Err(McpError::invalid_params(
+                    format!("unknown provider '{other}' — use auto or conductor"),
+                    None,
+                ))
+            }
+        };
+
+        // Parse mode.
+        let mode = match args.mode.as_deref() {
+            None | Some("architecture") => crate::consultant::types::ConsultantMode::Architecture,
+            Some("debugging") => crate::consultant::types::ConsultantMode::Debugging,
+            Some("code_review") | Some("code-review") => {
+                crate::consultant::types::ConsultantMode::CodeReview
+            }
+            Some("planning") => crate::consultant::types::ConsultantMode::Planning,
+            Some("research") => crate::consultant::types::ConsultantMode::Research,
+            Some("second_opinion") | Some("second-opinion") => {
+                crate::consultant::types::ConsultantMode::SecondOpinion
+            }
+            Some(other) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "unknown mode '{other}' — use architecture, debugging, code_review, \
+                         planning, research, or second_opinion"
+                    ),
+                    None,
+                ))
+            }
+        };
+
+        // Build the request.
+        let mut request = crate::consultant::types::ConsultantRequest {
+            provider: provider_choice.clone(),
+            mode: mode.clone(),
+            question: args.question.trim().to_string(),
+            context: args.context.clone(),
+            files: args
+                .files
+                .iter()
+                .map(|f| crate::consultant::types::ConsultantFileContext {
+                    path: f.path.clone(),
+                    content: f.content.clone(),
+                })
+                .collect(),
+            include_git_diff: args.include_git_diff.unwrap_or(false),
+            include_project_context: args.include_project_context.unwrap_or(false),
+            max_answer_length: args.max_answer_length.unwrap_or(0),
+        };
+
+        // Inject CodeBro engineering context when requested.
+        if args.include_project_context.unwrap_or(false) {
+            inject_project_context(&mut request, &self.workspace_root);
+        }
+        if args.include_git_diff.unwrap_or(false) {
+            inject_git_diff(&mut request, &self.workspace_root);
+        }
+
+        // Resolve provider and call consult.
+        let router = crate::consultant::build_router();
+        let provider = match router.resolve(&provider_choice) {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(McpError::internal_error(
+                    format!("provider resolution failed: {e}"),
+                    None,
+                ));
+            }
+        };
+
+        let response = match provider.consult(&request).await {
+            Ok(r) => r,
+            Err(crate::consultant::provider::ConsultantError::AuthenticationRequired(msg)) => {
+                return Err(McpError::internal_error(msg, None));
+            }
+            Err(e) => {
+                return Err(McpError::internal_error(
+                    format!("consultation failed: {e}"),
+                    None,
+                ));
+            }
+        };
+
+        let payload = json!({
+            "provider": response.provider,
+            "model": response.model,
+            "mode": mode.to_string(),
+            "answer": response.answer,
+            "summary": response.summary,
+            "recommendations": response.recommendations,
+            "risks": response.risks,
+            "confidence": response.confidence,
+            "metadata": response.metadata,
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1156,6 +1294,156 @@ pub struct ImpactArgs {
     pub max_nodes: Option<usize>,
 }
 
+/// Argument schema for `consult`.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ConsultArgs {
+    /// Provider to consult: `auto` or `conductor`. Defaults to `auto`
+    /// (first authenticated provider).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Consultation mode: `architecture`, `debugging`, `code_review`,
+    /// `planning`, `research`, or `second_opinion`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The question or task to consult on.
+    pub question: String,
+    /// Optional explicit context text supplementing automatic CodeBro context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Optional explicit file contexts to include.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ConsultFileArg>,
+    /// Whether to include the current git diff in the request context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_git_diff: Option<bool>,
+    /// Whether to include project facts and engineering memory in the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_project_context: Option<bool>,
+    /// Maximum answer length in characters (0 = provider default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_answer_length: Option<usize>,
+}
+
+/// A single file to attach to a consultation request.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ConsultFileArg {
+    /// Path relative to the workspace root.
+    pub path: String,
+    /// File contents.
+    pub content: String,
+}
+
+/// Inject project identity, facts summary, and memory into the request context
+/// so the consultant answers with project-awareness.
+fn inject_project_context(
+    request: &mut crate::consultant::types::ConsultantRequest,
+    workspace: &std::path::Path,
+) {
+    let mut ctx_parts: Vec<String> = Vec::new();
+
+    // Project identity.
+    let mut identity = crate::project_identity::ProjectIdentityRuntime::new(workspace);
+    if let Ok(_) = identity.load() {
+        let snap = identity.snapshot();
+        if !snap.name.is_empty() {
+            let lang = snap.languages.first().cloned().unwrap_or_default();
+            ctx_parts.push(format!("Project: {} ({})", snap.name, lang));
+        }
+    }
+
+    // Facts summary (compact — no raw facts, just counts).
+    let store = {
+        let path = workspace.join(".codebro/facts.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                match serde_json::from_slice::<crate::engineering_facts::FactsModel>(&bytes) {
+                    Ok(model) => Some(crate::fact_store::FactStore::from_model(&model)),
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        }
+    };
+    if let Some(ref store) = store {
+        let counts = store.collection().counts();
+        ctx_parts.push(format!(
+            "Verified facts: {} symbols, {} modules, {} tests, {} dependencies",
+            counts.symbols, counts.modules, counts.tests, counts.dependencies
+        ));
+    }
+
+    // Engineering memory (compact — just entry count and tags).
+    let mut memory = crate::engineering_memory::EngineeringMemoryRuntime::new(
+        workspace,
+        crate::project_identity::ProjectIdentityRuntime::new(workspace),
+    );
+    let _ = memory.load();
+    let entries = memory.snapshot();
+    if !entries.is_empty() {
+        let tags: std::collections::BTreeSet<&str> = entries
+            .iter()
+            .flat_map(|e| e.metadata.tags.iter().map(|s| s.as_str()))
+            .collect();
+        ctx_parts.push(format!(
+            "Engineering memory: {} entries, tags: {}",
+            entries.len(),
+            tags.iter()
+                .map(|s| *s)
+                .take(10)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    if !ctx_parts.is_empty() {
+        let context = ctx_parts.join("\n");
+        request.context = Some(match request.context.take() {
+            Some(existing) => format!("{existing}\n\n--- Project Context ---\n{context}"),
+            None => format!("--- Project Context ---\n{context}"),
+        });
+    }
+}
+
+/// Capture the current git diff (if any) and attach it to the request.
+fn inject_git_diff(
+    request: &mut crate::consultant::types::ConsultantRequest,
+    workspace: &std::path::Path,
+) {
+    let output = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["diff", "--cached", "--stat"])
+        .output();
+    let diff = match &output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            if text.is_empty() {
+                // Try uncommitted diff if staged is empty.
+                let out2 = std::process::Command::new("git")
+                    .current_dir(workspace)
+                    .args(["diff"])
+                    .output();
+                match out2 {
+                    Ok(o2) if o2.status.success() => {
+                        String::from_utf8_lossy(&o2.stdout).to_string()
+                    }
+                    _ => String::new(),
+                }
+            } else {
+                text
+            }
+        }
+        _ => String::new(),
+    };
+    if !diff.trim().is_empty() {
+        let truncated: String = diff.chars().take(4096).collect();
+        let context = format!("--- Git Diff ---\n{truncated}");
+        request.context = Some(match request.context.take() {
+            Some(existing) => format!("{existing}\n\n{context}"),
+            None => context,
+        });
+    }
+}
+
 /// Resolve a test command for the given workspace.
 fn resolve_test_command(workspace: &std::path::Path, explicit: Option<&str>) -> String {
     if let Some(cmd) = explicit {
@@ -1230,10 +1518,15 @@ impl rmcp::ServerHandler for CodeBroMcpServer {
                  or package, call codebro_impact_analyze (returns directed relationship edges, \
                  related tests, owning module/package, and provenance — descriptive evidence \
                  only, no risk scores).\n\
-               - To check the health of the CodeBro workspace (project identity, fact store, \
-                 engineering memory, git status), call codebro_repository_health (returns \
-                 structured exit code, status, per-check results, and summary).\n\
-              \n\
+              - To check the health of the CodeBro workspace (project identity, fact store, \
+                  engineering memory, git status), call codebro_repository_health (returns \
+                  structured exit code, status, per-check results, and summary).\n\
+                - To ask an AI consultant (Conductor, ChatGPT, Claude, DeepSeek) for opinions on \
+                  architecture, debugging, code review, planning, research, or second \
+                  opinions, call codebro_consult (supports provider selection, mode shaping, \
+                  and automatic injection of CodeBro engineering context like facts, memory, \
+                  and git diff).\n\
+               \n\
              WRITE PATH (OPTIONAL):\n\
              - codebro_apply_change is an optional guarded mutation API for controlled/autonomous \
                workflows. Use your native editing tools for normal coding edits. If you do use \
@@ -1294,6 +1587,7 @@ mod tests {
             "impact_analyze",
             "reindex",
             "repository_health",
+            "consult",
         ];
 
         for name in expected {
@@ -1358,6 +1652,7 @@ mod tests {
             "impact_analyze",
             "reindex",
             "repository_health",
+            "consult",
         ] {
             assert!(
                 server.get_tool(expected).is_some(),
@@ -1435,7 +1730,10 @@ mod tests {
         assert!(trust <= 1.0, "trust must be <= 1.0, got {trust}");
         // AgentDeclared base = 0.30, freshness Unknown = 0.8, confidence = 1.0
         // trust = 0.30 * 0.8 * 1.0 = 0.24
-        assert!((trust - 0.24).abs() < 1e-9, "expected trust ≈ 0.24 for conf=1.0, got {trust}");
+        assert!(
+            (trust - 0.24).abs() < 1e-9,
+            "expected trust ≈ 0.24 for conf=1.0, got {trust}"
+        );
     }
 
     /// M1-A.B: Lower confidence produces lower trust than high confidence.
@@ -1465,7 +1763,10 @@ mod tests {
         let trust = v["entries"][0]["trust"].as_f64().expect("trust is present");
         // AgentDeclared base = 0.30, freshness Unknown = 0.8, confidence = 0.5
         // trust = 0.30 * 0.8 * 0.5 = 0.12
-        assert!((trust - 0.12).abs() < 1e-9, "expected trust ≈ 0.12 for conf=0.5, got {trust}");
+        assert!(
+            (trust - 0.12).abs() < 1e-9,
+            "expected trust ≈ 0.12 for conf=0.5, got {trust}"
+        );
     }
 
     /// M1-A.C: Zero confidence produces the AgentDeclared base trust after
@@ -1490,11 +1791,21 @@ mod tests {
     async fn m1a_freshness_effect_on_trust() {
         use crate::provenance::{compute_trust, FreshnessStatus, SourceKind};
         let confidence = 0.8;
-        let t_fresh = compute_trust(&SourceKind::AgentDeclared, confidence, FreshnessStatus::Fresh);
-        let t_unknown =
-            compute_trust(&SourceKind::AgentDeclared, confidence, FreshnessStatus::Unknown);
-        let t_stale =
-            compute_trust(&SourceKind::AgentDeclared, confidence, FreshnessStatus::Stale);
+        let t_fresh = compute_trust(
+            &SourceKind::AgentDeclared,
+            confidence,
+            FreshnessStatus::Fresh,
+        );
+        let t_unknown = compute_trust(
+            &SourceKind::AgentDeclared,
+            confidence,
+            FreshnessStatus::Unknown,
+        );
+        let t_stale = compute_trust(
+            &SourceKind::AgentDeclared,
+            confidence,
+            FreshnessStatus::Stale,
+        );
         assert!(
             t_fresh > t_unknown,
             "fresh ({t_fresh}) must exceed unknown ({t_unknown})"
@@ -2063,7 +2374,11 @@ mod tests {
         assert!(!mods.is_empty(), "must report affected modules");
         // recommendation should mention reindex.
         assert!(
-            v["recommendation"].as_str().unwrap().to_lowercase().contains("init"),
+            v["recommendation"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("init"),
             "recommendation must mention init, got: {}",
             v["recommendation"].as_str().unwrap()
         );
@@ -2163,18 +2478,9 @@ mod tests {
         .await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["applied"], true);
-        assert_eq!(
-            v["affected_symbols"].as_array().map(|a| a.len()),
-            Some(0)
-        );
-        assert_eq!(
-            v["affected_modules"].as_array().map(|a| a.len()),
-            Some(0)
-        );
-        assert_eq!(
-            v["affected_fact_ids"].as_array().map(|a| a.len()),
-            Some(0)
-        );
+        assert_eq!(v["affected_symbols"].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(v["affected_modules"].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(v["affected_fact_ids"].as_array().map(|a| a.len()), Some(0));
         // needs_reindex is still true because any source-file change could
         // affect facts — but recommendation may be empty for non-source files.
         assert_eq!(v["needs_reindex"], true);
@@ -2384,7 +2690,8 @@ mod tests {
                 text_of(r)
             }
             "sandbox_build" => {
-                let p: SandboxBuildArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let p: SandboxBuildArgs =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
                 let r = server
                     .sandbox_build(Parameters(p))
                     .await
@@ -2410,6 +2717,14 @@ mod tests {
             "repository_health" => {
                 let r = server
                     .repository_health()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "consult" => {
+                let p: ConsultArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .consult(Parameters(p))
                     .await
                     .map_err(|e| e.to_string())?;
                 text_of(r)
@@ -2664,12 +2979,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let server = local_sandbox_server(&dir);
 
-        let out = call_tool_text(
-            &server,
-            "sandbox_exec",
-            json!({"command": "rm -rf /"}),
-        )
-        .await;
+        let out = call_tool_text(&server, "sandbox_exec", json!({"command": "rm -rf /"})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["denied"], true);
         assert_eq!(v["exit_code"], -1);
@@ -2694,12 +3004,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let server = local_sandbox_server(&dir);
 
-        let out = call_tool_text(
-            &server,
-            "sandbox_exec",
-            json!({"command": "cargo test"}),
-        )
-        .await;
+        let out = call_tool_text(&server, "sandbox_exec", json!({"command": "cargo test"})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["denied"], true);
     }
@@ -2708,17 +3013,20 @@ mod tests {
     #[tokio::test]
     async fn sandbox_test_auto_detects_cargo() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src").join("lib.rs"), "pub fn hello() -> i32 { 42 }\n").unwrap();
+        std::fs::write(
+            dir.path().join("src").join("lib.rs"),
+            "pub fn hello() -> i32 { 42 }\n",
+        )
+        .unwrap();
         let server = local_sandbox_server(&dir);
 
-        let out = call_tool_text(
-            &server,
-            "sandbox_test",
-            json!({}),
-        )
-        .await;
+        let out = call_tool_text(&server, "sandbox_test", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["execution"]["command"], "cargo test");
         assert!(v.get("verification").is_some());
@@ -2729,17 +3037,20 @@ mod tests {
     #[tokio::test]
     async fn sandbox_build_auto_detects_cargo() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src").join("lib.rs"), "pub fn hello() -> i32 { 42 }\n").unwrap();
+        std::fs::write(
+            dir.path().join("src").join("lib.rs"),
+            "pub fn hello() -> i32 { 42 }\n",
+        )
+        .unwrap();
         let server = local_sandbox_server(&dir);
 
-        let out = call_tool_text(
-            &server,
-            "sandbox_build",
-            json!({}),
-        )
-        .await;
+        let out = call_tool_text(&server, "sandbox_build", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["execution"]["command"], "cargo check");
         assert!(v.get("verification").is_some());
@@ -2806,7 +3117,9 @@ mod tests {
             .iter()
             .map(|s| s.as_str().unwrap())
             .collect();
-        assert!(violations.iter().any(|v| v.contains("expected success=false")));
+        assert!(violations
+            .iter()
+            .any(|v| v.contains("expected success=false")));
     }
 
     /// sandbox_exec with mixed stdout/stderr must keep them separated.
@@ -2865,12 +3178,7 @@ mod tests {
             return;
         }
         let server = local_sandbox_server_for_path(&fixture);
-        let out = call_tool_text(
-            &server,
-            "sandbox_build",
-            json!({}),
-        )
-        .await;
+        let out = call_tool_text(&server, "sandbox_build", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["execution"]["command"], "cargo check");
         assert_eq!(v["execution"]["exit_code"], 0);
@@ -2886,17 +3194,15 @@ mod tests {
             return;
         }
         let server = local_sandbox_server_for_path(&fixture);
-        let out = call_tool_text(
-            &server,
-            "sandbox_test",
-            json!({}),
-        )
-        .await;
+        let out = call_tool_text(&server, "sandbox_test", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["execution"]["command"], "cargo test");
         assert_eq!(v["execution"]["exit_code"], 0);
         assert_eq!(v["verification"]["verified"], true);
-        assert!(v["execution"]["stdout"].as_str().unwrap().contains("test result"));
+        assert!(v["execution"]["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("test result"));
     }
 
     /// Integration: sandbox_test against failing fixture reports failure evidence.
@@ -2908,12 +3214,7 @@ mod tests {
             return;
         }
         let server = local_sandbox_server_for_path(&fixture);
-        let out = call_tool_text(
-            &server,
-            "sandbox_test",
-            json!({}),
-        )
-        .await;
+        let out = call_tool_text(&server, "sandbox_test", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         // The fixture has a should_panic test which panics in normal test runs,
         // causing a non-zero exit.
@@ -2972,7 +3273,9 @@ mod tests {
             .iter()
             .map(|s| s.as_str().unwrap())
             .collect();
-        assert!(violations.iter().any(|v| v.contains("expected exit_code=0")));
+        assert!(violations
+            .iter()
+            .any(|v| v.contains("expected exit_code=0")));
     }
 
     /// sandbox_build on a non-Cargo workspace returns a no-op command.
@@ -2981,14 +3284,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let server = local_sandbox_server(&dir);
 
-        let out = call_tool_text(
-            &server,
-            "sandbox_build",
-            json!({}),
-        )
-        .await;
+        let out = call_tool_text(&server, "sandbox_build", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert!(v["execution"]["command"].as_str().unwrap().contains("no project manifest"));
+        assert!(v["execution"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("no project manifest"));
         assert_eq!(v["execution"]["exit_code"], 0);
         assert_eq!(v["verification"]["verified"], true);
     }
@@ -3014,7 +3315,9 @@ mod tests {
         let out = call_tool_text(&server, "sandbox_status", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert!(v.get("capabilities").is_some());
-        let caps = v["capabilities"].as_object().expect("capabilities is object");
+        let caps = v["capabilities"]
+            .as_object()
+            .expect("capabilities is object");
         assert_eq!(caps["isolation"], "none");
         assert_eq!(caps["filesystem_scope"], "policy_bounded");
         assert_eq!(caps["network_access"], "host");
@@ -3047,9 +3350,17 @@ mod tests {
     #[tokio::test]
     async fn sandbox_test_includes_repo_identity_and_state() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0.1.0\"\nedition=\"2021\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src").join("lib.rs"), "pub fn hello() -> i32 { 42 }\n").unwrap();
+        std::fs::write(
+            dir.path().join("src").join("lib.rs"),
+            "pub fn hello() -> i32 { 42 }\n",
+        )
+        .unwrap();
         // Initialize as git repo so repo_state is captured.
         std::process::Command::new("git")
             .current_dir(&dir)
@@ -3240,9 +3551,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|r| {
-                r["relationship_kind"] == "calls" && r["direction"] == "incoming"
-            })
+            .filter(|r| r["relationship_kind"] == "calls" && r["direction"] == "incoming")
             .collect();
         assert!(
             !rels.is_empty(),
@@ -3294,9 +3603,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|r| {
-                r["relationship_kind"] == "calls" && r["direction"] == "incoming"
-            })
+            .filter(|r| r["relationship_kind"] == "calls" && r["direction"] == "incoming")
             .collect();
         assert_eq!(
             incoming_calls.len(),
@@ -3346,9 +3653,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|r| {
-                r["relationship_kind"] == "calls" && r["provenance"] == "verified"
-            })
+            .filter(|r| r["relationship_kind"] == "calls" && r["provenance"] == "verified")
             .collect();
         // internal() is a private function — the call should not resolve
         // to a verified edge since the target symbol is not in the store
@@ -3434,8 +3739,14 @@ mod tests {
         .await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["status"], "ok");
-        assert_eq!(v["direct_relationships"].as_array().map(|a| a.len()), Some(0));
-        assert_eq!(v["transitive_relationships"].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(
+            v["direct_relationships"].as_array().map(|a| a.len()),
+            Some(0)
+        );
+        assert_eq!(
+            v["transitive_relationships"].as_array().map(|a| a.len()),
+            Some(0)
+        );
         assert_eq!(v["traversal_metadata"]["depth_limit"], 0);
     }
 
@@ -3463,7 +3774,10 @@ mod tests {
             json!({"target": "hello", "target_type": "symbol", "depth": 10}),
         )
         .await;
-        assert!(err.contains("depth") || err.contains("maximum"), "expected depth validation error, got: {err}");
+        assert!(
+            err.contains("depth") || err.contains("maximum"),
+            "expected depth validation error, got: {err}"
+        );
     }
 
     /// P2.3: direction=outgoing restricts results to outgoing edges only.
@@ -3597,12 +3911,7 @@ mod tests {
         crate::init::run(dir.path()).expect("init failed");
 
         let server = local_sandbox_server(&dir);
-        let out = call_tool_text(
-            &server,
-            "engineering_facts",
-            json!({"query": "helper"}),
-        )
-        .await;
+        let out = call_tool_text(&server, "engineering_facts", json!({"query": "helper"})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
 
         // provenance_summary must be present
@@ -3637,12 +3946,7 @@ mod tests {
         crate::init::run(dir.path()).expect("init failed");
 
         let server = local_sandbox_server(&dir);
-        let out = call_tool_text(
-            &server,
-            "engineering_facts",
-            json!({"query": "foo"}),
-        )
-        .await;
+        let out = call_tool_text(&server, "engineering_facts", json!({"query": "foo"})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         let facts = v["facts"].as_array().expect("facts is array");
         let foo = facts
@@ -3651,9 +3955,12 @@ mod tests {
             .expect("foo must be found");
 
         // module and package may be present (depends on tree-sitter output)
-        assert!(foo.get("module").is_some() || foo.get("package").is_some()
-            || foo["relationship_count"].is_number()
-            || foo["test_count"].is_number());
+        assert!(
+            foo.get("module").is_some()
+                || foo.get("package").is_some()
+                || foo["relationship_count"].is_number()
+                || foo["test_count"].is_number()
+        );
         // relationship_count must be a number when present
         if let Some(rc) = foo.get("relationship_count") {
             assert!(rc.is_number());
@@ -3689,12 +3996,7 @@ mod tests {
 
         // First query: freshness should be Fresh (or Unknown if not a git repo).
         let server = local_sandbox_server(&dir);
-        let out1 = call_tool_text(
-            &server,
-            "engineering_facts",
-            json!({"query": "original"}),
-        )
-        .await;
+        let out1 = call_tool_text(&server, "engineering_facts", json!({"query": "original"})).await;
         let v1: serde_json::Value = serde_json::from_str(&out1).expect("valid json");
         let fresh1 = v1["freshness"].as_str().unwrap();
 
@@ -3707,20 +4009,18 @@ mod tests {
 
         // Second query: freshness must be Stale (or Unknown if git unavailable).
         let server2 = local_sandbox_server(&dir);
-        let out2 = call_tool_text(
-            &server2,
-            "engineering_facts",
-            json!({"query": "original"}),
-        )
-        .await;
+        let out2 =
+            call_tool_text(&server2, "engineering_facts", json!({"query": "original"})).await;
         let v2: serde_json::Value = serde_json::from_str(&out2).expect("valid json");
         let fresh2 = v2["freshness"].as_str().unwrap();
 
         // If the first was Fresh, the second must be Stale (not Fresh).
         // If the first was Unknown (no git), both may be Unknown — that's ok.
         if fresh1 == "fresh" {
-            assert_eq!(fresh2, "stale",
-                "freshness must become stale after source modification");
+            assert_eq!(
+                fresh2, "stale",
+                "freshness must become stale after source modification"
+            );
         }
     }
 
@@ -3745,12 +4045,7 @@ mod tests {
         let server = local_sandbox_server(&dir);
 
         // Query by name must still work.
-        let out = call_tool_text(
-            &server,
-            "engineering_facts",
-            json!({"query": "Config"}),
-        )
-        .await;
+        let out = call_tool_text(&server, "engineering_facts", json!({"query": "Config"})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["returned"], 1);
         assert_eq!(v["facts"][0]["name"], "Config");
@@ -3764,15 +4059,14 @@ mod tests {
         )
         .await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert!(v["facts"].as_array().unwrap().iter().all(|f| f["kind"] == "symbol"));
+        assert!(v["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["kind"] == "symbol"));
 
         // Empty query without filter must still be rejected.
-        let err = call_tool_err(
-            &server,
-            "engineering_facts",
-            json!({"query": ""}),
-        )
-        .await;
+        let err = call_tool_err(&server, "engineering_facts", json!({"query": ""})).await;
         assert!(err.contains("query is required"));
     }
 
@@ -3800,11 +4094,7 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/a.rs"),
-            "pub fn foo() -> i32 { 42 }\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "pub fn foo() -> i32 { 42 }\n").unwrap();
         std::fs::write(
             dir.path().join("src/b.rs"),
             "use super::foo;\npub fn bar() -> i32 { foo() }\n",
@@ -3847,7 +4137,10 @@ mod tests {
         .await;
         let impact_v: serde_json::Value = serde_json::from_str(&impact_out).expect("valid json");
         // Freshness must be present (store has generation state and dir is a git repo... or not, but field exists).
-        assert!(impact_v.get("freshness").is_some(), "freshness field must be present");
+        assert!(
+            impact_v.get("freshness").is_some(),
+            "freshness field must be present"
+        );
 
         // Step 3: sandbox_test with the affected fact IDs as correlation.
         let test_out = call_tool_text(
@@ -3861,16 +4154,20 @@ mod tests {
         .await;
         let test_v: serde_json::Value = serde_json::from_str(&test_out).expect("valid json");
         let verification = &test_v["verification"];
-        assert!(verification.get("impacted_fact_ids").is_some(),
-            "impacted_fact_ids must be present in verification");
+        assert!(
+            verification.get("impacted_fact_ids").is_some(),
+            "impacted_fact_ids must be present in verification"
+        );
         let returned_ids: Vec<&str> = verification["impacted_fact_ids"]
             .as_array()
             .expect("impacted_fact_ids is array")
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(returned_ids, affected_fact_ids,
-            "verification must echo back the caller-supplied IDs");
+        assert_eq!(
+            returned_ids, affected_fact_ids,
+            "verification must echo back the caller-supplied IDs"
+        );
         // The IDs are correlation context only — they do not affect verified.
         // (Tests may pass or fail independently.)
         assert!(verification.get("verified").is_some());
@@ -3883,7 +4180,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let server = local_sandbox_server(&dir);
 
-        let ids = vec!["sym::example::foo_0".to_string(), "rel::foo_calls_bar".to_string()];
+        let ids = vec![
+            "sym::example::foo_0".to_string(),
+            "rel::foo_calls_bar".to_string(),
+        ];
         let out = call_tool_text(
             &server,
             "sandbox_build",
@@ -3987,14 +4287,9 @@ mod tests {
         assert_eq!(v["status"], "ok");
 
         // Subsequent engineering_facts must see the regenerated fact.
-        let facts_out = call_tool_text(
-            &server,
-            "engineering_facts",
-            json!({"query": "new_symbol"}),
-        )
-        .await;
-        let facts_v: serde_json::Value =
-            serde_json::from_str(&facts_out).expect("valid json");
+        let facts_out =
+            call_tool_text(&server, "engineering_facts", json!({"query": "new_symbol"})).await;
+        let facts_v: serde_json::Value = serde_json::from_str(&facts_out).expect("valid json");
         let facts = facts_v["facts"].as_array().expect("facts is array");
         assert!(
             facts.iter().any(|f| f["name"] == "new_symbol"),
@@ -4012,11 +4307,7 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn foo() -> i32 { 1 }\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn foo() -> i32 { 1 }\n").unwrap();
 
         // No prior init — facts.json should not exist.
         assert!(
@@ -4029,8 +4320,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["status"], "ok");
         assert!(v["fact_counts"]["total"].is_number());
-        assert!(dir.path().join(".codebro/facts.json").exists(),
-            "reindex must create .codebro/facts.json");
+        assert!(
+            dir.path().join(".codebro/facts.json").exists(),
+            "reindex must create .codebro/facts.json"
+        );
     }
 
     /// M4.D: reindex_tool_deterministic
@@ -4060,12 +4353,16 @@ mod tests {
         let v2: serde_json::Value = serde_json::from_str(&out2).expect("valid json");
 
         // Fact counts must remain identical.
-        assert_eq!(v1["fact_counts"], v2["fact_counts"],
-            "fact counts must be identical across reindexes");
+        assert_eq!(
+            v1["fact_counts"], v2["fact_counts"],
+            "fact counts must be identical across reindexes"
+        );
 
         // Validation must remain identical.
-        assert_eq!(v1["validation"], v2["validation"],
-            "validation must be identical across reindexes");
+        assert_eq!(
+            v1["validation"], v2["validation"],
+            "validation must be identical across reindexes"
+        );
     }
 
     /// M4.E: reindex_tool_preserves_generation_state
@@ -4115,18 +4412,25 @@ mod tests {
         let out = call_tool_text(&server, "reindex", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
 
-        let gen_state = v["generation_repo_state"].as_object().expect("generation_repo_state is object");
+        let gen_state = v["generation_repo_state"]
+            .as_object()
+            .expect("generation_repo_state is object");
         assert!(gen_state.contains_key("commit_sha"));
         assert!(gen_state.contains_key("working_tree_dirty"));
         assert!(gen_state.contains_key("working_tree_hash"));
 
         // Verify the generation_repo_state matches what's in the persisted facts.
         let facts: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).expect("read facts")
-        ).expect("parse facts");
-        let persisted_gen = facts["generation_repo_state"].as_object().expect("persisted generation_repo_state");
-        assert_eq!(gen_state, persisted_gen,
-            "reindex response generation_repo_state must match persisted facts");
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).expect("read facts"),
+        )
+        .expect("parse facts");
+        let persisted_gen = facts["generation_repo_state"]
+            .as_object()
+            .expect("persisted generation_repo_state");
+        assert_eq!(
+            gen_state, persisted_gen,
+            "reindex response generation_repo_state must match persisted facts"
+        );
     }
 
     /// M4.F: reindex_failure_is_reported
@@ -4139,11 +4443,7 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn foo() -> i32 { 1 }\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn foo() -> i32 { 1 }\n").unwrap();
 
         // Create a file at .codebro so that create_dir_all fails.
         std::fs::write(dir.path().join(".codebro"), "not-a-directory").unwrap();
@@ -4158,12 +4458,18 @@ mod tests {
         assert!(v["duration_ms"].is_number());
 
         // Must not contain fake success data.
-        assert!(v.get("fact_counts").is_none(),
-            "error response must not contain fact_counts");
-        assert!(v.get("generation_repo_state").is_none(),
-            "error response must not contain generation_repo_state");
-        assert!(v.get("validation").is_none(),
-            "error response must not contain validation");
+        assert!(
+            v.get("fact_counts").is_none(),
+            "error response must not contain fact_counts"
+        );
+        assert!(
+            v.get("generation_repo_state").is_none(),
+            "error response must not contain generation_repo_state"
+        );
+        assert!(
+            v.get("validation").is_none(),
+            "error response must not contain validation"
+        );
     }
 
     // ── M5: repository_health MCP tool tests ──────────────────────────
@@ -4187,10 +4493,16 @@ mod tests {
             "exit_code must be 0 or 1, got {}",
             v["exit_code"]
         );
-        assert!(v["status"] == "healthy" || v["status"] == "warn",
-            "status must be healthy or warn, got {}", v["status"]);
+        assert!(
+            v["status"] == "healthy" || v["status"] == "warn",
+            "status must be healthy or warn, got {}",
+            v["status"]
+        );
         assert!(v["checks"].is_array(), "checks must be an array");
-        assert!(!v["checks"].as_array().unwrap().is_empty(), "must have checks");
+        assert!(
+            !v["checks"].as_array().unwrap().is_empty(),
+            "must have checks"
+        );
         assert!(v["summary"].is_string(), "summary must be a string");
 
         let check_names: Vec<&str> = v["checks"]
@@ -4217,7 +4529,10 @@ mod tests {
 
         // Uninitialized workspace has warnings (missing .codebro, facts, etc.)
         // but no errors -> exit_code 1, status "warn".
-        assert_eq!(v["exit_code"], 1, "uninitialized workspace must return exit_code 1");
+        assert_eq!(
+            v["exit_code"], 1,
+            "uninitialized workspace must return exit_code 1"
+        );
         assert_eq!(v["status"], "warn", "status must be warn");
         assert!(v["checks"].is_array());
 
@@ -4241,7 +4556,10 @@ mod tests {
             .filter(|c| c["status"] == "error")
             .map(|c| c["name"].as_str().unwrap())
             .collect();
-        assert!(errors.is_empty(), "uninitialized workspace must have no errors, got: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "uninitialized workspace must have no errors, got: {errors:?}"
+        );
     }
 
     /// M5.C: repository_health_error_workspace — corrupt facts.json causes
@@ -4321,7 +4639,10 @@ mod tests {
 
         // Capture file list after.
         let after: Vec<std::path::PathBuf> = collect_paths(dir.path());
-        assert_eq!(before, after, "repository_health must not mutate the workspace");
+        assert_eq!(
+            before, after,
+            "repository_health must not mutate the workspace"
+        );
     }
 
     /// M5.F: repository_health_matches_doctor — the MCP wrapper must produce
@@ -4350,8 +4671,11 @@ mod tests {
 
         // Check count must match.
         let mcp_check_count = v["checks"].as_array().unwrap().len();
-        assert_eq!(mcp_check_count, doctor_checks.len(),
-            "MCP check count must match doctor check count");
+        assert_eq!(
+            mcp_check_count,
+            doctor_checks.len(),
+            "MCP check count must match doctor check count"
+        );
 
         // Each MCP check name/status must match a doctor check.
         let mcp_names: Vec<&str> = v["checks"]
@@ -4361,19 +4685,29 @@ mod tests {
             .map(|c| c["name"].as_str().unwrap())
             .collect();
         let doctor_names: Vec<&str> = doctor_checks.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(mcp_names, doctor_names,
-            "MCP check names must match doctor check names in order");
+        assert_eq!(
+            mcp_names, doctor_names,
+            "MCP check names must match doctor check names in order"
+        );
 
         for (mcp_c, doc_c) in v["checks"].as_array().unwrap().iter().zip(&doctor_checks) {
             let expected_status = if doc_c.ok {
                 "ok"
-            } else if doc_c.detail.as_deref().is_some_and(|d| d.starts_with("ERROR")) {
+            } else if doc_c
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("ERROR"))
+            {
                 "error"
             } else {
                 "warn"
             };
-            assert_eq!(mcp_c["status"].as_str().unwrap(), expected_status,
-                "status mismatch for check '{}'", doc_c.name);
+            assert_eq!(
+                mcp_c["status"].as_str().unwrap(),
+                expected_status,
+                "status mismatch for check '{}'",
+                doc_c.name
+            );
         }
     }
 
@@ -4422,6 +4756,111 @@ mod tests {
             crate::doctor::EXIT_ERROR => "error",
             crate::doctor::EXIT_WARN => "warn",
             _ => "healthy",
+        }
+    }
+
+    // ── C1: consult MCP tool tests ────────────────────────────────────
+
+    /// consult with an unknown provider must be rejected as invalid params.
+    #[tokio::test]
+    async fn consult_rejects_unknown_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server(&dir);
+
+        let err = call_tool_err(
+            &server,
+            "consult",
+            json!({"provider": "bogus", "question": "hello"}),
+        )
+        .await;
+        assert!(err.contains("unknown provider"), "got: {err}");
+    }
+
+    /// consult with `provider: "conductor"` is accepted and routed to the
+    /// Conductor provider (it must fail on auth, not on provider parsing).
+    #[tokio::test]
+    async fn consult_accepts_conductor_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server(&dir);
+
+        let result = call_tool(
+            &server,
+            "consult",
+            json!({"provider": "conductor", "question": "hello"}),
+        )
+        .await;
+        match result {
+            Ok(text) => {
+                let v: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+                assert_eq!(v["provider"], "conductor");
+            }
+            Err(err) => {
+                assert!(
+                    !err.contains("unknown provider"),
+                    "conductor must not be rejected as an unknown provider, got: {err}"
+                );
+                // Without CONDUCTOR_API_KEY this is an auth-required error.
+                assert!(
+                    err.contains("Conductor") || err.contains("conductor"),
+                    "expected a Conductor-specific error, got: {err}"
+                );
+            }
+        }
+    }
+
+    /// consult with an unknown mode must be rejected as invalid params.
+    #[tokio::test]
+    async fn consult_rejects_unknown_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server(&dir);
+
+        let err = call_tool_err(
+            &server,
+            "consult",
+            json!({"provider": "conductor", "mode": "bogus", "question": "hello"}),
+        )
+        .await;
+        assert!(err.contains("unknown mode"), "got: {err}");
+    }
+
+    /// consult with an empty question must be rejected.
+    #[tokio::test]
+    async fn consult_rejects_empty_question() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server(&dir);
+
+        let err = call_tool_err(&server, "consult", json!({"question": ""})).await;
+        assert!(err.contains("question must not be empty"), "got: {err}");
+    }
+
+    /// consult on auto provider with no authenticated providers returns an
+    /// auth-required error (not a panic or internal error).
+    #[tokio::test]
+    async fn consult_auto_no_auth_returns_actionable_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server(&dir);
+
+        let result = call_tool(
+            &server,
+            "consult",
+            json!({"provider": "auto", "question": "what is life?"}),
+        )
+        .await;
+        match result {
+            Ok(text) => {
+                let v: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+                assert!(v.is_object(), "consult returned structured output");
+            }
+            Err(err) => {
+                assert!(
+                    err.contains("auth")
+                        || err.contains("Auth")
+                        || err.contains("authenticated")
+                        || err.contains("Conductor")
+                        || err.contains("conductor"),
+                    "expected auth/error, got: {err}"
+                );
+            }
         }
     }
 }

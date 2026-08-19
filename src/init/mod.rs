@@ -757,10 +757,7 @@ mod tests {
 
         // Capture the repo state BEFORE running init.
         let pre_capture = crate::sandbox::RepoState::capture(&dir.path().to_path_buf());
-        assert!(
-            pre_capture.is_some(),
-            "capture must succeed in a git repo"
-        );
+        assert!(pre_capture.is_some(), "capture must succeed in a git repo");
         let pre_state = pre_capture.unwrap();
 
         run(dir.path()).unwrap();
@@ -771,7 +768,9 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(facts).unwrap()).unwrap();
 
         // The generation_repo_state must be Some and match the pre-generation capture.
-        let gen_state = model.generation_repo_state().expect("generation_repo_state must be set");
+        let gen_state = model
+            .generation_repo_state()
+            .expect("generation_repo_state must be set");
         assert_eq!(
             gen_state.working_tree_hash, pre_state.working_tree_hash,
             "generation_repo_state must reflect pre-generation repo state"

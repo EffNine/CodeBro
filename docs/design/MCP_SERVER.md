@@ -644,6 +644,69 @@ no auto-repair, no orchestration. Returns a structured JSON response:
 before relying on facts or memory. Replace the external `codebro doctor`
 CLI call with an in-MCP call.
 
+### 4.13 `consult`
+
+Ask an AI consultant (Conductor gateway) for opinions on architecture,
+debugging, code review, planning, research, or second opinions. Supports
+provider selection, mode shaping, and automatic injection of CodeBro
+engineering context (facts, memory, git diff).
+
+Arguments:
+
+- `provider` (optional): `"auto"` (default) or `"conductor"`. Unknown
+  providers are rejected as invalid params.
+- `mode` (optional): `architecture`, `debugging`, `code_review`,
+  `planning`, `research`, or `second_opinion`. Defaults to
+  `architecture`. Unknown modes are rejected.
+- `question` (required): the question or task to consult on.
+- `context` (optional): explicit context text supplementing automatic
+  CodeBro context injection.
+- `files` (optional): list of `{path, content}` entries attached to the
+  request.
+- `include_git_diff` (optional, default `false`): include the current
+  `git diff` in the request.
+- `include_project_context` (optional, default `false`): include project
+  identity, fact-store counts, and engineering memory summary.
+- `max_answer_length` (optional, default `0` = provider default): cap the
+  answer in characters; truncation occurs at sentence boundaries.
+
+Mode mapping (CodeBro → Conductor public mode):
+
+| CodeBro mode | Conductor mode |
+|-------------|---------------|
+| `architecture` | `agentic` |
+| `debugging` | `coding` |
+| `code_review` | `coding` |
+| `planning` | `planning` |
+| `research` | `reasoning` |
+| `second_opinion` | `reasoning` |
+
+Only Conductor-supported modes (`auto`, `coding`, `reasoning`, `vision`,
+`fast`, `planning`, `agentic`, `long_horizon`) are emitted.
+
+Transport: `POST {CONDUCTOR_BASE_URL}/v1/chat/completions` with
+`Authorization: Bearer <CONDUCTOR_API_KEY>`. OpenAI-compatible response
+schema. Non-streaming. 180 s timeout.
+
+Response shape:
+
+```json
+{
+  "provider": "conductor",
+  "model": "<model>",
+  "mode": "second_opinion",
+  "answer": "...",
+  "summary": "...",
+  "recommendations": [],
+  "risks": [],
+  "confidence": 0.5,
+  "metadata": { "mode": "reasoning" }
+}
+```
+
+**Use:** get AI-powered opinions with project-awareness. Project context
+and git diff are injected only when the caller opts in.
+
 ---
 
 ## 5. Sandbox Architecture

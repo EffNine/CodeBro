@@ -281,13 +281,17 @@ impl<'a> SearchEnrichment<'a> {
             *inc += 1;
             // Track provenance per endpoint (Verified beats Heuristic beats None).
             let pt = relationship_provenance(rel);
-            let prev = provenance_types.entry(rel.source.clone()).or_insert(ProvenanceType::None);
+            let prev = provenance_types
+                .entry(rel.source.clone())
+                .or_insert(ProvenanceType::None);
             if pt == ProvenanceType::Verified {
                 *prev = ProvenanceType::Verified;
             } else if *prev == ProvenanceType::None {
                 *prev = pt;
             }
-            let prev = provenance_types.entry(rel.target.clone()).or_insert(ProvenanceType::None);
+            let prev = provenance_types
+                .entry(rel.target.clone())
+                .or_insert(ProvenanceType::None);
             if pt == ProvenanceType::Verified {
                 *prev = ProvenanceType::Verified;
             } else if *prev == ProvenanceType::None {
@@ -346,12 +350,24 @@ fn record_from_fact_enriched(
                 .and_then(|mid| collection.module(mid))
                 .and_then(|m| m.package.as_ref())
                 .and_then(|pid| collection.package(pid).map(|p| p.name.clone()));
-            r.relationship_count =
-                Some(enrich.rel_counts.get(&FactId::Symbol(s.id.clone())).copied().unwrap_or(0));
-            r.test_count =
-                Some(enrich.sym_test_counts.get(&FactId::Symbol(s.id.clone())).copied().unwrap_or(0));
-            r.provenance_type =
-                enrich.provenance_types.get(&FactId::Symbol(s.id.clone())).copied();
+            r.relationship_count = Some(
+                enrich
+                    .rel_counts
+                    .get(&FactId::Symbol(s.id.clone()))
+                    .copied()
+                    .unwrap_or(0),
+            );
+            r.test_count = Some(
+                enrich
+                    .sym_test_counts
+                    .get(&FactId::Symbol(s.id.clone()))
+                    .copied()
+                    .unwrap_or(0),
+            );
+            r.provenance_type = enrich
+                .provenance_types
+                .get(&FactId::Symbol(s.id.clone()))
+                .copied();
             r
         }
         FactRef::Module(m) => {
@@ -366,21 +382,35 @@ fn record_from_fact_enriched(
                 .package
                 .as_ref()
                 .and_then(|pid| collection.package(pid).map(|p| p.name.clone()));
-            r.relationship_count =
-                Some(enrich.rel_counts.get(&FactId::Module(m.id.clone())).copied().unwrap_or(0));
+            r.relationship_count = Some(
+                enrich
+                    .rel_counts
+                    .get(&FactId::Module(m.id.clone()))
+                    .copied()
+                    .unwrap_or(0),
+            );
             r.test_count = Some(module_test_count(collection, &m.id));
-            r.provenance_type =
-                enrich.provenance_types.get(&FactId::Module(m.id.clone())).copied();
+            r.provenance_type = enrich
+                .provenance_types
+                .get(&FactId::Module(m.id.clone()))
+                .copied();
             r
         }
         FactRef::Package(p) => {
             let mut r = FactRecord::new("package", p.name.clone(), 0);
             r.summary = p.version.clone().map(|v| format!("version {v}"));
-            r.relationship_count =
-                Some(enrich.rel_counts.get(&FactId::Package(p.id.clone())).copied().unwrap_or(0));
+            r.relationship_count = Some(
+                enrich
+                    .rel_counts
+                    .get(&FactId::Package(p.id.clone()))
+                    .copied()
+                    .unwrap_or(0),
+            );
             r.test_count = Some(package_test_count(collection, &p.id));
-            r.provenance_type =
-                enrich.provenance_types.get(&FactId::Package(p.id.clone())).copied();
+            r.provenance_type = enrich
+                .provenance_types
+                .get(&FactId::Package(p.id.clone()))
+                .copied();
             r
         }
         FactRef::Test(t) => {
@@ -400,12 +430,15 @@ fn record_from_fact_enriched(
                 .and_then(|l| l.package.as_ref())
                 .and_then(|pid| collection.package(pid).map(|p| p.name.clone()))
                 .or_else(|| {
-                    t.location.as_ref().and_then(|l| l.module.as_ref()).and_then(|mid| {
-                        collection
-                            .module(mid)
-                            .and_then(|m| m.package.as_ref())
-                            .and_then(|pid| collection.package(pid).map(|p| p.name.clone()))
-                    })
+                    t.location
+                        .as_ref()
+                        .and_then(|l| l.module.as_ref())
+                        .and_then(|mid| {
+                            collection
+                                .module(mid)
+                                .and_then(|m| m.package.as_ref())
+                                .and_then(|pid| collection.package(pid).map(|p| p.name.clone()))
+                        })
                 });
             r.relationship_count = Some(0);
             r.test_count = Some(1);
@@ -1044,7 +1077,10 @@ mod tests {
         let store = enriched_store();
         let results = search_all(&store, "foo");
         assert!(!results.is_empty());
-        let foo = results.iter().find(|r| r.name == "foo").expect("foo must be found");
+        let foo = results
+            .iter()
+            .find(|r| r.name == "foo")
+            .expect("foo must be found");
         assert_eq!(foo.module, Some("src::lib".to_string()));
     }
 
@@ -1053,7 +1089,10 @@ mod tests {
         let store = enriched_store();
         let results = search_all(&store, "foo");
         assert!(!results.is_empty());
-        let foo = results.iter().find(|r| r.name == "foo").expect("foo must be found");
+        let foo = results
+            .iter()
+            .find(|r| r.name == "foo")
+            .expect("foo must be found");
         assert_eq!(foo.package, Some("enriched-pkg".to_string()));
     }
 
@@ -1061,7 +1100,10 @@ mod tests {
     fn enrichment_relationship_count() {
         let store = enriched_store();
         let results = search_all(&store, "foo");
-        let foo = results.iter().find(|r| r.name == "foo").expect("foo must be found");
+        let foo = results
+            .iter()
+            .find(|r| r.name == "foo")
+            .expect("foo must be found");
         // foo is source of both the verified Calls and heuristic References.
         assert_eq!(foo.relationship_count, Some(2));
     }
@@ -1070,7 +1112,10 @@ mod tests {
     fn enrichment_test_count() {
         let store = enriched_store();
         let results = search_all(&store, "foo");
-        let foo = results.iter().find(|r| r.name == "foo").expect("foo must be found");
+        let foo = results
+            .iter()
+            .find(|r| r.name == "foo")
+            .expect("foo must be found");
         assert_eq!(foo.test_count, Some(1));
     }
 
@@ -1078,7 +1123,10 @@ mod tests {
     fn enrichment_provenance_type_verified_wins() {
         let store = enriched_store();
         let results = search_all(&store, "foo");
-        let foo = results.iter().find(|r| r.name == "foo").expect("foo must be found");
+        let foo = results
+            .iter()
+            .find(|r| r.name == "foo")
+            .expect("foo must be found");
         // foo has both verified (Calls) and heuristic (References) relationships.
         // Verified should win as the strongest provenance.
         assert_eq!(foo.provenance_type, Some(ProvenanceType::Verified));
@@ -1088,7 +1136,10 @@ mod tests {
     fn enrichment_provenance_type_heuristic_on_target() {
         let store = enriched_store();
         let results = search_all(&store, "bar");
-        let bar = results.iter().find(|r| r.name == "bar").expect("bar must be found");
+        let bar = results
+            .iter()
+            .find(|r| r.name == "bar")
+            .expect("bar must be found");
         // bar is target of both verified and heuristic relationships.
         // Verified wins.
         assert_eq!(bar.provenance_type, Some(ProvenanceType::Verified));
@@ -1098,7 +1149,10 @@ mod tests {
     fn missing_provenance_classifies_as_unknown() {
         let store = enriched_store();
         let results = search_all(&store, "alpha");
-        let alpha = results.iter().find(|r| r.name == "alpha").expect("alpha must be found");
+        let alpha = results
+            .iter()
+            .find(|r| r.name == "alpha")
+            .expect("alpha must be found");
         // alpha has a relationship with no provenance metadata at all.
         // Missing provenance must classify as Unknown, not Verified.
         assert_eq!(alpha.provenance_type, Some(ProvenanceType::Unknown));
@@ -1108,7 +1162,10 @@ mod tests {
     fn unknown_provenance_classifies_as_unknown() {
         let store = enriched_store();
         let results = search_all(&store, "baz");
-        let baz = results.iter().find(|r| r.name == "baz").expect("baz must be found");
+        let baz = results
+            .iter()
+            .find(|r| r.name == "baz")
+            .expect("baz must be found");
         // baz has a relationship with provenance=unknown.
         assert_eq!(baz.provenance_type, Some(ProvenanceType::Unknown));
     }
@@ -1121,7 +1178,10 @@ mod tests {
         // But if we query something with only heuristic, it should be Heuristic.
         // Use baz which has only unknown provenance relationship.
         let results = search_all(&store, "baz");
-        let baz = results.iter().find(|r| r.name == "baz").expect("baz must be found");
+        let baz = results
+            .iter()
+            .find(|r| r.name == "baz")
+            .expect("baz must be found");
         assert_eq!(baz.provenance_type, Some(ProvenanceType::Unknown));
     }
 
@@ -1206,7 +1266,10 @@ mod tests {
         use crate::provenance::TRUST_STATIC_ANALYSIS;
         let t = compute_fact_trust(Some(ProvenanceType::Verified), FreshnessStatus::Fresh).unwrap();
         // base 0.90 × 1.0 × 1.0 = 0.90
-        assert!((t - TRUST_STATIC_ANALYSIS).abs() < 1e-9, "expected {TRUST_STATIC_ANALYSIS}, got {t}");
+        assert!(
+            (t - TRUST_STATIC_ANALYSIS).abs() < 1e-9,
+            "expected {TRUST_STATIC_ANALYSIS}, got {t}"
+        );
     }
 
     /// M1-B: Heuristic provenance → 0.8 provenance factor.
@@ -1224,8 +1287,7 @@ mod tests {
     #[test]
     fn m1b_unknown_provenance_factor() {
         use crate::provenance::TRUST_STATIC_ANALYSIS;
-        let t =
-            compute_fact_trust(Some(ProvenanceType::Unknown), FreshnessStatus::Fresh).unwrap();
+        let t = compute_fact_trust(Some(ProvenanceType::Unknown), FreshnessStatus::Fresh).unwrap();
         // base 0.90 × 0.6 × 1.0 = 0.54
         let expected = TRUST_STATIC_ANALYSIS * 0.6;
         assert!((t - expected).abs() < 1e-9, "expected {expected}, got {t}");
@@ -1235,10 +1297,12 @@ mod tests {
     #[test]
     fn m1b_none_provenance_neutral() {
         use crate::provenance::TRUST_STATIC_ANALYSIS;
-        let t =
-            compute_fact_trust(Some(ProvenanceType::None), FreshnessStatus::Fresh).unwrap();
+        let t = compute_fact_trust(Some(ProvenanceType::None), FreshnessStatus::Fresh).unwrap();
         // base 0.90 × 1.0 × 1.0 = 0.90 (same as Verified when fresh)
-        assert!((t - TRUST_STATIC_ANALYSIS).abs() < 1e-9, "expected {TRUST_STATIC_ANALYSIS}, got {t}");
+        assert!(
+            (t - TRUST_STATIC_ANALYSIS).abs() < 1e-9,
+            "expected {TRUST_STATIC_ANALYSIS}, got {t}"
+        );
     }
 
     /// M1-B: None with no provenance_type at all → also neutral.
@@ -1246,7 +1310,10 @@ mod tests {
     fn m1b_absent_provenance_type_is_neutral() {
         use crate::provenance::TRUST_STATIC_ANALYSIS;
         let t = compute_fact_trust(None, FreshnessStatus::Fresh).unwrap();
-        assert!((t - TRUST_STATIC_ANALYSIS).abs() < 1e-9, "expected {TRUST_STATIC_ANALYSIS}, got {t}");
+        assert!(
+            (t - TRUST_STATIC_ANALYSIS).abs() < 1e-9,
+            "expected {TRUST_STATIC_ANALYSIS}, got {t}"
+        );
     }
 
     /// M1-B: Stale freshness reduces trust for Verified provenance.
@@ -1257,7 +1324,10 @@ mod tests {
             compute_fact_trust(Some(ProvenanceType::Verified), FreshnessStatus::Fresh).unwrap();
         let t_stale =
             compute_fact_trust(Some(ProvenanceType::Verified), FreshnessStatus::Stale).unwrap();
-        assert!(t_fresh > t_stale, "fresh ({t_fresh}) must exceed stale ({t_stale})");
+        assert!(
+            t_fresh > t_stale,
+            "fresh ({t_fresh}) must exceed stale ({t_stale})"
+        );
         // stale: 0.90 × 1.0 × 0.6 = 0.54
         let expected_stale = TRUST_STATIC_ANALYSIS * 0.6;
         assert!((t_stale - expected_stale).abs() < 1e-9);
@@ -1278,8 +1348,14 @@ mod tests {
                 FreshnessStatus::Stale,
             ] {
                 let t = compute_fact_trust(Some(pt), freshness).unwrap();
-                assert!(t > 0.0, "trust must be > 0 for pt={pt:?} freshness={freshness:?}, got {t}");
-                assert!(t <= 1.0, "trust must be <= 1 for pt={pt:?} freshness={freshness:?}, got {t}");
+                assert!(
+                    t > 0.0,
+                    "trust must be > 0 for pt={pt:?} freshness={freshness:?}, got {t}"
+                );
+                assert!(
+                    t <= 1.0,
+                    "trust must be <= 1 for pt={pt:?} freshness={freshness:?}, got {t}"
+                );
             }
         }
         // Also test None variant
@@ -1289,8 +1365,14 @@ mod tests {
             FreshnessStatus::Stale,
         ] {
             let t = compute_fact_trust(None, freshness).unwrap();
-            assert!(t > 0.0, "trust must be > 0 for None pt freshness={freshness:?}, got {t}");
-            assert!(t <= 1.0, "trust must be <= 1 for None pt freshness={freshness:?}, got {t}");
+            assert!(
+                t > 0.0,
+                "trust must be > 0 for None pt freshness={freshness:?}, got {t}"
+            );
+            assert!(
+                t <= 1.0,
+                "trust must be <= 1 for None pt freshness={freshness:?}, got {t}"
+            );
         }
     }
 

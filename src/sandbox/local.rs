@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use super::{ExecutionResult, SandboxCommand, SandboxBackend, SandboxMode, SandboxPolicy};
+use super::{ExecutionResult, SandboxBackend, SandboxCommand, SandboxMode, SandboxPolicy};
 
 /// Command policy for the local sandbox backend.
 ///
@@ -118,9 +118,7 @@ impl LocalCommandPolicy {
         }
         match args[0] {
             "tsc" => args.iter().any(|a| *a == "--noEmit"),
-            "eslint" | "vitest" | "jest" => {
-                !args[1..].iter().any(|a| MUTATING_TOKENS.contains(a))
-            }
+            "eslint" | "vitest" | "jest" => !args[1..].iter().any(|a| MUTATING_TOKENS.contains(a)),
             _ => false,
         }
     }
@@ -148,11 +146,43 @@ impl LocalCommandPolicy {
 }
 
 const MUTATING_TOKENS: &[&str] = &[
-    "commit", "add", "rm", "mv", "checkout", "reset", "clean", "apply", "restore", "rebase",
-    "merge", "push", "pull", "fetch", "tag", "stash", "cherry-pick", "revert", "switch",
-    "config", "--fix", "--write", "-w", "--in-place", "--apply", "--amend", "--force", "-f",
-    "--delete", "--remove", "--purge", "--install", "--push", "--save", "--overwrite",
-    "--no-verify", "-i",
+    "commit",
+    "add",
+    "rm",
+    "mv",
+    "checkout",
+    "reset",
+    "clean",
+    "apply",
+    "restore",
+    "rebase",
+    "merge",
+    "push",
+    "pull",
+    "fetch",
+    "tag",
+    "stash",
+    "cherry-pick",
+    "revert",
+    "switch",
+    "config",
+    "--fix",
+    "--write",
+    "-w",
+    "--in-place",
+    "--apply",
+    "--amend",
+    "--force",
+    "-f",
+    "--delete",
+    "--remove",
+    "--purge",
+    "--install",
+    "--push",
+    "--save",
+    "--overwrite",
+    "--no-verify",
+    "-i",
 ];
 
 const CARGO_ALLOWED_FLAGS: &[&str] = &[
@@ -355,7 +385,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
         let policy = LocalCommandPolicy::for_workspace(dir.path());
-        for cmd in ["cargo check", "cargo test", "cargo build", "cargo clippy", "cargo test --lib"] {
+        for cmd in [
+            "cargo check",
+            "cargo test",
+            "cargo build",
+            "cargo clippy",
+            "cargo test --lib",
+        ] {
             assert!(policy.check(cmd), "'{cmd}' must be allowed");
         }
     }
@@ -386,7 +422,12 @@ mod tests {
     #[test]
     fn test_policy_denies_arbitrary_programs() {
         let policy = LocalCommandPolicy::for_workspace(std::path::Path::new("/tmp"));
-        for cmd in ["rm -rf /", "python3 -c 'print(1)'", "cat file.txt", "grep foo src/"] {
+        for cmd in [
+            "rm -rf /",
+            "python3 -c 'print(1)'",
+            "cat file.txt",
+            "grep foo src/",
+        ] {
             assert!(!policy.check(cmd), "'{cmd}' must be denied");
         }
     }
@@ -468,7 +509,10 @@ mod tests {
         };
         let policy = SandboxPolicy::new().with_timeout(5);
         let result = backend.execute(&dir.path().to_path_buf(), cmd, &policy);
-        assert!(result.denied, "cargo test must be denied without Cargo.toml");
+        assert!(
+            result.denied,
+            "cargo test must be denied without Cargo.toml"
+        );
     }
 
     #[test]

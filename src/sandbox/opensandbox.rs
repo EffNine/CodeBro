@@ -22,43 +22,25 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use super::{ExecutionResult, SandboxBackend, SandboxCommand, SandboxMode, SandboxPolicy};
 use futures::StreamExt;
-use super::{ExecutionResult, SandboxCommand, SandboxBackend, SandboxMode, SandboxPolicy};
 
 /// SSE event type from the execd command endpoint.
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 enum SseEvent {
     #[serde(rename = "init")]
-    Init {
-        text: String,
-        timestamp: i64,
-    },
+    Init { text: String, timestamp: i64 },
     #[serde(rename = "ping")]
-    Ping {
-        text: String,
-        timestamp: i64,
-    },
+    Ping { text: String, timestamp: i64 },
     #[serde(rename = "stdout")]
-    Stdout {
-        text: String,
-        timestamp: i64,
-    },
+    Stdout { text: String, timestamp: i64 },
     #[serde(rename = "stderr")]
-    Stderr {
-        text: String,
-        timestamp: i64,
-    },
+    Stderr { text: String, timestamp: i64 },
     #[serde(rename = "execution_complete")]
-    ExecutionComplete {
-        execution_time: u64,
-        timestamp: i64,
-    },
+    ExecutionComplete { execution_time: u64, timestamp: i64 },
     #[serde(rename = "error")]
-    Error {
-        timestamp: i64,
-        error: ExecdError,
-    },
+    Error { timestamp: i64, error: ExecdError },
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -285,9 +267,7 @@ impl OpenSandboxBackend {
         });
 
         match result {
-            Ok(r) => {
-                r
-            }
+            Ok(r) => r,
             Err(e) => {
                 let duration = start.elapsed().as_millis();
                 ExecutionResult {
@@ -335,13 +315,21 @@ impl OpenSandboxBackend {
             image: ImageSpec {
                 uri: self.config.image_uri.clone(),
             },
-            entrypoint: vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()],
+            entrypoint: vec![
+                "tail".to_string(),
+                "-f".to_string(),
+                "/dev/null".to_string(),
+            ],
             resource_limits: ResourceLimits {
                 cpu: self.config.resource_cpu.clone(),
                 memory: self.config.resource_memory.clone(),
             },
             timeout: Some(std::cmp::max(timeout_secs, 60)), // minimum 60s per API contract
-            env: if env.is_empty() { None } else { Some(env.clone()) },
+            env: if env.is_empty() {
+                None
+            } else {
+                Some(env.clone())
+            },
         };
 
         let create_url = format!("{}/sandboxes", self.config.base_url);
@@ -350,14 +338,19 @@ impl OpenSandboxBackend {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
         }
 
-        let resp = req_builder.send().await.map_err(|e| format!("create sandbox: {}", e))?;
+        let resp = req_builder
+            .send()
+            .await
+            .map_err(|e| format!("create sandbox: {}", e))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("create sandbox failed: {} {}", status, body));
         }
-        let create_resp: CreateSandboxResponse =
-            resp.json().await.map_err(|e| format!("parse create response: {}", e))?;
+        let create_resp: CreateSandboxResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("parse create response: {}", e))?;
         let sandbox_id = create_resp.id;
 
         // Step 2: Wait for sandbox to be running.
@@ -372,14 +365,9 @@ impl OpenSandboxBackend {
         } else {
             None
         };
-        let (stdout, stderr, exit_code, timeout_flag) = self.run_command(
-            &endpoint,
-            command,
-            working_dir,
-            cmd_timeout_ms,
-            env,
-        )
-        .await?;
+        let (stdout, stderr, exit_code, timeout_flag) = self
+            .run_command(&endpoint, command, working_dir, cmd_timeout_ms, env)
+            .await?;
 
         // Step 5: Delete sandbox.
         let _ = self.delete_sandbox(&sandbox_id).await;
@@ -485,9 +473,17 @@ impl OpenSandboxBackend {
         let url = format!("http://{}/command", endpoint);
         let req = RunCommandRequest {
             command: command.to_string(),
-            cwd: if cwd.is_empty() { None } else { Some(cwd.to_string()) },
+            cwd: if cwd.is_empty() {
+                None
+            } else {
+                Some(cwd.to_string())
+            },
             timeout: timeout_ms,
-            envs: if env.is_empty() { None } else { Some(env.clone()) },
+            envs: if env.is_empty() {
+                None
+            } else {
+                Some(env.clone())
+            },
         };
 
         let mut req_builder = self.client.post(&url).json(&req);
@@ -523,7 +519,14 @@ impl OpenSandboxBackend {
                     continue;
                 }
                 // Process this line directly.
-                if OpenSandboxBackend::process_sse_line(line, &mut stdout, &mut stderr, &mut exit_code, &mut timeout_flag, &mut got_complete)? {
+                if OpenSandboxBackend::process_sse_line(
+                    line,
+                    &mut stdout,
+                    &mut stderr,
+                    &mut exit_code,
+                    &mut timeout_flag,
+                    &mut got_complete,
+                )? {
                     got_complete = true;
                     break;
                 }
@@ -549,14 +552,12 @@ impl OpenSandboxBackend {
             return Ok(false);
         }
         // SSE lines may have "data: " prefix (standard) or be raw JSON.
-        let data = trimmed
-            .strip_prefix("data: ")
-            .unwrap_or(trimmed)
-            .trim();
+        let data = trimmed.strip_prefix("data: ").unwrap_or(trimmed).trim();
         if data.is_empty() {
             return Ok(false);
         }
-        let event: SseEvent = serde_json::from_str(data).map_err(|e| format!("parse SSE: {}", e))?;
+        let event: SseEvent =
+            serde_json::from_str(data).map_err(|e| format!("parse SSE: {}", e))?;
         match event {
             SseEvent::Init { .. } | SseEvent::Ping { .. } => {}
             SseEvent::Stdout { text, .. } => stdout.push_str(&text),
@@ -587,7 +588,10 @@ impl OpenSandboxBackend {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
         }
         let resp = req_builder.send().await.map_err(|e| e.to_string())?;
-        if !matches!(resp.status(), reqwest::StatusCode::NO_CONTENT | reqwest::StatusCode::NOT_FOUND) {
+        if !matches!(
+            resp.status(),
+            reqwest::StatusCode::NO_CONTENT | reqwest::StatusCode::NOT_FOUND
+        ) {
             return Err(format!("delete sandbox: HTTP {}", resp.status()));
         }
         Ok(())
@@ -617,16 +621,16 @@ impl SandboxBackend for OpenSandboxBackend {
             return false;
         }
         let url = &self.config.base_url;
-        let host = url.strip_prefix("http://").unwrap_or(url.strip_prefix("https://").unwrap_or(url));
+        let host = url
+            .strip_prefix("http://")
+            .unwrap_or(url.strip_prefix("https://").unwrap_or(url));
         let host = host.split('/').next().unwrap_or("");
         let (host, port) = if let Some(colon) = host.rfind(':') {
             (&host[..colon], host[colon + 1..].parse::<u16>().ok())
         } else {
             (host, None)
         };
-        let port = port.unwrap_or_else(|| {
-            if url.starts_with("https://") { 443 } else { 80 }
-        });
+        let port = port.unwrap_or_else(|| if url.starts_with("https://") { 443 } else { 80 });
         use std::net::TcpStream;
         match TcpStream::connect(format!("{host}:{port}")) {
             Ok(_) => true,
@@ -698,7 +702,11 @@ mod tests {
             image: ImageSpec {
                 uri: "python:3.11-slim".to_string(),
             },
-            entrypoint: vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()],
+            entrypoint: vec![
+                "tail".to_string(),
+                "-f".to_string(),
+                "/dev/null".to_string(),
+            ],
             resource_limits: ResourceLimits {
                 cpu: "500m".to_string(),
                 memory: "512Mi".to_string(),
@@ -709,7 +717,10 @@ mod tests {
         let json = serde_json::to_string(&req).expect("serialize");
         let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(v["image"]["uri"], "python:3.11-slim");
-        assert_eq!(v["entrypoint"], serde_json::json!(["tail", "-f", "/dev/null"]));
+        assert_eq!(
+            v["entrypoint"],
+            serde_json::json!(["tail", "-f", "/dev/null"])
+        );
         assert_eq!(v["resourceLimits"]["cpu"], "500m");
         assert_eq!(v["timeout"], 120);
     }
@@ -788,9 +799,17 @@ mod tests {
         ];
         for line in &lines {
             let done = OpenSandboxBackend::process_sse_line(
-                line, &mut stdout, &mut stderr, &mut exit_code, &mut timeout_flag, &mut got_complete
-            ).unwrap();
-            if done { break; }
+                line,
+                &mut stdout,
+                &mut stderr,
+                &mut exit_code,
+                &mut timeout_flag,
+                &mut got_complete,
+            )
+            .unwrap();
+            if done {
+                break;
+            }
         }
         assert_eq!(stdout, "hello\n");
         assert_eq!(exit_code, 0);
@@ -810,9 +829,17 @@ mod tests {
         ];
         for line in &lines2 {
             let done = OpenSandboxBackend::process_sse_line(
-                line, &mut stdout2, &mut stderr2, &mut exit_code2, &mut timeout_flag2, &mut got_complete2
-            ).unwrap();
-            if done { break; }
+                line,
+                &mut stdout2,
+                &mut stderr2,
+                &mut exit_code2,
+                &mut timeout_flag2,
+                &mut got_complete2,
+            )
+            .unwrap();
+            if done {
+                break;
+            }
         }
         assert_eq!(stdout2, "out\n");
         assert_eq!(stderr2, "err\n");

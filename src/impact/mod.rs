@@ -313,7 +313,8 @@ pub fn analyze(
         )
     } else if depth == 1 {
         // Backward-compatible: direct relationships only (both directions).
-        let mut relationships = gather_relationships(&collection, &target_fact_id, &target_info, &direction);
+        let mut relationships =
+            gather_relationships(&collection, &target_fact_id, &target_info, &direction);
         for rel in relationships.iter_mut() {
             rel.depth = 1;
         }
@@ -392,7 +393,10 @@ pub fn analyze(
         }
         completeness.limitations.push(format!(
             "traversal limited: {}",
-            traversal_meta.truncation_reason.as_deref().unwrap_or("unknown")
+            traversal_meta
+                .truncation_reason
+                .as_deref()
+                .unwrap_or("unknown")
         ));
     }
 
@@ -492,7 +496,12 @@ fn traverse(
     type_filter: &[String],
     max_nodes: usize,
     max_results: usize,
-) -> (Vec<ImpactRelationship>, Vec<ImpactRelationship>, ProvenanceSummary, TraversalMetadata) {
+) -> (
+    Vec<ImpactRelationship>,
+    Vec<ImpactRelationship>,
+    ProvenanceSummary,
+    TraversalMetadata,
+) {
     // Build adjacency lists.
     let (outgoing, incoming) = build_adjacency(collection, type_filter);
 
@@ -525,14 +534,24 @@ fn traverse(
 
         // Determine which adjacency list(s) to follow.
         let neighbors: Vec<GraphEdge> = match direction {
-            "outgoing" => outgoing.get(&current_id).map(|v| v.clone()).unwrap_or_default(),
-            "incoming" => incoming.get(&current_id).map(|v| v.clone()).unwrap_or_default(),
+            "outgoing" => outgoing
+                .get(&current_id)
+                .map(|v| v.clone())
+                .unwrap_or_default(),
+            "incoming" => incoming
+                .get(&current_id)
+                .map(|v| v.clone())
+                .unwrap_or_default(),
             _ => {
                 // "both": merge outgoing and incoming, deduplicating by target.
-                let out: Vec<GraphEdge> =
-                    outgoing.get(&current_id).map(|v| v.clone()).unwrap_or_default();
-                let inc: Vec<GraphEdge> =
-                    incoming.get(&current_id).map(|v| v.clone()).unwrap_or_default();
+                let out: Vec<GraphEdge> = outgoing
+                    .get(&current_id)
+                    .map(|v| v.clone())
+                    .unwrap_or_default();
+                let inc: Vec<GraphEdge> = incoming
+                    .get(&current_id)
+                    .map(|v| v.clone())
+                    .unwrap_or_default();
                 let mut merged: Vec<GraphEdge> = out.into_iter().chain(inc.into_iter()).collect();
                 merged.sort_by_key(|e| e.target_id.to_string());
                 merged.dedup_by_key(|e| e.target_id.to_string());
@@ -562,7 +581,11 @@ fn traverse(
                 "outgoing".to_string()
             };
 
-            let emit_key = (edge.target_id.clone(), edge_kind.clone(), edge_direction.clone());
+            let emit_key = (
+                edge.target_id.clone(),
+                edge_kind.clone(),
+                edge_direction.clone(),
+            );
             if !emitted.insert(emit_key) {
                 continue;
             }
@@ -584,11 +607,7 @@ fn traverse(
                 provenance: edge.provenance.clone(),
             });
 
-            let (name, _loc) = fact_name_loc(
-                collection,
-                &edge.target_id,
-                edge.location.as_ref(),
-            );
+            let (name, _loc) = fact_name_loc(collection, &edge.target_id, edge.location.as_ref());
             let rel = ImpactRelationship {
                 target_id: edge.target_id.to_string(),
                 target_name: name,
@@ -597,7 +616,11 @@ fn traverse(
                 source_location: edge.location.as_ref().and_then(|l| l.file.clone()),
                 provenance: edge.provenance.clone(),
                 depth: new_depth,
-                path: if new_depth >= 2 { new_path.clone() } else { Vec::new() },
+                path: if new_depth >= 2 {
+                    new_path.clone()
+                } else {
+                    Vec::new()
+                },
             };
 
             if new_depth == 1 {
@@ -681,7 +704,12 @@ fn traverse(
         truncation_reason,
     };
 
-    (direct_relationships, transitive_relationships, summary, meta)
+    (
+        direct_relationships,
+        transitive_relationships,
+        summary,
+        meta,
+    )
 }
 
 /// Check whether an incoming edge from `src` to `tgt` exists in the incoming
@@ -769,10 +797,7 @@ fn build_adjacency(
             .entry(r.referrer.clone())
             .or_default()
             .push(edge_out);
-        incoming
-            .entry(r.target.clone())
-            .or_default()
-            .push(edge_in);
+        incoming.entry(r.target.clone()).or_default().push(edge_in);
     }
 
     // Sort adjacency lists deterministically by target_id.
@@ -801,10 +826,7 @@ fn build_provenance_summary(relationships: &[ImpactRelationship]) -> ProvenanceS
 /// Resolve a human-readable symbol name to a symbolic ImpactTarget by
 /// searching the store. Returns None when no match is found, Some with
 /// one match, or Err when multiple matches exist (ambiguity).
-pub fn resolve_symbol_name(
-    store: &FactStore,
-    name: &str,
-) -> Result<ImpactTarget, String> {
+pub fn resolve_symbol_name(store: &FactStore, name: &str) -> Result<ImpactTarget, String> {
     let collection = store.collection();
     let query = name.to_lowercase();
     let mut matches: Vec<SymbolId> = Vec::new();
@@ -1075,10 +1097,7 @@ fn gather_tests(
                         tests.push(TestReference {
                             id: test.id.to_string(),
                             name: test.name.clone(),
-                            file: test
-                                .location
-                                .as_ref()
-                                .and_then(|l| l.file.clone()),
+                            file: test.location.as_ref().and_then(|l| l.file.clone()),
                             relation: "tests".to_string(),
                             provenance: Provenance::Verified,
                         });
@@ -1405,7 +1424,10 @@ fn build_completeness(
         }
     }
 
-    Completeness { status, limitations }
+    Completeness {
+        status,
+        limitations,
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -1448,17 +1470,17 @@ mod tests {
     use super::*;
     use crate::engineering_facts::{
         FactsBuilder, ModuleFact, ModuleId, PackageFact, PackageId, ReferenceFact,
-        RelationshipFact, RelationshipId, RelationshipKind, SymbolFact, SymbolId, TestFact,
-        TestId, WorkspaceFact, WorkspaceId,
+        RelationshipFact, RelationshipId, RelationshipKind, SymbolFact, SymbolId, TestFact, TestId,
+        WorkspaceFact, WorkspaceId,
     };
     use crate::fact_store::FactStore;
 
     fn make_store(
         modules: &[(&str, Option<&str>)],
-        symbols: &[( &str, &str, &str, Option<&str>)],
+        symbols: &[(&str, &str, &str, Option<&str>)],
         relationships: &[(&str, RelationshipKind, &str, &str)],
-        references: &[( &str, &str, &str)],
-        tests: &[( &str, &str, Vec<&str>, Option<&str>)],
+        references: &[(&str, &str, &str)],
+        tests: &[(&str, &str, Vec<&str>, Option<&str>)],
     ) -> FactStore {
         let mut builder = FactsBuilder::new();
         let ws_id = WorkspaceId::new("ws::test");
@@ -1541,7 +1563,8 @@ mod tests {
 
         // Heuristic references: same-name symbols across different modules
         // that have no explicit relationship or reference facts.
-        let mut existing_refs: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let mut existing_refs: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         for (ref_id, referrer, target) in references {
             existing_refs.insert((referrer.to_string(), target.to_string()));
             existing_refs.insert((target.to_string(), referrer.to_string()));
@@ -1551,7 +1574,10 @@ mod tests {
             std::collections::HashMap::new();
         for (mod_id, name, _kind_str, _pkg) in symbols {
             let sym_id = SymbolId::new(format!("sym::{mod_id}::{name}_function@1"));
-            by_name.entry(name.to_string()).or_default().push((sym_id.clone(), ModuleId::new(*mod_id)));
+            by_name
+                .entry(name.to_string())
+                .or_default()
+                .push((sym_id.clone(), ModuleId::new(*mod_id)));
         }
 
         for (name, syms) in &by_name {
@@ -1622,7 +1648,11 @@ mod tests {
                 ("mod::b", "foo", "function", Some("pkg1")),
             ],
             &[("rel::1", RelationshipKind::Imports, "mod::b", "mod::a")],
-            &[("ref::1", "sym::mod::b::foo_function@1", "sym::mod::a::foo_function@1")],
+            &[(
+                "ref::1",
+                "sym::mod::b::foo_function@1",
+                "sym::mod::a::foo_function@1",
+            )],
             &[],
         );
         let target = ImpactTarget::Symbol(SymbolId::new("sym::mod::a::foo_function@1"));
@@ -1647,7 +1677,12 @@ mod tests {
             &[("mod::a", "foo", "function", Some("pkg1"))],
             &[],
             &[],
-            &[("test::1", "test_foo", vec!["sym::mod::a::foo_function@1"], Some("mod::a"))],
+            &[(
+                "test::1",
+                "test_foo",
+                vec!["sym::mod::a::foo_function@1"],
+                Some("mod::a"),
+            )],
         );
         let target = ImpactTarget::Symbol(SymbolId::new("sym::mod::a::foo_function@1"));
         let result = analyze(
@@ -1799,7 +1834,11 @@ mod tests {
                 ("mod::b", "foo", "function", Some("pkg1")),
             ],
             &[("rel::1", RelationshipKind::Imports, "mod::b", "mod::a")],
-            &[("ref::1", "sym::mod::b::foo_function@1", "sym::mod::a::foo_function@1")],
+            &[(
+                "ref::1",
+                "sym::mod::b::foo_function@1",
+                "sym::mod::a::foo_function@1",
+            )],
             &[],
         );
         let target = ImpactTarget::Symbol(SymbolId::new("sym::mod::a::foo_function@1"));
@@ -1842,7 +1881,12 @@ mod tests {
                 ("mod::a", "caller", "function", Some("pkg1")),
                 ("mod::b", "callee", "function", Some("pkg1")),
             ],
-            &[("rel::call", RelationshipKind::Calls, "sym::mod::a::caller_function@1", "sym::mod::b::callee_function@1")],
+            &[(
+                "rel::call",
+                RelationshipKind::Calls,
+                "sym::mod::a::caller_function@1",
+                "sym::mod::b::callee_function@1",
+            )],
             &[],
             &[],
         );
@@ -1865,7 +1909,11 @@ mod tests {
         // A call to "foo" should not produce a verified edge because
         // the target is ambiguous.
         let store = make_store(
-            &[("mod::a", Some("pkg1")), ("mod::b", Some("pkg1")), ("mod::c", Some("pkg1"))],
+            &[
+                ("mod::a", Some("pkg1")),
+                ("mod::b", Some("pkg1")),
+                ("mod::c", Some("pkg1")),
+            ],
             &[
                 ("mod::a", "foo", "function", Some("pkg1")),
                 ("mod::b", "foo", "function", Some("pkg1")),
@@ -1908,9 +1956,14 @@ mod tests {
         let heur_refs: Vec<_> = result
             .direct_relationships
             .iter()
-            .filter(|r| r.relationship_kind == "references" && r.provenance == Provenance::Heuristic)
+            .filter(|r| {
+                r.relationship_kind == "references" && r.provenance == Provenance::Heuristic
+            })
             .collect();
-        assert!(heur_refs.len() >= 1, "expected heuristic reference from name coincidence");
+        assert!(
+            heur_refs.len() >= 1,
+            "expected heuristic reference from name coincidence"
+        );
     }
 
     // ── P2.3 bounded transitive traversal tests ───────────────────────────
@@ -2035,8 +2088,18 @@ mod tests {
             .iter()
             .filter(|r| r.depth == 2)
             .collect();
-        assert_eq!(depth1.len(), 2, "expected 2 depth-1 edges (a→b outgoing, c→a incoming), got {}", depth1.len());
-        assert_eq!(depth2.len(), 1, "expected 1 depth-2 edge (c→d), got {}", depth2.len());
+        assert_eq!(
+            depth1.len(),
+            2,
+            "expected 2 depth-1 edges (a→b outgoing, c→a incoming), got {}",
+            depth1.len()
+        );
+        assert_eq!(
+            depth2.len(),
+            1,
+            "expected 1 depth-2 edge (c→d), got {}",
+            depth2.len()
+        );
         assert_eq!(depth2[0].target_name, "d");
         assert_eq!(result.traversal_metadata.depth_limit, 2);
     }
@@ -2062,7 +2125,12 @@ mod tests {
             .iter()
             .filter(|r| r.depth == 2)
             .collect();
-        assert_eq!(depth2.len(), 1, "expected 1 depth-2 edge (c→d), got {}", depth2.len());
+        assert_eq!(
+            depth2.len(),
+            1,
+            "expected 1 depth-2 edge (c→d), got {}",
+            depth2.len()
+        );
         assert_eq!(depth2[0].target_name, "d");
         // No depth-3 edges because all nodes are already visited.
         let depth3: Vec<_> = result
@@ -2070,7 +2138,11 @@ mod tests {
             .iter()
             .filter(|r| r.depth == 3)
             .collect();
-        assert!(depth3.is_empty(), "expected no depth-3 edges, got {}", depth3.len());
+        assert!(
+            depth3.is_empty(),
+            "expected no depth-3 edges, got {}",
+            depth3.len()
+        );
         // Verify path is present for depth-2 edges.
         assert!(!depth2[0].path.is_empty(), "depth-2 edge should have path");
         assert_eq!(depth2[0].path.len(), 2);
@@ -2120,8 +2192,16 @@ mod tests {
                 .count();
         // a should not appear as a reached node since it's the start.
         // (The cycle c→a is skipped because a is already visited.)
-        assert_eq!(a_count, 0, "cycle back to target should not reappear, got {}", a_count);
-        assert!(!result.completeness.limitations.iter().any(|l| l.contains("infinite")));
+        assert_eq!(
+            a_count, 0,
+            "cycle back to target should not reappear, got {}",
+            a_count
+        );
+        assert!(!result
+            .completeness
+            .limitations
+            .iter()
+            .any(|l| l.contains("infinite")));
     }
 
     /// max_nodes limit makes the result partial with an explicit limitation.
@@ -2159,27 +2239,29 @@ mod tests {
         // Build a store with one verified and one heuristic edge.
         let mut builder = crate::engineering_facts::FactsBuilder::new();
         let ws_id = crate::engineering_facts::WorkspaceId::new("ws::test");
-        builder.add_workspace(
-            crate::engineering_facts::WorkspaceFact::new(ws_id.clone(), "test".to_string()),
-        );
+        builder.add_workspace(crate::engineering_facts::WorkspaceFact::new(
+            ws_id.clone(),
+            "test".to_string(),
+        ));
         let mid = crate::engineering_facts::ModuleId::new("mod::p");
         let mut mf = crate::engineering_facts::ModuleFact::new(mid.clone(), "mod".to_string());
         mf.path = Some("mod/p.rs".to_string());
         builder.add_module(mf);
 
-        let mut mk_sym = |mod_id: &str, name: &str| -> (crate::engineering_facts::SymbolId, String) {
-            let sid = crate::engineering_facts::SymbolId::new(format!(
-                "sym::{mod_id}::{name}_function@1"
-            ));
-            let mut sf = crate::engineering_facts::SymbolFact::new(
-                sid.clone(),
-                name.to_string(),
-                crate::engineering_facts::SymbolKind::Function,
-            );
-            sf.module = Some(crate::engineering_facts::ModuleId::new(mod_id));
-            builder.add_symbol(sf);
-            (sid, name.to_string())
-        };
+        let mut mk_sym =
+            |mod_id: &str, name: &str| -> (crate::engineering_facts::SymbolId, String) {
+                let sid = crate::engineering_facts::SymbolId::new(format!(
+                    "sym::{mod_id}::{name}_function@1"
+                ));
+                let mut sf = crate::engineering_facts::SymbolFact::new(
+                    sid.clone(),
+                    name.to_string(),
+                    crate::engineering_facts::SymbolKind::Function,
+                );
+                sf.module = Some(crate::engineering_facts::ModuleId::new(mod_id));
+                builder.add_symbol(sf);
+                (sid, name.to_string())
+            };
 
         let (sa, _) = mk_sym("mod::p", "a");
         let (sb, _) = mk_sym("mod::p", "b");
@@ -2201,10 +2283,9 @@ mod tests {
             FactId::Symbol(sb.clone()),
             FactId::Symbol(sc.clone()),
         );
-        rf2.metadata =
-            crate::engineering_facts::metadata::FactMetadata::builder()
-                .attr("provenance", "heuristic")
-                .build();
+        rf2.metadata = crate::engineering_facts::metadata::FactMetadata::builder()
+            .attr("provenance", "heuristic")
+            .build();
         builder.add_relationship(rf2);
 
         let store = FactStore::build(builder.build());
@@ -2266,7 +2347,14 @@ mod tests {
             r.direct_relationships
                 .iter()
                 .chain(r.transitive_relationships.iter())
-                .map(|e| (e.depth, e.relationship_kind.clone(), e.direction.clone(), e.target_id.clone()))
+                .map(|e| {
+                    (
+                        e.depth,
+                        e.relationship_kind.clone(),
+                        e.direction.clone(),
+                        e.target_id.clone(),
+                    )
+                })
                 .collect()
         }
         assert_eq!(snapshot(&r1), snapshot(&r2));
@@ -2388,9 +2476,9 @@ mod tests {
     #[test]
     fn impact_freshness_unknown_when_no_generation_state() {
         use crate::engineering_facts::FactsBuilder;
+        use crate::engineering_facts::SourceLocation;
         use crate::engineering_facts::{ModuleFact, ModuleId, SymbolFact, SymbolId, SymbolKind};
         use crate::engineering_facts::{WorkspaceFact, WorkspaceId};
-        use crate::engineering_facts::SourceLocation;
 
         let mut builder = FactsBuilder::new();
         builder.add_workspace(WorkspaceFact::new(
@@ -2403,7 +2491,9 @@ mod tests {
         builder.add_module(mf);
         let sym_id = SymbolId::new("sym::src/lib.rs::foo_function@1");
         let mut sf = SymbolFact::new(sym_id.clone(), "foo", SymbolKind::Function);
-        sf.location = SourceLocation::new().with_file("src/lib.rs").with_point(1, 0);
+        sf.location = SourceLocation::new()
+            .with_file("src/lib.rs")
+            .with_point(1, 0);
         builder.add_symbol(sf);
         let store = FactStore::build(builder.build());
 
@@ -2417,7 +2507,12 @@ mod tests {
         // and the store has no generation state, so Unknown.
         let tmpdir = tempfile::tempdir().unwrap();
         let target2 = ImpactTarget::Symbol(SymbolId::new("sym::src/lib.rs::foo_function@1"));
-        let result2 = analyze(&store, target2, &ImpactOptions::default(), Some(tmpdir.path()));
+        let result2 = analyze(
+            &store,
+            target2,
+            &ImpactOptions::default(),
+            Some(tmpdir.path()),
+        );
         assert_eq!(result2.freshness, Some(FreshnessStatus::Unknown));
     }
 
@@ -2425,9 +2520,9 @@ mod tests {
     #[test]
     fn impact_freshness_fresh_when_repo_unchanged() {
         use crate::engineering_facts::FactsBuilder;
+        use crate::engineering_facts::SourceLocation;
         use crate::engineering_facts::{ModuleFact, ModuleId, SymbolFact, SymbolId, SymbolKind};
         use crate::engineering_facts::{WorkspaceFact, WorkspaceId};
-        use crate::engineering_facts::SourceLocation;
         use crate::sandbox::RepoState;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2461,7 +2556,9 @@ mod tests {
         builder.add_module(mf);
         let sym_id = SymbolId::new("sym::src/lib.rs::foo_function@1");
         let mut sf = SymbolFact::new(sym_id.clone(), "foo", SymbolKind::Function);
-        sf.location = SourceLocation::new().with_file("src/lib.rs").with_point(1, 0);
+        sf.location = SourceLocation::new()
+            .with_file("src/lib.rs")
+            .with_point(1, 0);
         builder.add_symbol(sf);
         let store = FactStore::build(builder.build().with_generation_repo_state(gen_state));
 
@@ -2478,9 +2575,9 @@ mod tests {
     #[test]
     fn impact_freshness_stale_when_repo_changes() {
         use crate::engineering_facts::FactsBuilder;
+        use crate::engineering_facts::SourceLocation;
         use crate::engineering_facts::{ModuleFact, ModuleId, SymbolFact, SymbolId, SymbolKind};
         use crate::engineering_facts::{WorkspaceFact, WorkspaceId};
-        use crate::engineering_facts::SourceLocation;
         use crate::sandbox::RepoState;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2514,7 +2611,9 @@ mod tests {
         builder.add_module(mf);
         let sym_id = SymbolId::new("sym::src/lib.rs::foo_function@1");
         let mut sf = SymbolFact::new(sym_id.clone(), "foo", SymbolKind::Function);
-        sf.location = SourceLocation::new().with_file("src/lib.rs").with_point(1, 0);
+        sf.location = SourceLocation::new()
+            .with_file("src/lib.rs")
+            .with_point(1, 0);
         builder.add_symbol(sf);
         let store = FactStore::build(builder.build().with_generation_repo_state(gen_state));
 

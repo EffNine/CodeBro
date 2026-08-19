@@ -17,8 +17,8 @@
 //! The output feeds directly into the impact analysis graph.
 
 use crate::engineering_facts::{
-    FactId, FactsBuilder, ModuleId, ReferenceFact, ReferenceId, RelationshipFact,
-    RelationshipId, RelationshipKind, SymbolFact, SymbolId,
+    FactId, FactsBuilder, ModuleId, ReferenceFact, ReferenceId, RelationshipFact, RelationshipId,
+    RelationshipKind, SymbolFact, SymbolId,
 };
 use crate::intelligence::parser::{ParseCall, ParseImport};
 
@@ -196,10 +196,7 @@ fn resolve_callee(
 }
 
 /// Get the FactId for the caller symbol from call metadata.
-fn caller_fact_id(
-    symbols: &[SymbolFact],
-    call: &ParseCall,
-) -> FactId {
+fn caller_fact_id(symbols: &[SymbolFact], call: &ParseCall) -> FactId {
     // Try to find the symbol that contains this call by name + file match.
     if let Some(ref caller_name) = call.caller_symbol {
         for sym in symbols {
@@ -370,11 +367,7 @@ fn build_heuristic_references(
                     cand_mod = cand_mod.as_str(),
                     cand_name = candidate.name,
                 );
-                let mut rf = ReferenceFact::new(
-                    ReferenceId::new(ref_id),
-                    sym_fact,
-                    cand_fact,
-                );
+                let mut rf = ReferenceFact::new(ReferenceId::new(ref_id), sym_fact, cand_fact);
                 rf.metadata = crate::engineering_facts::metadata::FactMetadata::builder()
                     .attr("provenance", "heuristic")
                     .build();
