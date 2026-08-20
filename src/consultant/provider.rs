@@ -1,9 +1,8 @@
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Provider abstraction for the Consultant capability.
 //!
-//! Every concrete provider (ChatGPT Web, Claude Web, DeepSeek Web, mock, ...)
-//! implements this trait. The MCP tool and router talk only to this trait,
-//! never to a concrete provider directly.
+//! Every concrete provider implements this trait. The MCP tool and router talk
+//! only to this trait, never to a concrete provider directly.
 
 use anyhow::Result;
 
@@ -12,7 +11,7 @@ use super::types::{AuthStatus, ConsultantRequest, ConsultantResponse};
 /// Core provider trait. Implement this to add a new consultant provider.
 #[async_trait::async_trait]
 pub trait ConsultantProvider: Send + Sync {
-    /// Human-readable provider name (e.g. `"chatgpt"`, `"claude"`).
+    /// Human-readable provider name (e.g. `"conductor"`).
     fn name(&self) -> &str;
 
     /// Run a consultation. Returns a normalized response.

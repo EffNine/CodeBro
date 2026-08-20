@@ -1521,7 +1521,7 @@ impl rmcp::ServerHandler for CodeBroMcpServer {
               - To check the health of the CodeBro workspace (project identity, fact store, \
                   engineering memory, git status), call codebro_repository_health (returns \
                   structured exit code, status, per-check results, and summary).\n\
-                - To ask an AI consultant (Conductor, ChatGPT, Claude, DeepSeek) for opinions on \
+                - To ask an AI consultant (Conductor) for opinions on \
                   architecture, debugging, code review, planning, research, or second \
                   opinions, call codebro_consult (supports provider selection, mode shaping, \
                   and automatic injection of CodeBro engineering context like facts, memory, \

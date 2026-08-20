@@ -1,12 +1,11 @@
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
-//! Shared prompt builder for ChatGPT consultant providers.
+//! Shared prompt builder for consultant providers.
 //!
-//! Both the extension-based and Playwright-based ChatGPT providers use the
-//! same prompt format so that behavior is consistent regardless of transport.
+//! The prompt format is consistent across all consultant backends.
 
 use super::types::ConsultantRequest;
 
-/// Build the prompt text sent to ChatGPT.
+/// Build the prompt text sent to the consultant provider.
 ///
 /// The prompt includes mode, optional project context, file contents, the
 /// question, and formatting constraints. Prompt contents are **not** logged.

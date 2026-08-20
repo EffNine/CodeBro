@@ -13,12 +13,6 @@ use serde::{Deserialize, Serialize};
 pub enum ConsultantProvider {
     #[default]
     Auto,
-    #[serde(rename = "chatgpt")]
-    ChatGpt,
-    #[serde(rename = "claude")]
-    Claude,
-    #[serde(rename = "deepseek")]
-    DeepSeek,
     #[serde(rename = "conductor")]
     Conductor,
 }
@@ -27,9 +21,6 @@ impl std::fmt::Display for ConsultantProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConsultantProvider::Auto => write!(f, "auto"),
-            ConsultantProvider::ChatGpt => write!(f, "chatgpt"),
-            ConsultantProvider::Claude => write!(f, "claude"),
-            ConsultantProvider::DeepSeek => write!(f, "deepseek"),
             ConsultantProvider::Conductor => write!(f, "conductor"),
         }
     }

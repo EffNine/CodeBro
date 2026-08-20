@@ -64,6 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Consultant cleanup** — Removed dead `ChatGpt`, `Claude`, and `DeepSeek` variants from `ConsultantProvider` enum. Removed stale doc comments referencing removed browser/extension providers. Fixed unreachable-pattern clippy error in `ConsultantRouter::resolve`. Prompt builder and provider docs no longer reference ChatGPT/Claude/DeepSeek.
+
 ### Added
 - **Conductor consultant provider** — `ConductorProvider` (`src/consultant/providers/conductor.rs`) is now the primary and only supported consultant runtime. CodeBro calls Conductor's OpenAI-compatible `POST /v1/chat/completions` endpoint with `Authorization: Bearer <CONDUCTOR_API_KEY>`. Configuration via `CONDUCTOR_API_KEY`, `CONDUCTOR_BASE_URL` (default `http://127.0.0.1:8080`), and `CONDUCTOR_MODEL` env vars (or the secure credential store). CLI: `codebro consult --provider conductor --mode <mode> "question"`. MCP tool: `consult` (tool #15). Mode mapping: `architecture→agentic`, `debugging→coding`, `code_review→coding`, `planning→planning`, `research→reasoning`, `second_opinion→reasoning`.
 - **MCP `consult` tool (tool #15)** — Ask an AI consultant (Conductor gateway) for opinions. Supports `provider` (`auto` | `conductor`), `mode`, `question`, optional `context`, `files`, `include_git_diff`, `include_project_context`, `max_answer_length`. Project context and git diff are injected automatically when requested.

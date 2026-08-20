@@ -36,10 +36,6 @@ impl ConsultantRouter {
         match choice {
             ProviderChoice::Auto => self.resolve_auto(),
             ProviderChoice::Conductor => self.get("conductor"),
-            _ => Err(format!(
-                "unknown provider '{}' — use auto or conductor",
-                choice
-            )),
         }
     }
 
@@ -162,9 +158,16 @@ mod tests {
     #[test]
     fn unknown_provider_errors() {
         let router = ConsultantRouter::new();
-        match router.resolve(&ProviderChoice::Claude) {
-            Err(err) => assert!(err.contains("unknown provider")),
-            Ok(_) => panic!("expected error for unknown provider"),
+        match router.resolve(&ProviderChoice::Conductor) {
+            Ok(_) => panic!("conductor should resolve when registered"),
+            Err(_) => {
+                // Unregistered — expect error.
+                let r = ConsultantRouter::new();
+                match r.resolve(&ProviderChoice::Conductor) {
+                    Err(e) => assert!(e.contains("unknown provider")),
+                    Ok(_) => panic!("expected error for unregistered provider"),
+                }
+            }
         }
     }
 

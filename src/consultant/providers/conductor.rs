@@ -38,11 +38,10 @@ use super::super::prompt::{build_prompt, truncate_answer};
 use super::super::provider::{ConsultantError, ConsultantProvider};
 use super::super::types::{AuthStatus, ConsultantMode, ConsultantRequest, ConsultantResponse};
 
-/// Timeout for the entire consultation flow, matching the ChatGPT extension
-/// provider's convention.
+/// Timeout for the entire consultation flow.
 const CONSULTATION_TIMEOUT_SECS: u64 = 180;
 
-/// Maximum length of the extracted answer (matches the ChatGPT providers).
+/// Maximum length of the extracted answer.
 const MAX_ANSWER_LENGTH: usize = 16_000;
 
 /// Environment variables read by `ConductorProvider::new()`.
@@ -932,8 +931,7 @@ mod tests {
             ..Default::default()
         };
         let response = provider.consult(&request).await.expect("consult succeeds");
-        // Truncated at the first sentence boundary with the truncation marker
-        // (the shared truncate_answer convention used by the ChatGPT providers).
+        // Truncated at the first sentence boundary with the truncation marker.
         assert!(response.answer.starts_with("First sentence."));
         assert!(response.answer.ends_with("[truncated]"));
         assert!(
