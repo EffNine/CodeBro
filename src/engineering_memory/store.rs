@@ -20,6 +20,8 @@ pub enum StorageError {
     WrongWorkspaceRoot(String),
     WrongSchemaVersion(String),
     NotFound(String),
+    /// Store file exists but is not parseable; raw bytes were quarantined.
+    Corrupted(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -37,6 +39,7 @@ impl std::fmt::Display for StorageError {
                 write!(f, "wrong schema version: {}", v)
             }
             StorageError::NotFound(p) => write!(f, "not found: {}", p),
+            StorageError::Corrupted(msg) => write!(f, "corrupted store: {}", msg),
         }
     }
 }
@@ -96,7 +99,23 @@ impl EngineeringMemoryStore {
             return Err(StorageError::NotFound(format!("{}", path.display())));
         }
         let content = fs::read_to_string(&path)?;
-        let file: EngineeringMemoryFile = serde_json::from_str(&content)?;
+        let file: EngineeringMemoryFile = match serde_json::from_str(&content) {
+            Ok(f) => f,
+            Err(e) => {
+                // Preserve the corrupt bytes for manual recovery instead of
+                // leaving them in place where a later save would clobber them.
+                let quarantined = crate::persistence::quarantine_file(&path)
+                    .map_err(|qe| StorageError::Write(qe.to_string()))?;
+                return Err(StorageError::Corrupted(format!(
+                    "{}: {e} (quarantined to {})",
+                    path.display(),
+                    quarantined
+                        .as_ref()
+                        .map(|q| q.display().to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                )));
+            }
+        };
 
         if file.schema_version != CURRENT_SCHEMA_VERSION {
             return Err(StorageError::WrongSchemaVersion(file.schema_version));
@@ -110,15 +129,16 @@ impl EngineeringMemoryStore {
     }
 
     /// Save the engineering memory file.
+    ///
+    /// Writes are atomic and durable: content is staged in a temp file,
+    /// fsynced, then renamed over the destination. A crash mid-save can
+    /// never truncate an existing store.
     pub fn save(&self, file: &EngineeringMemoryFile) -> Result<(), StorageError> {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(file)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut f = fs::File::create(&self.memory_path())
+        crate::persistence::write_atomic(&self.memory_path(), json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
-        f.write_all(json.as_bytes())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        f.flush().map_err(|e| StorageError::Write(e.to_string()))?;
         Ok(())
     }
 
@@ -198,5 +218,37 @@ mod tests {
             .save(&EngineeringMemoryFile::new("/tmp/test"))
             .expect("save");
         assert!(store.memory_exists());
+    }
+
+    #[test]
+    fn test_corrupt_store_is_quarantined_not_clobbered() {
+        let (store, _tmp) = setup();
+        let path = store.memory_path();
+        std::fs::create_dir_all(store.codebro_dir()).expect("mkdir");
+        // Simulate a crash-truncated file (e.g. from the old non-atomic writer).
+        std::fs::write(&path, "{\"schema_version\": \"1.0.0\", \"entries\": [").expect("write");
+
+        let result = store.load("/tmp/test");
+        match &result {
+            Err(StorageError::Corrupted(msg)) => {
+                assert!(msg.contains("quarantined"), "error names quarantine: {msg}");
+            }
+            other => panic!("expected Corrupted error, got {:?}", other.as_ref().map(|_| ())),
+        }
+
+        // Raw bytes preserved beside the original; original path cleared so a
+        // subsequent clean save starts fresh instead of clobbering evidence.
+        let residue: Vec<_> = std::fs::read_dir(store.codebro_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            residue
+                .iter()
+                .any(|n| n.starts_with("engineering_memory.json.corrupt-")),
+            "quarantine file present: {residue:?}"
+        );
+        assert!(!path.exists(), "original corrupt file moved aside");
     }
 }

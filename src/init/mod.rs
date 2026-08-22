@@ -265,8 +265,10 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     let codebro_dir = root.join(".codebro");
     std::fs::create_dir_all(&codebro_dir).context("create .codebro directory")?;
     let out = codebro_dir.join("facts.json");
-    let file = std::fs::File::create(&out).context("create facts.json")?;
-    serde_json::to_writer_pretty(file, &model).context("serialize facts model")?;
+    let bytes = serde_json::to_vec_pretty(&model).context("serialize facts model")?;
+    // Atomic + durable: staged temp file, fsync, rename. A crash mid-write
+    // can never truncate an existing facts store.
+    crate::persistence::write_atomic(&out, &bytes).context("persist facts.json")?;
 
     let counts = model.counts();
     println!("codebro init complete");

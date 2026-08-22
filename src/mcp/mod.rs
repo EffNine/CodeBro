@@ -107,7 +107,21 @@ impl CodeBroMcpServer {
                 match serde_json::from_slice::<crate::engineering_facts::FactsModel>(&bytes) {
                     Ok(model) => crate::fact_store::FactStore::from_model(&model),
                     Err(e) => {
-                        tracing::warn!("ignoring unparseable {}: {e}", path.display());
+                        // Quarantine the corrupt store so the raw bytes are
+                        // preserved for recovery instead of being clobbered
+                        // by the next init. The fact store is derived state
+                        // (regenerable via `codebro init`), so we degrade to
+                        // an empty store — but never silently destroy data.
+                        let quarantined =
+                            crate::persistence::quarantine_file(&path).ok().flatten();
+                        tracing::warn!(
+                            "quarantining unparseable {}: {e} (moved to {})",
+                            path.display(),
+                            quarantined
+                                .as_ref()
+                                .map(|q| q.display().to_string())
+                                .unwrap_or_else(|| "<quarantine failed>".to_string())
+                        );
                         crate::fact_store::FactStore::empty()
                     }
                 }
@@ -468,7 +482,28 @@ impl CodeBroMcpServer {
             &self.workspace_root,
             identity,
         );
-        let _ = memory.load();
+        // Fail closed: if an existing store cannot be loaded (corrupt,
+        // wrong schema, wrong workspace), refuse to write. Proceeding on
+        // an empty runtime would persist a file containing only this new
+        // entry and permanently destroy the accumulated store.
+        if let Err(load_err) = memory.load() {
+            let absent = matches!(
+                load_err,
+                crate::engineering_memory::runtime::EngineeringMemoryError::Storage(
+                    crate::engineering_memory::store::StorageError::NotFound(_)
+                )
+            );
+            if !absent {
+                return Err(McpError::internal_error(
+                    format!(
+                        "refusing to record: existing memory store could not be loaded \
+                         ({load_err}). Recover the quarantined file or fix the store, \
+                         then retry."
+                    ),
+                    None,
+                ));
+            }
+        }
 
         // Deterministic id from the key: upsert semantics.
         let id = format!("mem::{key}");

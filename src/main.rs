@@ -30,6 +30,7 @@ mod metrics;
 mod observability;
 mod onboarding;
 mod planning;
+mod persistence;
 mod plugin_sdk;
 mod preference_engine;
 mod project_identity;

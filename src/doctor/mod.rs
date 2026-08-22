@@ -184,17 +184,19 @@ pub fn report(workspace_root: &Path) -> Result<(i32, Vec<Check>)> {
                 format!("{count} entries"),
             ));
         }
+        Err(crate::engineering_memory::runtime::EngineeringMemoryError::Storage(
+            crate::engineering_memory::store::StorageError::NotFound(_),
+        )) => {
+            checks.push(Check::pass(
+                "engineering_memory",
+                "absent (no entries recorded yet)",
+            ));
+        }
         Err(e) => {
-            let exists = memory_path.exists();
-            if exists {
-                checks.push(Check::fail("engineering_memory", e.to_string()));
-                errors += 1;
-            } else {
-                checks.push(Check::pass(
-                    "engineering_memory",
-                    "absent (no entries recorded yet)",
-                ));
-            }
+            // Any other load failure (corrupt/quarantined, wrong schema,
+            // wrong workspace) is an error condition worth surfacing.
+            checks.push(Check::fail("engineering_memory", e.to_string()));
+            errors += 1;
         }
     }
 
