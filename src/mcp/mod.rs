@@ -892,7 +892,17 @@ impl CodeBroMcpServer {
     async fn reindex(&self) -> Result<CallToolResult, McpError> {
         let start = std::time::Instant::now();
 
-        match crate::init::run(&self.workspace_root) {
+        // The init pipeline is fully synchronous (filesystem walk +
+        // tree-sitter parsing) and can take minutes on large workspaces.
+        // Run it on the blocking thread pool so the async runtime — and
+        // therefore every other in-flight MCP tool call on this stdio
+        // connection — stays responsive.
+        let root = self.workspace_root.clone();
+        let init_result = tokio::task::spawn_blocking(move || crate::init::run(&root))
+            .await
+            .map_err(|e| McpError::internal_error(format!("reindex worker panicked: {e}"), None))?;
+
+        match init_result {
             Ok(()) => {
                 // Invalidate the mtime-based fact store cache so the next
                 // call reloads the freshly written .codebro/facts.json.
