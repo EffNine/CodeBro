@@ -94,6 +94,9 @@ pub struct ParseCall {
     pub callee_name: String,
     /// Whether the callee name could be resolved to a known symbol pattern.
     pub is_qualified: bool,
+    /// Receiver type hint: the qualifier of a path call (`User` in
+    /// `User::new()`), `"self"`/`"Self"` for self-calls, else `None`.
+    pub receiver_type: Option<String>,
 }
 
 /// A structured import target extracted from an import/use statement.
@@ -401,7 +404,15 @@ impl CodeParser {
                 });
             }
             "impl" | "impl_item" => {
-                let name = self.name_of(node, source, "type_identifier");
+                // Prefer the LAST direct type identifier: for
+                // `impl Display for Foo` the self type is Foo, not the
+                // trait; for plain `impl Foo` it is Foo either way.
+                let name = node
+                    .children(&mut node.walk())
+                    .filter(|c| c.kind() == "type_identifier")
+                    .last()
+                    .and_then(|n| self.node_name(n, source))
+                    .unwrap_or_else(|| "unknown".to_string());
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -1057,7 +1068,39 @@ impl CodeParser {
             line_start: self.line_to_u32(node.start_position()),
             callee_name,
             is_qualified,
+            receiver_type: self.extract_receiver_type(callee, source),
         });
+    }
+
+    /// Receiver-type hint for a call: the qualifier segment of a path call
+    /// (`User` in `User::new()`, including `Self`), or `"self"` for
+    /// instance calls on self. Plain variable receivers yield `None` —
+    /// without binding information they carry no trustworthy type.
+    fn extract_receiver_type(&self, callee: Node, source: &str) -> Option<String> {
+        match callee.kind() {
+            "scoped_identifier" | "qualified_identifier" => {
+                let path = callee.child_by_field_name("path")?;
+                self.last_path_segment_text(path, source)
+            }
+            "field_expression" => {
+                let value = callee.child_by_field_name("value")?;
+                let text = self.node_text(value, source);
+                (text == "self").then(|| "self".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Final identifier of a (possibly nested) path node: follows the
+    /// `name` field through nested scoped identifiers.
+    fn last_path_segment_text(&self, node: Node, source: &str) -> Option<String> {
+        if let Some(name) = node.child_by_field_name("name") {
+            return self.last_path_segment_text(name, source);
+        }
+        match node.kind() {
+            "identifier" | "type_identifier" => self.node_name(node, source),
+            _ => None,
+        }
     }
 
     /// Walk a callee node tree and return the final identifier text.
@@ -1169,3 +1212,29 @@ pub fn parse_source(language: &str, source: &str, file_path: &str) -> Result<Par
     parser.parse_source(source, file_path)
 }
 
+
+#[cfg(test)]
+mod receiver_tests {
+    use super::*;
+
+    #[test]
+    fn extract_receiver_types_for_path_self_and_plain_calls() {
+        let mut p = CodeParser::new("rust").unwrap();
+        let src = "struct A;\nimpl A { fn go(&self) { self.save(); Self::prep(); } }\nfn main() { A::new(); helper(); obj.method(); }\n";
+        let r = p
+            .parse_file(std::path::Path::new("lib.rs"), src)
+            .unwrap();
+        let find = |name: &str| {
+            r.calls
+                .iter()
+                .find(|c| c.callee_name == name)
+                .unwrap_or_else(|| panic!("no call to {name}"))
+        };
+        assert_eq!(find("save").receiver_type.as_deref(), Some("self"));
+        assert_eq!(find("prep").receiver_type.as_deref(), Some("Self"));
+        assert_eq!(find("new").receiver_type.as_deref(), Some("A"));
+        assert_eq!(find("helper").receiver_type, None);
+        // Plain variable receivers carry no trustworthy type.
+        assert_eq!(find("method").receiver_type, None);
+    }
+}

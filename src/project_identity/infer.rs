@@ -177,6 +177,16 @@ fn mine_adr_decisions(root: &Path) -> Vec<MinedDecision> {
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+            .filter(|p| {
+                // Index/readme/template files in the ADR directory are not
+                // decisions themselves.
+                let stem = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                !matches!(stem.as_str(), "readme" | "template" | "index")
+            })
             .collect();
         files.sort();
         for file in files {

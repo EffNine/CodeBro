@@ -56,6 +56,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     // Collect AST-derived calls and imports per file for relationship building.
     let mut all_calls: Vec<crate::intelligence::parser::ParseCall> = Vec::new();
     let mut all_imports: Vec<crate::intelligence::parser::ParseImport> = Vec::new();
+    let mut impl_scopes: Vec<crate::impact::relationships::ImplScope> = Vec::new();
     let mut skipped_oversized: usize = 0;
     // Machine-generated "source" files that embed datasets (common in ML
     // repos: data.py with megabytes of array literals, bundled minified
@@ -124,6 +125,20 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         }
         all_calls.extend(parsed.calls.iter().cloned());
         all_imports.extend(parsed.import_targets.iter().cloned());
+
+        // Record impl block extents so method calls can be attributed to
+        // their self type during relationship resolution.
+        use crate::intelligence::parser::SymbolKind as P;
+        for sym in &parsed.symbols {
+            if matches!(sym.kind, P::Impl) && sym.name != "unknown" {
+                impl_scopes.push(crate::impact::relationships::ImplScope {
+                    file: rel.clone(),
+                    start: sym.line_start,
+                    end: sym.line_end,
+                    type_name: sym.name.clone(),
+                });
+            }
+        }
 
         for sym in parsed.symbols {
             let kind = map_symbol_kind(&sym.kind);
@@ -264,6 +279,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         &collected_symbols,
         &all_calls,
         &all_imports,
+        &impl_scopes,
     );
     if rel_count > 0 {
         println!("  relationships: {rel_count}");
@@ -1427,6 +1443,93 @@ mod tests {
         assert!(
             !model.modules().iter().any(|m| m.path.as_deref() == Some("src/embedded_data.rs")),
             "oversized file must not produce a module fact"
+        );
+    }
+
+    /// Receiver-type resolution: `A::new()` and `B::new()` must resolve to
+    /// their own impl's method even though the bare name is ambiguous, and
+    /// `self.ping_hit()` inside `impl Ping` must pick Ping's method.
+    #[test]
+    fn receiver_type_disambiguates_same_name_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"recv-probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub struct Ping;\npub struct Pong;\nimpl Ping { pub fn new() -> Self { Ping } pub fn ping_hit(&self) {} }\nimpl Pong { pub fn new() -> Self { Pong } pub fn pong_hit(&self) {} }\npub fn mainish() { let _p = Ping::new(); let _q = Pong::new(); }\nimpl Ping { pub fn go(&self) { self.ping_hit(); } }\n",
+        )
+        .unwrap();
+
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+
+        let name_of_id: std::collections::HashMap<&str, &str> = model
+            .symbols()
+            .iter()
+            .map(|s| (s.id.as_str(), s.name.as_str()))
+            .collect();
+        let endpoint_name = |e: &crate::engineering_facts::FactId| match e {
+            crate::engineering_facts::FactId::Symbol(s) => name_of_id.get(s.as_str()).copied(),
+            _ => None,
+        };
+
+        let calls: Vec<(String, String)> = model
+            .relationships()
+            .iter()
+            .filter(|r| r.kind == crate::engineering_facts::RelationshipKind::Calls)
+            .filter_map(|r| {
+                Some((
+                    endpoint_name(&r.source)?.to_string(),
+                    endpoint_name(&r.target)?.to_string(),
+                ))
+            })
+            .collect();
+
+        // Both same-name `new` methods resolved, each exactly once.
+        let news: Vec<&String> = calls
+            .iter()
+            .filter(|(s, t)| s == "mainish" && t == "new")
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(
+            news.len(),
+            2,
+            "mainish must reach both new() impls, got {calls:?}"
+        );
+
+        // Same-line calls to same-named methods must not produce
+        // duplicate relationship ids (id carries a target hash).
+        {
+            let raw =
+                std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap();
+            let model: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let ids: Vec<&str> = model["relationships"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r["id"].as_str())
+                .collect();
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            let dupes = sorted.windows(2).filter(|w| w[0] == w[1]).count();
+            assert_eq!(dupes, 0, "duplicate relationship ids: {ids:?}");
+        }
+
+        // Self-call inside impl Ping resolves to Ping's method only.
+        assert!(
+            calls.iter().any(|(s, t)| s == "go" && t == "ping_hit"),
+            "self.ping_hit() must resolve within impl Ping, got {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|(_, t)| t == "pong_hit"),
+            "no edge may invent a call to pong_hit, got {calls:?}"
         );
     }
 }

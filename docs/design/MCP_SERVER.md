@@ -570,7 +570,7 @@ Provenance levels:
 
 | Relationship | Source | Provenance |
 |-------------|--------|------------|
-| `Calls` | Actual `call_expression` nodes in the AST, resolved to known symbols by name+module | `verified` |
+| `Calls` | Actual `call_expression` nodes in the AST, resolved receiver-type first: `Type::method()` binds to that type's impl, `self.m()` / `Self::m()` bind to the enclosing impl; namespace qualifiers fall back to bare-name rules. Ambiguity always skips — no invented evidence. | `verified` |
 | `Imports` (module→module) | Actual `use` / `import` statements parsed from source | `verified` |
 | `References` (symbol→symbol) | Name-coincidence fallback when no AST evidence exists | `heuristic` |
 | `Imports` (module→module) | Name-coincidence fallback when no AST import evidence exists | `heuristic` |

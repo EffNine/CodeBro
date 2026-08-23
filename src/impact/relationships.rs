@@ -22,6 +22,36 @@ use crate::engineering_facts::{
 };
 use crate::intelligence::parser::{ParseCall, ParseImport};
 
+/// An `impl` block's textual extent, used to attribute method calls to
+/// their self type (e.g. calls inside `impl User` belong to `User`).
+#[derive(Debug, Clone)]
+pub struct ImplScope {
+    pub file: String,
+    pub start: u32,
+    pub end: u32,
+    pub type_name: String,
+}
+
+/// The innermost impl type whose block contains `file:line`.
+fn enclosing_impl<'a>(
+    scopes: &'a [ImplScope],
+    file: &str,
+    line: u32,
+) -> Option<&'a str> {
+    scopes
+        .iter()
+        .filter(|s| s.file == file && s.start <= line && line <= s.end)
+        .min_by_key(|s| s.end.saturating_sub(s.start))
+        .map(|s| s.type_name.as_str())
+}
+
+/// The impl type owning a candidate symbol, via span containment.
+fn symbol_impl<'a>(scopes: &'a [ImplScope], sym: &SymbolFact) -> Option<&'a str> {
+    let file = sym.location.file.as_deref()?;
+    let line = sym.location.line?;
+    enclosing_impl(scopes, file, line)
+}
+
 /// Build relationship and reference facts from module/symbol data plus
 /// AST-derived calls and imports.
 ///
@@ -32,20 +62,22 @@ pub fn build_relationships(
     symbols: &[SymbolFact],
     calls: &[ParseCall],
     imports: &[ParseImport],
+    impl_scopes: &[ImplScope],
 ) -> usize {
     let mut count = 0u64;
 
     // ── Verified edges from AST data ──────────────────────────────────
 
-    // Build a symbol lookup: name + module → SymbolId (for call resolution).
-    let mut name_to_sym: std::collections::HashMap<String, Vec<(&SymbolId, &ModuleId)>> =
+    // Symbol lookup by name (for call resolution). Candidates keep the
+    // full fact so receiver/impl matching can inspect location and kind.
+    let mut name_to_sym: std::collections::HashMap<String, Vec<&SymbolFact>> =
         std::collections::HashMap::new();
     for sym in symbols {
-        if let Some(ref mod_id) = sym.module {
+        if sym.module.is_some() {
             name_to_sym
                 .entry(sym.name.clone())
                 .or_default()
-                .push((&sym.id, mod_id));
+                .push(sym);
         }
     }
 
@@ -60,8 +92,12 @@ pub fn build_relationships(
         std::collections::HashSet::new();
 
     for call in calls {
-        // Resolve the callee name to a SymbolId.
-        if let Some(callee_sym_id) = resolve_callee(&name_to_sym, &call.callee_name, call) {
+        // Resolve the callee name to a SymbolId, preferring receiver-type
+        // and enclosing-impl matches over bare-name coincidence.
+        let caller_impl = enclosing_impl(impl_scopes, &call.caller_file, call.line_start);
+        if let Some(callee_sym_id) =
+            resolve_callee(&name_to_sym, &call.callee_name, call, impl_scopes, caller_impl)
+        {
             // Skip edges whose caller cannot be resolved to a known symbol
             // fact — dangling endpoints would break store validation and
             // pollute the impact graph.
@@ -71,11 +107,20 @@ pub fn build_relationships(
             let callee_fact_id = FactId::Symbol(callee_sym_id.clone());
             let edge = (caller_fact_id.clone(), callee_fact_id);
             if verified_call_edges.insert(edge) {
+                // Disambiguator from the resolved target: two calls can
+                // share file+line+name (`Ping::new(); Pong::new();`) yet
+                // resolve to different symbols; the id must not collide.
+                let mut h: u64 = 0x811c_9dc5;
+                for b in callee_sym_id.as_str().bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
                 let rel_id = format!(
-                    "rel::{caller_file}::{callee_name}@{line}",
+                    "rel::{caller_file}::{callee_name}@{line}#{h:016x}",
                     caller_file = call.caller_file,
                     callee_name = call.callee_name,
                     line = call.line_start,
+                    h = h,
                 );
                 let rf = RelationshipFact::new(
                     RelationshipId::new(rel_id),
@@ -150,54 +195,90 @@ pub fn build_relationships(
 
 // ── Call resolution ───────────────────────────────────────────────────
 
-/// Resolve a callee name to a SymbolId using the symbol name index.
-/// Returns None if the name doesn't match any known symbol, or if there
-/// are multiple ambiguous matches in the same module.
+/// Resolve a callee name to a SymbolId.
+///
+/// Resolution order (most confident first; ambiguity always skips — the
+/// graph must never invent evidence):
+///
+/// 1. **Receiver-typed** — the call names its type (`User::new()`,
+///    `self.save()`, `Self::help()`): match candidates owned by that
+///    impl type. A unique typed match wins even when other types define
+///    the same method name.
+/// 2. **Enclosing-impl preference** — unqualified calls inside
+///    `impl X` prefer methods of `X`.
+/// 3. **Bare-name fallback** — exactly one global candidate, or all
+///    candidates in one module.
 fn resolve_callee(
-    name_to_sym: &std::collections::HashMap<String, Vec<(&SymbolId, &ModuleId)>>,
+    name_to_sym: &std::collections::HashMap<String, Vec<&SymbolFact>>,
     callee_name: &str,
     call: &ParseCall,
+    impl_scopes: &[ImplScope],
+    caller_impl: Option<&str>,
 ) -> Option<SymbolId> {
     let candidates = name_to_sym.get(callee_name)?;
     if candidates.is_empty() {
         return None;
     }
+    let owner_impl = |sym: &SymbolFact| symbol_impl(impl_scopes, sym);
 
-    // If the call is qualified (e.g. `pkg::func()`), try to match on
-    // the full qualified name first.
-    if call.is_qualified {
-        // For qualified calls, we only create a relationship if the
-        // callee name uniquely identifies one symbol. We don't attempt
-        // full path resolution since we don't have namespace facts yet.
-        if candidates.len() == 1 {
-            return Some(candidates[0].0.clone());
+    // The type this call is explicitly addressed to, if any.
+    let wanted_impl: Option<String> = match call.receiver_type.as_deref() {
+        Some("self") | Some("Self") => caller_impl.map(str::to_string),
+        Some(other) => Some(other.to_string()),
+        None => None,
+    };
+
+    if let Some(want) = &wanted_impl {
+        let mut typed: Vec<SymbolId> = candidates
+            .iter()
+            .filter(|s| owner_impl(s) == Some(want.as_str()))
+            .map(|s| s.id.clone())
+            .collect();
+        typed.sort();
+        typed.dedup();
+        if !typed.is_empty() {
+            return typed.first().filter(|_| typed.len() == 1).cloned();
         }
-        // Ambiguous qualified call — skip to avoid false positives.
-        return None;
+        // The qualifier IS a known impl type but owns no such method —
+        // genuinely unresolvable; never invent a cross-type edge.
+        let known_type = impl_scopes.iter().any(|s| &s.type_name == want);
+        if known_type {
+            return None;
+        }
+        // Otherwise the qualifier is a namespace segment (e.g.
+        // `crate::util::helper`) — fall through to bare-name rules.
     }
 
-    // For unqualified calls, find symbols with matching name in any module.
-    // If there's exactly one match globally, use it.
-    // If there are multiple, we need the caller's context to disambiguate.
+    if !call.is_qualified {
+        if let Some(impl_type) = caller_impl {
+            let mut typed: Vec<SymbolId> = candidates
+                .iter()
+                .filter(|s| owner_impl(s) == Some(impl_type))
+                .map(|s| s.id.clone())
+                .collect();
+            typed.sort();
+            typed.dedup();
+            if typed.len() == 1 {
+                return typed.into_iter().next();
+            }
+        }
+    }
+
+    if call.is_qualified {
+        // Qualified but untyped receiver (`obj.method()` with unknown
+        // obj): only a unique global candidate is trustworthy.
+        return (candidates.len() == 1).then(|| candidates[0].id.clone());
+    }
+
+    // Unqualified bare-name fallback: unique globally, or all in one module.
     if candidates.len() == 1 {
-        return Some(candidates[0].0.clone());
+        return Some(candidates[0].id.clone());
     }
-
-    // Multiple candidates: prefer the one in the same module as the caller
-    // (local shadowing / re-export pattern).
-    for (sym_id, _mod_id) in candidates {
-        // We don't have access to symbol location here; just check if all
-        // candidates are in the same module.
-    }
-
-    // Fall back: if all candidates are in the same module, pick the first.
-    // Otherwise, ambiguous — don't create a verified edge.
-    let first_mod = candidates[0].1;
-    if candidates.iter().all(|(_, m)| *m == first_mod) {
-        return Some(candidates[0].0.clone());
-    }
-
-    None
+    let first_mod = candidates[0].module.clone();
+    candidates
+        .iter()
+        .all(|s| s.module == first_mod)
+        .then(|| candidates[0].id.clone())
 }
 
 /// Get the FactId for the caller symbol from call metadata. Returns `None`
