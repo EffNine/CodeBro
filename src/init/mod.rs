@@ -1531,6 +1531,58 @@ mod tests {
             !calls.iter().any(|(_, t)| t == "pong_hit"),
             "no edge may invent a call to pong_hit, got {calls:?}"
         );
+
+        // Untyped variable receivers never invent edges: a uniquely named
+        // free function must NOT attract `var.unique_fn()` calls.
+        std::fs::write(
+            dir.path().join("src/extra.rs"),
+            "use crate::{Ping};\npub fn unique_helper() {}\npub fn caller() { let x = 1; x.abs(); unique_helper(); let p = Ping::new(); p.ping_hit(); }\n",
+        )
+        .unwrap();
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+        let name_of_id: std::collections::HashMap<&str, &str> = model
+            .symbols()
+            .iter()
+            .map(|s| (s.id.as_str(), s.name.as_str()))
+            .collect();
+        let endpoint_name = |e: &crate::engineering_facts::FactId| match e {
+            crate::engineering_facts::FactId::Symbol(s) => name_of_id.get(s.as_str()).copied(),
+            _ => None,
+        };
+        let extra_calls: Vec<(String, String)> = model
+            .relationships()
+            .iter()
+            .filter(|r| r.kind == crate::engineering_facts::RelationshipKind::Calls)
+            .filter_map(|r| {
+                Some((
+                    endpoint_name(&r.source)?.to_string(),
+                    endpoint_name(&r.target)?.to_string(),
+                ))
+            })
+            .collect();
+        // Bare unqualified call still resolves.
+        assert!(
+            extra_calls.iter().any(|(s, t)| s == "caller" && t == "unique_helper"),
+            "unqualified unique fn must resolve, got {extra_calls:?}"
+        );
+        // Untyped variable receivers (`p.ping_hit()`, `x.abs()`) stay
+        // honestly unresolved — no edge is invented from bare-name
+        // coincidence. Typed calls (`Ping::new()`) still resolve. Let-
+        // binding type inference is tracked separately in the roadmap.
+        let allowed: std::collections::HashSet<&str> =
+            ["unique_helper", "new"].into_iter().collect();
+        let invented: Vec<&(String, String)> = extra_calls
+            .iter()
+            .filter(|(s, t)| s == "caller" && !allowed.contains(t.as_str()))
+            .collect();
+        assert!(
+            invented.is_empty(),
+            "untyped receivers must not invent edges, got {invented:?} in {extra_calls:?}"
+        );
     }
 }
 

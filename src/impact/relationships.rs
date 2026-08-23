@@ -122,12 +122,15 @@ pub fn build_relationships(
                     line = call.line_start,
                     h = h,
                 );
-                let rf = RelationshipFact::new(
+                let mut rf = RelationshipFact::new(
                     RelationshipId::new(rel_id),
                     RelationshipKind::Calls,
                     caller_fact_id,
                     FactId::Symbol(callee_sym_id),
                 );
+                rf.metadata = crate::engineering_facts::metadata::FactMetadata::builder()
+                    .attr("provenance", "verified")
+                    .build();
                 builder.add_relationship(rf);
                 count += 1;
             }
@@ -153,12 +156,15 @@ pub fn build_relationships(
                         caller_file = imp.file,
                         target_mod = target_mod_id.as_str(),
                     );
-                    let rf = RelationshipFact::new(
+                    let mut rf = RelationshipFact::new(
                         RelationshipId::new(rel_id),
                         RelationshipKind::Imports,
                         FactId::Module(target_mod_id.clone()),
                         FactId::Module(caller_mod),
                     );
+                    rf.metadata = crate::engineering_facts::metadata::FactMetadata::builder()
+                        .attr("provenance", "verified")
+                        .build();
                     builder.add_relationship(rf);
                     count += 1;
                 }
@@ -265,8 +271,16 @@ fn resolve_callee(
     }
 
     if call.is_qualified {
-        // Qualified but untyped receiver (`obj.method()` with unknown
-        // obj): only a unique global candidate is trustworthy.
+        // Qualified with an untyped receiver (`obj.method()`,
+        // `items.iter().any(..)`): the receiver's type is unknown, so a
+        // bare-name match against an unrelated same-named function is
+        // guesswork, not evidence. Skip — no invented edges.
+        if call.receiver_type.is_none() {
+            return None;
+        }
+        // Namespace-style qualifier that named no known impl (e.g.
+        // `crate::util::helper`): only a unique global candidate is
+        // trustworthy.
         return (candidates.len() == 1).then(|| candidates[0].id.clone());
     }
 
