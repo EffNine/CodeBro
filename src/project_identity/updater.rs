@@ -28,6 +28,7 @@ pub struct IdentityChanges {
     pub add_roadmap_items: Vec<RoadmapItem>,
     pub complete_roadmap_item: Option<String>,
     pub add_milestone: Option<String>,
+    pub add_milestones: Vec<String>,
     pub update_architecture_summary: Option<String>,
     pub add_important_files: Vec<String>,
     pub add_languages: Vec<String>,
@@ -56,6 +57,7 @@ impl IdentityChanges {
             && self.add_roadmap_items.is_empty()
             && self.complete_roadmap_item.is_none()
             && self.add_milestone.is_none()
+            && self.add_milestones.is_empty()
             && self.update_architecture_summary.is_none()
             && self.add_important_files.is_empty()
             && self.add_languages.is_empty()
@@ -176,6 +178,10 @@ impl ProjectIdentityUpdater {
         }
 
         if let Some(milestone) = changes.add_milestone {
+            identity = identity.add_recent_milestone(milestone);
+        }
+
+        for milestone in changes.add_milestones {
             identity = identity.add_recent_milestone(milestone);
         }
 

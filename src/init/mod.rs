@@ -495,6 +495,51 @@ fn refresh_identity(
         }
     }
 
+    // Mined documentation content — human-authored text parsed verbatim
+    // from the workspace's own docs, never guessed.
+    for mined in &inferred.decisions {
+        if current
+            .engineering_decisions
+            .iter()
+            .any(|d| d.id == mined.id)
+        {
+            continue;
+        }
+        use crate::project_identity::DecisionStatus;
+        let decision = crate::project_identity::EngineeringDecision::new(
+            mined.id.clone(),
+            mined.title.clone(),
+            mined
+                .description
+                .clone()
+                .unwrap_or_else(|| mined.title.clone()),
+            Some(mined.source_file.clone()),
+        );
+        let status = match mined.status {
+            "accepted" => DecisionStatus::Accepted,
+            "deprecated" => DecisionStatus::Deprecated,
+            "superseded" => DecisionStatus::Superseded,
+            _ => DecisionStatus::Proposed,
+        };
+        changes
+            .add_decisions
+            .push(decision.with_status(status));
+    }
+    for convention in &inferred.conventions {
+        if !current.coding_conventions.contains(convention)
+            && !changes.add_conventions.contains(convention)
+        {
+            changes.add_conventions.push(convention.clone());
+        }
+    }
+    for milestone in &inferred.milestones {
+        if !current.recent_milestones.contains(milestone)
+            && !changes.add_milestones.contains(milestone)
+        {
+            changes.add_milestones.push(milestone.clone());
+        }
+    }
+
     if changes.is_empty() {
         return Ok(false);
     }
@@ -732,6 +777,25 @@ fn parse_cargo_package(
             } else {
                 kind
             };
+            // The same crate may appear in several sections (e.g.
+            // [dependencies] and [dev-dependencies]). The dependency id is
+            // keyed by name only, so keep one entry — the most product-
+            // relevant kind wins (direct > build > dev).
+            if let Some(existing) = dependencies
+                .iter_mut()
+                .find(|d| d.name == *dep_name)
+            {
+                let rank = |k: DependencyKind| match k {
+                    DependencyKind::Direct => 0,
+                    DependencyKind::Build => 1,
+                    _ => 2,
+                };
+                if rank(effective_kind) < rank(existing.kind) {
+                    existing.kind = effective_kind;
+                    existing.version = version;
+                }
+                continue;
+            }
             dependencies.push(DiscoveredDependency {
                 name: dep_name.clone(),
                 version,
@@ -1267,6 +1331,69 @@ mod tests {
             .unwrap()
             .iter()
             .any(|c| c == "never touch release tags"));
+    }
+
+    /// Documentation mining: ADRs become engineering decisions, an
+    /// AGENTS.md Conventions section becomes coding conventions, and
+    /// CHANGELOG releases become milestones. Re-running init must be
+    /// idempotent — no duplicated mined entries.
+    #[test]
+    fn init_mines_documented_intent_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/ADR")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"mine-probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "pub fn main() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("docs/ADR/ADR-001-pick-sqlite.md"),
+            "# ADR-001: Pick SQLite\n\n**Status:** Accepted\n\n## Context\nSingle-file embedded storage is enough for v1.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "## Dev workflow\n\n### Conventions\n\n- Format before commit.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("CHANGELOG.md"), "## [0.1.0] - 2026-01-01\n- first\n").unwrap();
+
+        run(dir.path()).unwrap();
+        let read_identity = || {
+            let raw =
+                std::fs::read_to_string(dir.path().join(".codebro/project_identity.json")).unwrap();
+            let identity: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            identity
+        };
+        let identity = read_identity();
+        assert_eq!(
+            identity["engineering_decisions"][0]["id"], "adr-001-pick-sqlite",
+            "ADR decision mined"
+        );
+        assert_eq!(identity["engineering_decisions"][0]["status"], "Accepted");
+        assert!(identity["coding_conventions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "Format before commit."));
+        assert_eq!(identity["recent_milestones"].as_array().unwrap().len(), 1);
+
+        // Idempotent: second init must not duplicate anything.
+        run(dir.path()).unwrap();
+        let identity = read_identity();
+        assert_eq!(identity["engineering_decisions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            identity["coding_conventions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| *c == "Format before commit.")
+                .count(),
+            1
+        );
+        assert_eq!(identity["recent_milestones"].as_array().unwrap().len(), 1);
     }
 
     /// Regression: machine-generated source files that embed datasets
