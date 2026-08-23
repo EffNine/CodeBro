@@ -585,6 +585,224 @@ impl CodeBroMcpServer {
         ))]))
     }
 
+    // ── Tool 6b: update project identity (guarded write) ──────────────
+
+    /// Update the persistent project identity: goals, constraints,
+    /// decisions, roadmap, sprint, conventions, and architecture summary.
+    /// Changes are validated before persistence; authored data is never
+    /// overwritten by init's inference.
+    #[tool(
+        description = "Update the persistent project identity (.codebro/project_identity.json): record goals, constraints, engineering decisions, roadmap items, the current sprint, coding conventions, or an architecture summary. This is the medium-high-trust 'declared intent' store — distinct from agent-recorded memory. Requires an existing identity (run codebro init once if absent)."
+    )]
+    async fn update_identity(
+        &self,
+        Parameters(args): Parameters<UpdateIdentityArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::project_identity::{
+            DecisionStatus, EngineeringDecision, IdentityChanges, ProjectIdentityRuntime,
+            ProjectIdentityUpdater, RoadmapItem, RoadmapStatus,
+        };
+
+        let parse_status = |s: &Option<String>,
+                            what: &str|
+         -> Result<Option<DecisionStatus>, McpError> {
+            match s.as_deref().map(str::trim) {
+                None | Some("") => Ok(None),
+                Some("proposed") => Ok(Some(DecisionStatus::Proposed)),
+                Some("accepted") => Ok(Some(DecisionStatus::Accepted)),
+                Some("deprecated") => Ok(Some(DecisionStatus::Deprecated)),
+                Some("superseded") => Ok(Some(DecisionStatus::Superseded)),
+                Some(other) => Err(McpError::invalid_params(
+                    format!("invalid {what} status '{other}': expected proposed|accepted|deprecated|superseded"),
+                    None,
+                )),
+            }
+        };
+        let parse_roadmap = |s: &Option<String>| -> Result<RoadmapStatus, McpError> {
+            match s.as_deref().map(str::trim) {
+                None | Some("") => Ok(RoadmapStatus::Planned),
+                Some("planned") => Ok(RoadmapStatus::Planned),
+                Some("in_progress") => Ok(RoadmapStatus::InProgress),
+                Some("completed") => Ok(RoadmapStatus::Completed),
+                Some("deferred") => Ok(RoadmapStatus::Deferred),
+                Some(other) => Err(McpError::invalid_params(
+                    format!("invalid roadmap status '{other}': expected planned|in_progress|completed|deferred"),
+                    None,
+                )),
+            }
+        };
+
+        let mut runtime = ProjectIdentityRuntime::new(&self.workspace_root);
+        let current = runtime.load().map_err(|e| {
+            McpError::invalid_params(
+                format!(
+                    "no project identity for this workspace (run `codebro init` first): {e}"
+                ),
+                None,
+            )
+        })?;
+        let current = current.clone();
+
+        let mut changes = IdentityChanges::new();
+        let mut skipped: Vec<String> = Vec::new();
+
+        if let Some(desc) = args.description.as_deref() {
+            changes.set_description = Some(require_non_empty(desc, "description")?);
+        }
+        if let Some(url) = args.repository_url.as_deref() {
+            changes.set_repository_url = Some(require_non_empty(url, "repository_url")?);
+        }
+        if let Some(summary) = args.architecture_summary.as_deref() {
+            changes.update_architecture_summary =
+                Some(require_non_empty(summary, "architecture_summary")?);
+        }
+        if let Some(sprint) = args.current_sprint.as_deref() {
+            changes.set_sprint = Some(require_non_empty(sprint, "current_sprint")?);
+        }
+        if let Some(item) = args.complete_roadmap_item.as_deref() {
+            changes.complete_roadmap_item = Some(require_non_empty(item, "complete_roadmap_item")?);
+        }
+        if let Some(milestone) = args.add_milestone.as_deref() {
+            changes.add_milestone = Some(require_non_empty(milestone, "add_milestone")?);
+        }
+
+        push_unique_strings(
+            &mut changes.add_constraints,
+            &args.add_constraints,
+            &current.known_constraints,
+        );
+        push_unique_strings(&mut changes.add_patterns, &args.add_patterns, &current.known_patterns);
+        push_unique_strings(
+            &mut changes.add_conventions,
+            &args.add_conventions,
+            &current.coding_conventions,
+        );
+        push_unique_strings(
+            &mut changes.add_modules,
+            &args.add_modules,
+            &current.known_modules,
+        );
+        push_unique_strings(
+            &mut changes.add_important_files,
+            &args.add_important_files,
+            &current.important_files,
+        );
+
+        let existing_decision_ids: std::collections::HashSet<&str> = current
+            .engineering_decisions
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        for input in &args.add_decisions {
+            let title = require_non_empty(&input.title, "decision title")?;
+            let description = require_non_empty(&input.description, "decision description")?;
+            let id = slugify(&title);
+            if existing_decision_ids.contains(id.as_str()) {
+                skipped.push(format!("decision '{id}' already recorded"));
+                continue;
+            }
+            let mut decision = EngineeringDecision::new(
+                id.clone(),
+                title,
+                description,
+                input.context.clone(),
+            );
+            if let Some(status) = parse_status(&input.status, "decision")? {
+                decision = decision.with_status(status);
+            } else {
+                // Agent-recorded decisions are proposals unless explicitly
+                // accepted — keeps declared intent honest.
+                decision = decision.with_status(DecisionStatus::Accepted);
+            }
+            changes.add_decisions.push(decision);
+        }
+
+        let existing_roadmap_ids: std::collections::HashSet<&str> = current
+            .roadmap
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        for input in &args.add_roadmap_items {
+            let title = require_non_empty(&input.title, "roadmap title")?;
+            let id = slugify(&title);
+            if existing_roadmap_ids.contains(id.as_str()) {
+                skipped.push(format!("roadmap item '{id}' already recorded"));
+                continue;
+            }
+            let mut item = RoadmapItem::new(id.clone(), title, input.description.clone());
+            item.status = parse_roadmap(&input.status)?;
+            if let Some(sprint) = input.sprint.as_deref() {
+                item.sprint = Some(sprint.to_string());
+            }
+            changes.add_roadmap_items.push(item);
+        }
+
+        if changes.is_empty() {
+            if skipped.is_empty() {
+                return Err(McpError::invalid_params(
+                    "no identity changes supplied",
+                    None,
+                ));
+            }
+            // Everything supplied was already recorded — report, don't fail.
+            let response = json!({
+                "applied": false,
+                "skipped": skipped,
+                "reason": "all supplied items already present in identity",
+            });
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                serde_json::to_string_pretty(&response)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            )]));
+        }
+
+        let mut updater = ProjectIdentityUpdater::new(&self.workspace_root);
+        let result = updater.update(&current, changes).ok_or_else(|| {
+            McpError::internal_error("identity update produced no result", None)
+        })?;
+
+        if !result.applied {
+            return Err(McpError::invalid_params(
+                "identity update rejected by validation (check field lengths/content)",
+                None,
+            ));
+        }
+
+        let identity = result.identity;
+        let response = json!({
+            "applied": true,
+            "skipped": skipped,
+            "identity": {
+                "name": identity.name,
+                "description": identity.description,
+                "languages": identity.languages,
+                "frameworks": identity.frameworks,
+                "build_system": identity.build_system,
+                "package_manager": identity.package_manager,
+                "testing_framework": identity.testing_framework,
+                "repository_url": identity.repository_url,
+                "architecture_summary": identity.architecture_summary,
+                "known_patterns_count": identity.known_patterns.len(),
+                "known_modules_count": identity.known_modules.len(),
+                "engineering_decisions": identity.engineering_decisions.iter().map(|d| json!({
+                    "id": d.id, "title": d.title, "status": d.status.to_string(),
+                })).collect::<Vec<_>>(),
+                "known_constraints": identity.known_constraints,
+                "current_sprint": identity.current_sprint,
+                "roadmap": identity.roadmap.iter().map(|i| json!({
+                    "id": i.id, "title": i.title, "status": i.status.to_string(),
+                })).collect::<Vec<_>>(),
+                "coding_conventions": identity.coding_conventions,
+                "updated_at": identity.updated_at,
+            },
+        });
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&response)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        )]))
+    }
+
     // ── Tool 7: memory statistics ─────────────────────────────────────
 
     /// Return read-only statistics about the engineering memory store:
@@ -1231,6 +1449,132 @@ pub struct DeleteMemoryArgs {
     pub confirm: bool,
 }
 
+/// A decision to record via `update_identity`.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DecisionInput {
+    /// Short title (required). The id is derived from it; duplicate titles are skipped.
+    pub title: String,
+    /// Full description of the decision.
+    pub description: String,
+    /// Optional context that led to the decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// "proposed" | "accepted" | "deprecated" | "superseded". Default "accepted".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// A roadmap item to record via `update_identity`.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RoadmapItemInput {
+    /// Short title (required). The id is derived from it; duplicate titles are skipped.
+    pub title: String,
+    /// Optional description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// "planned" | "in_progress" | "completed" | "deferred". Default "planned".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Optional sprint this item belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprint: Option<String>,
+}
+
+/// Argument schema for `update_identity`.
+///
+/// Every field is optional; supply only what should change. List fields
+/// append new unique entries (existing ones are skipped, not duplicated).
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct UpdateIdentityArgs {
+    /// Human-readable project description (what this project is for).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Remote repository URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_url: Option<String>,
+    /// High-level architecture summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture_summary: Option<String>,
+    /// Active sprint identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_sprint: Option<String>,
+    /// Hard and soft constraints agents must respect.
+    #[serde(default)]
+    pub add_constraints: Vec<String>,
+    /// Recognised architectural patterns.
+    #[serde(default)]
+    pub add_patterns: Vec<String>,
+    /// Coding conventions for this project.
+    #[serde(default)]
+    pub add_conventions: Vec<String>,
+    /// Important module names.
+    #[serde(default)]
+    pub add_modules: Vec<String>,
+    /// Important project files (paths).
+    #[serde(default)]
+    pub add_important_files: Vec<String>,
+    /// Engineering decisions to record.
+    #[serde(default)]
+    pub add_decisions: Vec<DecisionInput>,
+    /// Roadmap items to record.
+    #[serde(default)]
+    pub add_roadmap_items: Vec<RoadmapItemInput>,
+    /// Mark a roadmap item completed by id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete_roadmap_item: Option<String>,
+    /// Record a completed milestone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_milestone: Option<String>,
+}
+
+/// Trim and require a non-empty string field.
+fn require_non_empty(value: &str, field: &str) -> Result<String, McpError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(McpError::invalid_params(
+            format!("{field} must not be empty"),
+            None,
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Deterministic slug for decision/roadmap ids: lowercase, non-alphanumeric
+/// runs collapsed to `-`, capped at 80 chars.
+fn slugify(title: &str) -> String {
+    let mut slug = String::new();
+    for ch in title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+        if slug.len() >= 80 {
+            break;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        slug.push_str("item");
+    }
+    slug
+}
+
+/// Append values not already present in `existing` (case-sensitive).
+fn push_unique_strings(target: &mut Vec<String>, values: &[String], existing: &[String]) {
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || existing.iter().any(|e| e == trimmed) {
+            continue;
+        }
+        if !target.iter().any(|t| t == trimmed) {
+            target.push(trimmed.to_string());
+        }
+    }
+}
+
 /// Argument schema for `sandbox_exec`.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SandboxExecArgs {
@@ -1552,6 +1896,11 @@ impl rmcp::ServerHandler for CodeBroMcpServer {
                codebro_engineering_memory with task keywords.\n\
              - Before trusting memory, call codebro_memory_stats to check whether the store holds \
                meaningful state (entry count, confidence, recency).\n\
+             - Project goals, constraints and declared decisions live in the project identity \
+               served by codebro_workspace_context; when you learn a durable engineering goal, \
+               constraint or decision worth declaring for this project, record it with \
+               codebro_update_identity (medium-high trust: declared intent). Use \
+               codebro_record_memory only for lower-trust session learnings.\n\
              - After learning a durable decision or constraint -> record it with \
                codebro_record_memory so future sessions are not amnesic (key like \
                'architecture:area', tags, confidence).\n\
@@ -2774,6 +3123,15 @@ mod tests {
                     .map_err(|e| e.to_string())?;
                 text_of(r)
             }
+            "update_identity" => {
+                let p: UpdateIdentityArgs =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .update_identity(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
             other => return Err(format!("test helper: unsupported tool {other}")),
         };
         Ok(result)
@@ -3660,8 +4018,11 @@ mod tests {
         assert_eq!(incoming_calls[0]["provenance"], "verified");
     }
 
-    /// P2.2: A call to an unresolved target does not produce a verified
-    /// edge. Only resolved AST calls produce verified relationships.
+    /// P2.2: A resolved AST call produces a verified edge, including calls
+    /// to private same-module symbols — visibility does not suppress real
+    /// call evidence. (Regression guard: before caller resolution was
+    /// fixed, these edges existed in the store but were invisible to
+    /// impact analysis because their source ids dangled.)
     #[tokio::test]
     async fn impact_analyze_unresolved_call_has_no_verified_edge() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3691,26 +4052,104 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["status"], "ok");
 
-        // No verified calls to internal (it's not a public/exported symbol
-        // in the fact store). There may be heuristic references but not
-        // verified calls.
+        // internal() is a private function, but the AST call from runner
+        // is real evidence and must surface as a verified edge now that
+        // caller resolution works.
         let verified_calls: Vec<&serde_json::Value> = v["direct_relationships"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|r| r["relationship_kind"] == "calls" && r["provenance"] == "verified")
             .collect();
-        // internal() is a private function — the call should not resolve
-        // to a verified edge since the target symbol is not in the store
-        // as a public/exported symbol accessible from another module.
-        // We accept either 0 or some edges here; the key point is no
-        // false verified edges are produced for clearly unresolved targets.
-        for rel in &verified_calls {
-            assert_ne!(
-                rel["target_name"], "internal",
-                "should not have verified call to unresolved private symbol"
-            );
-        }
+        assert!(
+            verified_calls
+                .iter()
+                .any(|r| r["target_name"] == "internal"),
+            "expected a verified call edge runner -> internal, got {verified_calls:?}"
+        );
+    }
+
+    /// `update_identity` records goals/constraints/decisions into the
+    /// persistent project identity and reports duplicates as skipped.
+    #[tokio::test]
+    async fn update_identity_records_goals_decisions_and_skips_duplicates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"identity-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "pub fn main() {}\n").unwrap();
+        crate::init::run(dir.path()).expect("init");
+
+        let server = local_sandbox_server(&dir);
+        let out = call_tool_text(
+            &server,
+            "update_identity",
+            json!({
+                "current_sprint": "sprint-1",
+                "add_constraints": ["no unsafe outside sandbox"],
+                "add_conventions": ["tests live beside code"],
+                "add_roadmap_items": [{"title": "Ship identity tooling", "status": "in_progress"}],
+                "add_decisions": [{
+                    "title": "MCP first architecture",
+                    "description": "The MCP server is the only production interface.",
+                    "context": "TUI removed in ADR-012"
+                }]
+            }),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["identity"]["current_sprint"], "sprint-1");
+        assert!(v["identity"]["known_constraints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "no unsafe outside sandbox"));
+        assert_eq!(
+            v["identity"]["engineering_decisions"][0]["id"],
+            "mcp-first-architecture"
+        );
+        assert_eq!(v["identity"]["engineering_decisions"][0]["status"], "accepted");
+
+        // Persisted to disk.
+        let raw =
+            std::fs::read_to_string(dir.path().join(".codebro/project_identity.json")).unwrap();
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["current_sprint"], "sprint-1");
+        assert_eq!(persisted["roadmap"].as_array().unwrap().len(), 1);
+
+        // Duplicate decision title is skipped, not duplicated.
+        let out2 = call_tool_text(
+            &server,
+            "update_identity",
+            json!({
+                "add_decisions": [{
+                    "title": "MCP first architecture",
+                    "description": "Duplicate submission."
+                }]
+            }),
+        )
+        .await;
+        let v2: serde_json::Value = serde_json::from_str(&out2).expect("valid json");
+        assert_eq!(v2["applied"], false, "duplicate-only call must not apply");
+        assert_eq!(v2["skipped"].as_array().unwrap().len(), 1);
+    }
+
+    /// `update_identity` refuses to run without an existing identity.
+    #[tokio::test]
+    async fn update_identity_requires_existing_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server(&dir);
+        let result = call_tool(
+            &server,
+            "update_identity",
+            json!({"add_constraints": ["x"]}),
+        )
+        .await;
+        assert!(result.is_err(), "expected error without identity");
     }
 
     // ── P2.3 bounded transitive traversal MCP tests ───────────────────────

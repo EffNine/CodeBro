@@ -59,6 +59,7 @@
 pub mod builder;
 pub mod diagnostics;
 pub mod identity;
+pub mod infer;
 pub mod loader;
 pub mod migration;
 pub mod runtime;
@@ -73,6 +74,7 @@ pub use identity::{
     DecisionStatus, EngineeringDecision, ProjectIdentity, RoadmapItem, RoadmapStatus,
     CURRENT_SCHEMA_VERSION,
 };
+pub use infer::infer_identity;
 pub use loader::{LoadError, LoadResult, ProjectIdentityLoader};
 pub use runtime::{ProjectIdentityProvider, ProjectIdentityRuntime, RuntimeError};
 pub use statistics::ProjectIdentityStatistics;

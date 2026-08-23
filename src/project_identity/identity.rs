@@ -383,6 +383,12 @@ impl ProjectIdentity {
         self
     }
 
+    pub fn with_repository_url(mut self, url: impl Into<String>) -> Self {
+        self.repository_url = Some(url.into());
+        self.updated_at = chrono::Utc::now().to_rfc3339();
+        self
+    }
+
     pub fn with_framework(mut self, framework: impl Into<String>) -> Self {
         self.frameworks.push(framework.into());
         self.frameworks.sort();

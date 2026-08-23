@@ -204,6 +204,32 @@ keys. Persists to `.codebro/engineering_memory.json`.
 **Use:** remove stale or wrong entries; completes the memory lifecycle
 (create/read/update/delete).
 
+### 4.6b `update_identity` *(new)*
+
+Updates the persistent project identity (`.codebro/project_identity.json`):
+description, repository URL, architecture summary, current sprint,
+constraints, coding conventions, patterns, important modules/files,
+engineering decisions, and roadmap items.
+
+- Every field is optional; list fields append **new unique entries only**
+  (existing values are skipped, never duplicated).
+- Decision and roadmap ids are derived from titles (slugified). Duplicate
+  titles are reported in a `skipped` array instead of erroring; an update
+  consisting solely of already-present items returns `applied: false`.
+- Agent-recorded decisions default to status `accepted`; explicit
+  `status` overrides (`proposed|accepted|deprecated|superseded`).
+- Requires an existing identity — `codebro init` creates one.
+- Delegates to `ProjectIdentityUpdater`, which validates before persisting
+  all eight projection files. Re-running `codebro init` fills only fields
+  nobody authored: curated goals/constraints/decisions survive re-init;
+  machine-generated summaries are refreshed, human prose is not.
+
+**Use:** record project goals and declared engineering intent — the
+medium-high-trust store served by `workspace_context`. This is distinct
+from agent-recorded memory (`record_memory`, low trust): identity changes
+should reflect deliberate declarations about the project, not session
+learnings.
+
 ### 4.7 `sandbox_exec` *(new)*
 
 Executes a command in an isolated sandbox. The command is policy-checked

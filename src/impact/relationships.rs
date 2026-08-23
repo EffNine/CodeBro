@@ -62,7 +62,12 @@ pub fn build_relationships(
     for call in calls {
         // Resolve the callee name to a SymbolId.
         if let Some(callee_sym_id) = resolve_callee(&name_to_sym, &call.callee_name, call) {
-            let caller_fact_id = caller_fact_id(symbols, &call);
+            // Skip edges whose caller cannot be resolved to a known symbol
+            // fact — dangling endpoints would break store validation and
+            // pollute the impact graph.
+            let Some(caller_fact_id) = caller_fact_id(symbols, &call) else {
+                continue;
+            };
             let callee_fact_id = FactId::Symbol(callee_sym_id.clone());
             let edge = (caller_fact_id.clone(), callee_fact_id);
             if verified_call_edges.insert(edge) {
@@ -195,15 +200,17 @@ fn resolve_callee(
     None
 }
 
-/// Get the FactId for the caller symbol from call metadata.
-fn caller_fact_id(symbols: &[SymbolFact], call: &ParseCall) -> FactId {
+/// Get the FactId for the caller symbol from call metadata. Returns `None`
+/// when the caller cannot be resolved to a known symbol fact; the edge is
+/// then skipped so the store never holds a dangling endpoint.
+fn caller_fact_id(symbols: &[SymbolFact], call: &ParseCall) -> Option<FactId> {
     // Try to find the symbol that contains this call by name + file match.
     if let Some(ref caller_name) = call.caller_symbol {
         for sym in symbols {
             if &sym.name == caller_name {
                 if let Some(ref loc_file) = sym.location.file {
                     if loc_file == &call.caller_file {
-                        return FactId::Symbol(sym.id.clone());
+                        return Some(FactId::Symbol(sym.id.clone()));
                     }
                 }
             }
@@ -213,16 +220,13 @@ fn caller_fact_id(symbols: &[SymbolFact], call: &ParseCall) -> FactId {
     for sym in symbols {
         if let Some(ref loc_file) = sym.location.file {
             if loc_file == &call.caller_file {
-                return FactId::Symbol(sym.id.clone());
+                return Some(FactId::Symbol(sym.id.clone()));
             }
         }
     }
-    // Last resort: synthetic caller id based on file + line.
-    FactId::Symbol(SymbolId::new(format!(
-        "sym::{file}::anon_call@{line}",
-        file = call.caller_file,
-        line = call.line_start,
-    )))
+    // Unresolvable caller (e.g. a file with no extracted symbols): drop the
+    // edge rather than emit a synthetic id that resolves to no fact.
+    None
 }
 
 // ── Import resolution ─────────────────────────────────────────────────
@@ -328,6 +332,11 @@ fn build_heuristic_references(
     // Build the set of module pairs with verified relationships.
     let module_connected = build_module_relationship_map(verified_calls, verified_imports);
 
+    // Reference ids are keyed by (source module, name, target module,
+    // name); several same-name symbol facts in one module would otherwise
+    // emit identical ids and trip duplicate-facts validation.
+    let mut seen_ref_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for sym in symbols {
         let sym_mod = match &sym.module {
             Some(m) => m,
@@ -367,6 +376,9 @@ fn build_heuristic_references(
                     cand_mod = cand_mod.as_str(),
                     cand_name = candidate.name,
                 );
+                if !seen_ref_ids.insert(ref_id.clone()) {
+                    continue;
+                }
                 let mut rf = ReferenceFact::new(ReferenceId::new(ref_id), sym_fact, cand_fact);
                 rf.metadata = crate::engineering_facts::metadata::FactMetadata::builder()
                     .attr("provenance", "heuristic")

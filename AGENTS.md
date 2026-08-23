@@ -38,7 +38,7 @@ Core subsystem directories (all under `src/`):
 
 | Directory | Role |
 |-----------|------|
-| `mcp/` | MCP server: 14 tools over stdio (the public interface) |
+| `mcp/` | MCP server: 16 tools over stdio (the public interface) |
 | `mcp/facts.rs` | Deterministic relevance-ranked fact retrieval engine |
 | `sandbox/` | Sandbox execution abstraction (trait + local + OpenSandbox backends + VerificationResult contracts) |
 | `init/` | Fact-store population pipeline (`codebro init`) |
@@ -78,7 +78,7 @@ Core subsystem directories (all under `src/`):
 
 ## MCP contract
 
-The server exposes exactly 14 tools over stdio (`rmcp` transport). MCP handlers are thin adapters — they do not duplicate business logic; they construct runtime instances and delegate.
+The server exposes exactly 16 tools over stdio (`rmcp` transport). MCP handlers are thin adapters — they do not duplicate business logic; they construct runtime instances and delegate.
 
 ### Tool inventory
 
@@ -90,6 +90,7 @@ The server exposes exactly 14 tools over stdio (`rmcp` transport). MCP handlers 
 | `memory_stats` | read | Read-only statistics about the engineering memory store: entry count, configured token budget, tag distribution, average confidence, oldest/newest timestamps. |
 | `record_memory` | write | Upsert a persistent engineering memory entry. Values are secret-redacted before storage. Updating an existing key updates the full logical entry (value AND confidence, importance, tags, source). Keys are capped at 256 chars; values at 64 KB; tags at 32 entries, 64 chars each. |
 | `delete_memory` | write | Delete an engineering memory entry by exact key. **Requires `confirm=true`** — omitting it is a no-op. Prevents accidental or speculative deletion. Deleting a missing key errors. |
+| `update_identity` | write | Update the persistent project identity (`.codebro/project_identity.json`): description, constraints, engineering decisions, roadmap items, sprint, conventions, patterns, architecture summary. This is the medium-high-trust "declared intent" store — distinct from agent-recorded memory. Requires an existing identity (`codebro init` creates one). List fields append new unique entries; duplicate decisions/roadmap titles are reported as skipped, not errors. Decision ids are derived from titles; agent-recorded decisions default to status `accepted`. |
 | `apply_change` | write *(optional)* | Guarded single-file mutation through the ChangeEngine. Enforces workspace boundary, refuses stale or ambiguous edits. For new files pass `old=""`. Agents should use their native editing tools for normal coding edits; this is available for controlled/autonomous workflows. |
 | `sandbox_exec` | write | Execute a command in an isolated sandbox. Returns structured evidence with provenance: `exit_code`, `stdout`, `stderr`, `duration_ms`, `success`, `timeout`, `denied`, `execution_id`, `timestamp`, `repo_identity`, `repo_state`, `sandbox_capabilities`, `reproducibility`, `resolved_command`. Only read-only build/test/lint commands are permitted. Secret-redacted output. |
 | `sandbox_test` | write | Run the project's tests with structured verification. Auto-detects project type (cargo → `cargo test`, go → `go test`, npm → `npm test`). Returns `execution` + `verification` (pass/fail + violations). Execution evidence includes provenance envelope. Optional `expected_exit_code` and `expected_success` contracts. |
@@ -98,6 +99,7 @@ The server exposes exactly 14 tools over stdio (`rmcp` transport). MCP handlers 
 | `impact_analyze` | read | Structural impact analysis: given a symbol, file, module, or package, returns directed relationship edges (callers, importers, references), related tests, owning module/package, and provenance metadata. Descriptive evidence only — no risk scores or prescriptions. |
 | `reindex` | write | Perform a full engineering fact reindex: regenerate `.codebro/facts.json` by re-scanning the entire workspace via the existing `codebro init` pipeline. Use after source changes when `apply_change.needs_reindex=true`. Returns `status`, `fact_counts`, `generation_repo_state`, `validation`, and `duration_ms`. This is a full rebuild, not incremental. |
 | `repository_health` | read | Return a structured read-only health report for the CodeBro workspace (exit code, status, per-check results, summary). Delegates to the existing `codebro doctor` implementation. Checks: workspace_root, .codebro, project_identity, facts, engineering_memory, git. |
+| `consult` | write | Ask an AI consultant (Conductor gateway) for opinions on architecture, debugging, code review, planning, research, or second opinions. Supports provider selection (`auto`/`conductor`), mode shaping, and automatic injection of CodeBro engineering context (facts, memory, git diff). |
 
 Full design: [`docs/design/MCP_SERVER.md`](docs/design/MCP_SERVER.md).
 

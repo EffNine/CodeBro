@@ -35,6 +35,8 @@ pub struct IdentityChanges {
     pub set_build_system: Option<String>,
     pub set_package_manager: Option<String>,
     pub set_testing_framework: Option<String>,
+    pub set_description: Option<String>,
+    pub set_repository_url: Option<String>,
 }
 
 impl IdentityChanges {
@@ -61,6 +63,8 @@ impl IdentityChanges {
             && self.set_build_system.is_none()
             && self.set_package_manager.is_none()
             && self.set_testing_framework.is_none()
+            && self.set_description.is_none()
+            && self.set_repository_url.is_none()
     }
 }
 
@@ -201,6 +205,14 @@ impl ProjectIdentityUpdater {
 
         if let Some(tf) = changes.set_testing_framework {
             identity = identity.with_testing_framework(tf);
+        }
+
+        if let Some(desc) = changes.set_description {
+            identity = identity.with_description(desc);
+        }
+
+        if let Some(url) = changes.set_repository_url {
+            identity = identity.with_repository_url(url);
         }
 
         // Validate before writing anything.

@@ -393,6 +393,17 @@ fn index_module(collection: &FactCollection) -> Vec<FactIdPair> {
             ));
         }
     }
+    // Module-endpoint relationships (e.g. AST-derived imports) carry no
+    // source location; scope them under both endpoint modules so they are
+    // queryable per-module and never orphaned in validation.
+    for r in collection.relationships() {
+        if matches!(r.source.kind(), FactKind::Module) {
+            out.push(pair(&r.source, &FactId::Relationship(r.id.clone())));
+        }
+        if matches!(r.target.kind(), FactKind::Module) {
+            out.push(pair(&r.target, &FactId::Relationship(r.id.clone())));
+        }
+    }
     for f in collection.references() {
         if let Some(m) = f.location.as_ref().and_then(|l| l.module.as_ref()) {
             out.push(pair(

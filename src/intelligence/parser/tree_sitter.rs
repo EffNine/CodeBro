@@ -201,12 +201,28 @@ impl CodeParser {
             _ => {}
         }
 
+        let enclosing = self.enclosing_callable(node, source, parent);
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
-                self.extract_symbols(child, source, file_path, result, parent)?;
+                self.extract_symbols(child, source, file_path, result, enclosing.as_deref())?;
             }
         }
         Ok(())
+    }
+
+    /// The nearest enclosing callable name for a node, used to attribute
+    /// extracted calls to their containing function. Function-like nodes
+    /// become the enclosing name for everything beneath them; every other
+    /// node inherits its parent's context.
+    fn enclosing_callable(&self, node: Node, source: &str, parent: Option<&str>) -> Option<String> {
+        match node.kind() {
+            "fn" | "function_item" | "function_definition" | "function_declaration"
+            | "method_declaration" | "method_definition" => {
+                let name = self.name_of(node, source, "identifier");
+                (name != "unknown").then_some(name)
+            }
+            _ => parent.map(|p| p.to_string()),
+        }
     }
 
     fn node_text(&self, node: Node, source: &str) -> String {
@@ -456,7 +472,7 @@ impl CodeParser {
                     doc_comment: None,
                 });
             }
-            "use" | "use_item" => {
+            "use" | "use_item" | "use_declaration" => {
                 let text = self.node_text(node, source);
                 result.imports.push(text);
                 // Also extract a structured import target for relationship
@@ -1030,7 +1046,10 @@ impl CodeParser {
         }
         let is_qualified = matches!(
             callee.kind(),
-            "field_expression" | "selector_expression" | "qualified_identifier"
+            "field_expression"
+                | "selector_expression"
+                | "qualified_identifier"
+                | "scoped_identifier"
         );
         result.calls.push(ParseCall {
             caller_file: file_name.to_string(),
@@ -1052,7 +1071,7 @@ impl CodeParser {
                 last.map(|n| self.extract_callee_name(n, source))
                     .unwrap_or_default()
             }
-            "qualified_identifier" => {
+            "qualified_identifier" | "scoped_identifier" => {
                 // Rust qualified path: take the last identifier segment.
                 let last = node.child(node.child_count().saturating_sub(1));
                 last.map(|n| self.extract_callee_name(n, source))
@@ -1070,21 +1089,35 @@ impl CodeParser {
         let use_path = node
             .children(&mut node.walk())
             .find(|c| c.kind() == "use_path" || c.kind() == "scoped_use_path");
-        let path_node = use_path?;
-        // Collect identifier children in order.
         let mut parts = Vec::new();
-        for child in path_node.children(&mut path_node.walk()) {
-            if child.kind() == "identifier" || child.kind() == "type_identifier" {
-                if let Some(text) = self.node_name(child, source) {
-                    parts.push(text);
+        if let Some(path_node) = use_path {
+            // Collect identifier children in order.
+            for child in path_node.children(&mut path_node.walk()) {
+                if child.kind() == "identifier" || child.kind() == "type_identifier" {
+                    if let Some(text) = self.node_name(child, source) {
+                        parts.push(text);
+                    }
                 }
             }
         }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join("."))
+        if !parts.is_empty() {
+            return Some(parts.join("."));
         }
+        // Fallback: current tree-sitter-rust wraps the path in a
+        // `scoped_identifier` instead of `use_path`; slice it out of the
+        // raw statement text ("use crate::util;" -> "crate.util").
+        // Complex patterns (globs, brace groups) are still rejected.
+        let text = self.node_text(node, source);
+        let trimmed = text
+            .trim()
+            .trim_start_matches("use ")
+            .trim_end()
+            .trim_end_matches(';')
+            .trim();
+        if trimmed.is_empty() || trimmed.contains('{') || trimmed.contains('*') {
+            return None;
+        }
+        Some(trimmed.replace("::", "."))
     }
 
     /// Parse a Go import declaration into a path + optional alias.
@@ -1135,3 +1168,4 @@ pub fn parse_source(language: &str, source: &str, file_path: &str) -> Result<Par
     let mut parser = CodeParser::new(language)?;
     parser.parse_source(source, file_path)
 }
+

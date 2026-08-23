@@ -56,6 +56,13 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     // Collect AST-derived calls and imports per file for relationship building.
     let mut all_calls: Vec<crate::intelligence::parser::ParseCall> = Vec::new();
     let mut all_imports: Vec<crate::intelligence::parser::ParseImport> = Vec::new();
+    let mut skipped_oversized: usize = 0;
+    // Machine-generated "source" files that embed datasets (common in ML
+    // repos: data.py with megabytes of array literals, bundled minified
+    // bundles, snapshot dumps with a .js/.py extension) explode parse
+    // memory and CPU for zero engineering value. Real hand-written source
+    // stays far below this bound.
+    const MAX_SOURCE_FILE_BYTES: u64 = 512 * 1024;
     for file in &files {
         let rel = file
             .strip_prefix(&root)
@@ -67,6 +74,16 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         ) else {
             continue;
         };
+
+        // Size gate before any read: one stat instead of loading the
+        // whole file into memory just to reject it.
+        match std::fs::metadata(file) {
+            Ok(meta) if meta.len() <= MAX_SOURCE_FILE_BYTES => {}
+            _ => {
+                skipped_oversized += 1;
+                continue;
+            }
+        }
 
         let source = match std::fs::read_to_string(file) {
             Ok(s) => s,
@@ -91,8 +108,22 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         collected_modules.push(mf);
 
         // Parse symbols with the existing tree-sitter parser.
-        let parsed = crate::intelligence::parser::tree_sitter::parse_file(language, file, &source)
-            .with_context(|| format!("parse {} ({language})", file.display()))?;
+        let mut parsed =
+            crate::intelligence::parser::tree_sitter::parse_file(language, file, &source)
+                .with_context(|| format!("parse {} ({language})", file.display()))?;
+
+        // The parser only knows the bare file name; rewrite call/import
+        // locations to the workspace-relative path so caller resolution and
+        // import resolution match symbol/module facts (which are keyed by
+        // the relative path).
+        for call in &mut parsed.calls {
+            call.caller_file = rel.clone();
+        }
+        for imp in &mut parsed.import_targets {
+            imp.file = rel.clone();
+        }
+        all_calls.extend(parsed.calls.iter().cloned());
+        all_imports.extend(parsed.import_targets.iter().cloned());
 
         for sym in parsed.symbols {
             let kind = map_symbol_kind(&sym.kind);
@@ -127,10 +158,6 @@ pub fn run(workspace_root: &Path) -> Result<()> {
             }
             builder.add_symbol(sf.clone());
             collected_symbols.push(sf);
-
-            // Collect AST calls and imports from this file.
-            all_calls.extend(parsed.calls.iter().cloned());
-            all_imports.extend(parsed.import_targets.iter().cloned());
 
             // Test detection (heuristic MVP): function/method names that
             // look like tests, or files whose path mentions "test".
@@ -242,6 +269,12 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         println!("  relationships: {rel_count}");
     }
 
+    // Derive a deterministic architecture summary and the top modules by
+    // symbol count from the collected data, before it is dropped.
+    let arch_summary =
+        architecture_summary(&collected_modules, &collected_symbols, packages.len());
+    let top_modules = top_modules_by_symbols(&collected_modules, &collected_symbols, 8);
+
     // Drop intermediate collected data early — the builder now owns
     // all the facts. Keeping these vectors alive during serialization
     // would duplicate the symbol/call/import data in RAM.
@@ -270,6 +303,18 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     // can never truncate an existing facts store.
     crate::persistence::write_atomic(&out, &bytes).context("persist facts.json")?;
 
+    // ── Refresh project identity ─────────────────────────────────────
+    // Fill only what no one has authored yet: re-running init never
+    // clobbers curated identity data (goals, constraints, decisions).
+    match refresh_identity(&root, &ws_name, &arch_summary, &top_modules) {
+        Ok(true) => println!("  identity:    refreshed"),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!("identity refresh skipped: {e}");
+            println!("  identity:    refresh failed ({e})");
+        }
+    }
+
     let counts = model.counts();
     println!("codebro init complete");
     println!("  workspace:   {ws_name}");
@@ -281,9 +326,219 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     println!("  dependencies: {}", counts.dependencies);
     println!("  relationships: {}", counts.relationships);
     println!("  references:    {}", counts.references);
+    if skipped_oversized > 0 {
+        println!(
+            "  skipped:     {skipped_oversized} oversized source files (>{} KiB)",
+            MAX_SOURCE_FILE_BYTES / 1024
+        );
+    }
     println!("  facts file:  {}", out.display());
 
     Ok(())
+}
+
+/// Deterministic one-line architecture summary from collected facts.
+///
+/// Example: "359 modules in 24 source areas; primary areas by symbol
+/// count: mcp (412), engineering_facts (388), intelligence (350)."
+fn architecture_summary(
+    modules: &[ModuleFact],
+    symbols: &[SymbolFact],
+    package_count: usize,
+) -> String {
+    // module id → workspace-relative path.
+    let path_of: std::collections::HashMap<&ModuleId, &str> = modules
+        .iter()
+        .filter_map(|m| m.path.as_deref().map(|p| (&m.id, p)))
+        .collect();
+
+    // Symbols per source area: the directory component after `src/` (or
+    // "(root)" for top-level files).
+    let mut area_symbols: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut area_modules: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for m in modules {
+        let area = source_area(m.path.as_deref().unwrap_or(""));
+        *area_modules.entry(area).or_default() += 1;
+    }
+    for s in symbols {
+        let area = s
+            .module
+            .as_ref()
+            .and_then(|mid| path_of.get(mid).copied())
+            .map(source_area)
+            .unwrap_or_else(|| "(root)".to_string());
+        *area_symbols.entry(area).or_default() += 1;
+    }
+
+    let mut ranked: Vec<(String, usize)> = area_symbols.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // Entry-point noise ("src/main.rs" alone) should not crowd out real
+    // source areas when there are any.
+    if ranked.len() > 1 {
+        ranked.retain(|(area, _)| area != "(root)");
+    }
+    let top: Vec<String> = ranked
+        .iter()
+        .take(3)
+        .map(|(area, n)| format!("{area} ({n})"))
+        .collect();
+
+    format!(
+        "{} modules across {} packages, organized into {} source areas; primary areas by symbol count: {}",
+        modules.len(),
+        package_count,
+        area_modules.len(),
+        if top.is_empty() {
+            "none".to_string()
+        } else {
+            top.join(", ")
+        }
+    )
+}
+
+/// Source area for a workspace-relative file path: the first directory
+/// component after an optional leading `src/`, else "(root)".
+fn source_area(path: &str) -> String {
+    let stripped = path.strip_prefix("src/").unwrap_or(path);
+    match stripped.split_once('/') {
+        Some((area, _)) => area.to_string(),
+        None => "(root)".to_string(),
+    }
+}
+
+/// Up to `limit` module paths ranked by contained symbol count
+/// (descending; ties broken by path for determinism).
+fn top_modules_by_symbols(
+    modules: &[ModuleFact],
+    symbols: &[SymbolFact],
+    limit: usize,
+) -> Vec<String> {
+    let mut counts: std::collections::HashMap<&ModuleId, usize> =
+        std::collections::HashMap::new();
+    for s in symbols {
+        if let Some(mid) = &s.module {
+            *counts.entry(mid).or_default() += 1;
+        }
+    }
+    let mut ranked: Vec<(&str, usize)> = modules
+        .iter()
+        .filter_map(|m| {
+            let path = m.path.as_deref()?;
+            let n = counts.get(&m.id).copied().unwrap_or(0);
+            Some((path, n))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    ranked.into_iter().take(limit).map(|(path, _)| path.to_string()).collect()
+}
+
+/// Refresh `.codebro/` project identity for the initialized workspace.
+///
+/// Deterministic surface inference fills only fields that are still empty,
+/// so human- or agent-authored goals/constraints/decisions survive re-init.
+/// Returns `Ok(true)` when changes were applied, `Ok(false)` when identity
+/// was already complete.
+fn refresh_identity(
+    root: &Path,
+    ws_name: &str,
+    arch_summary: &str,
+    top_modules: &[String],
+) -> Result<bool> {
+    use crate::project_identity::{IdentityChanges, ProjectIdentityUpdater};
+
+    let inferred = crate::project_identity::infer_identity(root);
+
+    let mut runtime = crate::project_identity::ProjectIdentityRuntime::new(root);
+    let current = match runtime.load() {
+        Ok(_) => runtime.snapshot(),
+        Err(_) => {
+            runtime.create_minimal(ws_name, primary_language(root))?;
+            runtime.snapshot()
+        }
+    };
+
+    let mut changes = IdentityChanges::new();
+    if current.description.is_none() {
+        changes.set_description = inferred.description;
+    }
+    if current.repository_url.is_none() {
+        changes.set_repository_url = inferred.repository_url;
+    }
+    if current.build_system.is_none() {
+        changes.set_build_system = inferred.build_system;
+    }
+    if current.package_manager.is_none() {
+        changes.set_package_manager = inferred.package_manager;
+    }
+    if current.testing_framework.is_none() {
+        changes.set_testing_framework = inferred.testing_framework;
+    }
+    for fw in inferred.frameworks {
+        if !current.frameworks.contains(&fw) {
+            changes.add_frameworks.push(fw);
+        }
+    }
+    for file in inferred.important_files {
+        if !current.important_files.contains(&file) {
+            changes.add_important_files.push(file);
+        }
+    }
+    if !arch_summary.is_empty() && machine_generated_summary(current.architecture_summary.as_deref())
+    {
+        changes.update_architecture_summary = Some(arch_summary.to_string());
+    }
+    for module in top_modules {
+        if !current.known_modules.contains(module) {
+            changes.add_modules.push(module.clone());
+        }
+    }
+
+    if changes.is_empty() {
+        return Ok(false);
+    }
+
+    let mut updater = ProjectIdentityUpdater::new(root);
+    match updater.update(&current, changes) {
+        Some(result) if result.applied => Ok(true),
+        Some(result) => Err(anyhow::anyhow!(
+            "identity update rejected by validation: {:?}",
+            result.diagnostics.validation_errors
+        )),
+        None => Ok(false),
+    }
+}
+
+/// True when the existing summary was itself generated by this pipeline
+/// (matches the deterministic template), so init may refresh it. Prose
+/// summaries authored by humans or agents are never overwritten.
+fn machine_generated_summary(existing: Option<&str>) -> bool {
+    match existing {
+        None => true,
+        Some(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return true;
+            }
+            trimmed.contains(" modules across ")
+                || trimmed.contains(" modules in ")
+                || trimmed.starts_with("organized into ")
+        }
+    }
+}
+
+/// Primary language of the workspace based on which manifest exists.
+fn primary_language(root: &Path) -> &'static str {
+    if root.join("Cargo.toml").is_file() {
+        "rust"
+    } else if root.join("go.mod").is_file() {
+        "go"
+    } else if root.join("tsconfig.json").is_file() || root.join("package.json").is_file() {
+        "typescript"
+    } else {
+        "unknown"
+    }
 }
 
 /// A single declared dependency (crate name + version constraint + kind).
@@ -782,6 +1037,271 @@ mod tests {
             "generation_repo_state must reflect pre-generation commit SHA"
         );
     }
+
+    /// Regression: call edges must resolve their caller to a real symbol
+    /// fact. The parser only knows the bare file name while symbol facts
+    /// carry the workspace-relative path; when init failed to normalize
+    /// this, every verified edge fell back to a synthetic `anon_call` id
+    /// that resolved to no fact, and store validation reported one
+    /// `broken_index` issue per relationship.
+    #[test]
+    fn call_edges_resolve_to_real_symbols_and_store_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"edge-probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "mod util;\nfn aaa() {}\npub fn main() { aaa(); util::helper(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/util.rs"),
+            "pub fn helper() -> i32 { 42 }\n",
+        )
+        .unwrap();
+
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+
+        // Every Calls edge must have both endpoints resolving to real
+        // symbol facts — no dangling synthetic ids.
+        let sym_ids: std::collections::HashSet<&str> =
+            model.symbols().iter().map(|s| s.id.as_str()).collect();
+        let mod_ids: std::collections::HashSet<&str> =
+            model.modules().iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            !model.relationships().is_empty(),
+            "expected AST-derived relationships"
+        );
+        for r in model.relationships() {
+            let endpoint_ok = |e: &crate::engineering_facts::FactId| match e {
+                crate::engineering_facts::FactId::Symbol(s) => sym_ids.contains(s.as_str()),
+                crate::engineering_facts::FactId::Module(m) => mod_ids.contains(m.as_str()),
+                _ => false,
+            };
+            let src = format!("{:?}", r.source);
+            let tgt = format!("{:?}", r.target);
+            assert!(
+                !src.contains("anon_call") && !tgt.contains("anon_call"),
+                "dangling anon_call endpoint in edge {}: {} -> {}",
+                r.id,
+                src,
+                tgt
+            );
+            assert!(endpoint_ok(&r.source), "unresolved source in {}", r.id);
+            assert!(endpoint_ok(&r.target), "unresolved target in {}", r.id);
+        }
+
+        // The caller of both calls must be attributed to their enclosing
+        // function (`main`), matched by name + workspace-relative path.
+        let main_id = model
+            .symbols()
+            .iter()
+            .find(|s| s.name == "main")
+            .map(|s| s.id.as_str().to_string())
+            .expect("main symbol fact");
+        let call_targets_from_main: Vec<String> = model
+            .relationships()
+            .iter()
+            .filter(|r| {
+                r.kind == crate::engineering_facts::RelationshipKind::Calls
+                    && matches!(&r.source, crate::engineering_facts::FactId::Symbol(s) if s.as_str() == main_id)
+            })
+            .map(|r| format!("{:?}", r.target))
+            .collect();
+        assert!(
+            call_targets_from_main.iter().any(|t| t.contains("aaa")),
+            "main -> aaa edge missing, got {call_targets_from_main:?}"
+        );
+        assert!(
+            call_targets_from_main.iter().any(|t| t.contains("helper")),
+            "main -> helper (qualified call) edge missing, got {call_targets_from_main:?}"
+        );
+
+        // The frozen store must validate with zero issues.
+        let report = crate::fact_store::store::FactStore::build(model.clone()).validate();
+        assert!(
+            report.passed(),
+            "store validation failed: {:?}",
+            report.issues.iter().take(5).collect::<Vec<_>>()
+        );
+        assert_eq!(report.issue_count(), 0);
+    }
+
+    /// Regression: import edges must resolve now that import locations use
+    /// the workspace-relative path (`find_module_for_file` compares against
+    /// module paths keyed by that same relative path).
+    #[test]
+    fn ast_import_edges_resolve_between_modules() {        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"import-probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "mod util;\nuse crate::util;\nfn main() { util::helper(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/util.rs"),
+            "pub fn helper() {}\n",
+        )
+        .unwrap();
+
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+
+        let imports: Vec<_> = model
+            .relationships()
+            .iter()
+            .filter(|r| r.kind == crate::engineering_facts::RelationshipKind::Imports)
+            .collect();
+        assert!(!imports.is_empty(), "expected AST-derived Imports edges");
+        let mod_ids: std::collections::HashSet<&str> =
+            model.modules().iter().map(|m| m.id.as_str()).collect();
+        for r in &imports {
+            let ok = |e: &crate::engineering_facts::FactId| match e {
+                crate::engineering_facts::FactId::Module(m) => mod_ids.contains(m.as_str()),
+                _ => false,
+            };
+            assert!(
+                ok(&r.source) && ok(&r.target),
+                "unresolved import edge {}",
+                r.id
+            );
+        }
+    }
+
+    /// init must populate the project identity from the deterministic
+    /// workspace surface: description, toolchain, frameworks, architecture
+    /// summary and important files.
+    #[test]
+    fn init_populates_project_identity_from_workspace_surface() {        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"goal-probe\"\ndescription = \"Probe whether init fills identity.\"\n\n[dependencies]\ntokio = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "pub fn main() {}\n").unwrap();
+
+        run(dir.path()).unwrap();
+        let raw =
+            std::fs::read_to_string(dir.path().join(".codebro/project_identity.json")).unwrap();
+        let identity: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(
+            identity["description"],
+            "Probe whether init fills identity.",
+            "manifest description flows into identity"
+        );
+        assert_eq!(identity["build_system"], "cargo");
+        assert_eq!(identity["testing_framework"], "cargo test");
+        assert!(identity["frameworks"].as_array().unwrap().iter().any(|f| f == "tokio"));
+        assert!(!identity["architecture_summary"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty());
+        assert!((identity["known_modules"].as_array().unwrap()).len() >= 1);
+        assert!(identity["important_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "Cargo.toml"));
+    }
+
+    /// Re-running init must never overwrite authored identity data
+    /// (goals, constraints, decisions) — inference only fills gaps.
+    #[test]
+    fn init_preserves_authored_identity_on_reinit() {
+        use crate::project_identity::{IdentityChanges, ProjectIdentityUpdater};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"merge-probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "pub fn main() {}\n").unwrap();
+
+        // First init: inference fills the gaps.
+        run(dir.path()).unwrap();
+
+        // Author goals on top of the inferred identity.
+        let mut runtime = crate::project_identity::ProjectIdentityRuntime::new(dir.path());
+        runtime.load().unwrap();
+        let current = runtime.snapshot();
+        let mut changes = IdentityChanges::new();
+        changes.set_description = Some("Human-authored purpose statement".to_string());
+        changes.add_constraints = vec!["never touch release tags".to_string()];
+        let mut updater = ProjectIdentityUpdater::new(dir.path());
+        let result = updater.update(&current, changes).expect("update applies");
+        assert!(result.applied);
+
+        // Re-init: authored values survive; nothing is clobbered.
+        run(dir.path()).unwrap();
+        let raw =
+            std::fs::read_to_string(dir.path().join(".codebro/project_identity.json")).unwrap();
+        let identity: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            identity["description"],
+            "Human-authored purpose statement",
+            "authored description must win over re-inference"
+        );
+        assert_eq!(identity["build_system"], "cargo", "inferred fields persist");
+        assert!(identity["known_constraints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "never touch release tags"));
+    }
+
+    /// Regression: machine-generated source files that embed datasets
+    /// (hundreds of MB of array literals with a .py/.js extension) must be
+    /// skipped, not read and parsed — parsing them exploded memory (~700 MB
+    /// RSS for a single 9 MB file) and CPU until the process appeared to
+    /// hang on dataset-heavy repos.
+    #[test]
+    fn init_skips_oversized_generated_source_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"bigdata-probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        // Small, legitimate source: parsed normally.
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn real_fn() -> u32 { 1 }\n").unwrap();
+        // Oversized generated "source": 600 KiB of embedded data.
+        let big = format!("pub const BLOB: &[u8] = &[\n{}\n];\n", "1,".repeat(300_000));
+        std::fs::write(dir.path().join("src/embedded_data.rs"), big).unwrap();
+
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+
+        let names: Vec<&str> = model.symbols().iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"real_fn"), "small file must still parse");
+        assert!(
+            !model.modules().iter().any(|m| m.path.as_deref() == Some("src/embedded_data.rs")),
+            "oversized file must not produce a module fact"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -837,3 +1357,5 @@ mod go_tests {
         assert!(names.contains(&"Allow"));
     }
 }
+
+
