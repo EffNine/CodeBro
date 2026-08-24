@@ -78,6 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Unused dev-dependency** `tokio-test`.
 
 ### Added
+- **Python and Node workspace indexing at `codebro init`** — the tree-sitter parsers were already there; discovery now meets them. `pyproject.toml` ([project] name/version, PEP 508 dependencies with extras/specifiers stripped, optional-dependencies as Optional kind), `setup.py`/`setup.cfg` (best-effort name/`install_requires`), and `requirements.txt` (comments/editables excluded) produce package + dependency facts; `package.json` produces Direct/Dev dependency facts with tsconfig.json promoting the language to typescript. The no-manifest fallback now reports a real language instead of "unknown", module names drop any supported extension (`.py`/`.ts`/`.go`, not just `.rs`), and venv/pycache/site-packages/.next directories are excluded from scans. 5 new tests.
 - **ARCHITECTURE.md** — live module map, dependency rule, trust model, CLI reference.
 
 ### Tests

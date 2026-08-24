@@ -96,8 +96,17 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         let owner_pkg_id: Option<PackageId> =
             package_for_path(&root, file, &packages).map(|p| p.id.clone());
 
-        // Module fact per file.
-        let module_name = rel.replace('/', "::").replace(".rs", "");
+        // Module fact per file. The module name drops any supported source
+        // extension (not just .rs — python/typescript files are first-class).
+        let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let stem = if ext.is_empty() {
+            rel.clone()
+        } else {
+            rel.strip_suffix(&format!(".{ext}"))
+                .unwrap_or(&rel)
+                .to_string()
+        };
+        let module_name = stem.replace('/', "::");
         let mid = ModuleId::new(format!("mod::{}", rel));
         let mut mf = ModuleFact::new(mid.clone(), module_name);
         mf.package = owner_pkg_id.clone();
@@ -596,8 +605,19 @@ fn primary_language(root: &Path) -> &'static str {
         "rust"
     } else if root.join("go.mod").is_file() {
         "go"
-    } else if root.join("tsconfig.json").is_file() || root.join("package.json").is_file() {
+    } else if root.join("tsconfig.json").is_file()
+        || root.join("package.json").is_file()
+            && root.join("tsconfig.json").is_file()
+    {
         "typescript"
+    } else if root.join("package.json").is_file() {
+        "javascript"
+    } else if root.join("pyproject.toml").is_file()
+        || root.join("setup.py").is_file()
+        || root.join("setup.cfg").is_file()
+        || root.join("requirements.txt").is_file()
+    {
+        "python"
     } else {
         "unknown"
     }
@@ -638,6 +658,21 @@ fn discover_packages(
             return (vec![pkg], targets);
         }
     }
+    let package_json = root.join("package.json");
+    if package_json.exists() {
+        if let Some((pkg, targets)) = parse_node_package(root, ws_id) {
+            return (vec![pkg], targets);
+        }
+    }
+    let python_manifest_found = root.join("pyproject.toml").is_file()
+        || root.join("setup.py").is_file()
+        || root.join("setup.cfg").is_file()
+        || root.join("requirements.txt").is_file();
+    if python_manifest_found {
+        if let Some((pkg, targets)) = parse_python_package(root, ws_id) {
+            return (vec![pkg], targets);
+        }
+    }
 
     // Fallback: a single unnamed root package.
     let name = root
@@ -645,12 +680,13 @@ fn discover_packages(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "root".to_string());
     let id = PackageId::new(format!("pkg::{name}"));
+    let fallback_language = primary_language(root).to_string();
     let mut fallback_target = BuildTargetFact::new(
         BuildTargetId::new(format!("build::bin::{name}")),
         name.clone(),
         BuildTargetKind::Binary,
     );
-    fallback_target.language = Some("unknown".to_string());
+    fallback_target.language = Some(fallback_language.clone());
     fallback_target.package = Some(id.clone());
 
     (
@@ -658,7 +694,7 @@ fn discover_packages(
             id,
             name,
             version: None,
-            language: "unknown".to_string(),
+            language: fallback_language,
             path: root.to_path_buf(),
             dependencies: Vec::new(),
         }],
@@ -900,6 +936,253 @@ fn parse_go_package(
     ))
 }
 
+/// Parse a Node `package.json` into a package plus a binary target and its
+/// dependencies. `dependencies` map to Direct, `devDependencies` to Dev.
+fn parse_node_package(
+    root: &Path,
+    _ws_id: &WorkspaceId,
+) -> Option<(DiscoveredPackage, Vec<BuildTargetFact>)> {
+    let text = std::fs::read_to_string(root.join("package.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let name = value.get("name")?.as_str()?.to_string();
+    let version = value
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let id = PackageId::new(format!("pkg::{name}"));
+    let language = primary_language(root).to_string();
+
+    let mut target = BuildTargetFact::new(
+        BuildTargetId::new(format!("build::bin::{name}")),
+        name.clone(),
+        BuildTargetKind::Binary,
+    );
+    target.package = Some(id.clone());
+    target.language = Some(language.clone());
+
+    // Dependencies: flat name → version-range maps.
+    let mut dependencies: Vec<DiscoveredDependency> = Vec::new();
+    for (section, kind) in [
+        ("dependencies", DependencyKind::Direct),
+        ("devDependencies", DependencyKind::Dev),
+    ] {
+        if let Some(map) = value.get(section).and_then(|m| m.as_object()) {
+            for dep in map.keys() {
+                dependencies.push(DiscoveredDependency {
+                    name: dep.clone(),
+                    version: None,
+                    kind,
+                });
+            }
+        }
+    }
+
+    Some((
+        DiscoveredPackage {
+            id,
+            name,
+            version,
+            language,
+            path: root.to_path_buf(),
+            dependencies,
+        },
+        vec![target],
+    ))
+}
+
+/// Parse Python project metadata into a package plus a binary target and its
+/// dependencies. Preference order: `pyproject.toml` ([project] table),
+/// `setup.py`/`setup.cfg` (name/version only), `requirements.txt`
+/// (requirement lines; extras and version specifiers are stripped).
+fn parse_python_package(
+    root: &Path,
+    _ws_id: &WorkspaceId,
+) -> Option<(DiscoveredPackage, Vec<BuildTargetFact>)> {
+    // 1) pyproject.toml — PEP 621 [project] table.
+    if let Ok(text) = std::fs::read_to_string(root.join("pyproject.toml")) {
+        if let Ok(value) = text.parse::<toml::Value>() {
+            if let Some(project) = value.get("project") {
+                if let Some(name) = project.get("name").and_then(|n| n.as_str()) {
+                    return Some(finish_python_package(
+                        root,
+                        name.to_string(),
+                        project
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        python_deps_from_iterable(
+                            project
+                                .get("dependencies")
+                                .and_then(|d| d.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|s| s.as_str())
+                                        .map(|s| s.to_string())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default(),
+                            DependencyKind::Direct,
+                        ),
+                        python_deps_from_iterable(
+                            project
+                                .get("optional-dependencies")
+                                .and_then(|d| d.as_table())
+                                .map(|m| {
+                                    m.values()
+                                        .filter_map(|a| a.as_array())
+                                        .flat_map(|a| a.iter().filter_map(|s| s.as_str()))
+                                        .map(|s| s.to_string())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default(),
+                            DependencyKind::Optional,
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // 2) setup.py / setup.cfg — name and (best-effort) install_requires.
+    let setup_py = root.join("setup.py");
+    let setup_cfg = root.join("setup.cfg");
+    if setup_py.exists() || setup_cfg.exists() {
+        let text = std::fs::read_to_string(&setup_py)
+            .or_else(|_| std::fs::read_to_string(&setup_cfg))
+            .ok()?;
+        let name = extract_setup_name(&text)?;
+        let deps = python_deps_from_iterable(
+            extract_install_requires(&text)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            DependencyKind::Direct,
+        );
+        return Some(finish_python_package(root, name, None, deps, Vec::new()));
+    }
+
+    // 3) requirements.txt — one requirement per line.
+    if let Ok(text) = std::fs::read_to_string(root.join("requirements.txt")) {
+        // A requirements file alone has no package name; use the directory.
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "root".to_string());
+        let deps: Vec<String> = text
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('-'))
+            .map(|l| l.to_string())
+            .collect();
+        return Some(finish_python_package(
+            root,
+            name,
+            None,
+            python_deps_from_iterable(deps, DependencyKind::Direct),
+            Vec::new(),
+        ));
+    }
+
+    None
+}
+
+/// Shared tail of Python discovery: build the package + binary target.
+fn finish_python_package(
+    root: &Path,
+    name: String,
+    version: Option<String>,
+    direct: Vec<DiscoveredDependency>,
+    optional: Vec<DiscoveredDependency>,
+) -> (DiscoveredPackage, Vec<BuildTargetFact>) {
+    let id = PackageId::new(format!("pkg::{name}"));
+    let mut target = BuildTargetFact::new(
+        BuildTargetId::new(format!("build::bin::{name}")),
+        name.clone(),
+        BuildTargetKind::Binary,
+    );
+    target.package = Some(id.clone());
+    target.language = Some("python".to_string());
+
+    let mut dependencies = direct;
+    dependencies.extend(optional);
+
+    (
+        DiscoveredPackage {
+            id,
+            name,
+            version,
+            language: "python".to_string(),
+            path: root.to_path_buf(),
+            dependencies,
+        },
+        vec![target],
+    )
+}
+
+/// Convert raw requirement strings ("requests>=2.0", "uvicorn[standard]")
+/// into discovered dependencies by stripping extras/specifiers.
+fn python_deps_from_iterable<I>(reqs: I, kind: DependencyKind) -> Vec<DiscoveredDependency>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    reqs.into_iter()
+        .map(|req| req.as_ref().trim().to_string())
+        .filter(|req| !req.is_empty() && !req.starts_with('#'))
+        .map(|req| DiscoveredDependency {
+            name: strip_requirement_specifier(&req),
+            version: None,
+            kind,
+        })
+        .collect()
+}
+
+/// "requests[async]>=2.31,<3" -> "requests"
+fn strip_requirement_specifier(req: &str) -> String {
+    let name: String = req
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+        .collect();
+    name
+}
+
+/// Best-effort `name="..."` extraction from setup.py/setup.cfg content.
+fn extract_setup_name(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        for prefix in ["name=", "name ="] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                let value = rest.trim().trim_matches('"').trim_matches('\'').trim();
+                if !value.is_empty() && value != "{" {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Best-effort `install_requires=[...]` list extraction from setup.py.
+fn extract_install_requires(text: &str) -> Vec<&str> {
+    let start = match text.find("install_requires") {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let open = match text[start..].find('[') {
+        Some(o) => start + o,
+        None => return Vec::new(),
+    };
+    let close = match text[open..].find(']') {
+        Some(c) => open + c,
+        None => return Vec::new(),
+    };
+    text[open + 1..close]
+        .split(',')
+        .map(|s| s.trim().trim_matches('"').trim_matches('\''))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Find the first package whose root path prefixes `file`.
 fn package_for_path<'a>(
     root: &Path,
@@ -927,6 +1210,8 @@ fn discover_source_files(root: &Path) -> Vec<PathBuf> {
             !matches!(
                 name.as_str(),
                 ".git" | ".codebro" | "target" | "node_modules" | "dist" | "build" | "vendor"
+                | ".venv" | "venv" | "__pycache__" | ".mypy_cache" | ".pytest_cache"
+                | "site-packages" | ".next" | "coverage"
             )
         })
     {
@@ -1642,3 +1927,145 @@ mod go_tests {
 }
 
 
+
+#[cfg(test)]
+mod python_node_tests {
+    use super::*;
+
+    #[test]
+    fn pyproject_extracts_name_version_and_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"mylib\"\nversion = \"0.2.0\"\ndependencies = [\n  \"requests>=2.31\",\n  \"uvicorn[standard]\",\n]\n\n[project.optional-dependencies]\ndev = [\"pytest>=8\"]\n",
+        )
+        .unwrap();
+        let (pkg, targets) = discover_packages(dir.path(), &WorkspaceId::new("ws::x"));
+        assert_eq!(pkg[0].name, "mylib");
+        assert_eq!(pkg[0].language, "python");
+        assert_eq!(pkg[0].version.as_deref(), Some("0.2.0"));
+        let names: Vec<(&str, DependencyKind)> = pkg[0]
+            .dependencies
+            .iter()
+            .map(|d| (d.name.as_str(), d.kind))
+            .collect();
+        assert!(names.contains(&("requests", DependencyKind::Direct)));
+        assert!(names.contains(&("uvicorn", DependencyKind::Direct)));
+        assert!(names.contains(&("pytest", DependencyKind::Optional)));
+        // Specifiers/extras must not leak into dependency names.
+        assert!(!pkg[0].dependencies.iter().any(|d| d.name.contains(">")));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].language.as_deref(), Some("python"));
+    }
+
+    #[test]
+    fn requirements_txt_falls_back_to_directory_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("svc")).unwrap();
+        std::fs::write(
+            dir.path().join("svc/requirements.txt"),
+            "# comment\nflask==3.0.0\ngunicorn\n-e editable-not-a-dep\n",
+        )
+        .unwrap();
+        let (pkg, _) = discover_packages(dir.path().join("svc").as_path(), &WorkspaceId::new("ws::x"));
+        assert_eq!(pkg[0].name, "svc");
+        assert_eq!(pkg[0].language, "python");
+        let names: Vec<&str> = pkg[0].dependencies.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"flask"));
+        assert!(names.contains(&"gunicorn"));
+        assert!(!names.iter().any(|n| n.starts_with('-')));
+    }
+
+    #[test]
+    fn package_json_separates_direct_and_dev_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "@scope/web", "version": "1.4.2", "dependencies": {"express": "^4.19.0"}, "devDependencies": {"typescript": "~5.4"}}"#,
+        )
+        .unwrap();
+        let (pkg, targets) = discover_packages(dir.path(), &WorkspaceId::new("ws::x"));
+        assert_eq!(pkg[0].name, "@scope/web");
+        assert_eq!(pkg[0].language, "javascript");
+        let kinds: Vec<(&str, DependencyKind)> = pkg[0]
+            .dependencies
+            .iter()
+            .map(|d| (d.name.as_str(), d.kind))
+            .collect();
+        assert!(kinds.contains(&("express", DependencyKind::Direct)));
+        assert!(kinds.contains(&("typescript", DependencyKind::Dev)));
+        assert_eq!(targets[0].language.as_deref(), Some("javascript"));
+
+        // tsconfig.json promotes the workspace to typescript.
+        std::fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        let (pkg2, targets2) = discover_packages(dir.path(), &WorkspaceId::new("ws::x"));
+        assert_eq!(pkg2[0].language, "typescript");
+        assert_eq!(targets2[0].language.as_deref(), Some("typescript"));
+    }
+
+    #[test]
+    fn python_workspace_end_to_end_produces_symbols_and_clean_module_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"widget\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src/widget")).unwrap();
+        std::fs::write(
+            dir.path().join("src/widget/engine.py"),
+            "import os\n\nclass Engine:\n    def start(self):\n        return os.environ.get(\"X\")\n\ndef ignite(engine):\n    return engine.start()\n",
+        )
+        .unwrap();
+        let r = run(dir.path());
+        assert!(r.is_ok(), "run failed: {r:?}");
+        let facts_path = dir.path().join(".codebro/facts.json");
+        let model: FactsModel =
+            serde_json::from_str(&std::fs::read_to_string(facts_path).unwrap()).unwrap();
+
+        // Symbols: class + method + function.
+        let names: Vec<&str> = model.symbols().iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Engine"), "symbols: {names:?}");
+        assert!(names.contains(&"start"), "symbols: {names:?}");
+        assert!(names.contains(&"ignite"), "symbols: {names:?}");
+
+        // Module name carries no ".py" extension.
+        assert!(
+            model.modules().iter().any(|m| m.name == "src::widget::engine"),
+            "modules: {:?}",
+            model.modules().iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+
+        // Dependency fact from pyproject (none declared here) and package language.
+        assert_eq!(model.dependencies().len(), 0);
+        let pkgs = model.packages();
+        assert!(
+            pkgs.iter().all(|p| p.language.as_deref() == Some("python")),
+            "packages: {:?}",
+            pkgs.iter().map(|p| &p.language).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn node_workspace_roundtrip_produces_valid_store() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "webapp", "dependencies": {"left-pad": "1.3.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("index.ts"),
+            "export function boot(): string {\n  return \"ok\";\n}\n",
+        )
+        .unwrap();
+        let r = run(dir.path());
+        assert!(r.is_ok(), "run failed: {r:?}");
+        let facts_path = dir.path().join(".codebro/facts.json");
+        let model: FactsModel =
+            serde_json::from_str(&std::fs::read_to_string(facts_path).unwrap()).unwrap();
+        assert_eq!(model.dependencies().len(), 1);
+        let names: Vec<&str> = model.symbols().iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"boot"), "symbols: {names:?}");
+    }
+}
