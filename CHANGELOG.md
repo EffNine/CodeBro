@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.0] - 2026-08-24
+
+> **The engineering intelligence runtime layer for AI coding agents.**
+> Full release notes: [`docs/RELEASE_v1.0.0.md`](docs/RELEASE_v1.0.0.md).
+
+### Added
+- **Workspace architecture** — ten domain crates (`core`, `parsers`, `fact-store`, `identity-runtime`, `memory-runtime`, `sandbox-runtime`, `impact-engine`, `indexer`, `change-engine`, `mcp-server`) with dependency direction enforced by `scripts/check_workspace_deps.sh`.
+- **Repository intelligence graph** — `Language`/`Framework`/`EntryPoint` fact kinds; multi-manifest package discovery (Cargo, Go, npm/pnpm/yarn lockfiles, pyproject/setup); evidence-based framework detection; HTTP routes as first-class symbols; documentation-reference and configuration edges.
+- **Incremental indexing** — content-addressed tree-sitter parse cache (unchanged files never re-parse; byte-identical output cold vs warm) plus `codebro facts diff` with impact projection.
+- **Engineering memory V2** — lifecycle statuses, TTL/expiry with automatic sweep, structured provenance, audited confidence adjustments, key-replacement conflict lineage and near-duplicate detection. Schema 1.1.0 loads 1.0.0 stores.
+- **Impact analysis V2** — per-edge confidence (provenance quality × depth decay) and reason on every relationship.
+- **Transactional changes** — `apply_changes` MCP tool: validate-all → preview → cross-set staleness pass → sequential apply with automatic rollback.
+- **Evidence envelope completed** — executions now carry environment capture alongside git revision/state, exit code, duration, redacted output, reproducibility classification.
+
+### Changed
+- **17-tool frozen MCP contract** ([`docs/MCP_API_V1.md`](docs/MCP_API_V1.md)) — adds `apply_changes`; additive-only evolution from here.
+- **Legacy retirement** — ~110k lines of retired TUI-agent / Adaptive-Platform code deleted (`docs/LEGACY_RETIREMENT.md`).
+- **Security** — `h2` bumped past RUSTSEC-2026-0258; RUSTSEC-2025-0009 (`ring`) accepted with rationale in `.cargo/audit.toml`.
+
+### Performance
+- Large synthetic repo (~92k functions): cold init 2.2 s, warm (parse cache) 1.2 s; medium repo 101 ms → 44 ms warm. Benchmarks: `scripts/bench.sh`, `docs/benchmark/results.md`.
+
 ## [0.7.0-mcp-rc2] - 2026-08-17
 
 > **Status:** Release candidate for real-world agent dogfooding and stabilization.
@@ -152,9 +174,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Send + Sync, serde (JSON/TOML) round-trips, full determinism
   - 27 new tests; full suite 2063 passed / 0 failed
 
-## [1.0.0] - 2026-08-06
+## [TUI-era 1.0.0] - 2026-08-06
 
-> **Note:** This section documents the TUI-era release (pre-MCP). The current release is v0.7.0-mcp-rc2 on the MCP-first `main` branch.
+> **Note:** This section documents the retired TUI-era product (pre-MCP).
+> The version number was later reused by the MCP-first runtime: see
+> [1.0.0 - 2026-08-24](#100---2026-08-24) above and
+> `docs/LEGACY_RETIREMENT.md`.
 
 
 ### Added

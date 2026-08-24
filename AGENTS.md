@@ -298,8 +298,8 @@ AGENTS.md is an operational guide, not a duplicate of ADRs or design docs. When 
 
 ## Release discipline
 
-- **Current version:** `v0.7.0-mcp-rc2` (see `Cargo.toml` and tag `v0.7.0-mcp-rc2`).
-- **Release commit:** TBD — this will be the v0.7.0-mcp-rc2 release commit. `origin/main` may contain post-RC2 commits.
+- **Current version:** `v1.0.0` (workspace version in root `Cargo.toml`; tag `v1.0.0`).
+- **Release commit:** `709f40e`. The v1.0.0 tag is immutable — future changes use new commits and new tags.
 - The RC2 tag must not be modified or moved.
 - Future changes after RC2 use new commits and new tags.
 - Release build: `cargo build --release` produces `target/release/codebro`.
