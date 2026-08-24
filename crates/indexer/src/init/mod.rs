@@ -27,6 +27,7 @@ use crate::engineering_facts::{
 };
 
 /// Run the population pipeline for a workspace root and persist the model.
+pub mod cache;
 pub mod repo_intel;
 
 pub fn run(workspace_root: &Path) -> Result<()> {
@@ -52,6 +53,13 @@ pub fn run(workspace_root: &Path) -> Result<()> {
 
     // ── Source files ─────────────────────────────────────────────────
     let files = discover_source_files(&root);
+
+    // Incremental indexing is content-addressed: unchanged files reuse the
+    // parse cache keyed by their content digest, so no previous-digest state
+    // is needed here.
+    let mut current_digests: std::collections::BTreeMap<String, String> = Default::default();
+    let parse_cache_dir = root.join(".codebro/cache/parse");
+    let (mut cache_hits, mut cache_misses) = (0usize, 0usize);
 
     // ── Modules & symbols ────────────────────────────────────────────
     let mut collected_modules: Vec<ModuleFact> = Vec::new();
@@ -99,6 +107,31 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         stat_entry.0 += 1;
         stat_entry.1 += source.lines().count() as u64;
 
+        let content_digest = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(source.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+        current_digests.insert(rel.clone(), content_digest.clone());
+
+        // Content-addressed parse cache: skip tree-sitting when an entry for
+        // exactly this content already exists.
+        let mut parsed = match cache::load(&parse_cache_dir, &content_digest, language) {
+            Some(cached) => {
+                cache_hits += 1;
+                cached
+            }
+            None => {
+                cache_misses += 1;
+                let fresh =
+                    crate::intelligence::parser::tree_sitter::parse_file(language, file, &source)
+                        .with_context(|| format!("parse {} ({language})", file.display()))?;
+                cache::store(&parse_cache_dir, &content_digest, language, &fresh);
+                fresh
+            }
+        };
+
         // Owning package: first package that path-prefixes this file.
         let owner_pkg_id: Option<PackageId> =
             package_for_path(&root, file, &packages).map(|p| p.id.clone());
@@ -125,10 +158,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         builder.add_module(mf.clone());
         collected_modules.push(mf);
 
-        // Parse symbols with the existing tree-sitter parser.
-        let mut parsed =
-            crate::intelligence::parser::tree_sitter::parse_file(language, file, &source)
-                .with_context(|| format!("parse {} ({language})", file.display()))?;
+        // `parsed` comes from the parse cache or a fresh parse (above).
 
         // The parser only knows the bare file name; rewrite call/import
         // locations to the workspace-relative path so caller resolution and
@@ -349,6 +379,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     } else {
         model
     };
+    let model = model.with_file_digests(current_digests);
 
     // ── Persist ──────────────────────────────────────────────────────
     let codebro_dir = root.join(".codebro");
@@ -386,6 +417,9 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     println!("  languages:     {}", counts.languages);
     println!("  frameworks:    {}", counts.frameworks);
     println!("  entry points:  {}", counts.entry_points);
+    println!(
+        "  parse cache:   {cache_hits} reused, {cache_misses} parsed"
+    );
     if skipped_oversized > 0 {
         println!(
             "  skipped:     {skipped_oversized} oversized source files (>{} KiB)",
@@ -1341,6 +1375,172 @@ fn map_visibility(vis: Option<&str>) -> Visibility {
     }
 }
 
+/// Load the persisted facts model for a workspace, if present and valid.
+pub fn load_facts_model(root: &Path) -> Option<FactsModel> {
+    let path = root.join(".codebro/facts.json");
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
+/// The deterministic result of comparing repository state against the last
+/// indexed state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactsDiffReport {
+    pub added: Vec<String>,
+    pub modified: Vec<String>,
+    pub deleted: Vec<String>,
+    /// Modules whose source files changed.
+    pub modules_affected: usize,
+    /// Symbols defined inside affected files.
+    pub symbols_affected: usize,
+    /// Tests located inside affected files.
+    pub tests_related: usize,
+    /// True when the stored model predates per-file digests.
+    pub digests_missing: bool,
+}
+
+impl std::fmt::Display for FactsDiffReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "changed files: {} added, {} modified, {} deleted",
+            self.added.len(), self.modified.len(), self.deleted.len())?;
+        for rel in &self.added {
+            writeln!(f, "   + {rel}")?;
+        }
+        for rel in &self.modified {
+            writeln!(f, "   ~ {rel}")?;
+        }
+        for rel in &self.deleted {
+            writeln!(f, "   - {rel}")?;
+        }
+        if !self.added.is_empty() || !self.modified.is_empty() || !self.deleted.is_empty() {
+            writeln!(f, "impact:")?;
+            writeln!(f, "  - {} module(s) affected", self.modules_affected)?;
+            writeln!(f, "  - {} symbol(s) defined in affected files", self.symbols_affected)?;
+            writeln!(f, "  - {} test(s) located in affected files", self.tests_related)?;
+        } else {
+            writeln!(f, "  no changes since last index")?;
+        }
+        Ok(())
+    }
+}
+
+/// Compare the current repository state against the last indexed state and
+/// project the engineering impact. Deterministic: classification is by
+/// content digest; impact numbers derive from the frozen fact store.
+pub fn compute_facts_diff(root: &Path) -> Result<FactsDiffReport> {
+    let root = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf());
+    let model = load_facts_model(&root)
+        .ok_or_else(|| anyhow::anyhow!("no facts store found; run `codebro init` first"))?;
+    let previous: std::collections::BTreeMap<String, String> = model
+        .file_digests()
+        .cloned()
+        .unwrap_or_default();
+
+    // Current per-file digests over the same discovery rules init uses.
+    let mut current: std::collections::BTreeMap<String, String> = Default::default();
+    for file in discover_source_files(&root) {
+        let Ok(source) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let rel = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .to_string();
+        current.insert(rel, sha256_hex(source.as_bytes()));
+    }
+
+    let mut added: Vec<&String> = Vec::new();
+    let mut modified: Vec<&String> = Vec::new();
+    let mut deleted: Vec<&String> = Vec::new();
+    for (rel, digest) in &current {
+        match previous.get(rel) {
+            None => added.push(rel),
+            Some(prev) if prev != digest => modified.push(rel),
+            _ => {}
+        }
+    }
+    for rel in previous.keys() {
+        if !current.contains_key(rel) {
+            deleted.push(rel);
+        }
+    }
+    let digests_missing = previous.is_empty();
+
+    // Impact projection over affected files (modified ∪ deleted ∪ added).
+    let mut affected: Vec<String> = Vec::new();
+    affected.extend(added.iter().map(|s| (*s).clone()));
+    affected.extend(modified.iter().map(|s| (*s).clone()));
+    affected.extend(deleted.iter().map(|s| (*s).clone()));
+    affected.sort();
+    affected.dedup();
+
+    let modules_affected = model
+        .modules()
+        .iter()
+        .filter(|m| {
+            m.path
+                .as_deref()
+                .is_some_and(|p| affected.iter().any(|a| a == p))
+        })
+        .count();
+    let symbols_affected = model
+        .symbols()
+        .iter()
+        .filter(|s| {
+            s.location
+                .file
+                .as_deref()
+                .is_some_and(|f| affected.iter().any(|a| a == f))
+        })
+        .count();
+    let tests_related = model
+        .tests()
+        .iter()
+        .filter(|t| {
+            t.location
+                .as_ref()
+                .and_then(|l| l.file.as_deref())
+                .is_some_and(|f| affected.iter().any(|a| a == f))
+        })
+        .count();
+
+    Ok(FactsDiffReport {
+        added: added.into_iter().cloned().collect(),
+        modified: modified.into_iter().cloned().collect(),
+        deleted: deleted.into_iter().cloned().collect(),
+        modules_affected,
+        symbols_affected,
+        tests_related,
+        digests_missing,
+    })
+}
+
+/// `codebro facts diff` entry point: compute and print the report.
+pub fn facts_diff(root: &Path) -> Result<()> {
+    let root = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf());
+    let report = compute_facts_diff(&root)?;
+    println!("facts diff — {}", root.display());
+    if report.digests_missing {
+        println!(
+            "  note: stored facts carry no per-file digests; run `codebro init` to enable precise diffs"
+        );
+    }
+    print!("{report}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1426,6 +1626,8 @@ mod tests {
         .unwrap();
 
         // Initialize a git repo so RepoState::capture succeeds.
+        // Mirror the repo convention: .codebro runtime state is ignored.
+        std::fs::write(dir.path().join(".gitignore"), ".codebro/\n").unwrap();
         std::process::Command::new("git")
             .current_dir(dir.path())
             .args(["init"])
@@ -1944,6 +2146,89 @@ mod tests {
             "untyped receivers must not invent edges, got {invented:?} in {extra_calls:?}"
         );
     }
+
+    // ── Phase 4: incremental fact index + facts diff ───────────────────
+
+    #[test]
+    fn parse_cache_reuses_unchanged_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"cache-probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn warm() {}\n").unwrap();
+
+        run(dir.path()).unwrap();
+        let cache_dir = dir.path().join(".codebro/cache/parse");
+        let entries_before: Vec<_> =
+            std::fs::read_dir(&cache_dir).unwrap().flatten().collect();
+        assert!(!entries_before.is_empty(), "cache entries must be written");
+
+        run(dir.path()).unwrap();
+        let entries_after: Vec<_> =
+            std::fs::read_dir(&cache_dir).unwrap().flatten().collect();
+        assert_eq!(
+            entries_before.len(),
+            entries_after.len(),
+            "second run must reuse the cache, not grow it"
+        );
+    }
+
+    #[test]
+    fn facts_json_carries_file_digests_and_stays_backwards_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn d() {}\n").unwrap();
+        run(dir.path()).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap();
+        let model: FactsModel = serde_json::from_str(&raw).unwrap();
+        let digests = model.file_digests().expect("digests present");
+        assert!(digests.contains_key("src/lib.rs"));
+
+        // A pre-Phase-4 store without digests must still load.
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let mut legacy = value.clone();
+        legacy["file_digests"] = serde_json::Value::Null;
+        let stripped = serde_json::to_string(&legacy).unwrap();
+        let old_model: FactsModel = serde_json::from_str(&stripped).unwrap();
+        assert!(old_model.file_digests().is_none());
+    }
+
+    #[test]
+    fn compute_facts_diff_reports_modification_and_impact() {
+        use crate::init::FactsDiffReport;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"diff-probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn alpha() {}\n#[test]\nfn test_alpha() {}\n",
+        )
+        .unwrap();
+        run(dir.path()).unwrap();
+
+        // Baseline: no changes.
+        let base: FactsDiffReport = compute_facts_diff(dir.path()).unwrap();
+        assert!(base.added.is_empty() && base.modified.is_empty() && base.deleted.is_empty());
+
+        // Modify lib.rs, add extra.rs.
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn alpha_changed() {}\n").unwrap();
+        std::fs::write(dir.path().join("src/extra.rs"), "pub fn beta() {}\n").unwrap();
+        let report: FactsDiffReport = compute_facts_diff(dir.path()).unwrap();
+        assert_eq!(report.modified, vec!["src/lib.rs".to_string()]);
+        assert_eq!(report.added, vec!["src/extra.rs".to_string()]);
+        assert!(report.deleted.is_empty());
+        // extra.rs was never indexed, so only lib.rs's stored module counts.
+        assert_eq!(report.modules_affected, 1);
+        assert!(report.symbols_affected >= 1);
+        assert_eq!(report.tests_related, 1);
+    }
 }
 
 #[cfg(test)]
@@ -2287,4 +2572,3 @@ mod python_node_tests {
         assert!(patterns.contains(&"multi-language".to_string()), "{patterns:?}");
     }
 }
-

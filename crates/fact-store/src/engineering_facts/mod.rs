@@ -166,6 +166,11 @@ pub struct FactsModel {
     /// freshness comparison against the current repository state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     generation_repo_state: Option<RepoState>,
+    /// Per-source-file content digests (sha256) at generation time, keyed by
+    /// workspace-relative path. Backwards compatible: absent in models
+    /// written before incremental indexing (Phase 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_digests: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl Default for FactsModel {
@@ -193,6 +198,7 @@ impl FactsModel {
             frameworks: Vec::new(),
             entry_points: Vec::new(),
             generation_repo_state: None,
+            file_digests: None,
         }
     }
 
@@ -458,6 +464,20 @@ impl FactsModel {
         self.generation_repo_state = Some(state);
         self
     }
+
+    /// Per-source-file content digests captured during generation.
+    pub fn file_digests(&self) -> Option<&std::collections::BTreeMap<String, String>> {
+        self.file_digests.as_ref()
+    }
+
+    /// Attach per-source-file content digests.
+    pub fn with_file_digests(
+        mut self,
+        digests: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.file_digests = Some(digests);
+        self
+    }
 }
 
 /// A mutable, absorbing builder that freezes into an immutable `FactsModel`.
@@ -590,6 +610,7 @@ impl FactsBuilder {
             frameworks: self.frameworks,
             entry_points: self.entry_points,
             generation_repo_state: self.generation_repo_state,
+            file_digests: None,
         };
         sort_by_id(&mut model.workspaces);
         sort_by_id(&mut model.modules);

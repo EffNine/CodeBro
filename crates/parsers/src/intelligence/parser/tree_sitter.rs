@@ -6,7 +6,7 @@ use tree_sitter::{Language, Node, Parser, Point};
 
 use crate::intelligence::parser::languages;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SymbolKind {
     Function,
     Class,
@@ -53,7 +53,7 @@ impl std::fmt::Display for SymbolKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParsedSymbol {
     pub name: String,
     pub kind: SymbolKind,
@@ -69,7 +69,7 @@ pub struct ParsedSymbol {
     pub doc_comment: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParseResult {
     pub symbols: Vec<ParsedSymbol>,
     pub imports: Vec<String>,
@@ -82,7 +82,7 @@ pub struct ParseResult {
 }
 
 /// A call expression found in the AST.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParseCall {
     /// The module-relative file path of the caller.
     pub caller_file: String,
@@ -100,7 +100,7 @@ pub struct ParseCall {
 }
 
 /// A structured import target extracted from an import/use statement.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParseImport {
     /// The module-relative file path.
     pub file: String,

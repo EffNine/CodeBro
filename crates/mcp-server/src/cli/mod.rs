@@ -47,6 +47,12 @@ enum Commands {
         command: AuthCommands,
     },
 
+    /// Inspect the engineering fact store.
+    Facts {
+        #[command(subcommand)]
+        command: FactsCommands,
+    },
+
     /// Ask an AI consultant for opinions on architecture, debugging, code review, etc.
     Consult {
         /// Provider to consult: auto or conductor.
@@ -73,6 +79,17 @@ enum Commands {
 enum AuthCommands {
     /// Show authentication status for all consultant providers.
     Status,
+}
+
+#[derive(Subcommand)]
+enum FactsCommands {
+    /// Diff the current repository state against the last indexed state and
+    /// project the engineering impact (modules, symbols, tests).
+    Diff {
+        /// Workspace root; defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
 }
 
 const FALLBACK_MODEL: &str = "gpt-4o";
@@ -133,6 +150,12 @@ pub async fn run() -> Result<()> {
             };
             crate::init::run(&workspace_root)?;
         }
+        Some(Commands::Facts { command }) => match command {
+            FactsCommands::Diff { root } => {
+                let root = root.unwrap_or_else(|| std::env::current_dir().unwrap());
+                crate::init::facts_diff(&root)?;
+            }
+        },
         Some(Commands::Doctor { root }) => {
             let workspace_root = match root {
                 Some(p) => p,
