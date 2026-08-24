@@ -52,13 +52,13 @@ fn recording_memory_preserves_fact_store_bytes() {
     std::fs::write(&facts_path, before).unwrap();
 
     // Record memory through the canonical runtime seam.
-    let mut identity = codebro_identity_runtime::project_identity::ProjectIdentityRuntime::new(dir.path());
+    let mut identity =
+        codebro_identity_runtime::project_identity::ProjectIdentityRuntime::new(dir.path());
     let _ = identity.load();
-    let mut memory =
-        codebro_memory_runtime::engineering_memory::EngineeringMemoryRuntime::new(
-            dir.path(),
-            identity,
-        );
+    let mut memory = codebro_memory_runtime::engineering_memory::EngineeringMemoryRuntime::new(
+        dir.path(),
+        identity,
+    );
     let entry = codebro_memory_runtime::engineering_memory::types::EngineeringMemoryEntry::new(
         "mem::sep-test",
         "separation:test",

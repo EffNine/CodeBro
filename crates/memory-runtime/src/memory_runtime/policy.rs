@@ -21,8 +21,7 @@ impl Default for RetentionPolicy {
 }
 
 /// Memory eviction policy.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[allow(clippy::upper_case_acronyms)] // canonical eviction-policy names
 pub enum EvictionPolicy {
     /// Evict least recently used
@@ -38,10 +37,8 @@ pub enum EvictionPolicy {
     FIFO,
 }
 
-
 /// Memory expiration policy.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum ExpirationPolicy {
     /// No expiration
     #[default]
@@ -54,10 +51,8 @@ pub enum ExpirationPolicy {
     ImportanceThreshold { threshold: f64 },
 }
 
-
 /// Memory priority policy.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum PriorityPolicy {
     /// Priority based on importance metadata
     #[default]
@@ -68,10 +63,8 @@ pub enum PriorityPolicy {
     Frequency,
 }
 
-
 /// Conflict resolution policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ConflictPolicy {
     /// First match wins (Session > Project > Global)
     #[default]
@@ -85,7 +78,6 @@ pub enum ConflictPolicy {
     /// Most accessed wins
     MostAccessed,
 }
-
 
 /// Access rule for memory entries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

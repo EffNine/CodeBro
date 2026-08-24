@@ -409,10 +409,16 @@ fn apply_cargo(text: &str, out: &mut InferredIdentity) {
         return;
     };
     let package = value.get("package");
-    if let Some(desc) = package.and_then(|p| p.get("description")).and_then(|d| d.as_str()) {
+    if let Some(desc) = package
+        .and_then(|p| p.get("description"))
+        .and_then(|d| d.as_str())
+    {
         out.description = normalize_description(desc);
     }
-    if let Some(url) = package.and_then(|p| p.get("repository")).and_then(|r| r.as_str()) {
+    if let Some(url) = package
+        .and_then(|p| p.get("repository"))
+        .and_then(|r| r.as_str())
+    {
         out.repository_url = Some(url.to_string());
     }
 
@@ -446,9 +452,7 @@ fn collect_go_frameworks(go_mod_text: &str, out: &mut InferredIdentity) {
     for line in go_mod_text.lines() {
         let line = line.trim();
         for (dep, fw) in GO_FRAMEWORKS {
-            if line.starts_with(dep)
-                || line.starts_with(&format!("\"{dep}"))
-            {
+            if line.starts_with(dep) || line.starts_with(&format!("\"{dep}")) {
                 found.insert(fw.to_string());
             }
         }
@@ -465,7 +469,8 @@ fn collect_js_frameworks(package_json_text: &str, out: &mut InferredIdentity) {
         if let Some(deps) = value.get(section).and_then(|d| d.as_object()) {
             for name in deps.keys() {
                 let base = name.split('/').next_back().unwrap_or(name);
-                if let Some((_, fw)) = JS_FRAMEWORKS.iter().find(|(k, _)| *k == base || *k == name) {
+                if let Some((_, fw)) = JS_FRAMEWORKS.iter().find(|(k, _)| *k == base || *k == name)
+                {
                     found.insert(fw.to_string());
                 }
             }
@@ -538,9 +543,7 @@ fn normalize_description(s: &str) -> Option<String> {
     }
     const MAX: usize = 240;
     if desc.len() > MAX {
-        let cut = desc[..MAX]
-            .rfind(char::is_whitespace)
-            .unwrap_or(MAX);
+        let cut = desc[..MAX].rfind(char::is_whitespace).unwrap_or(MAX);
         desc = format!("{}…", desc[..cut].trim_end());
     }
     (!desc.is_empty()).then_some(desc)
@@ -582,19 +585,29 @@ mod tests {
             inferred.description.as_deref(),
             Some("A probe for testing inference. Extra sentence here.")
         );
-        assert_eq!(inferred.repository_url.as_deref(), Some("https://github.com/example/probe"));
+        assert_eq!(
+            inferred.repository_url.as_deref(),
+            Some("https://github.com/example/probe")
+        );
         assert_eq!(inferred.build_system.as_deref(), Some("cargo"));
         assert_eq!(inferred.package_manager.as_deref(), Some("cargo"));
         assert_eq!(inferred.testing_framework.as_deref(), Some("cargo test"));
         // serde/clap are ordinary deps; only platform-level crates count.
-        assert_eq!(inferred.frameworks, vec!["clap".to_string(), "tokio".to_string()]);
+        assert_eq!(
+            inferred.frameworks,
+            vec!["clap".to_string(), "tokio".to_string()]
+        );
         assert!(inferred.important_files.contains(&"Cargo.toml".to_string()));
     }
 
     #[test]
     fn readme_fills_description_when_manifest_is_silent() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"probe\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("README.md"),
             "# probe\n\n[![badge](img.shields.io/x)](x)\n\nDoes something useful for people. Second line adds detail.\n",
@@ -677,7 +690,11 @@ mod mining_tests {
         assert_eq!(d1.id, "adr-001-use-rust");
         assert_eq!(d1.title, "Use Rust");
         assert_eq!(d1.status, "accepted");
-        assert!(d1.description.as_deref().unwrap().starts_with("We need memory safety"));
+        assert!(d1
+            .description
+            .as_deref()
+            .unwrap()
+            .starts_with("We need memory safety"));
         assert_eq!(inferred.decisions[1].status, "proposed");
 
         assert_eq!(

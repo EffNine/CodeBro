@@ -197,11 +197,7 @@ impl ChangeEngine {
     /// Public because it is the reusable core of mid-transaction rollback;
     /// also exercised directly by tests since inducing real write failures
     /// is environment-dependent (root ignores permission bits).
-    pub fn rollback_changes(
-        &self,
-        tx: &PreparedTransaction,
-        applied: &[PathBuf],
-    ) -> Vec<PathBuf> {
+    pub fn rollback_changes(&self, tx: &PreparedTransaction, applied: &[PathBuf]) -> Vec<PathBuf> {
         let mut rolled_back = Vec::with_capacity(applied.len());
         for done in applied.iter().rev() {
             let Some(original) = tx.changes.iter().find(|c| &c.path == done) else {

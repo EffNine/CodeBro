@@ -40,8 +40,14 @@ fn multi_file_transaction_applies_every_change() {
     assert_eq!(report.applied.len(), 2);
     assert_eq!(report.created, vec![dir.path().join("c.txt")]);
     assert!(report.rolled_back.is_empty());
-    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "ALPHA\n");
-    assert_eq!(std::fs::read_to_string(dir.path().join("c.txt")).unwrap(), "gamma");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "ALPHA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("c.txt")).unwrap(),
+        "gamma"
+    );
 }
 
 #[test]
@@ -120,8 +126,14 @@ fn stale_file_aborts_whole_transaction_without_writes() {
     assert!(err.to_string().contains("changed since preparation"));
 
     // NOTHING may be written — including the untouched b.txt.
-    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "tampered");
-    assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "two");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "tampered"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "two"
+    );
 }
 
 #[test]

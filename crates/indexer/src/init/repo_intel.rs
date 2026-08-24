@@ -59,7 +59,8 @@ pub fn language_facts(stats: &LangStats) -> Vec<LanguageFact> {
     stats
         .iter()
         .map(|(lang, (files, lines))| {
-            let mut fact = LanguageFact::new(LanguageId::new(format!("lang::{lang}")), lang.clone());
+            let mut fact =
+                LanguageFact::new(LanguageId::new(format!("lang::{lang}")), lang.clone());
             fact.file_count = *files;
             fact.line_count = *lines;
             fact
@@ -149,18 +150,16 @@ pub fn framework_facts(packages: &[PackageDeps]) -> Vec<FrameworkFact> {
                 continue;
             };
             let key = (dep.clone(), ecosystem.to_string());
-            by_evidence
-                .entry(key)
-                .or_insert_with(|| {
-                    let mut fact = FrameworkFact::new(
-                        FrameworkId::new(format!("fw::{}", slug(dep))),
-                        fw_name,
-                        ecosystem,
-                        dep.clone(),
-                    );
-                    fact.scope_package = Some(pkg.id.clone());
-                    fact
-                });
+            by_evidence.entry(key).or_insert_with(|| {
+                let mut fact = FrameworkFact::new(
+                    FrameworkId::new(format!("fw::{}", slug(dep))),
+                    fw_name,
+                    ecosystem,
+                    dep.clone(),
+                );
+                fact.scope_package = Some(pkg.id.clone());
+                fact
+            });
         }
     }
     by_evidence.into_values().collect()
@@ -183,20 +182,21 @@ pub fn entry_point_facts(root: &Path, packages: &[PackageDeps]) -> Vec<EntryPoin
     let mut out: BTreeMap<String, EntryPointFact> = BTreeMap::new();
     for pkg in packages {
         let pkg_dir = pkg.path.clone();
-        let rel = |p: &Path| p
-            .strip_prefix(root)
-            .unwrap_or(p)
-            .to_string_lossy()
-            .to_string();
+        let rel = |p: &Path| {
+            p.strip_prefix(root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .to_string()
+        };
 
         match pkg.language.as_str() {
             "rust" => {
                 let main = pkg_dir.join("src/main.rs");
                 if main.is_file() {
                     insert_entry(
-                                        &mut out,
-                                        pkg,
-                                        EntryPointFact::new(
+                        &mut out,
+                        pkg,
+                        EntryPointFact::new(
                             EntryPointId::new(format!("entry::{}", rel(&main))),
                             pkg.name.clone(),
                             rel(&main),
@@ -209,9 +209,9 @@ pub fn entry_point_facts(root: &Path, packages: &[PackageDeps]) -> Vec<EntryPoin
                 if bins.is_dir() {
                     for f in bin_entries(&bins, "rs") {
                         insert_entry(
-                                        &mut out,
-                                        pkg,
-                                        EntryPointFact::new(
+                            &mut out,
+                            pkg,
+                            EntryPointFact::new(
                                 EntryPointId::new(format!("entry::{}", rel(&f))),
                                 stem(&f),
                                 rel(&f),
@@ -237,9 +237,9 @@ pub fn entry_point_facts(root: &Path, packages: &[PackageDeps]) -> Vec<EntryPoin
                         if let Ok(text) = std::fs::read_to_string(&cand) {
                             if text.contains("func main") {
                                 insert_entry(
-                                        &mut out,
-                                        pkg,
-                                        EntryPointFact::new(
+                                    &mut out,
+                                    pkg,
+                                    EntryPointFact::new(
                                         EntryPointId::new(format!("entry::{}", rel(&cand))),
                                         stem(&cand),
                                         rel(&cand),
@@ -261,14 +261,17 @@ pub fn entry_point_facts(root: &Path, packages: &[PackageDeps]) -> Vec<EntryPoin
                                 serde_json::Value::String(path) => {
                                     let p = pkg_dir.join(path.as_str());
                                     if p.is_file() {
-                                        insert_entry(&mut out, pkg,
+                                        insert_entry(
+                                            &mut out,
+                                            pkg,
                                             EntryPointFact::new(
                                                 EntryPointId::new(format!("entry::{}", rel(&p))),
                                                 pkg.name.clone(),
                                                 rel(&p),
                                                 EntryPointKind::Binary,
                                                 pkg.language.clone(),
-                                            ));
+                                            ),
+                                        );
                                     }
                                 }
                                 serde_json::Value::Object(map) => {
@@ -276,14 +279,20 @@ pub fn entry_point_facts(root: &Path, packages: &[PackageDeps]) -> Vec<EntryPoin
                                         if let Some(ps) = path.as_str() {
                                             let p = pkg_dir.join(ps);
                                             if p.is_file() {
-                                                insert_entry(&mut out, pkg,
+                                                insert_entry(
+                                                    &mut out,
+                                                    pkg,
                                                     EntryPointFact::new(
-                                                        EntryPointId::new(format!("entry::{}", rel(&p))),
+                                                        EntryPointId::new(format!(
+                                                            "entry::{}",
+                                                            rel(&p)
+                                                        )),
                                                         bin_name.clone(),
                                                         rel(&p),
                                                         EntryPointKind::Binary,
                                                         pkg.language.clone(),
-                                                    ));
+                                                    ),
+                                                );
                                             }
                                         }
                                     }
@@ -295,9 +304,9 @@ pub fn entry_point_facts(root: &Path, packages: &[PackageDeps]) -> Vec<EntryPoin
                             let p = pkg_dir.join(main);
                             if p.is_file() {
                                 insert_entry(
-                                        &mut out,
-                                        pkg,
-                                        EntryPointFact::new(
+                                    &mut out,
+                                    pkg,
+                                    EntryPointFact::new(
                                         EntryPointId::new(format!("entry::{}", rel(&p))),
                                         "main",
                                         rel(&p),
@@ -325,9 +334,9 @@ pub fn entry_point_facts(root: &Path, packages: &[PackageDeps]) -> Vec<EntryPoin
                                 // entry record names the script and cites the
                                 // pyproject as its path evidence.
                                 insert_entry(
-                                        &mut out,
-                                        pkg,
-                                        EntryPointFact::new(
+                                    &mut out,
+                                    pkg,
+                                    EntryPointFact::new(
                                         EntryPointId::new(format!("entry::script::{}", slug(name))),
                                         name.clone(),
                                         rel(&pyproject),
@@ -342,9 +351,9 @@ pub fn entry_point_facts(root: &Path, packages: &[PackageDeps]) -> Vec<EntryPoin
                 // __main__.py modules (bounded search depth 3).
                 for p in find_files(&pkg_dir, "__main__.py", 3) {
                     insert_entry(
-                                        &mut out,
-                                        pkg,
-                                        EntryPointFact::new(
+                        &mut out,
+                        pkg,
+                        EntryPointFact::new(
                             EntryPointId::new(format!("entry::{}", rel(&p))),
                             "__main__",
                             rel(&p),
@@ -368,8 +377,7 @@ fn insert_entry(
     // Attach the owning-package scope projection; entries are keyed by id so
     // duplicate detections dedupe deterministically.
     fact.package = Some(pkg.id.clone());
-    out.entry(fact.id.as_str().to_string())
-        .or_insert(fact);
+    out.entry(fact.id.as_str().to_string()).or_insert(fact);
 }
 
 fn bin_entries(dir: &Path, ext: &str) -> Vec<PathBuf> {

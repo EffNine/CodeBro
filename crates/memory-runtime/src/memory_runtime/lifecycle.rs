@@ -40,10 +40,7 @@ impl MemoryLifecycle {
         let id = entry.id.clone();
         let tier = entry.tier;
         entries.insert(id.clone(), entry);
-        tier_index
-            .entry(tier)
-            .or_default()
-            .insert(id.clone());
+        tier_index.entry(tier).or_default().insert(id.clone());
 
         self.record_event(MemoryEvent::PolicyApplied {
             event_id: uuid::Uuid::new_v4().to_string(),

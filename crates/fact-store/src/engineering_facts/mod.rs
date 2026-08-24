@@ -52,8 +52,8 @@
 pub mod architecture;
 pub mod build_target;
 pub mod dependency;
-pub mod entry_point;
 pub mod diagnostics;
+pub mod entry_point;
 pub mod framework;
 pub mod ids;
 pub mod language;

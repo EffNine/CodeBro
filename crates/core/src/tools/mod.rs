@@ -14,7 +14,6 @@
 //! The full historical tool platform (registry, hooks, lifecycle, discovery,
 //! filesystem/git/playwright tools) lives in `crate::legacy::tools`.
 
-
 #![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod capabilities;
 pub mod change;
@@ -26,9 +25,9 @@ pub mod streaming;
 
 // Re-export core types
 pub use capabilities::{PermissionPolicy, ToolCapabilities, ToolCategory};
+pub use change::ChangePlan;
 pub use context::{ExecutionId, ToolContext, ToolContextBuilder, ToolResult};
 pub use patch::{FilePatch, PatchEngine, PatchSet};
-pub use change::ChangePlan;
 pub use shell::{RunCommand, ShellCommandRecord, ShellHistory};
 pub use streaming::{
     channel_stream, channel_stream_factory, sync_to_stream, AsyncTool, StreamChunk, StreamResult,

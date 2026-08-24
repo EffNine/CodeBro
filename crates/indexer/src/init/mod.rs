@@ -177,8 +177,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
 
         // HTTP/API route declarations become first-class Route symbols so
         // the impact engine can reason about them like any other symbol.
-        let mut route_syms =
-            graph_edges::route_symbols(&ws_id, &rel, language, &source);
+        let mut route_syms = graph_edges::route_symbols(&ws_id, &rel, language, &source);
         if !route_syms.is_empty() {
             collected_routes.append(&mut route_syms);
         }
@@ -383,7 +382,9 @@ pub fn run(workspace_root: &Path) -> Result<()> {
             if !entry.file_type().is_file() || !graph_edges::is_doc_file(entry.path()) {
                 continue;
             }
-            if std::fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(u64::MAX)
+            if std::fs::metadata(entry.path())
+                .map(|m| m.len())
+                .unwrap_or(u64::MAX)
                 > MAX_DOC_BYTES
             {
                 continue;
@@ -409,7 +410,8 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         }
         docs.sort();
 
-        let mut symbols_by_name: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut symbols_by_name: std::collections::BTreeMap<String, Vec<String>> =
+            Default::default();
         let mut all_syms: Vec<&SymbolFact> = collected_symbols.iter().collect();
         all_syms.extend(collected_routes.iter());
         for s in all_syms {
@@ -424,12 +426,20 @@ pub fn run(workspace_root: &Path) -> Result<()> {
 
         // Configuration artifacts: package-scoped modules with Configures
         // edges, so manifests participate in the dependency graph.
-        for pkg in packages.iter().filter(|p| !p.id.as_str().ends_with("::external")) {
+        for pkg in packages
+            .iter()
+            .filter(|p| !p.id.as_str().ends_with("::external"))
+        {
             let manifests: &[&str] = match pkg.language.as_str() {
                 "rust" => &["Cargo.toml"],
                 "go" => &["go.mod"],
                 "javascript" | "typescript" => &["package.json"],
-                "python" => &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"],
+                "python" => &[
+                    "pyproject.toml",
+                    "setup.py",
+                    "setup.cfg",
+                    "requirements.txt",
+                ],
                 _ => &[],
             };
             for m in manifests {
@@ -442,8 +452,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
                     .unwrap_or(&abs)
                     .to_string_lossy()
                     .to_string();
-                let (mf, edge) =
-                    graph_edges::config_module_and_edge(&ws_id, &rel, &pkg.id);
+                let (mf, edge) = graph_edges::config_module_and_edge(&ws_id, &rel, &pkg.id);
                 builder.add_module(mf);
                 builder.add_relationship(edge);
             }
@@ -452,8 +461,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
 
     // Derive a deterministic architecture summary and the top modules by
     // symbol count from the collected data, before it is dropped.
-    let arch_summary =
-        architecture_summary(&collected_modules, &collected_symbols, packages.len());
+    let arch_summary = architecture_summary(&collected_modules, &collected_symbols, packages.len());
     let top_modules = top_modules_by_symbols(&collected_modules, &collected_symbols, 8);
 
     // Drop intermediate collected data early — the builder now owns
@@ -512,9 +520,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     println!("  languages:     {}", counts.languages);
     println!("  frameworks:    {}", counts.frameworks);
     println!("  entry points:  {}", counts.entry_points);
-    println!(
-        "  parse cache:   {cache_hits} reused, {cache_misses} parsed"
-    );
+    println!("  parse cache:   {cache_hits} reused, {cache_misses} parsed");
     if skipped_oversized > 0 {
         println!(
             "  skipped:     {skipped_oversized} oversized source files (>{} KiB)",
@@ -604,8 +610,7 @@ fn top_modules_by_symbols(
     symbols: &[SymbolFact],
     limit: usize,
 ) -> Vec<String> {
-    let mut counts: std::collections::HashMap<&ModuleId, usize> =
-        std::collections::HashMap::new();
+    let mut counts: std::collections::HashMap<&ModuleId, usize> = std::collections::HashMap::new();
     for s in symbols {
         if let Some(mid) = &s.module {
             *counts.entry(mid).or_default() += 1;
@@ -620,7 +625,11 @@ fn top_modules_by_symbols(
         })
         .collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    ranked.into_iter().take(limit).map(|(path, _)| path.to_string()).collect()
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(path, _)| path.to_string())
+        .collect()
 }
 
 /// Refresh `.codebro/` project identity for the initialized workspace.
@@ -675,7 +684,8 @@ fn refresh_identity(
             changes.add_important_files.push(file);
         }
     }
-    if !arch_summary.is_empty() && machine_generated_summary(current.architecture_summary.as_deref())
+    if !arch_summary.is_empty()
+        && machine_generated_summary(current.architecture_summary.as_deref())
     {
         changes.update_architecture_summary = Some(arch_summary.to_string());
     }
@@ -685,9 +695,7 @@ fn refresh_identity(
         }
     }
     for pattern in patterns {
-        if !current.known_patterns.contains(pattern)
-            && !changes.add_patterns.contains(pattern)
-        {
+        if !current.known_patterns.contains(pattern) && !changes.add_patterns.contains(pattern) {
             changes.add_patterns.push(pattern.clone());
         }
     }
@@ -718,9 +726,7 @@ fn refresh_identity(
             "superseded" => DecisionStatus::Superseded,
             _ => DecisionStatus::Proposed,
         };
-        changes
-            .add_decisions
-            .push(decision.with_status(status));
+        changes.add_decisions.push(decision.with_status(status));
     }
     for convention in &inferred.conventions {
         if !current.coding_conventions.contains(convention)
@@ -777,8 +783,7 @@ fn primary_language(root: &Path) -> &'static str {
     } else if root.join("go.mod").is_file() {
         "go"
     } else if root.join("tsconfig.json").is_file()
-        || root.join("package.json").is_file()
-            && root.join("tsconfig.json").is_file()
+        || root.join("package.json").is_file() && root.join("tsconfig.json").is_file()
     {
         "typescript"
     } else if root.join("package.json").is_file() {
@@ -828,8 +833,13 @@ fn manifest_dirs(root: &Path) -> Vec<PathBuf> {
         }
         let is_manifest = matches!(
             entry.file_name().to_string_lossy().as_ref(),
-            "Cargo.toml" | "go.mod" | "package.json" | "pyproject.toml" | "setup.py"
-                | "setup.cfg" | "requirements.txt"
+            "Cargo.toml"
+                | "go.mod"
+                | "package.json"
+                | "pyproject.toml"
+                | "setup.py"
+                | "setup.cfg"
+                | "requirements.txt"
         );
         if is_manifest {
             if let Some(parent) = entry.path().parent() {
@@ -1037,10 +1047,7 @@ fn parse_cargo_package(
             // [dependencies] and [dev-dependencies]). The dependency id is
             // keyed by name only, so keep one entry — the most product-
             // relevant kind wins (direct > build > dev).
-            if let Some(existing) = dependencies
-                .iter_mut()
-                .find(|d| d.name == *dep_name)
-            {
+            if let Some(existing) = dependencies.iter_mut().find(|d| d.name == *dep_name) {
                 let rank = |k: DependencyKind| match k {
                     DependencyKind::Direct => 0,
                     DependencyKind::Build => 1,
@@ -1412,9 +1419,21 @@ fn discover_source_files(root: &Path) -> Vec<PathBuf> {
             let name = e.file_name().to_string_lossy().to_string();
             !matches!(
                 name.as_str(),
-                ".git" | ".codebro" | "target" | "node_modules" | "dist" | "build" | "vendor"
-                | ".venv" | "venv" | "__pycache__" | ".mypy_cache" | ".pytest_cache"
-                | "site-packages" | ".next" | "coverage"
+                ".git"
+                    | ".codebro"
+                    | "target"
+                    | "node_modules"
+                    | "dist"
+                    | "build"
+                    | "vendor"
+                    | ".venv"
+                    | "venv"
+                    | "__pycache__"
+                    | ".mypy_cache"
+                    | ".pytest_cache"
+                    | "site-packages"
+                    | ".next"
+                    | "coverage"
             )
         })
     {
@@ -1503,8 +1522,13 @@ pub struct FactsDiffReport {
 
 impl std::fmt::Display for FactsDiffReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "changed files: {} added, {} modified, {} deleted",
-            self.added.len(), self.modified.len(), self.deleted.len())?;
+        writeln!(
+            f,
+            "changed files: {} added, {} modified, {} deleted",
+            self.added.len(),
+            self.modified.len(),
+            self.deleted.len()
+        )?;
         for rel in &self.added {
             writeln!(f, "   + {rel}")?;
         }
@@ -1517,8 +1541,16 @@ impl std::fmt::Display for FactsDiffReport {
         if !self.added.is_empty() || !self.modified.is_empty() || !self.deleted.is_empty() {
             writeln!(f, "impact:")?;
             writeln!(f, "  - {} module(s) affected", self.modules_affected)?;
-            writeln!(f, "  - {} symbol(s) defined in affected files", self.symbols_affected)?;
-            writeln!(f, "  - {} test(s) located in affected files", self.tests_related)?;
+            writeln!(
+                f,
+                "  - {} symbol(s) defined in affected files",
+                self.symbols_affected
+            )?;
+            writeln!(
+                f,
+                "  - {} test(s) located in affected files",
+                self.tests_related
+            )?;
         } else {
             writeln!(f, "  no changes since last index")?;
         }
@@ -1530,15 +1562,11 @@ impl std::fmt::Display for FactsDiffReport {
 /// project the engineering impact. Deterministic: classification is by
 /// content digest; impact numbers derive from the frozen fact store.
 pub fn compute_facts_diff(root: &Path) -> Result<FactsDiffReport> {
-    let root = root
-        .canonicalize()
-        .unwrap_or_else(|_| root.to_path_buf());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let model = load_facts_model(&root)
         .ok_or_else(|| anyhow::anyhow!("no facts store found; run `codebro init` first"))?;
-    let previous: std::collections::BTreeMap<String, String> = model
-        .file_digests()
-        .cloned()
-        .unwrap_or_default();
+    let previous: std::collections::BTreeMap<String, String> =
+        model.file_digests().cloned().unwrap_or_default();
 
     // Current per-file digests over the same discovery rules init uses.
     let mut current: std::collections::BTreeMap<String, String> = Default::default();
@@ -1622,9 +1650,7 @@ pub fn compute_facts_diff(root: &Path) -> Result<FactsDiffReport> {
 
 /// `codebro facts diff` entry point: compute and print the report.
 pub fn facts_diff(root: &Path) -> Result<()> {
-    let root = root
-        .canonicalize()
-        .unwrap_or_else(|_| root.to_path_buf());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let report = compute_facts_diff(&root)?;
     println!("facts diff — {}", root.display());
     if report.digests_missing {
@@ -1882,7 +1908,8 @@ mod tests {
     /// the workspace-relative path (`find_module_for_file` compares against
     /// module paths keyed by that same relative path).
     #[test]
-    fn ast_import_edges_resolve_between_modules() {        let dir = tempfile::tempdir().unwrap();
+    fn ast_import_edges_resolve_between_modules() {
+        let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -1894,11 +1921,7 @@ mod tests {
             "mod util;\nuse crate::util;\nfn main() { util::helper(); }\n",
         )
         .unwrap();
-        std::fs::write(
-            dir.path().join("src/util.rs"),
-            "pub fn helper() {}\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("src/util.rs"), "pub fn helper() {}\n").unwrap();
 
         run(dir.path()).unwrap();
         let model: FactsModel = serde_json::from_str(
@@ -1931,7 +1954,8 @@ mod tests {
     /// workspace surface: description, toolchain, frameworks, architecture
     /// summary and important files.
     #[test]
-    fn init_populates_project_identity_from_workspace_surface() {        let dir = tempfile::tempdir().unwrap();
+    fn init_populates_project_identity_from_workspace_surface() {
+        let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -1946,13 +1970,16 @@ mod tests {
         let identity: serde_json::Value = serde_json::from_str(&raw).unwrap();
 
         assert_eq!(
-            identity["description"],
-            "Probe whether init fills identity.",
+            identity["description"], "Probe whether init fills identity.",
             "manifest description flows into identity"
         );
         assert_eq!(identity["build_system"], "cargo");
         assert_eq!(identity["testing_framework"], "cargo test");
-        assert!(identity["frameworks"].as_array().unwrap().iter().any(|f| f == "tokio"));
+        assert!(identity["frameworks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "tokio"));
         assert!(!identity["architecture_summary"]
             .as_str()
             .unwrap_or_default()
@@ -2000,8 +2027,7 @@ mod tests {
             std::fs::read_to_string(dir.path().join(".codebro/project_identity.json")).unwrap();
         let identity: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(
-            identity["description"],
-            "Human-authored purpose statement",
+            identity["description"], "Human-authored purpose statement",
             "authored description must win over re-inference"
         );
         assert_eq!(identity["build_system"], "cargo", "inferred fields persist");
@@ -2037,7 +2063,11 @@ mod tests {
             "## Dev workflow\n\n### Conventions\n\n- Format before commit.\n",
         )
         .unwrap();
-        std::fs::write(dir.path().join("CHANGELOG.md"), "## [0.1.0] - 2026-01-01\n- first\n").unwrap();
+        std::fs::write(
+            dir.path().join("CHANGELOG.md"),
+            "## [0.1.0] - 2026-01-01\n- first\n",
+        )
+        .unwrap();
 
         run(dir.path()).unwrap();
         let read_identity = || {
@@ -2062,7 +2092,10 @@ mod tests {
         // Idempotent: second init must not duplicate anything.
         run(dir.path()).unwrap();
         let identity = read_identity();
-        assert_eq!(identity["engineering_decisions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            identity["engineering_decisions"].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(
             identity["coding_conventions"]
                 .as_array()
@@ -2090,7 +2123,11 @@ mod tests {
         )
         .unwrap();
         // Small, legitimate source: parsed normally.
-        std::fs::write(dir.path().join("src/lib.rs"), "pub fn real_fn() -> u32 { 1 }\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn real_fn() -> u32 { 1 }\n",
+        )
+        .unwrap();
         // Oversized generated "source": 600 KiB of embedded data.
         let big = format!("pub const BLOB: &[u8] = &[\n{}\n];\n", "1,".repeat(300_000));
         std::fs::write(dir.path().join("src/embedded_data.rs"), big).unwrap();
@@ -2104,7 +2141,10 @@ mod tests {
         let names: Vec<&str> = model.symbols().iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"real_fn"), "small file must still parse");
         assert!(
-            !model.modules().iter().any(|m| m.path.as_deref() == Some("src/embedded_data.rs")),
+            !model
+                .modules()
+                .iter()
+                .any(|m| m.path.as_deref() == Some("src/embedded_data.rs")),
             "oversized file must not produce a module fact"
         );
     }
@@ -2170,8 +2210,7 @@ mod tests {
         // Same-line calls to same-named methods must not produce
         // duplicate relationship ids (id carries a target hash).
         {
-            let raw =
-                std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap();
+            let raw = std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap();
             let model: serde_json::Value = serde_json::from_str(&raw).unwrap();
             let ids: Vec<&str> = model["relationships"]
                 .as_array()
@@ -2229,7 +2268,9 @@ mod tests {
             .collect();
         // Bare unqualified call still resolves.
         assert!(
-            extra_calls.iter().any(|(s, t)| s == "caller" && t == "unique_helper"),
+            extra_calls
+                .iter()
+                .any(|(s, t)| s == "caller" && t == "unique_helper"),
             "unqualified unique fn must resolve, got {extra_calls:?}"
         );
         // Untyped variable receivers (`p.ping_hit()`, `x.abs()`) stay
@@ -2263,13 +2304,11 @@ mod tests {
 
         run(dir.path()).unwrap();
         let cache_dir = dir.path().join(".codebro/cache/parse");
-        let entries_before: Vec<_> =
-            std::fs::read_dir(&cache_dir).unwrap().flatten().collect();
+        let entries_before: Vec<_> = std::fs::read_dir(&cache_dir).unwrap().flatten().collect();
         assert!(!entries_before.is_empty(), "cache entries must be written");
 
         run(dir.path()).unwrap();
-        let entries_after: Vec<_> =
-            std::fs::read_dir(&cache_dir).unwrap().flatten().collect();
+        let entries_after: Vec<_> = std::fs::read_dir(&cache_dir).unwrap().flatten().collect();
         assert_eq!(
             entries_before.len(),
             entries_after.len(),
@@ -2349,7 +2388,10 @@ mod tests {
             "app.get('/orders', handler);\nrouter.delete(\"/orders/:id\", h);\n",
         );
         assert_eq!(ts.len(), 2);
-        assert_eq!((ts[0].method.as_str(), ts[0].path.as_str()), ("GET", "/orders"));
+        assert_eq!(
+            (ts[0].method.as_str(), ts[0].path.as_str()),
+            ("GET", "/orders")
+        );
         assert_eq!(ts[1].path, "/orders/:id");
 
         let py = graph_edges::extract_routes(
@@ -2358,10 +2400,7 @@ mod tests {
         );
         assert_eq!(py.len(), 2);
 
-        let go = graph_edges::extract_routes(
-            "go",
-            "http.HandleFunc(\"/healthz\", handler)\n",
-        );
+        let go = graph_edges::extract_routes("go", "http.HandleFunc(\"/healthz\", handler)\n");
         assert_eq!(go.len(), 1);
         assert_eq!(go[0].path, "/healthz");
 
@@ -2488,8 +2527,6 @@ mod go_tests {
     }
 }
 
-
-
 #[cfg(test)]
 mod python_node_tests {
     use super::*;
@@ -2529,10 +2566,15 @@ mod python_node_tests {
             "# comment\nflask==3.0.0\ngunicorn\n-e editable-not-a-dep\n",
         )
         .unwrap();
-        let (pkg, _) = discover_packages(dir.path().join("svc").as_path(), &WorkspaceId::new("ws::x"));
+        let (pkg, _) =
+            discover_packages(dir.path().join("svc").as_path(), &WorkspaceId::new("ws::x"));
         assert_eq!(pkg[0].name, "svc");
         assert_eq!(pkg[0].language, "python");
-        let names: Vec<&str> = pkg[0].dependencies.iter().map(|d| d.name.as_str()).collect();
+        let names: Vec<&str> = pkg[0]
+            .dependencies
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
         assert!(names.contains(&"flask"));
         assert!(names.contains(&"gunicorn"));
         assert!(!names.iter().any(|n| n.starts_with('-')));
@@ -2593,7 +2635,10 @@ mod python_node_tests {
 
         // Module name carries no ".py" extension.
         assert!(
-            model.modules().iter().any(|m| m.name == "src::widget::engine"),
+            model
+                .modules()
+                .iter()
+                .any(|m| m.name == "src::widget::engine"),
             "modules: {:?}",
             model.modules().iter().map(|m| &m.name).collect::<Vec<_>>()
         );
@@ -2650,9 +2695,7 @@ mod python_node_tests {
             };
             std::fs::write(
                 crate_dir.join("Cargo.toml"),
-                format!(
-                    "[package]\nname = \"demo-{name}\"\nversion = \"0.1.0\"\n{dep_section}"
-                ),
+                format!("[package]\nname = \"demo-{name}\"\nversion = \"0.1.0\"\n{dep_section}"),
             )
             .unwrap();
             std::fs::write(crate_dir.join("src/lib.rs"), "pub fn x() {}\n").unwrap();
@@ -2662,11 +2705,7 @@ mod python_node_tests {
             &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
         )
         .unwrap();
-        let names: Vec<&str> = model
-            .packages()
-            .iter()
-            .map(|p| p.name.as_str())
-            .collect();
+        let names: Vec<&str> = model.packages().iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"demo-core"), "packages: {names:?}");
         assert!(names.contains(&"demo-server"), "packages: {names:?}");
         assert_eq!(model.dependencies().len(), 1, "deps: {names:?}");
@@ -2676,14 +2715,22 @@ mod python_node_tests {
     fn language_facts_aggregate_scanned_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}\npub fn b() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn a() {}\npub fn b() {}\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("helper.py"), "def f():\n    pass\n").unwrap();
         run(dir.path()).unwrap();
         let model: FactsModel = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
         )
         .unwrap();
-        assert!(model.languages().len() >= 2, "langs: {:?}", model.languages());
+        assert!(
+            model.languages().len() >= 2,
+            "langs: {:?}",
+            model.languages()
+        );
         let rust = model
             .languages()
             .iter()
@@ -2745,7 +2792,11 @@ mod python_node_tests {
             &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
         )
         .unwrap();
-        let entries: Vec<&str> = model.entry_points().iter().map(|e| e.path.as_str()).collect();
+        let entries: Vec<&str> = model
+            .entry_points()
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect();
         assert!(entries.contains(&"src/main.rs"), "entries: {entries:?}");
         let main = model
             .entry_points()
@@ -2753,7 +2804,10 @@ mod python_node_tests {
             .find(|e| e.path == "src/main.rs")
             .unwrap();
         assert_eq!(main.name, "svc");
-        assert_eq!(main.kind, codebro_fact_store::engineering_facts::EntryPointKind::Binary);
+        assert_eq!(
+            main.kind,
+            codebro_fact_store::engineering_facts::EntryPointKind::Binary
+        );
     }
 
     #[test]
@@ -2772,6 +2826,9 @@ mod python_node_tests {
             dep_names: vec![],
         }];
         let patterns = repo_intel::detect_patterns(dir.path(), &pkgs, &stats);
-        assert!(patterns.contains(&"multi-language".to_string()), "{patterns:?}");
+        assert!(
+            patterns.contains(&"multi-language".to_string()),
+            "{patterns:?}"
+        );
     }
 }

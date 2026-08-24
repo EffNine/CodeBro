@@ -562,20 +562,12 @@ fn traverse(
 
         // Determine which adjacency list(s) to follow.
         let neighbors: Vec<GraphEdge> = match direction {
-            "outgoing" => outgoing
-                .get(&current_id).cloned()
-                .unwrap_or_default(),
-            "incoming" => incoming
-                .get(&current_id).cloned()
-                .unwrap_or_default(),
+            "outgoing" => outgoing.get(&current_id).cloned().unwrap_or_default(),
+            "incoming" => incoming.get(&current_id).cloned().unwrap_or_default(),
             _ => {
                 // "both": merge outgoing and incoming, deduplicating by target.
-                let out: Vec<GraphEdge> = outgoing
-                    .get(&current_id).cloned()
-                    .unwrap_or_default();
-                let inc: Vec<GraphEdge> = incoming
-                    .get(&current_id).cloned()
-                    .unwrap_or_default();
+                let out: Vec<GraphEdge> = outgoing.get(&current_id).cloned().unwrap_or_default();
+                let inc: Vec<GraphEdge> = incoming.get(&current_id).cloned().unwrap_or_default();
                 let mut merged: Vec<GraphEdge> = out.into_iter().chain(inc).collect();
                 merged.sort_by_key(|e| e.target_id.to_string());
                 merged.dedup_by_key(|e| e.target_id.to_string());
@@ -883,17 +875,17 @@ fn resolve_target(
     target: &ImpactTarget,
 ) -> Option<ResolvedTarget> {
     match target {
-        ImpactTarget::Symbol(sym_id) => {
-            collection.symbol(sym_id).map(|sym| (
-                    FactId::Symbol(sym.id.clone()),
-                    ImpactTargetInfo {
-                        id: sym.id.to_string(),
-                        kind: "symbol".to_string(),
-                        name: Some(sym.name.clone()),
-                        path: sym.location.file.clone(),
-                    },
-                ))
-        }
+        ImpactTarget::Symbol(sym_id) => collection.symbol(sym_id).map(|sym| {
+            (
+                FactId::Symbol(sym.id.clone()),
+                ImpactTargetInfo {
+                    id: sym.id.to_string(),
+                    kind: "symbol".to_string(),
+                    name: Some(sym.name.clone()),
+                    path: sym.location.file.clone(),
+                },
+            )
+        }),
         ImpactTarget::File(path) => {
             for m in collection.modules() {
                 if let Some(mp) = &m.path {
@@ -927,28 +919,28 @@ fn resolve_target(
             }
             None
         }
-        ImpactTarget::Module(mod_id) => {
-            collection.module(mod_id).map(|m| (
-                    FactId::Module(m.id.clone()),
-                    ImpactTargetInfo {
-                        id: m.id.to_string(),
-                        kind: "module".to_string(),
-                        name: Some(m.name.clone()),
-                        path: m.path.clone(),
-                    },
-                ))
-        }
-        ImpactTarget::Package(pkg_id) => {
-            collection.package(pkg_id).map(|p| (
-                    FactId::Package(p.id.clone()),
-                    ImpactTargetInfo {
-                        id: p.id.to_string(),
-                        kind: "package".to_string(),
-                        name: Some(p.name.clone()),
-                        path: None,
-                    },
-                ))
-        }
+        ImpactTarget::Module(mod_id) => collection.module(mod_id).map(|m| {
+            (
+                FactId::Module(m.id.clone()),
+                ImpactTargetInfo {
+                    id: m.id.to_string(),
+                    kind: "module".to_string(),
+                    name: Some(m.name.clone()),
+                    path: m.path.clone(),
+                },
+            )
+        }),
+        ImpactTarget::Package(pkg_id) => collection.package(pkg_id).map(|p| {
+            (
+                FactId::Package(p.id.clone()),
+                ImpactTargetInfo {
+                    id: p.id.to_string(),
+                    kind: "package".to_string(),
+                    name: Some(p.name.clone()),
+                    path: None,
+                },
+            )
+        }),
     }
 }
 
@@ -2682,12 +2674,21 @@ mod tests {
         for (id, path) in [("mod::a.rs", "a.rs"), ("mod::b.rs", "b.rs")] {
             let mut m = ModuleFact::new(ModuleId::new(id), path.to_string());
             m.path = Some(path.to_string());
-            m.location =
-                crate::engineering_facts::SourceLocation::new().with_workspace(WorkspaceId::new("ws::t")).with_file(path);
+            m.location = crate::engineering_facts::SourceLocation::new()
+                .with_workspace(WorkspaceId::new("ws::t"))
+                .with_file(path);
             builder.add_module(m);
         }
-        let fa = SymbolFact::new(SymbolId::new("sym::a"), "fa", crate::engineering_facts::SymbolKind::Function);
-        let fb = SymbolFact::new(SymbolId::new("sym::b"), "fb", crate::engineering_facts::SymbolKind::Function);
+        let fa = SymbolFact::new(
+            SymbolId::new("sym::a"),
+            "fa",
+            crate::engineering_facts::SymbolKind::Function,
+        );
+        let fb = SymbolFact::new(
+            SymbolId::new("sym::b"),
+            "fb",
+            crate::engineering_facts::SymbolKind::Function,
+        );
         builder.add_symbol(fa);
         builder.add_symbol(fb);
         let mut call = RelationshipFact::new(
@@ -2708,9 +2709,21 @@ mod tests {
             !result.direct_relationships.is_empty(),
             "expected direct relationships"
         );
-        for rel in result.direct_relationships.iter().chain(result.transitive_relationships.iter()) {
-            assert!((0.0..=1.0).contains(&rel.confidence), "confidence out of range: {:?}", rel);
-            assert!(rel.reason.is_some(), "reason missing on {:?}", rel.target_id);
+        for rel in result
+            .direct_relationships
+            .iter()
+            .chain(result.transitive_relationships.iter())
+        {
+            assert!(
+                (0.0..=1.0).contains(&rel.confidence),
+                "confidence out of range: {:?}",
+                rel
+            );
+            assert!(
+                rel.reason.is_some(),
+                "reason missing on {:?}",
+                rel.target_id
+            );
         }
     }
 }

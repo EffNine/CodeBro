@@ -287,8 +287,8 @@ impl ProjectIdentityStorage {
         };
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(self.sprint_path())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
+        let mut file =
+            fs::File::create(self.sprint_path()).map_err(|e| StorageError::Write(e.to_string()))?;
         file.write_all(json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         file.flush()

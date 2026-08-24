@@ -219,7 +219,6 @@ mod tests {
         runtime
             .create(test_entry("e1", MemoryTier::Session, "key", "value"))
             .unwrap();
-
     }
 
     #[test]

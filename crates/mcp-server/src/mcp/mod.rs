@@ -36,7 +36,8 @@ use crate::provenance::{compute_trust, FreshnessStatus, SourceKind};
 /// check so a concurrent `codebro init` is picked up. Everything else is
 /// constructed fresh per call.
 /// Cached immutable fact store keyed by the facts.json mtime.
-type FactsCache = Arc<std::sync::Mutex<Option<(Option<std::time::SystemTime>, crate::fact_store::FactStore)>>>;
+type FactsCache =
+    Arc<std::sync::Mutex<Option<(Option<std::time::SystemTime>, crate::fact_store::FactStore)>>>;
 
 #[derive(Clone)]
 pub struct CodeBroMcpServer {
@@ -114,8 +115,7 @@ impl CodeBroMcpServer {
                         // by the next init. The fact store is derived state
                         // (regenerable via `codebro init`), so we degrade to
                         // an empty store — but never silently destroy data.
-                        let quarantined =
-                            crate::persistence::quarantine_file(&path).ok().flatten();
+                        let quarantined = crate::persistence::quarantine_file(&path).ok().flatten();
                         tracing::warn!(
                             "quarantining unparseable {}: {e} (moved to {})",
                             path.display(),
@@ -591,13 +591,7 @@ impl CodeBroMcpServer {
             conflicts_reported = outcome
                 .conflicts
                 .iter()
-                .map(|c| {
-                    format!(
-                        "{}:{}",
-                        c.kind_str(),
-                        c.prior_key
-                    )
-                })
+                .map(|c| format!("{}:{}", c.kind_str(), c.prior_key))
                 .collect();
         }
         memory
@@ -607,10 +601,7 @@ impl CodeBroMcpServer {
         let action = if exists { "updated" } else { "recorded" };
         let mut summary = format!("memory {action}: {key}");
         if !conflicts_reported.is_empty() {
-            summary.push_str(&format!(
-                "; conflicts: {}",
-                conflicts_reported.join(", ")
-            ));
+            summary.push_str(&format!("; conflicts: {}", conflicts_reported.join(", ")));
         }
         Ok(CallToolResult::success(vec![ContentBlock::text(summary)]))
     }
@@ -713,9 +704,7 @@ impl CodeBroMcpServer {
         let mut runtime = ProjectIdentityRuntime::new(&self.workspace_root);
         let current = runtime.load().map_err(|e| {
             McpError::invalid_params(
-                format!(
-                    "no project identity for this workspace (run `codebro init` first): {e}"
-                ),
+                format!("no project identity for this workspace (run `codebro init` first): {e}"),
                 None,
             )
         })?;
@@ -749,7 +738,11 @@ impl CodeBroMcpServer {
             &args.add_constraints,
             &current.known_constraints,
         );
-        push_unique_strings(&mut changes.add_patterns, &args.add_patterns, &current.known_patterns);
+        push_unique_strings(
+            &mut changes.add_patterns,
+            &args.add_patterns,
+            &current.known_patterns,
+        );
         push_unique_strings(
             &mut changes.add_conventions,
             &args.add_conventions,
@@ -779,12 +772,8 @@ impl CodeBroMcpServer {
                 skipped.push(format!("decision '{id}' already recorded"));
                 continue;
             }
-            let mut decision = EngineeringDecision::new(
-                id.clone(),
-                title,
-                description,
-                input.context.clone(),
-            );
+            let mut decision =
+                EngineeringDecision::new(id.clone(), title, description, input.context.clone());
             if let Some(status) = parse_status(&input.status, "decision")? {
                 decision = decision.with_status(status);
             } else {
@@ -795,11 +784,8 @@ impl CodeBroMcpServer {
             changes.add_decisions.push(decision);
         }
 
-        let existing_roadmap_ids: std::collections::HashSet<&str> = current
-            .roadmap
-            .iter()
-            .map(|i| i.id.as_str())
-            .collect();
+        let existing_roadmap_ids: std::collections::HashSet<&str> =
+            current.roadmap.iter().map(|i| i.id.as_str()).collect();
         for input in &args.add_roadmap_items {
             let title = require_non_empty(&input.title, "roadmap title")?;
             let id = slugify(&title);
@@ -835,9 +821,9 @@ impl CodeBroMcpServer {
         }
 
         let mut updater = ProjectIdentityUpdater::new(&self.workspace_root);
-        let result = updater.update(&current, changes).ok_or_else(|| {
-            McpError::internal_error("identity update produced no result", None)
-        })?;
+        let result = updater
+            .update(&current, changes)
+            .ok_or_else(|| McpError::internal_error("identity update produced no result", None))?;
 
         if !result.applied {
             return Err(McpError::invalid_params(
@@ -1883,10 +1869,7 @@ fn inject_project_context(
         ctx_parts.push(format!(
             "Engineering memory: {} entries, tags: {}",
             entries.len(),
-            tags.iter().copied()
-                .take(10)
-                .collect::<Vec<_>>()
-                .join(", ")
+            tags.iter().copied().take(10).collect::<Vec<_>>().join(", ")
         ));
     }
 
@@ -2020,10 +2003,7 @@ mod phase8_tests {
         // Python project without node/cargo manifests.
         let py = tempfile::tempdir().unwrap();
         std::fs::write(py.path().join("pyproject.toml"), "[project]").unwrap();
-        assert_eq!(
-            resolve_test_command(py.path(), None),
-            "python -m pytest -q"
-        );
+        assert_eq!(resolve_test_command(py.path(), None), "python -m pytest -q");
 
         // Explicit commands always win.
         assert_eq!(
@@ -4285,7 +4265,10 @@ mod tests {
             v["identity"]["engineering_decisions"][0]["id"],
             "mcp-first-architecture"
         );
-        assert_eq!(v["identity"]["engineering_decisions"][0]["status"], "accepted");
+        assert_eq!(
+            v["identity"]["engineering_decisions"][0]["status"],
+            "accepted"
+        );
 
         // Persisted to disk.
         let raw =
@@ -5399,7 +5382,11 @@ mod tests {
 
     fn collect_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut paths = Vec::new();
-        for entry in walkdir::WalkDir::new(dir).min_depth(1).into_iter().flatten() {
+        for entry in walkdir::WalkDir::new(dir)
+            .min_depth(1)
+            .into_iter()
+            .flatten()
+        {
             paths.push(entry.path().to_path_buf());
         }
         paths.sort();

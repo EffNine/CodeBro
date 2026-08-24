@@ -219,8 +219,12 @@ impl CodeParser {
     /// node inherits its parent's context.
     fn enclosing_callable(&self, node: Node, source: &str, parent: Option<&str>) -> Option<String> {
         match node.kind() {
-            "fn" | "function_item" | "function_definition" | "function_declaration"
-            | "method_declaration" | "method_definition" => {
+            "fn"
+            | "function_item"
+            | "function_definition"
+            | "function_declaration"
+            | "method_declaration"
+            | "method_definition" => {
                 let name = self.name_of(node, source, "identifier");
                 (name != "unknown").then_some(name)
             }
@@ -1212,7 +1216,6 @@ pub fn parse_source(language: &str, source: &str, file_path: &str) -> Result<Par
     parser.parse_source(source, file_path)
 }
 
-
 #[cfg(test)]
 mod receiver_tests {
     use super::*;
@@ -1221,9 +1224,7 @@ mod receiver_tests {
     fn extract_receiver_types_for_path_self_and_plain_calls() {
         let mut p = CodeParser::new("rust").unwrap();
         let src = "struct A;\nimpl A { fn go(&self) { self.save(); Self::prep(); } }\nfn main() { A::new(); helper(); obj.method(); }\n";
-        let r = p
-            .parse_file(std::path::Path::new("lib.rs"), src)
-            .unwrap();
+        let r = p.parse_file(std::path::Path::new("lib.rs"), src).unwrap();
         let find = |name: &str| {
             r.calls
                 .iter()

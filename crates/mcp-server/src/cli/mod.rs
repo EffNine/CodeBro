@@ -166,18 +166,16 @@ pub async fn run() -> Result<()> {
         }
         Some(Commands::Auth { command }) => match command {
             AuthCommands::Status => {
-                {
-                    let name = "conductor";
-                    let status = if name == "conductor" {
-                        use crate::consultant::provider::ConsultantProvider as _;
-                        let provider =
-                            crate::consultant::providers::conductor::ConductorProvider::new();
-                        provider.auth_status()
-                    } else {
-                        crate::consultant::types::AuthStatus::Unauthenticated
-                    };
-                    println!("{name}: {status}");
-                }
+                let name = "conductor";
+                let status = if name == "conductor" {
+                    use crate::consultant::provider::ConsultantProvider as _;
+                    let provider =
+                        crate::consultant::providers::conductor::ConductorProvider::new();
+                    provider.auth_status()
+                } else {
+                    crate::consultant::types::AuthStatus::Unauthenticated
+                };
+                println!("{name}: {status}");
             }
         },
         Some(Commands::Consult {
@@ -314,10 +312,7 @@ fn inject_project_context(
         ctx_parts.push(format!(
             "Engineering memory: {} entries, tags: {}",
             entries.len(),
-            tags.iter().copied()
-                .take(10)
-                .collect::<Vec<_>>()
-                .join(", ")
+            tags.iter().copied().take(10).collect::<Vec<_>>().join(", ")
         ));
     }
 

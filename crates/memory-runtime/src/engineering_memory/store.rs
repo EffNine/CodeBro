@@ -236,7 +236,10 @@ mod tests {
             Err(StorageError::Corrupted(msg)) => {
                 assert!(msg.contains("quarantined"), "error names quarantine: {msg}");
             }
-            other => panic!("expected Corrupted error, got {:?}", other.as_ref().map(|_| ())),
+            other => panic!(
+                "expected Corrupted error, got {:?}",
+                other.as_ref().map(|_| ())
+            ),
         }
 
         // Raw bytes preserved beside the original; original path cleared so a

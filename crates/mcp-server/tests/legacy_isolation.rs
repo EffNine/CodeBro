@@ -46,9 +46,7 @@ fn live_sources_do_not_reference_legacy() {
             if trimmed.contains("crate::legacy") || trimmed.contains("legacy::") {
                 offenders.push(format!(
                     "{}:{}: {}",
-                    normalized.trim_start_matches(
-                        root.to_string_lossy().trim_end_matches('/')
-                    ),
+                    normalized.trim_start_matches(root.to_string_lossy().trim_end_matches('/')),
                     idx + 1,
                     trimmed
                 ));

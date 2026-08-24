@@ -232,7 +232,11 @@ impl EngineeringMemoryMetadata {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        self.expires_at = if seconds == 0 { None } else { Some(now + seconds) };
+        self.expires_at = if seconds == 0 {
+            None
+        } else {
+            Some(now + seconds)
+        };
         self
     }
 

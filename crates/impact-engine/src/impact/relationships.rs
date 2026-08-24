@@ -33,11 +33,7 @@ pub struct ImplScope {
 }
 
 /// The innermost impl type whose block contains `file:line`.
-fn enclosing_impl<'a>(
-    scopes: &'a [ImplScope],
-    file: &str,
-    line: u32,
-) -> Option<&'a str> {
+fn enclosing_impl<'a>(scopes: &'a [ImplScope], file: &str, line: u32) -> Option<&'a str> {
     scopes
         .iter()
         .filter(|s| s.file == file && s.start <= line && line <= s.end)
@@ -74,10 +70,7 @@ pub fn build_relationships(
         std::collections::HashMap::new();
     for sym in symbols {
         if sym.module.is_some() {
-            name_to_sym
-                .entry(sym.name.clone())
-                .or_default()
-                .push(sym);
+            name_to_sym.entry(sym.name.clone()).or_default().push(sym);
         }
     }
 
@@ -95,9 +88,13 @@ pub fn build_relationships(
         // Resolve the callee name to a SymbolId, preferring receiver-type
         // and enclosing-impl matches over bare-name coincidence.
         let caller_impl = enclosing_impl(impl_scopes, &call.caller_file, call.line_start);
-        if let Some(callee_sym_id) =
-            resolve_callee(&name_to_sym, &call.callee_name, call, impl_scopes, caller_impl)
-        {
+        if let Some(callee_sym_id) = resolve_callee(
+            &name_to_sym,
+            &call.callee_name,
+            call,
+            impl_scopes,
+            caller_impl,
+        ) {
             // Skip edges whose caller cannot be resolved to a known symbol
             // fact — dangling endpoints would break store validation and
             // pollute the impact graph.

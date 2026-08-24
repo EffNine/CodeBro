@@ -171,7 +171,10 @@ impl<P: ProjectIdentityProvider + Clone> EngineeringMemoryRuntime<P> {
     /// The entry is stored at project tier in both the in-memory store and
     /// the underlying `MemoryRuntime`. The file is NOT persisted automatically;
     /// call `persist()` to write to disk.
-    pub fn record(&mut self, entry: EngineeringMemoryEntry) -> Result<RecordOutcome, EngineeringMemoryError> {
+    pub fn record(
+        &mut self,
+        entry: EngineeringMemoryEntry,
+    ) -> Result<RecordOutcome, EngineeringMemoryError> {
         if self.entries.iter().any(|e| e.id == entry.id) {
             return Err(EngineeringMemoryError::Generic(format!(
                 "entry already exists: {}",
@@ -825,12 +828,14 @@ mod tests {
         let resolved = provider.resolve_for_task(&["auth".to_string()], &[]);
         assert!(resolved.is_empty());
     }
-// ── Memory V2: lifecycle, expiry, provenance, conflicts ────────────
+    // ── Memory V2: lifecycle, expiry, provenance, conflicts ────────────
 
     #[test]
     fn key_conflict_supersedes_prior_entry_with_lineage() {
         let mut runtime = empty_runtime();
-        runtime.record(make_entry("e1", "auth:token", "jwt based")).unwrap();
+        runtime
+            .record(make_entry("e1", "auth:token", "jwt based"))
+            .unwrap();
         let outcome = runtime
             .record(make_entry("e2", "auth:token", "oauth2 with rotation"))
             .unwrap();
@@ -841,7 +846,10 @@ mod tests {
 
         let snap = runtime.snapshot();
         let e1 = snap.iter().find(|e| e.id == "e1").unwrap();
-        assert_eq!(e1.metadata.status, crate::engineering_memory::types::MemoryStatus::Superseded);
+        assert_eq!(
+            e1.metadata.status,
+            crate::engineering_memory::types::MemoryStatus::Superseded
+        );
         let e2 = snap.iter().find(|e| e.id == "e2").unwrap();
         assert_eq!(e2.metadata.supersedes.as_deref(), Some("e1"));
     }
@@ -849,7 +857,9 @@ mod tests {
     #[test]
     fn identical_key_and_value_is_not_a_conflict() {
         let mut runtime = empty_runtime();
-        runtime.record(make_entry("e1", "build:cmd", "cargo test --workspace")).unwrap();
+        runtime
+            .record(make_entry("e1", "build:cmd", "cargo test --workspace"))
+            .unwrap();
         let outcome = runtime
             .record(make_entry("e2", "build:cmd", "cargo test --workspace"))
             .unwrap();
@@ -866,7 +876,11 @@ mod tests {
         entry.metadata.expires_at = Some(1); // epoch second 1: long past
         runtime.record(entry).unwrap();
         runtime
-            .record(make_entry("fresh", "deploy:new-region", "us-east-2 (current)"))
+            .record(make_entry(
+                "fresh",
+                "deploy:new-region",
+                "us-east-2 (current)",
+            ))
             .unwrap();
 
         let swept = runtime.sweep_expired();
@@ -888,15 +902,25 @@ mod tests {
             .map(|m| m.value.clone())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!joined.contains("eu-west-1"), "expired entry leaked: {joined}");
-        assert!(joined.contains("us-east-2"), "active entry missing: {joined}");
+        assert!(
+            !joined.contains("eu-west-1"),
+            "expired entry leaked: {joined}"
+        );
+        assert!(
+            joined.contains("us-east-2"),
+            "active entry missing: {joined}"
+        );
     }
 
     #[test]
     fn confidence_adjustments_leave_an_auditable_trail() {
         let mut runtime = empty_runtime();
-        runtime.record(make_entry("adj", "risk:rollback", "feature-flagged")).unwrap();
-        let a1 = runtime.adjust_confidence("adj", 0.7, Some("verified in prod".into())).unwrap();
+        runtime
+            .record(make_entry("adj", "risk:rollback", "feature-flagged"))
+            .unwrap();
+        let a1 = runtime
+            .adjust_confidence("adj", 0.7, Some("verified in prod".into()))
+            .unwrap();
         assert_eq!((a1.from, a1.to), (0.9, 0.7));
         let _ = runtime.adjust_confidence("adj", 1.5, None).unwrap(); // clamped to 1.0
 
@@ -904,7 +928,10 @@ mod tests {
         let entry = adj_snapshot.iter().find(|e| e.id == "adj").unwrap();
         assert_eq!(entry.metadata.confidence, 1.0);
         assert_eq!(entry.metadata.adjustments.len(), 2);
-        assert_eq!(entry.metadata.adjustments[0].reason.as_deref(), Some("verified in prod"));
+        assert_eq!(
+            entry.metadata.adjustments[0].reason.as_deref(),
+            Some("verified in prod")
+        );
 
         let missing = runtime.adjust_confidence("ghost", 0.5, None);
         assert!(missing.is_err());
@@ -913,11 +940,13 @@ mod tests {
     #[test]
     fn near_duplicate_detection_flags_high_overlap_values() {
         let mut runtime = empty_runtime();
-        runtime.record(make_entry(
-            "orig",
-            "api:limit",
-            "rate limit is 100 requests per minute per token",
-        )).unwrap();
+        runtime
+            .record(make_entry(
+                "orig",
+                "api:limit",
+                "rate limit is 100 requests per minute per token",
+            ))
+            .unwrap();
         let outcome = runtime
             .record(make_entry(
                 "dup",
@@ -926,7 +955,10 @@ mod tests {
             ))
             .unwrap();
         assert!(
-            outcome.conflicts.iter().any(|c| c.kind_str() == "near_duplicate"),
+            outcome
+                .conflicts
+                .iter()
+                .any(|c| c.kind_str() == "near_duplicate"),
             "expected near-duplicate conflict, got {:?}",
             outcome.conflicts
         );
@@ -934,7 +966,7 @@ mod tests {
 
     #[test]
     fn pre_v11_memory_store_loads_with_defaults() {
-        use crate::engineering_memory::{EngineeringMemoryFile, store::EngineeringMemoryStore};
+        use crate::engineering_memory::{store::EngineeringMemoryStore, EngineeringMemoryFile};
         let dir = tempfile::tempdir().unwrap();
         let codebro_dir = dir.path().join(".codebro");
         std::fs::create_dir_all(&codebro_dir).unwrap();
@@ -953,8 +985,7 @@ mod tests {
         );
         std::fs::write(codebro_dir.join("engineering_memory.json"), legacy).unwrap();
         let store = EngineeringMemoryStore::new(dir.path());
-        let file: EngineeringMemoryFile =
-            store.load(&root_str).expect("legacy store must load");
+        let file: EngineeringMemoryFile = store.load(&root_str).expect("legacy store must load");
         assert_eq!(file.entries.len(), 1);
         assert_eq!(
             file.entries[0].metadata.status,
@@ -962,9 +993,7 @@ mod tests {
         );
         assert!(file.entries[0].metadata.expires_at.is_none());
     }
-
 }
-
 
 /// The result of recording a memory entry.
 #[derive(Debug, Clone, PartialEq)]
@@ -1020,5 +1049,9 @@ fn token_overlap(a: &str, b: &str) -> f64 {
     }
     let inter = sa.intersection(&sb).count();
     let union = sa.union(&sb).count();
-    if union == 0 { 0.0 } else { inter as f64 / union as f64 }
+    if union == 0 {
+        0.0
+    } else {
+        inter as f64 / union as f64
+    }
 }

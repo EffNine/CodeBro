@@ -419,10 +419,9 @@ impl VerificationResult {
 
         // When no explicit success expectation is set but exit_code != 0,
         // treat non-zero as a failure violation (common default).
-        if expected_success.is_none() && expected_exit_code.is_none()
-            && !execution.success {
-                violations.push(format!("non-zero exit: {}", execution.exit_code));
-            }
+        if expected_success.is_none() && expected_exit_code.is_none() && !execution.success {
+            violations.push(format!("non-zero exit: {}", execution.exit_code));
+        }
 
         let verified = violations.is_empty();
         let summary = if verified {
@@ -481,10 +480,9 @@ impl VerificationResult {
 
         // When no explicit success expectation is set but exit_code != 0,
         // treat non-zero as a failure violation (common default).
-        if expected_success.is_none() && expected_exit_code.is_none()
-            && !execution.success {
-                violations.push(format!("non-zero exit: {}", execution.exit_code));
-            }
+        if expected_success.is_none() && expected_exit_code.is_none() && !execution.success {
+            violations.push(format!("non-zero exit: {}", execution.exit_code));
+        }
 
         let verified = violations.is_empty();
         let summary = if verified {
@@ -541,7 +539,6 @@ pub enum Reproducibility {
     #[default]
     Unknown,
 }
-
 
 impl std::fmt::Display for Reproducibility {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

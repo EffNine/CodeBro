@@ -78,10 +78,7 @@ pub fn extract_routes(language: &str, source: &str) -> Vec<DetectedRoute> {
         match language {
             "rust" => {
                 // #[get("/path")] #[post("/path")] etc. (actix/rocket style)
-                if let Some(rest) = line
-                    .strip_prefix("#[")
-                    .and_then(|s| s.split_once('('))
-                {
+                if let Some(rest) = line.strip_prefix("#[").and_then(|s| s.split_once('(')) {
                     let attr = rest.0.trim().to_lowercase();
                     if matches!(
                         attr.as_str(),
