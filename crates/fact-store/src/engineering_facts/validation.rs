@@ -450,6 +450,15 @@ impl FactsValidator {
         for f in model.architecture_rules() {
             push(FactKind::ArchitectureRule, f.id.as_str());
         }
+        for f in model.languages() {
+            push(FactKind::Language, f.id.as_str());
+        }
+        for f in model.frameworks() {
+            push(FactKind::Framework, f.id.as_str());
+        }
+        for f in model.entry_points() {
+            push(FactKind::EntryPoint, f.id.as_str());
+        }
         let set: HashMap<String, ()> = ids.iter().map(|(_, s)| (s.clone(), ())).collect();
         Universe { ordered: ids, set }
     }

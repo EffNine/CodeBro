@@ -216,6 +216,15 @@ impl FactStoreBuilder {
         for f in model.architecture_rules() {
             self.facts.add_architecture_rule(f.clone());
         }
+        for f in model.languages() {
+            self.facts.add_language(f.clone());
+        }
+        for f in model.frameworks() {
+            self.facts.add_framework(f.clone());
+        }
+        for f in model.entry_points() {
+            self.facts.add_entry_point(f.clone());
+        }
         self
     }
 

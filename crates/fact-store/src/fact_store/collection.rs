@@ -68,6 +68,18 @@ impl FactCollection {
         self.model.architecture_rules()
     }
 
+    pub fn languages(&self) -> &[crate::engineering_facts::LanguageFact] {
+        self.model.languages()
+    }
+
+    pub fn frameworks(&self) -> &[crate::engineering_facts::FrameworkFact] {
+        self.model.frameworks()
+    }
+
+    pub fn entry_points(&self) -> &[crate::engineering_facts::EntryPointFact] {
+        self.model.entry_points()
+    }
+
     /// Total number of facts across all categories.
     pub fn len(&self) -> usize {
         self.model.len()
@@ -172,5 +184,8 @@ impl FactCollection {
                     .iter()
                     .map(FactRef::ArchitectureRule),
             )
+            .chain(self.model.languages().iter().map(FactRef::Language))
+            .chain(self.model.frameworks().iter().map(FactRef::Framework))
+            .chain(self.model.entry_points().iter().map(FactRef::EntryPoint))
     }
 }

@@ -118,6 +118,12 @@ opaque_id!(/// Opaque id of a `DiagnosticFact`.
     DiagnosticId, FactKind::Diagnostic);
 opaque_id!(/// Opaque id of an `ArchitectureRuleFact`.
     ArchitectureRuleId, FactKind::ArchitectureRule);
+opaque_id!(/// Opaque id of a `LanguageFact`.
+    LanguageId, FactKind::Language);
+opaque_id!(/// Opaque id of a `FrameworkFact`.
+    FrameworkId, FactKind::Framework);
+opaque_id!(/// Opaque id of an `EntryPointFact`.
+    EntryPointId, FactKind::EntryPoint);
 
 /// A union id referencing any engineering fact, used by cross-entity links
 /// (relationship and reference endpoints, diagnostic `related`, architecture
@@ -135,6 +141,9 @@ pub enum FactId {
     Reference(ReferenceId),
     Diagnostic(DiagnosticId),
     ArchitectureRule(ArchitectureRuleId),
+    Language(LanguageId),
+    Framework(FrameworkId),
+    EntryPoint(EntryPointId),
 }
 
 impl FactId {
@@ -152,6 +161,9 @@ impl FactId {
             FactKind::Reference => FactId::Reference(ReferenceId::new(value)),
             FactKind::Diagnostic => FactId::Diagnostic(DiagnosticId::new(value)),
             FactKind::ArchitectureRule => FactId::ArchitectureRule(ArchitectureRuleId::new(value)),
+            FactKind::Language => FactId::Language(LanguageId::new(value)),
+            FactKind::Framework => FactId::Framework(FrameworkId::new(value)),
+            FactKind::EntryPoint => FactId::EntryPoint(EntryPointId::new(value)),
         }
     }
 
@@ -169,6 +181,9 @@ impl FactId {
             FactId::Reference(_) => FactKind::Reference,
             FactId::Diagnostic(_) => FactKind::Diagnostic,
             FactId::ArchitectureRule(_) => FactKind::ArchitectureRule,
+            FactId::Language(_) => FactKind::Language,
+            FactId::Framework(_) => FactKind::Framework,
+            FactId::EntryPoint(_) => FactKind::EntryPoint,
         }
     }
 
@@ -186,6 +201,9 @@ impl FactId {
             FactId::Reference(id) => id.as_str(),
             FactId::Diagnostic(id) => id.as_str(),
             FactId::ArchitectureRule(id) => id.as_str(),
+            FactId::Language(id) => id.as_str(),
+            FactId::Framework(id) => id.as_str(),
+            FactId::EntryPoint(id) => id.as_str(),
         }
     }
 }

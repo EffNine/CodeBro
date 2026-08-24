@@ -29,6 +29,9 @@
 //! | Reference | `ReferenceFact` | `relationship.rs` |
 //! | Diagnostic | `DiagnosticFact` | `diagnostics.rs` |
 //! | Architecture Rule | `ArchitectureRuleFact` | `architecture.rs` |
+//! | Language | `LanguageFact` | `language.rs` |
+//! | Framework | `FrameworkFact` | `framework.rs` |
+//! | Entry Point | `EntryPointFact` | `entry_point.rs` |
 //! | Visibility | `Visibility` | `visibility.rs` |
 //! | API Surface | `ApiSurface` | `symbol.rs` |
 //! | Source Location | `SourceLocation` | `location.rs` |
@@ -49,8 +52,11 @@
 pub mod architecture;
 pub mod build_target;
 pub mod dependency;
+pub mod entry_point;
 pub mod diagnostics;
+pub mod framework;
 pub mod ids;
+pub mod language;
 pub mod location;
 pub mod metadata;
 pub mod module;
@@ -69,10 +75,14 @@ pub use crate::engineering_facts::architecture::ArchitectureRuleFact;
 pub use crate::engineering_facts::build_target::{BuildTargetFact, BuildTargetKind};
 pub use crate::engineering_facts::dependency::{DependencyFact, DependencyKind};
 pub use crate::engineering_facts::diagnostics::DiagnosticFact;
+pub use crate::engineering_facts::entry_point::{EntryPointFact, EntryPointKind};
+pub use crate::engineering_facts::framework::FrameworkFact;
 pub use crate::engineering_facts::ids::{
-    ArchitectureRuleId, BuildTargetId, DependencyId, DiagnosticId, FactId, FactIdKind, IdKey,
-    ModuleId, PackageId, ReferenceId, RelationshipId, SymbolId, TestId, WorkspaceId,
+    ArchitectureRuleId, BuildTargetId, DependencyId, DiagnosticId, EntryPointId, FactId,
+    FactIdKind, FrameworkId, IdKey, LanguageId, ModuleId, PackageId, ReferenceId, RelationshipId,
+    SymbolId, TestId, WorkspaceId,
 };
+pub use crate::engineering_facts::language::LanguageFact;
 pub use crate::engineering_facts::location::{Position, SourceLocation, Span};
 pub use crate::engineering_facts::metadata::{Attribute, FactMetadata, Tag};
 pub use crate::engineering_facts::module::ModuleFact;
@@ -106,6 +116,9 @@ pub enum FactRef<'a> {
     Reference(&'a ReferenceFact),
     Diagnostic(&'a DiagnosticFact),
     ArchitectureRule(&'a ArchitectureRuleFact),
+    Language(&'a LanguageFact),
+    Framework(&'a FrameworkFact),
+    EntryPoint(&'a EntryPointFact),
 }
 
 /// Per-category fact counts.
@@ -122,6 +135,9 @@ pub struct ModelCounts {
     pub references: usize,
     pub diagnostics: usize,
     pub architecture_rules: usize,
+    pub languages: usize,
+    pub frameworks: usize,
+    pub entry_points: usize,
     pub total: usize,
 }
 
@@ -143,6 +159,9 @@ pub struct FactsModel {
     references: Vec<ReferenceFact>,
     diagnostics: Vec<DiagnosticFact>,
     architecture_rules: Vec<ArchitectureRuleFact>,
+    languages: Vec<LanguageFact>,
+    frameworks: Vec<FrameworkFact>,
+    entry_points: Vec<EntryPointFact>,
     /// Repository state at the time facts were generated. Used for
     /// freshness comparison against the current repository state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,6 +189,9 @@ impl FactsModel {
             references: Vec::new(),
             diagnostics: Vec::new(),
             architecture_rules: Vec::new(),
+            languages: Vec::new(),
+            frameworks: Vec::new(),
+            entry_points: Vec::new(),
             generation_repo_state: None,
         }
     }
@@ -225,6 +247,18 @@ impl FactsModel {
         &self.architecture_rules
     }
 
+    pub fn languages(&self) -> &[LanguageFact] {
+        &self.languages
+    }
+
+    pub fn frameworks(&self) -> &[FrameworkFact] {
+        &self.frameworks
+    }
+
+    pub fn entry_points(&self) -> &[EntryPointFact] {
+        &self.entry_points
+    }
+
     // ── O(log n) binary-search lookups; no allocation ─────────────────────
 
     /// True when any fact in the model carries `id`.
@@ -246,6 +280,9 @@ impl FactsModel {
             FactId::Reference(v) => self.reference(v).map(FactRef::Reference),
             FactId::Diagnostic(v) => self.diagnostic(v).map(FactRef::Diagnostic),
             FactId::ArchitectureRule(v) => self.architecture_rule(v).map(FactRef::ArchitectureRule),
+            FactId::Language(v) => self.language(v).map(FactRef::Language),
+            FactId::Framework(v) => self.framework(v).map(FactRef::Framework),
+            FactId::EntryPoint(v) => self.entry_point(v).map(FactRef::EntryPoint),
         }
     }
 
@@ -337,6 +374,30 @@ impl FactsModel {
             .map(|i| &self.architecture_rules[i])
     }
 
+    /// Look up a language by opaque id.
+    pub fn language(&self, id: &LanguageId) -> Option<&LanguageFact> {
+        self.languages
+            .binary_search_by(|f| f.id.cmp(id))
+            .ok()
+            .map(|i| &self.languages[i])
+    }
+
+    /// Look up a framework by opaque id.
+    pub fn framework(&self, id: &FrameworkId) -> Option<&FrameworkFact> {
+        self.frameworks
+            .binary_search_by(|f| f.id.cmp(id))
+            .ok()
+            .map(|i| &self.frameworks[i])
+    }
+
+    /// Look up an entry point by opaque id.
+    pub fn entry_point(&self, id: &EntryPointId) -> Option<&EntryPointFact> {
+        self.entry_points
+            .binary_search_by(|f| f.id.cmp(id))
+            .ok()
+            .map(|i| &self.entry_points[i])
+    }
+
     // ── Aggregation ───────────────────────────────────────────────────────
 
     /// Total number of facts across all categories.
@@ -352,6 +413,9 @@ impl FactsModel {
             + self.references.len()
             + self.diagnostics.len()
             + self.architecture_rules.len()
+            + self.languages.len()
+            + self.frameworks.len()
+            + self.entry_points.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -372,6 +436,9 @@ impl FactsModel {
             references: self.references.len(),
             diagnostics: self.diagnostics.len(),
             architecture_rules: self.architecture_rules.len(),
+            languages: self.languages.len(),
+            frameworks: self.frameworks.len(),
+            entry_points: self.entry_points.len(),
             total: self.len(),
         }
     }
@@ -411,6 +478,9 @@ pub struct FactsBuilder {
     references: Vec<ReferenceFact>,
     diagnostics: Vec<DiagnosticFact>,
     architecture_rules: Vec<ArchitectureRuleFact>,
+    languages: Vec<LanguageFact>,
+    frameworks: Vec<FrameworkFact>,
+    entry_points: Vec<EntryPointFact>,
     generation_repo_state: Option<RepoState>,
 }
 
@@ -474,6 +544,21 @@ impl FactsBuilder {
         self
     }
 
+    pub fn add_language(&mut self, fact: LanguageFact) -> &mut Self {
+        self.languages.push(fact);
+        self
+    }
+
+    pub fn add_framework(&mut self, fact: FrameworkFact) -> &mut Self {
+        self.frameworks.push(fact);
+        self
+    }
+
+    pub fn add_entry_point(&mut self, fact: EntryPointFact) -> &mut Self {
+        self.entry_points.push(fact);
+        self
+    }
+
     /// Set the generation-time repository state.
     pub fn with_generation_repo_state(mut self, state: RepoState) -> Self {
         self.generation_repo_state = Some(state);
@@ -501,6 +586,9 @@ impl FactsBuilder {
             references: self.references,
             diagnostics: self.diagnostics,
             architecture_rules: self.architecture_rules,
+            languages: self.languages,
+            frameworks: self.frameworks,
+            entry_points: self.entry_points,
             generation_repo_state: self.generation_repo_state,
         };
         sort_by_id(&mut model.workspaces);
@@ -514,6 +602,9 @@ impl FactsBuilder {
         sort_by_id(&mut model.references);
         sort_by_id(&mut model.diagnostics);
         sort_by_id(&mut model.architecture_rules);
+        sort_by_id(&mut model.languages);
+        sort_by_id(&mut model.frameworks);
+        sort_by_id(&mut model.entry_points);
         model
     }
 }
@@ -549,4 +640,7 @@ id_carrier! {
     ReferenceFact,
     DiagnosticFact,
     ArchitectureRuleFact,
+    LanguageFact,
+    FrameworkFact,
+    EntryPointFact,
 }

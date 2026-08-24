@@ -24,11 +24,17 @@ pub enum FactKind {
     Reference,
     Diagnostic,
     ArchitectureRule,
+    /// Detected repository language (aggregated source-file surface).
+    Language,
+    /// Detected framework, proven by a concrete dependency or manifest key.
+    Framework,
+    /// Detected program entry point.
+    EntryPoint,
 }
 
 impl FactKind {
     /// All known entity categories, in a stable order.
-    pub const ALL: [FactKind; 11] = [
+    pub const ALL: [FactKind; 14] = [
         FactKind::Workspace,
         FactKind::Module,
         FactKind::Package,
@@ -40,6 +46,9 @@ impl FactKind {
         FactKind::Reference,
         FactKind::Diagnostic,
         FactKind::ArchitectureRule,
+        FactKind::Language,
+        FactKind::Framework,
+        FactKind::EntryPoint,
     ];
 
     /// Canonical snake_case name.
@@ -56,6 +65,9 @@ impl FactKind {
             FactKind::Reference => "reference",
             FactKind::Diagnostic => "diagnostic",
             FactKind::ArchitectureRule => "architecture_rule",
+            FactKind::Language => "language",
+            FactKind::Framework => "framework",
+            FactKind::EntryPoint => "entry_point",
         }
     }
 
@@ -74,6 +86,9 @@ impl FactKind {
             "reference" => Some(FactKind::Reference),
             "diagnostic" => Some(FactKind::Diagnostic),
             "architecture_rule" => Some(FactKind::ArchitectureRule),
+            "language" => Some(FactKind::Language),
+            "framework" => Some(FactKind::Framework),
+            "entry_point" => Some(FactKind::EntryPoint),
             _ => None,
         }
     }

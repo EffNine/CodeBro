@@ -89,6 +89,9 @@ pub struct FactIndex {
     references: Vec<FactId>,
     diagnostics: Vec<FactId>,
     architecture_rules: Vec<FactId>,
+    languages: Vec<FactId>,
+    frameworks: Vec<FactId>,
+    entry_points: Vec<FactId>,
     // Reverse scope indexes.
     by_workspace: ReverseIndex,
     by_package: ReverseIndex,
@@ -121,6 +124,11 @@ impl FactIndex {
             architecture_rules: indexed(collection.architecture_rules(), |f| {
                 FactId::ArchitectureRule(f.id.clone())
             }),
+            languages: indexed(collection.languages(), |f| FactId::Language(f.id.clone())),
+            frameworks: indexed(collection.frameworks(), |f| FactId::Framework(f.id.clone())),
+            entry_points: indexed(collection.entry_points(), |f| {
+                FactId::EntryPoint(f.id.clone())
+            }),
             by_workspace: ReverseIndex::new(index_workspace(collection)),
             by_package: ReverseIndex::new(index_package(collection)),
             by_module: ReverseIndex::new(index_module(collection)),
@@ -142,6 +150,9 @@ impl FactIndex {
             FactKind::Reference => &self.references,
             FactKind::Diagnostic => &self.diagnostics,
             FactKind::ArchitectureRule => &self.architecture_rules,
+            FactKind::Language => &self.languages,
+            FactKind::Framework => &self.frameworks,
+            FactKind::EntryPoint => &self.entry_points,
         }
     }
 
@@ -321,6 +332,14 @@ fn index_package(collection: &FactCollection) -> Vec<FactIdPair> {
             out.push(pair(
                 &FactId::Package(p.clone()),
                 &FactId::Module(f.id.clone()),
+            ));
+        }
+    }
+    for e in collection.entry_points() {
+        if let Some(p) = &e.package {
+            out.push(pair(
+                &FactId::Package(p.clone()),
+                &FactId::EntryPoint(e.id.clone()),
             ));
         }
     }
@@ -517,6 +536,9 @@ pub(crate) fn fact_id_of(fact: &FactRef<'_>) -> FactId {
         FactRef::Reference(f) => FactId::Reference(f.id.clone()),
         FactRef::Diagnostic(f) => FactId::Diagnostic(f.id.clone()),
         FactRef::ArchitectureRule(f) => FactId::ArchitectureRule(f.id.clone()),
+        FactRef::Language(f) => FactId::Language(f.id.clone()),
+        FactRef::Framework(f) => FactId::Framework(f.id.clone()),
+        FactRef::EntryPoint(f) => FactId::EntryPoint(f.id.clone()),
     }
 }
 

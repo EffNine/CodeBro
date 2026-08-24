@@ -27,6 +27,8 @@ use crate::engineering_facts::{
 };
 
 /// Run the population pipeline for a workspace root and persist the model.
+pub mod repo_intel;
+
 pub fn run(workspace_root: &Path) -> Result<()> {
     let root = workspace_root
         .canonicalize()
@@ -59,6 +61,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     let mut all_imports: Vec<crate::intelligence::parser::ParseImport> = Vec::new();
     let mut impl_scopes: Vec<crate::impact::relationships::ImplScope> = Vec::new();
     let mut skipped_oversized: usize = 0;
+    let mut lang_stats: repo_intel::LangStats = Default::default();
     // Machine-generated "source" files that embed datasets (common in ML
     // repos: data.py with megabytes of array literals, bundled minified
     // bundles, snapshot dumps with a .js/.py extension) explode parse
@@ -91,6 +94,10 @@ pub fn run(workspace_root: &Path) -> Result<()> {
             Ok(s) => s,
             Err(_) => continue, // binary/unreadable: skip
         };
+
+        let stat_entry = lang_stats.entry(language.to_string()).or_insert((0, 0));
+        stat_entry.0 += 1;
+        stat_entry.1 += source.lines().count() as u64;
 
         // Owning package: first package that path-prefixes this file.
         let owner_pkg_id: Option<PackageId> =
@@ -280,6 +287,29 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         builder.add_build_target(bt.clone());
     }
     ws.packages = packages.iter().map(|p| p.id.clone()).collect();
+
+    // ── Repository intelligence surface ──────────────────────────────
+    for fact in repo_intel::language_facts(&lang_stats) {
+        builder.add_language(fact);
+    }
+    let pkg_deps: Vec<repo_intel::PackageDeps> = packages
+        .iter()
+        .filter(|p| !p.id.as_str().ends_with("::external"))
+        .map(|p| repo_intel::PackageDeps {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            language: p.language.clone(),
+            path: p.path.clone(),
+            dep_names: p.dependencies.iter().map(|d| d.name.clone()).collect(),
+        })
+        .collect();
+    for fact in repo_intel::framework_facts(&pkg_deps) {
+        builder.add_framework(fact);
+    }
+    for fact in repo_intel::entry_point_facts(&root, &pkg_deps) {
+        builder.add_entry_point(fact);
+    }
+
     builder.add_workspace(ws);
 
     // ── Build cross-module relationship facts ────────────────────────
@@ -332,7 +362,8 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     // ── Refresh project identity ─────────────────────────────────────
     // Fill only what no one has authored yet: re-running init never
     // clobbers curated identity data (goals, constraints, decisions).
-    match refresh_identity(&root, &ws_name, &arch_summary, &top_modules) {
+    let patterns = repo_intel::detect_patterns(&root, &pkg_deps, &lang_stats);
+    match refresh_identity(&root, &ws_name, &arch_summary, &top_modules, &patterns) {
         Ok(true) => println!("  identity:    refreshed"),
         Ok(false) => {}
         Err(e) => {
@@ -352,6 +383,9 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     println!("  dependencies: {}", counts.dependencies);
     println!("  relationships: {}", counts.relationships);
     println!("  references:    {}", counts.references);
+    println!("  languages:     {}", counts.languages);
+    println!("  frameworks:    {}", counts.frameworks);
+    println!("  entry points:  {}", counts.entry_points);
     if skipped_oversized > 0 {
         println!(
             "  skipped:     {skipped_oversized} oversized source files (>{} KiB)",
@@ -471,6 +505,7 @@ fn refresh_identity(
     ws_name: &str,
     arch_summary: &str,
     top_modules: &[String],
+    patterns: &[String],
 ) -> Result<bool> {
     use crate::project_identity::{IdentityChanges, ProjectIdentityUpdater};
 
@@ -518,6 +553,13 @@ fn refresh_identity(
     for module in top_modules {
         if !current.known_modules.contains(module) {
             changes.add_modules.push(module.clone());
+        }
+    }
+    for pattern in patterns {
+        if !current.known_patterns.contains(pattern)
+            && !changes.add_patterns.contains(pattern)
+        {
+            changes.add_patterns.push(pattern.clone());
         }
     }
 
@@ -642,36 +684,68 @@ struct DiscoveredPackage {
 
 /// Read `Cargo.toml` (Rust) or `go.mod` (Go) for the workspace root; fall
 /// back to a single root-level package when no manifest is found.
+/// Every directory in the tree carrying at least one supported manifest.
+/// Deterministic order; skip-list shared with source discovery.
+fn manifest_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| !repo_intel::skip_dir(&e.file_name().to_string_lossy()))
+    {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let is_manifest = matches!(
+            entry.file_name().to_string_lossy().as_ref(),
+            "Cargo.toml" | "go.mod" | "package.json" | "pyproject.toml" | "setup.py"
+                | "setup.cfg" | "requirements.txt"
+        );
+        if is_manifest {
+            if let Some(parent) = entry.path().parent() {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 fn discover_packages(
     root: &Path,
     ws_id: &WorkspaceId,
 ) -> (Vec<DiscoveredPackage>, Vec<BuildTargetFact>) {
-    let cargo = root.join("Cargo.toml");
-    if cargo.exists() {
-        if let Some((pkg, targets)) = parse_cargo_package(root, ws_id) {
-            return (vec![pkg], targets);
+    let mut packages: Vec<DiscoveredPackage> = Vec::new();
+    let mut build_targets: Vec<BuildTargetFact> = Vec::new();
+
+    // Scan every manifest-bearing directory (workspace members, monorepo
+    // packages, nested services). Priority per directory: Cargo > Go >
+    // Node > Python.
+    for dir in manifest_dirs(root) {
+        let parsed = if dir.join("Cargo.toml").is_file() {
+            parse_cargo_package(&dir, ws_id)
+        } else if dir.join("go.mod").is_file() {
+            parse_go_package(&dir, ws_id)
+        } else if dir.join("package.json").is_file() {
+            parse_node_package(&dir, ws_id)
+        } else if dir.join("pyproject.toml").is_file()
+            || dir.join("setup.py").is_file()
+            || dir.join("setup.cfg").is_file()
+            || dir.join("requirements.txt").is_file()
+        {
+            parse_python_package(&dir, ws_id)
+        } else {
+            None
+        };
+        if let Some((pkg, mut targets)) = parsed {
+            packages.push(pkg);
+            build_targets.append(&mut targets);
         }
     }
-    let go_mod = root.join("go.mod");
-    if go_mod.exists() {
-        if let Some((pkg, targets)) = parse_go_package(root, ws_id) {
-            return (vec![pkg], targets);
-        }
-    }
-    let package_json = root.join("package.json");
-    if package_json.exists() {
-        if let Some((pkg, targets)) = parse_node_package(root, ws_id) {
-            return (vec![pkg], targets);
-        }
-    }
-    let python_manifest_found = root.join("pyproject.toml").is_file()
-        || root.join("setup.py").is_file()
-        || root.join("setup.cfg").is_file()
-        || root.join("requirements.txt").is_file();
-    if python_manifest_found {
-        if let Some((pkg, targets)) = parse_python_package(root, ws_id) {
-            return (vec![pkg], targets);
-        }
+    if !packages.is_empty() {
+        return (packages, build_targets);
     }
 
     // Fallback: a single unnamed root package.
@@ -2068,4 +2142,149 @@ mod python_node_tests {
         let names: Vec<&str> = model.symbols().iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"boot"), "symbols: {names:?}");
     }
+
+    // ── Phase 3: universal repository intelligence ─────────────────────
+
+    #[test]
+    fn multi_manifest_workspace_discovers_member_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        for (name, dep) in [("core", None), ("server", Some("serde"))] {
+            let crate_dir = dir.path().join("crates").join(name);
+            std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+            let dep_section = match dep {
+                Some(d) => format!("\n[dependencies]\n{d} = \"1\"\n"),
+                None => String::new(),
+            };
+            std::fs::write(
+                crate_dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"demo-{name}\"\nversion = \"0.1.0\"\n{dep_section}"
+                ),
+            )
+            .unwrap();
+            std::fs::write(crate_dir.join("src/lib.rs"), "pub fn x() {}\n").unwrap();
+        }
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+        let names: Vec<&str> = model
+            .packages()
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(names.contains(&"demo-core"), "packages: {names:?}");
+        assert!(names.contains(&"demo-server"), "packages: {names:?}");
+        assert_eq!(model.dependencies().len(), 1, "deps: {names:?}");
+    }
+
+    #[test]
+    fn language_facts_aggregate_scanned_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}\npub fn b() {}\n").unwrap();
+        std::fs::write(dir.path().join("helper.py"), "def f():\n    pass\n").unwrap();
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(model.languages().len() >= 2, "langs: {:?}", model.languages());
+        let rust = model
+            .languages()
+            .iter()
+            .find(|l| l.name == "rust")
+            .expect("rust language fact");
+        assert_eq!(rust.file_count, 1);
+        assert_eq!(rust.line_count, 2);
+        let py = model
+            .languages()
+            .iter()
+            .find(|l| l.name == "python")
+            .expect("python language fact");
+        assert_eq!(py.file_count, 1);
+    }
+
+    #[test]
+    fn framework_facts_require_dependency_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "web", "dependencies": {"express": "^4.18.0", "left-pad": "1.3.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("index.js"), "const x = 1;\n").unwrap();
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+        let frameworks: Vec<(&str, &str)> = model
+            .frameworks()
+            .iter()
+            .map(|f| (f.name.as_str(), f.evidence.as_str()))
+            .collect();
+        assert!(
+            frameworks.contains(&("Express", "express")),
+            "frameworks: {frameworks:?}"
+        );
+        // left-pad proves nothing — no framework fact may exist for it.
+        assert!(
+            !frameworks.iter().any(|(name, _)| *name == "left-pad"),
+            "frameworks: {frameworks:?}"
+        );
+        assert_eq!(model.frameworks().len(), 1);
+    }
+
+    #[test]
+    fn entry_point_facts_from_conventions_and_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"svc\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+        let entries: Vec<&str> = model.entry_points().iter().map(|e| e.path.as_str()).collect();
+        assert!(entries.contains(&"src/main.rs"), "entries: {entries:?}");
+        let main = model
+            .entry_points()
+            .iter()
+            .find(|e| e.path == "src/main.rs")
+            .unwrap();
+        assert_eq!(main.name, "svc");
+        assert_eq!(main.kind, codebro_fact_store::engineering_facts::EntryPointKind::Binary);
+    }
+
+    #[test]
+    fn detect_patterns_flags_cargo_workspace_and_polyglot() {
+        use crate::init::repo_intel;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let mut stats: repo_intel::LangStats = Default::default();
+        stats.insert("rust".into(), (3, 100));
+        stats.insert("python".into(), (1, 20));
+        let pkgs = vec![repo_intel::PackageDeps {
+            id: PackageId::new("pkg::a"),
+            name: "a".into(),
+            language: "rust".into(),
+            path: dir.path().to_path_buf(),
+            dep_names: vec![],
+        }];
+        let patterns = repo_intel::detect_patterns(dir.path(), &pkgs, &stats);
+        assert!(patterns.contains(&"multi-language".to_string()), "{patterns:?}");
+    }
 }
+

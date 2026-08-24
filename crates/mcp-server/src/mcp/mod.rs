@@ -163,6 +163,9 @@ impl CodeBroMcpServer {
                 "references": counts.references,
                 "diagnostics": counts.diagnostics,
                 "architecture_rules": counts.architecture_rules,
+                "languages": counts.languages,
+                "frameworks": counts.frameworks,
+                "entry_points": counts.entry_points,
                 "total": counts.total,
             },
         });
@@ -205,6 +208,9 @@ impl CodeBroMcpServer {
                     "reference" => FactKind::Reference,
                     "diagnostic" => FactKind::Diagnostic,
                     "architecture_rule" | "architecturerule" => FactKind::ArchitectureRule,
+                    "language" => FactKind::Language,
+                    "framework" => FactKind::Framework,
+                    "entry_point" | "entrypoint" => FactKind::EntryPoint,
                     other => {
                         return Err(McpError::invalid_params(
                             format!("unknown fact kind '{other}'"),
@@ -1151,6 +1157,9 @@ impl CodeBroMcpServer {
                         "references": counts.references,
                         "diagnostics": counts.diagnostics,
                         "architecture_rules": counts.architecture_rules,
+                "languages": counts.languages,
+                "frameworks": counts.frameworks,
+                "entry_points": counts.entry_points,
                         "total": counts.total,
                     },
                     "generation_repo_state": gen_state.map(|s| json!({

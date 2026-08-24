@@ -251,7 +251,15 @@ impl FactValidation {
         }
         for fact in collection.iter() {
             let is_external_package = matches!(fact, FactRef::Package(p) if p.workspace.is_none());
-            if matches!(fact, FactRef::Workspace(_) | FactRef::Dependency(_)) || is_external_package
+            // Repository-level intelligence facts (languages, frameworks)
+            // and dependency links carry no scope projection by design.
+            if matches!(
+                fact,
+                FactRef::Workspace(_)
+                    | FactRef::Dependency(_)
+                    | FactRef::Language(_)
+                    | FactRef::Framework(_)
+            ) || is_external_package
             {
                 continue;
             }

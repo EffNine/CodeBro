@@ -171,6 +171,9 @@ fn fact_id_of_ref(fact: &FactRef<'_>) -> FactId {
         FactRef::Reference(f) => FactId::Reference(f.id.clone()),
         FactRef::Diagnostic(f) => FactId::Diagnostic(f.id.clone()),
         FactRef::ArchitectureRule(f) => FactId::ArchitectureRule(f.id.clone()),
+        FactRef::Language(f) => FactId::Language(f.id.clone()),
+        FactRef::Framework(f) => FactId::Framework(f.id.clone()),
+        FactRef::EntryPoint(f) => FactId::EntryPoint(f.id.clone()),
     }
 }
 

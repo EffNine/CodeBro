@@ -25,6 +25,9 @@ pub struct IndexSizes {
     pub references: usize,
     pub diagnostics: usize,
     pub architecture_rules: usize,
+    pub languages: usize,
+    pub frameworks: usize,
+    pub entry_points: usize,
     pub total: usize,
 }
 
@@ -65,6 +68,9 @@ impl FactStatistics {
             references: index.kind_len(FactKind::Reference),
             diagnostics: index.kind_len(FactKind::Diagnostic),
             architecture_rules: index.kind_len(FactKind::ArchitectureRule),
+            languages: index.kind_len(FactKind::Language),
+            frameworks: index.kind_len(FactKind::Framework),
+            entry_points: index.kind_len(FactKind::EntryPoint),
             total: index.primary_len(),
         };
         let reverse = ReverseIndexSizes {
@@ -97,6 +103,9 @@ impl FactStatistics {
             FactKind::Reference => self.counts.references,
             FactKind::Diagnostic => self.counts.diagnostics,
             FactKind::ArchitectureRule => self.counts.architecture_rules,
+            FactKind::Language => self.counts.languages,
+            FactKind::Framework => self.counts.frameworks,
+            FactKind::EntryPoint => self.counts.entry_points,
         }
     }
 }

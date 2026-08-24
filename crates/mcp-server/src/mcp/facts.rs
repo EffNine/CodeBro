@@ -469,6 +469,45 @@ fn record_from_fact_enriched(
             r.provenance_type = Some(ProvenanceType::None);
             r
         }
+        FactRef::Language(l) => {
+            let mut r = FactRecord::new("language", l.name.clone(), 0);
+            r.summary = Some(format!(
+                "{} source file(s), {} lines",
+                l.file_count, l.line_count
+            ));
+            r.relationship_count = Some(0);
+            r.test_count = Some(0);
+            r.provenance_type = Some(ProvenanceType::Verified);
+            r
+        }
+        FactRef::Framework(fw) => {
+            let mut r = FactRecord::new("framework", fw.name.clone(), 0);
+            r.summary = Some(format!(
+                "{} framework, proven by dependency '{}'",
+                fw.ecosystem, fw.evidence
+            ));
+            r.package = fw
+                .scope_package
+                .as_ref()
+                .and_then(|pid| collection.package(pid).map(|p| p.name.clone()));
+            r.relationship_count = Some(0);
+            r.test_count = Some(0);
+            r.provenance_type = Some(ProvenanceType::Verified);
+            r
+        }
+        FactRef::EntryPoint(e) => {
+            let mut r = FactRecord::new("entry_point", e.name.clone(), 0);
+            r.path = Some(e.path.clone());
+            r.summary = Some(format!("{} entry point ({})", e.kind.as_str(), e.language));
+            r.package = e
+                .package
+                .as_ref()
+                .and_then(|pid| collection.package(pid).map(|p| p.name.clone()));
+            r.relationship_count = Some(0);
+            r.test_count = Some(0);
+            r.provenance_type = Some(ProvenanceType::Verified);
+            r
+        }
         _ => return None,
     };
     r.trust = compute_fact_trust(r.provenance_type, freshness);
