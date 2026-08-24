@@ -62,23 +62,15 @@ fn live_sources_do_not_reference_legacy() {
     );
 }
 
-/// The legacy module must remain test-only: it is declared under #[cfg(test)].
+/// Legacy must stay retired: no `mod legacy` declaration may exist anywhere
+/// in the live module tree.
 #[test]
 fn legacy_is_test_only() {
     let lib = std::fs::read_to_string(repo_root().join("crates/mcp-server/src/lib.rs"))
         .expect("mcp-server lib.rs");
-    let lines: Vec<&str> = lib.lines().collect();
-    let mod_line = lines
-        .iter()
-        .position(|l| l.trim() == "pub mod legacy;")
-        .expect("legacy module declaration present");
     assert!(
-        mod_line > 0,
-        "declaration must not be the first line of lib.rs"
-    );
-    assert_eq!(
-        lines[mod_line - 1].trim(),
-        "#[cfg(test)]",
-        "legacy must be gated by #[cfg(test)] directly above its declaration"
+        !lib.contains("mod legacy"),
+        "the legacy module was retired in v1 (see docs/LEGACY_RETIREMENT.md); \
+         it must not be re-declared"
     );
 }

@@ -147,17 +147,3 @@ impl Config {
         Ok(())
     }
 }
-
-
-/// Test-only constructor used by workspace integration tests.
-#[cfg(feature = "test-support")]
-impl Config {
-    pub fn default_test() -> Self {
-        Config {
-            provider: "openai".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            model: "gpt-4o".to_string(),
-            api_key: None,
-        }
-    }
-}

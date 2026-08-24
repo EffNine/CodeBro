@@ -17,9 +17,6 @@ pub mod doctor;
 pub mod mcp;
 pub mod providers;
 
-#[cfg(test)]
-pub mod legacy;
-
 // ---- path-compatibility re-exports (workspace split) --------------------
 pub use codebro_change_engine::coding;
 pub use codebro_core::{cancellation, config, error, persistence, provenance, tools};
