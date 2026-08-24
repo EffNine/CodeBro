@@ -1314,7 +1314,15 @@ mod tests {
             .ok();
         std::process::Command::new("git")
             .current_dir(dir.path())
-            .args(["commit", "-m", "initial"])
+            .args([
+                "-c",
+                "user.email=codebro@test",
+                "-c",
+                "user.name=codebro",
+                "commit",
+                "-m",
+                "initial",
+            ])
             .output()
             .ok();
 
@@ -1342,7 +1350,15 @@ mod tests {
             .ok();
         std::process::Command::new("git")
             .current_dir(dir.path())
-            .args(["commit", "-m", "initial"])
+            .args([
+                "-c",
+                "user.email=codebro@test",
+                "-c",
+                "user.name=codebro",
+                "commit",
+                "-m",
+                "initial",
+            ])
             .output()
             .ok();
 
@@ -1379,7 +1395,15 @@ mod tests {
             .ok();
         std::process::Command::new("git")
             .current_dir(dir.path())
-            .args(["commit", "-m", "initial"])
+            .args([
+                "-c",
+                "user.email=codebro@test",
+                "-c",
+                "user.name=codebro",
+                "commit",
+                "-m",
+                "initial",
+            ])
             .output()
             .ok();
 
@@ -1452,7 +1476,15 @@ mod tests {
             .ok();
         std::process::Command::new("git")
             .current_dir(&dir)
-            .args(["commit", "-m", "init"])
+            .args([
+                "-c",
+                "user.email=codebro@test",
+                "-c",
+                "user.name=codebro",
+                "commit",
+                "-m",
+                "init",
+            ])
             .output()
             .ok();
 
@@ -1480,7 +1512,15 @@ mod tests {
             .ok();
         std::process::Command::new("git")
             .current_dir(&dir)
-            .args(["commit", "-m", "init"])
+            .args([
+                "-c",
+                "user.email=codebro@test",
+                "-c",
+                "user.name=codebro",
+                "commit",
+                "-m",
+                "init",
+            ])
             .output()
             .ok();
 
@@ -1512,7 +1552,15 @@ mod tests {
             .ok();
         std::process::Command::new("git")
             .current_dir(&dir)
-            .args(["commit", "-m", "init"])
+            .args([
+                "-c",
+                "user.email=codebro@test",
+                "-c",
+                "user.name=codebro",
+                "commit",
+                "-m",
+                "init",
+            ])
             .output()
             .ok();
         let state1 = RepoState::capture(&dir.path().to_path_buf()).unwrap();
