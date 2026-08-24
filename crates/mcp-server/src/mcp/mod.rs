@@ -414,6 +414,52 @@ impl CodeBroMcpServer {
         )]))
     }
 
+    /// Apply a multi-file transaction atomically: validate → preview →
+    /// apply all-or-nothing with rollback. Enforces the workspace boundary,
+    /// refuses stale or ambiguous edits, and detects conflicts across the
+    /// whole set before writing anything.
+    #[tool(
+        description = "Apply a multi-file transaction through the ChangeEngine. All-or-nothing: changes are validated against current content, then applied with automatic rollback if any write fails. For new files pass old as an empty string. Use apply_change for single-file edits."
+    )]
+    async fn apply_changes(
+        &self,
+        Parameters(args): Parameters<ApplyChangesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let engine =
+            crate::coding::change_engine::ChangeEngine::new(&self.workspace_root, &[], false);
+
+        let requests: Vec<crate::coding::transaction::TransactionRequest> = args
+            .changes
+            .iter()
+            .map(|c| crate::coding::transaction::TransactionRequest {
+                path: c.path.clone(),
+                old: c.old.clone(),
+                new: c.new.clone(),
+            })
+            .collect();
+
+        let prepared = engine
+            .prepare_changes(&requests)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        let report = engine
+            .apply_transaction(&prepared)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let response = json!({
+            "applied": report.success(),
+            "applied_count": report.applied.len(),
+            "created": report.created.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "rolled_back": report.rolled_back.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "preview": prepared.preview(),
+        });
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&response)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        )]))
+    }
+
     // ── Tool 5: record engineering memory (guarded write) ─────────────
 
     /// Record or update an engineering memory entry. Values are
@@ -1449,6 +1495,25 @@ pub struct ChangeArgs {
     pub old: String,
     /// Replacement text.
     pub new: String,
+}
+
+/// One change inside an `apply_changes` transaction.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TransactionChangeArgs {
+    /// Path to the file, relative to the workspace root.
+    pub path: String,
+    /// Exact existing text to replace; empty to create a new file.
+    pub old: String,
+    /// Replacement text.
+    pub new: String,
+}
+
+/// Argument schema for `apply_changes` (transactional multi-file mutation).
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ApplyChangesArgs {
+    /// The set of changes applied all-or-nothing: either every change lands
+    /// or the workspace is rolled back to its prior state.
+    pub changes: Vec<TransactionChangeArgs>,
 }
 
 /// Argument schema for `record_memory`.

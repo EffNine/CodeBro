@@ -9,6 +9,7 @@ description = "CodeBro change engine — guarded single-file mutation seam (work
 codebro-core.workspace = true
 
 anyhow.workspace = true
+tracing.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true

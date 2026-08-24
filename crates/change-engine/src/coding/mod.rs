@@ -11,5 +11,7 @@
 
 #![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod change_engine;
+pub mod transaction;
 
 pub use change_engine::{ChangeEngine, PreparedChange};
+pub use transaction::{PreparedTransaction, TransactionReport, TransactionRequest};
