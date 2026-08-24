@@ -246,21 +246,123 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "codebro"
+name = "codebro-change-engine"
+version = "0.7.0-mcp-rc2"
+dependencies = [
+ "anyhow",
+ "codebro-core",
+ "futures",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "walkdir",
+]
+
+[[package]]
+name = "codebro-core"
+version = "0.7.0-mcp-rc2"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "futures",
+ "libc",
+ "portable-pty",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "uuid",
+]
+
+[[package]]
+name = "codebro-fact-store"
+version = "0.7.0-mcp-rc2"
+dependencies = [
+ "chrono",
+ "codebro-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "toml",
+ "walkdir",
+]
+
+[[package]]
+name = "codebro-identity-runtime"
+version = "0.7.0-mcp-rc2"
+dependencies = [
+ "chrono",
+ "codebro-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "codebro-impact-engine"
+version = "0.7.0-mcp-rc2"
+dependencies = [
+ "chrono",
+ "codebro-core",
+ "codebro-fact-store",
+ "codebro-parsers",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "codebro-indexer"
+version = "0.7.0-mcp-rc2"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codebro-core",
+ "codebro-fact-store",
+ "codebro-identity-runtime",
+ "codebro-impact-engine",
+ "codebro-parsers",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
+name = "codebro-mcp-server"
 version = "0.7.0-mcp-rc2"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "clap",
+ "codebro-change-engine",
+ "codebro-core",
+ "codebro-fact-store",
+ "codebro-identity-runtime",
+ "codebro-impact-engine",
+ "codebro-indexer",
+ "codebro-memory-runtime",
+ "codebro-parsers",
+ "codebro-sandbox-runtime",
  "dirs",
  "futures",
- "libc",
- "portable-pty",
  "regex",
  "reqwest",
  "rmcp",
- "rusqlite",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -271,6 +373,37 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "codebro-memory-runtime"
+version = "0.7.0-mcp-rc2"
+dependencies = [
+ "chrono",
+ "codebro-core",
+ "codebro-identity-runtime",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "codebro-parsers"
+version = "0.7.0-mcp-rc2"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codebro-core",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-javascript",
@@ -279,6 +412,25 @@ dependencies = [
  "tree-sitter-typescript",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "codebro-sandbox-runtime"
+version = "0.7.0-mcp-rc2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "codebro-core",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

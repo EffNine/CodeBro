@@ -1,0 +1,19 @@
+[package]
+name = "codebro-impact-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CodeBro impact engine — structural impact analysis over the engineering relationship graph"
+
+[dependencies]
+codebro-core.workspace = true
+codebro-fact-store.workspace = true
+codebro-parsers.workspace = true
+
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

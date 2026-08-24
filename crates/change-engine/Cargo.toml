@@ -1,0 +1,19 @@
+[package]
+name = "codebro-change-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CodeBro change engine — guarded single-file mutation seam (workspace boundary, stale protection)"
+
+[dependencies]
+codebro-core.workspace = true
+
+anyhow.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

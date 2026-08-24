@@ -1,0 +1,47 @@
+[package]
+name = "codebro-mcp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CodeBro MCP server — the public interface of the engineering intelligence runtime"
+
+[[bin]]
+name = "codebro"
+path = "src/main.rs"
+
+[dependencies]
+codebro-change-engine.workspace = true
+codebro-core.workspace = true
+codebro-fact-store.workspace = true
+codebro-identity-runtime.workspace = true
+codebro-impact-engine.workspace = true
+codebro-indexer.workspace = true
+codebro-memory-runtime.workspace = true
+codebro-parsers.workspace = true
+codebro-sandbox-runtime.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+futures.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+walkdir.workspace = true
+codebro-core = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+toml.workspace = true

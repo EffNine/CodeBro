@@ -1,48 +1,52 @@
-[package]
-name = "codebro"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.7.0-mcp-rc2"
 edition = "2021"
-description = "MCP-based engineering intelligence runtime: verified facts, engineering memory, impact analysis, and safe execution for AI coding agents"
 license = "MIT"
+description = "CodeBro — engineering intelligence runtime for AI coding agents"
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates (dependency direction: mcp-server -> services -> parsers/core)
+codebro-core = { path = "crates/core" }
+codebro-parsers = { path = "crates/parsers" }
+codebro-fact-store = { path = "crates/fact-store" }
+codebro-identity-runtime = { path = "crates/identity-runtime" }
+codebro-memory-runtime = { path = "crates/memory-runtime" }
+codebro-sandbox-runtime = { path = "crates/sandbox-runtime" }
+codebro-impact-engine = { path = "crates/impact-engine" }
+codebro-indexer = { path = "crates/indexer" }
+codebro-change-engine = { path = "crates/change-engine" }
+
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
+dirs = "5"
+futures = "0.3"
+libc = "0.2.189"
+portable-pty = "0.9.0"
+regex = "1"
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "cookies"] }
+rmcp = { version = "3.1.2", features = ["transport-io"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+schemars = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-walkdir = "2"
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-anyhow = "1"
-thiserror = "1"
-futures = "0.3"
-dirs = "5"
-async-trait = "0.1"
-tempfile = "3"
-sha2 = "0.10"
-regex = "1"
 tree-sitter = "0.20"
-tree-sitter-rust = "0.20"
-tree-sitter-python = "0.20"
-tree-sitter-javascript = "0.20"
-tree-sitter-typescript = "0.20"
 tree-sitter-go = "0.20"
-rusqlite = { version = "0.31", features = ["bundled"] }
-portable-pty = "0.9.0"
-libc = "0.2.189"
-rmcp = { version = "3.1.2", features = ["transport-io"] }
-schemars = "0.8"
-
-[dev-dependencies]
-
-[features]
-default = []
-opensandbox-integration = []
-
-[[bin]]
-name = "codebro"
-path = "src/main.rs"
+tree-sitter-javascript = "0.20"
+tree-sitter-python = "0.20"
+tree-sitter-rust = "0.20"
+tree-sitter-typescript = "0.20"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"

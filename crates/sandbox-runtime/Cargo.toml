@@ -1,0 +1,24 @@
+[package]
+name = "codebro-sandbox-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CodeBro sandbox runtime — policy-bounded local and OpenSandbox command execution with evidence envelopes"
+
+[dependencies]
+codebro-core.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

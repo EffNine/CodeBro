@@ -1,0 +1,18 @@
+[package]
+name = "codebro-identity-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CodeBro project identity runtime — declared-intent store for goals, constraints, decisions"
+
+[dependencies]
+codebro-core.workspace = true
+
+chrono.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
