@@ -1,10 +1,12 @@
 # CodeBro
 
-Persistent engineering context and memory for AI coding agents, exposed through MCP.
+**CodeBro is an MCP-based engineering intelligence runtime that provides AI coding agents with repository understanding, verified facts, engineering memory, impact analysis, and safe execution.**
 
 AI coding agents are good at reasoning, but they repeatedly rediscover project
 structure and forget engineering decisions across sessions. CodeBro solves this
 by maintaining verified facts and recorded memory that persist between sessions.
+
+Architecture and module map: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ```
               AI Coding Agents

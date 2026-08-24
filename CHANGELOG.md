@@ -64,6 +64,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Runtime consolidation — legacy isolation** — the retired TUI agent stack and Adaptive Platform subsystems (33 top-level modules: agent loop, planner, subagents, canonical runtime, tool platform, intent/preference/recommendation engines, plugin SDK, service registry, …) moved under `src/legacy/` with an explicit boundary doc. Legacy compiles only under `#[cfg(test)]` as a regression suite; it has no entry point from `main` and no live module imports it. The live runtime is now ~47k LOC across 19 module roots (down from ~157k across 52).
+- **Dependency direction enforced** — `coding/` reduced to the ChangeEngine (`change_engine.rs`); the Sprint 30F subagent surfaces moved to `legacy::{coding_tooling, coding_contract, coding_runtime, coding_limits, coding_tests}`. `engineering_memory` absorbed the `engineering_context::memory` adapter. `tools/` keeps only shell/pty/patch/change/context/streaming/capabilities; `providers/` keeps catalog+models. Final graph: `MCP → Engineering Runtime → Core Services`.
+- **Clippy meaningful again** — crate-wide blanket suppressions removed from every live module; each live module root carries one documented inner allow for `dead_code`/`unused_imports` only. All other lints active and clean (0 warnings, `--all-targets`). Surfaced fixes: provenance match restructure, `sort_by_key`, let-else guards in impact traversal, `io::Error::other`, sandbox backend signatures now take `&Path`, self-assignment removal in identity migration.
+- **Toolchain pinned** — `rust-toolchain.toml` sets channel `1.97`. The committed lockfile already required cargo ≥1.85 via edition2024 transitive deps (`idna_adapter`); this makes the floor explicit.
+
+### Fixed
+- **Verification commands inherit CodeBro build env** — spawned `sh -c` commands (shell tool + PTY backend) dropped nothing before; a workspace's own `cargo check/test` could be redirected into CodeBro's `CARGO_TARGET_DIR`, contending across sessions and breaking evidence reproducibility. `CARGO_TARGET_DIR`, `RUSTFLAGS`, `CARGO_BUILD_TARGET` are now stripped at spawn.
+- **Identity migration self-assignments** — `migrate_v090_to_v100` assigned fields to themselves; serde defaults already cover missing-field fill on load.
+
+### Removed
+- **Unused dev-dependency** `tokio-test`.
+
+### Added
+- **ARCHITECTURE.md** — live module map, dependency rule, trust model, CLI reference.
+
+### Tests
+- Test inventory is now honestly separated: **752 runtime tests** vs **2,467 legacy regression tests** (previously reported as one undifferentiated green number). Full suite: 3219 collected; runtime suite green; 11 ignored by design.
+
 ### Fixed
 - **Duplicate dependency facts when a crate appears in multiple Cargo sections** — `async-trait` in both `[dependencies]` and `[dev-dependencies]` produced two identical `dep::` facts (ids are name-keyed). One entry is kept; the most product-relevant kind wins (direct > build > dev). Found by running init against a real 833 MB workspace.
 - **README blockquote artifacts leaked into inferred descriptions** — a leading `> One API key. One endpoint.` mined as `"> One API key..."`. Blockquote markers and emphasis characters are now stripped before the two-sentence cap.

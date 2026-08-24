@@ -2,7 +2,7 @@
 name = "codebro"
 version = "0.7.0-mcp-rc2"
 edition = "2021"
-description = "Your AI coding partner in the terminal"
+description = "MCP-based engineering intelligence runtime: verified facts, engineering memory, impact analysis, and safe execution for AI coding agents"
 license = "MIT"
 
 [dependencies]
