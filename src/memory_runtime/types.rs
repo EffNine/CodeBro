@@ -219,11 +219,10 @@ pub struct MemoryResolution {
 
 impl MemoryResolution {
     pub fn new(query: MemoryQuery, hits: Vec<MemoryEntry>, latency_ms: u64) -> Self {
-        let resolution_order = if query.tier.is_some() {
-            vec![query.tier.unwrap()]
-        } else {
-            vec![MemoryTier::Session, MemoryTier::Project, MemoryTier::Global]
-        };
+        let resolution_order = query
+            .tier
+            .map(|tier| vec![tier])
+            .unwrap_or_else(|| vec![MemoryTier::Session, MemoryTier::Project, MemoryTier::Global]);
 
         let misses = resolution_order
             .iter()

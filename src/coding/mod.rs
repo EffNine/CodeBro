@@ -9,6 +9,7 @@
 //! restricted registry, agent loop) is legacy architecture and lives in
 //! `crate::legacy`.
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod change_engine;
 
 pub use change_engine::{ChangeEngine, PreparedChange};

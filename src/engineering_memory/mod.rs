@@ -39,6 +39,7 @@
 //! EngineeringMemoryContext → Prompt Builder (unchanged)
 //! ```
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod memory_context;
 pub mod provider;
 pub mod resolver;

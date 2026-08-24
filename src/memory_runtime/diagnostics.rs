@@ -242,7 +242,7 @@ mod tests {
             diag.record_resolution_latency(i);
         }
         let p95 = diag.p95_resolution_latency();
-        assert!(p95 >= 90 && p95 <= 100);
+        assert!((90..=100).contains(&p95));
     }
 
     #[test]

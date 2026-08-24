@@ -143,10 +143,7 @@ pub fn channel_stream(
     }
 
     let stream = stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Some(chunk) => Some((chunk, rx)),
-            None => None,
-        }
+        rx.recv().await.map(|chunk| (chunk, rx))
     });
 
     StreamResult::new(stream, tool_name)
@@ -161,7 +158,7 @@ pub fn channel_stream(
 /// If the producer thread cannot be started, the stream yields a single final
 /// error chunk so the failure is observable rather than a silent empty stream.
 pub fn channel_stream_factory(
-    tool_name: &str,
+    _tool_name: &str,
     produce: impl FnOnce(mpsc::Sender<StreamChunk>) + Send + 'static,
 ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
     let (tx, mut rx) = mpsc::channel::<StreamChunk>(32);

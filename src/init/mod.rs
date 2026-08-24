@@ -9,6 +9,7 @@
 //! package dependencies (from Cargo.toml), and cross-module relationship
 //! facts inferred from symbol name co-occurrence.
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -668,7 +669,7 @@ fn discover_packages(
 /// Parse a Cargo manifest into a package plus bin/lib targets.
 fn parse_cargo_package(
     root: &Path,
-    ws_id: &WorkspaceId,
+    _ws_id: &WorkspaceId,
 ) -> Option<(DiscoveredPackage, Vec<BuildTargetFact>)> {
     let text = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
     let value: toml::Value = text.parse().ok()?;
@@ -1028,7 +1029,7 @@ mod tests {
         assert!(names.contains(&"Config"));
         assert!(names.contains(&"main"));
         // Test detection heuristic picks test_x.
-        assert!(model.tests().len() >= 1);
+        assert!(!model.tests().is_empty());
     }
 
     #[test]
@@ -1294,7 +1295,7 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .is_empty());
-        assert!((identity["known_modules"].as_array().unwrap()).len() >= 1);
+        assert!(!identity["known_modules"].as_array().unwrap().is_empty());
         assert!(identity["important_files"]
             .as_array()
             .unwrap()

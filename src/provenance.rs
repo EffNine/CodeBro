@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Canonical provenance and claim envelope types (Phase A).
 //!
 //! This module provides a shared semantic vocabulary for claims without
@@ -44,6 +43,7 @@
 //! is a concrete use case. No `Authority` enum, type, scoring, or resolver
 //! exists in Phase A.
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -923,7 +923,6 @@ mod tests {
 
     #[test]
     fn trust_respects_freshness() {
-        let p = sample_provenance();
         let t_fresh = compute_trust(&SourceKind::StaticAnalysis, 0.5, FreshnessStatus::Fresh);
 
         let t_stale = compute_trust(&SourceKind::StaticAnalysis, 0.5, FreshnessStatus::Stale);

@@ -42,7 +42,7 @@ impl MemoryLifecycle {
         entries.insert(id.clone(), entry);
         tier_index
             .entry(tier)
-            .or_insert_with(|| HashSet::new())
+            .or_default()
             .insert(id.clone());
 
         self.record_event(MemoryEvent::PolicyApplied {

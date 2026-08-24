@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Fact Store Foundation (P10.5.1).
 //!
 //! The **canonical immutable repository for Engineering Facts**. The store
@@ -42,6 +41,7 @@
 //! no UUID generation, no timestamp and no randomness anywhere in the
 //! module. Every public type is `Send + Sync`.
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod collection;
 pub mod diagnostics;
 pub mod index;

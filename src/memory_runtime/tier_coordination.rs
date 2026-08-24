@@ -139,12 +139,12 @@ impl TierCoordinator {
         let to_evict = match policy.eviction {
             EvictionPolicy::LRU => {
                 let mut sorted = entries;
-                sorted.sort_by(|a, b| a.last_accessed.cmp(&b.last_accessed));
+                sorted.sort_by_key(|a| a.last_accessed);
                 sorted
             }
             EvictionPolicy::LFU => {
                 let mut sorted = entries;
-                sorted.sort_by(|a, b| a.access_count.cmp(&b.access_count));
+                sorted.sort_by_key(|a| a.access_count);
                 sorted
             }
             EvictionPolicy::LowestImportance => {
@@ -169,7 +169,7 @@ impl TierCoordinator {
             }
             EvictionPolicy::FIFO => {
                 let mut sorted = entries;
-                sorted.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                sorted.sort_by_key(|a| a.created_at);
                 sorted
             }
         };

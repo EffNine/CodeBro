@@ -464,7 +464,7 @@ fn collect_js_frameworks(package_json_text: &str, out: &mut InferredIdentity) {
     for section in ["dependencies", "peerDependencies"] {
         if let Some(deps) = value.get(section).and_then(|d| d.as_object()) {
             for name in deps.keys() {
-                let base = name.split('/').last().unwrap_or(name);
+                let base = name.split('/').next_back().unwrap_or(name);
                 if let Some((_, fw)) = JS_FRAMEWORKS.iter().find(|(k, _)| *k == base || *k == name) {
                     found.insert(fw.to_string());
                 }
@@ -526,7 +526,7 @@ fn normalize_description(s: &str) -> Option<String> {
         return None;
     }
     let mut sentences: Vec<&str> = vec![];
-    for sent in collapsed.split_inclusive(|c| c == '.' || c == '!' || c == '?') {
+    for sent in collapsed.split_inclusive(['.', '!', '?']) {
         sentences.push(sent.trim());
         if sentences.len() == 2 {
             break;

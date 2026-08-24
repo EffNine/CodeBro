@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 mod cancellation;
 mod cli;
 mod coding;

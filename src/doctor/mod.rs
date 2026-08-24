@@ -8,6 +8,7 @@
 //! - `1` — warnings (recoverable)
 //! - `2` — errors (needs `codebro init` or manual repair)
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 use std::path::Path;
 
 use anyhow::Result;
@@ -173,7 +174,7 @@ pub fn report(workspace_root: &Path) -> Result<(i32, Vec<Check>)> {
     }
 
     // ── 5. Engineering memory ─────────────────────────────────────────
-    let memory_path = codebro_dir.join("engineering_memory.json");
+    let _memory_path = codebro_dir.join("engineering_memory.json");
     let identity_for_memory = crate::project_identity::ProjectIdentityRuntime::new(&root);
     let mut memory =
         crate::engineering_memory::EngineeringMemoryRuntime::new(&root, identity_for_memory);

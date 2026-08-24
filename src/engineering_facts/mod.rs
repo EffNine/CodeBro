@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Engineering Facts Model (P10.5.0).
 //!
 //! The canonical engineering data model consumed by the Engineering
@@ -46,6 +45,7 @@
 //!   strings supplied by producers.
 //! - Every type is `Send + Sync` and safe to share across threads via `Arc`.
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod architecture;
 pub mod build_target;
 pub mod dependency;
@@ -482,7 +482,7 @@ impl FactsBuilder {
 
     /// Freeze into an immutable, id-sorted `FactsModel`.
     pub fn build(self) -> FactsModel {
-        fn sort_by_id<T>(v: &mut Vec<T>)
+        fn sort_by_id<T>(v: &mut [T])
         where
             T: IdCarrier,
         {

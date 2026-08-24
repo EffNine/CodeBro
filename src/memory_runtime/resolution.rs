@@ -159,11 +159,11 @@ impl MemoryResolver {
                 all_hits.into_iter().take(query.max_results).collect()
             }
             super::policy::ConflictPolicy::MostRecent => {
-                all_hits.sort_by(|a, b| b.last_accessed.cmp(&a.last_accessed));
+                all_hits.sort_by_key(|m| std::cmp::Reverse(m.last_accessed));
                 all_hits.into_iter().take(query.max_results).collect()
             }
             super::policy::ConflictPolicy::MostAccessed => {
-                all_hits.sort_by(|a, b| b.access_count.cmp(&a.access_count));
+                all_hits.sort_by_key(|m| std::cmp::Reverse(m.access_count));
                 all_hits.into_iter().take(query.max_results).collect()
             }
         };
@@ -181,11 +181,10 @@ impl MemoryResolver {
             });
         }
 
-        let resolution_order = if query.tier.is_some() {
-            vec![query.tier.unwrap()]
-        } else {
-            vec![MemoryTier::Session, MemoryTier::Project, MemoryTier::Global]
-        };
+        let resolution_order = query
+            .tier
+            .map(|tier| vec![tier])
+            .unwrap_or_else(|| vec![MemoryTier::Session, MemoryTier::Project, MemoryTier::Global]);
 
         let misses = resolution_order
             .iter()

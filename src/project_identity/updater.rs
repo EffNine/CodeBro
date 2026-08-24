@@ -239,7 +239,7 @@ impl ProjectIdentityUpdater {
 
         // Persist the updated identity and all projections.
         let save_start = Instant::now();
-        if let Err(e) = self.storage.save_all(&identity) {
+        if let Err(_e) = self.storage.save_all(&identity) {
             let update_time_us = update_start.elapsed().as_micros() as u64;
             self.update_count += 1;
             let diagnostics =

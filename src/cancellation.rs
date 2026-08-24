@@ -11,6 +11,7 @@
 //! while a blocking future such as `rx.recv()` or `stream_response()` is
 //! in progress.
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;

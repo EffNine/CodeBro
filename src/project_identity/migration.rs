@@ -34,11 +34,8 @@ const MIGRATIONS: &[Migration] = &[
 fn migrate_v090_to_v100(identity: ProjectIdentity) -> ProjectIdentity {
     let mut id = identity;
     id.schema_version = CURRENT_SCHEMA_VERSION.to_string();
-    // Add default values for new fields that may be missing.
-    id.known_patterns = id.known_patterns;
-    id.known_modules = id.known_modules;
-    id.coding_conventions = id.coding_conventions;
-    id.recent_milestones = id.recent_milestones;
+    // v1.0.0 adds known_patterns/known_modules/coding_conventions/
+    // recent_milestones; serde defaults fill any missing fields on load.
     id
 }
 

@@ -522,10 +522,9 @@ fn package_test_count(
 
 fn relationship_provenance(rel: &crate::engineering_facts::RelationshipFact) -> ProvenanceType {
     match rel.metadata.get("provenance") {
-        Some(p) if p == "heuristic" => ProvenanceType::Heuristic,
-        Some(p) if p == "unknown" => ProvenanceType::Unknown,
+        Some("heuristic") => ProvenanceType::Heuristic,
+        Some("unknown") | None => ProvenanceType::Unknown,
         Some(_) => ProvenanceType::Verified,
-        None => ProvenanceType::Unknown,
     }
 }
 
@@ -1173,7 +1172,6 @@ mod tests {
     #[test]
     fn heuristic_provenance_classifies_as_heuristic() {
         let store = enriched_store();
-        let results = search_all(&store, "alpha");
         // alpha only has a missing-provenance relationship, so Unknown.
         // But if we query something with only heuristic, it should be Heuristic.
         // Use baz which has only unknown provenance relationship.

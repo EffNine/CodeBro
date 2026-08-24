@@ -303,6 +303,7 @@ fn run_pty(
 /// process group is terminated, the reader is drained within its grace, and an
 /// error is returned for the worker to surface as a terminal `Error` — there
 /// is no infinite polling loop, no orphan, and no hanging receiver.
+#[allow(clippy::too_many_arguments)] // worker-loop state; a struct would obscure the single call site
 fn waiter_loop(
     child: &mut Box<dyn Child + Send + Sync>,
     group_leader: Option<i32>,
@@ -499,9 +500,8 @@ mod tests {
         let mut out = String::new();
         rt.block_on(async {
             while let Some(ev) = rx.recv().await {
-                match &ev {
-                    PtyEvent::Output(c) => out.push_str(c),
-                    _ => {}
+                if let PtyEvent::Output(c) = &ev {
+                    out.push_str(c);
                 }
                 events.push(ev.clone());
                 if ev.is_terminal() {
@@ -777,12 +777,9 @@ mod tests {
         let mut exit_code = None;
         rt.block_on(async {
             while let Some(ev) = rx.recv().await {
-                match &ev {
-                    PtyEvent::Exited { exit_code: code } => {
-                        exit_code = Some(*code);
-                        break;
-                    }
-                    _ => {}
+                if let PtyEvent::Exited { exit_code: code } = &ev {
+                    exit_code = Some(*code);
+                    break;
                 }
             }
         });
@@ -807,10 +804,7 @@ mod tests {
 
     impl portable_pty::Child for ErrTryWaitChild {
         fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "forced try_wait failure",
-            ))
+            Err(std::io::Error::other("forced try_wait failure"))
         }
         fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
             Ok(portable_pty::ExitStatus::with_exit_code(1))

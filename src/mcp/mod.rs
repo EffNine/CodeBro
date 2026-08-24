@@ -9,6 +9,7 @@
 //! Run with `codebro serve` (stdio transport). See `docs/design/MCP_SERVER.md`
 //! for the roadmap.
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,13 +35,14 @@ use crate::provenance::{compute_trust, FreshnessStatus, SourceKind};
 /// process (loaded once, reused across calls) with a modification-time
 /// check so a concurrent `codebro init` is picked up. Everything else is
 /// constructed fresh per call.
+/// Cached immutable fact store keyed by the facts.json mtime.
+type FactsCache = Arc<std::sync::Mutex<Option<(Option<std::time::SystemTime>, crate::fact_store::FactStore)>>>;
+
 #[derive(Clone)]
 pub struct CodeBroMcpServer {
     workspace_root: PathBuf,
     tool_router: ToolRouter<Self>,
-    facts_cache: Arc<
-        std::sync::Mutex<Option<(Option<std::time::SystemTime>, crate::fact_store::FactStore)>>,
-    >,
+    facts_cache: FactsCache,
     sandbox_runtime: crate::sandbox::SandboxRuntime,
 }
 
@@ -377,7 +379,7 @@ impl CodeBroMcpServer {
         let prepared = engine
             .prepare(&args.path, &args.old, &args.new)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        let apply_result = engine
+        let _apply_result = engine
             .apply(&prepared)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
@@ -1202,7 +1204,7 @@ impl CodeBroMcpServer {
             _ => "healthy",
         };
 
-        let check_count = checks.len();
+        let _check_count = checks.len();
         let error_count = checks
             .iter()
             .filter(|c| !c.ok && c.detail.as_deref().is_some_and(|d| d.starts_with("ERROR")))
@@ -1732,7 +1734,7 @@ fn inject_project_context(
 
     // Project identity.
     let mut identity = crate::project_identity::ProjectIdentityRuntime::new(workspace);
-    if let Ok(_) = identity.load() {
+    if identity.load().is_ok() {
         let snap = identity.snapshot();
         if !snap.name.is_empty() {
             let lang = snap.languages.first().cloned().unwrap_or_default();
@@ -1776,8 +1778,7 @@ fn inject_project_context(
         ctx_parts.push(format!(
             "Engineering memory: {} entries, tags: {}",
             entries.len(),
-            tags.iter()
-                .map(|s| *s)
+            tags.iter().copied()
                 .take(10)
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -2322,7 +2323,7 @@ mod tests {
                 "trust must be present for each resolved entry"
             );
             let t = entry["trust"].as_f64().expect("trust is a number");
-            assert!(t >= 0.0 && t <= 1.0, "trust must be in [0,1], got {t}");
+            assert!((0.0..=1.0).contains(&t), "trust must be in [0,1], got {t}");
         }
     }
 
@@ -5226,10 +5227,8 @@ mod tests {
 
     fn collect_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut paths = Vec::new();
-        for entry in walkdir::WalkDir::new(dir).min_depth(1) {
-            if let Ok(e) = entry {
-                paths.push(e.path().to_path_buf());
-            }
+        for entry in walkdir::WalkDir::new(dir).min_depth(1).into_iter().flatten() {
+            paths.push(entry.path().to_path_buf());
         }
         paths.sort();
         paths

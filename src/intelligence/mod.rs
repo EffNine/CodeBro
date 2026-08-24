@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Intelligence Platform - Read-only code understanding layer.
 //!
 //! This module provides the foundation for code intelligence within CodeBro.
@@ -17,6 +16,7 @@
 //! | `lsp` | LSP protocol foundation types |
 //! | `diagnostics` | Platform health monitoring |
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod context;
 pub mod diagnostics;
 pub mod graph;

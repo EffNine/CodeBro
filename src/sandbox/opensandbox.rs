@@ -19,7 +19,7 @@
 //! - `OPEN_SANDBOX_MAX_OUTPUT_BYTES` — max output size (default: 65536)
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::{ExecutionResult, SandboxBackend, SandboxCommand, SandboxMode, SandboxPolicy};
@@ -221,7 +221,7 @@ impl OpenSandboxBackend {
     /// 6. Delete the sandbox
     fn execute(
         &self,
-        workspace_root: &PathBuf,
+        workspace_root: &Path,
         cmd: SandboxCommand,
         policy: &SandboxPolicy,
     ) -> ExecutionResult {
@@ -243,7 +243,7 @@ impl OpenSandboxBackend {
 
         // Clone everything needed for the async block (run_async requires 'static).
         let backend = self.clone();
-        let workspace_root_clone = workspace_root.clone();
+        let workspace_root_clone = workspace_root.to_path_buf();
         let command_clone = command.clone();
         let working_dir_clone = working_dir.clone();
         let env_clone = policy.env.clone();
@@ -306,7 +306,7 @@ impl OpenSandboxBackend {
         working_dir: &str,
         timeout_secs: u64,
         env: &HashMap<String, String>,
-        workspace_root: &PathBuf,
+        workspace_root: &Path,
         start: Instant,
         metadata: HashMap<String, String>,
     ) -> Result<ExecutionResult, String> {
@@ -601,7 +601,7 @@ impl OpenSandboxBackend {
 impl SandboxBackend for OpenSandboxBackend {
     fn execute(
         &self,
-        workspace_root: &PathBuf,
+        workspace_root: &Path,
         cmd: SandboxCommand,
         policy: &SandboxPolicy,
     ) -> ExecutionResult {

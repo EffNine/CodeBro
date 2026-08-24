@@ -249,7 +249,7 @@ impl ProjectIdentityRuntime {
                 let load_time_us = load_start.elapsed().as_micros() as u64;
                 self.diagnostics = ProjectIdentityDiagnostics::new(IdentitySource::Loaded)
                     .with_load_time(load_time_us);
-                let report = super::validation::ValidationReport::default();
+                let _report = super::validation::ValidationReport::default();
                 // Reconstruct a ValidationReport from the error messages.
                 let mut report = super::validation::ValidationReport::new();
                 for msg in errors {

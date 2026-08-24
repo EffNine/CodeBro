@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Consultant capability — AI provider abstraction integrated into CodeBro.
 //!
 //! Provides a unified `consult` MCP tool that routes requests to one of
@@ -10,6 +9,7 @@
 //! `CONDUCTOR_API_KEY` or the secure credential store.
 //! No passwords, cookies, or tokens are stored or inspected.
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod types;
 
 pub mod prompt;

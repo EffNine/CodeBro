@@ -14,8 +14,8 @@
 //! The full historical tool platform (registry, hooks, lifecycle, discovery,
 //! filesystem/git/playwright tools) lives in `crate::legacy::tools`.
 
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod capabilities;
 pub mod change;
 pub mod context;

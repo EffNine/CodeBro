@@ -6,7 +6,7 @@
 //! (a subset of the Testing subagent policy) before any process spawns.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::{ExecutionResult, SandboxBackend, SandboxCommand, SandboxMode, SandboxPolicy};
@@ -253,7 +253,7 @@ impl LocalSandboxBackend {
 impl SandboxBackend for LocalSandboxBackend {
     fn execute(
         &self,
-        workspace_root: &PathBuf,
+        workspace_root: &Path,
         cmd: SandboxCommand,
         policy: &SandboxPolicy,
     ) -> ExecutionResult {

@@ -56,6 +56,7 @@
 //! - `current_sprint.json` — active sprint
 //! - `metadata.json` — schema version and timestamps
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod builder;
 pub mod diagnostics;
 pub mod identity;

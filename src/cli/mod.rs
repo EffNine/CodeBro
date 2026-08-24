@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -143,7 +143,8 @@ pub async fn run() -> Result<()> {
         }
         Some(Commands::Auth { command }) => match command {
             AuthCommands::Status => {
-                for name in ["conductor"] {
+                {
+                    let name = "conductor";
                     let status = if name == "conductor" {
                         use crate::consultant::provider::ConsultantProvider as _;
                         let provider =
@@ -248,7 +249,7 @@ fn inject_project_context(
     let mut ctx_parts: Vec<String> = Vec::new();
 
     let mut identity = crate::project_identity::ProjectIdentityRuntime::new(workspace);
-    if let Ok(_) = identity.load() {
+    if identity.load().is_ok() {
         let snap = identity.snapshot();
         if !snap.name.is_empty() {
             let lang = snap.languages.first().cloned().unwrap_or_default();
@@ -290,8 +291,7 @@ fn inject_project_context(
         ctx_parts.push(format!(
             "Engineering memory: {} entries, tags: {}",
             entries.len(),
-            tags.iter()
-                .map(|s| *s)
+            tags.iter().copied()
                 .take(10)
                 .collect::<Vec<_>>()
                 .join(", ")

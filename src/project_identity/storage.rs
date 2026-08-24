@@ -156,7 +156,7 @@ impl ProjectIdentityStorage {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(identity)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(&self.identity_path())
+        let mut file = fs::File::create(self.identity_path())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         file.write_all(json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
@@ -193,7 +193,7 @@ impl ProjectIdentityStorage {
         };
         let json = serde_json::to_string_pretty(&meta)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(&self.workspace_path())
+        let mut file = fs::File::create(self.workspace_path())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         file.write_all(json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
@@ -222,7 +222,7 @@ impl ProjectIdentityStorage {
         };
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(&self.architecture_path())
+        let mut file = fs::File::create(self.architecture_path())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         file.write_all(json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
@@ -236,7 +236,7 @@ impl ProjectIdentityStorage {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(decisions)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(&self.decisions_path())
+        let mut file = fs::File::create(self.decisions_path())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         file.write_all(json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
@@ -250,7 +250,7 @@ impl ProjectIdentityStorage {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(constraints)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(&self.constraints_path())
+        let mut file = fs::File::create(self.constraints_path())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         file.write_all(json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
@@ -264,7 +264,7 @@ impl ProjectIdentityStorage {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(items)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(&self.roadmap_path())
+        let mut file = fs::File::create(self.roadmap_path())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         file.write_all(json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
@@ -287,7 +287,7 @@ impl ProjectIdentityStorage {
         };
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(&self.sprint_path())
+        let mut file = fs::File::create(self.sprint_path())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         file.write_all(json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
@@ -311,7 +311,7 @@ impl ProjectIdentityStorage {
         };
         let json = serde_json::to_string_pretty(&meta)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(&self.metadata_path())
+        let mut file = fs::File::create(self.metadata_path())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         file.write_all(json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;

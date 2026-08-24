@@ -15,6 +15,7 @@
 //! output of configuration structs: `CredentialStore` only ever returns
 //! values on demand and only reports presence in listings.
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

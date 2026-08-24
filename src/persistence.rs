@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Atomic file persistence helpers for CodeBro state files.
 //!
 //! All durable JSON state (facts store, engineering memory, project
@@ -11,6 +10,7 @@
 //! unreadable file aside under a `.corrupt-<timestamp>` suffix. The raw
 //! bytes are preserved for manual recovery; nothing is deleted.
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 use std::fs;
 use std::io;
 use std::io::Write as _;

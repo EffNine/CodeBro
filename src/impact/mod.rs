@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Impact analysis: determine what is structurally affected by changing a
 //! symbol, file, module, or package.
 //!
@@ -6,6 +5,7 @@
 //! queries over relationships, references, tests, and scope membership.
 //! Output is descriptive evidence only — no risk scores, no prescriptions.
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod relationships;
 
 use serde::{Deserialize, Serialize};
@@ -314,7 +314,7 @@ pub fn analyze(
     } else if depth == 1 {
         // Backward-compatible: direct relationships only (both directions).
         let mut relationships =
-            gather_relationships(&collection, &target_fact_id, &target_info, &direction);
+            gather_relationships(collection, &target_fact_id, &target_info, &direction);
         for rel in relationships.iter_mut() {
             rel.depth = 1;
         }
@@ -333,7 +333,7 @@ pub fn analyze(
     } else {
         // Bounded BFS traversal.
         traverse(
-            &collection,
+            collection,
             &target_fact_id,
             &target_info,
             depth,
@@ -368,7 +368,7 @@ pub fn analyze(
         .collect();
 
     let mut tests = if opts.include_tests {
-        gather_tests(&collection, &target_fact_id, &target)
+        gather_tests(collection, &target_fact_id, &target)
     } else {
         Vec::new()
     };
@@ -376,17 +376,17 @@ pub fn analyze(
         tests.truncate(opts.max_results);
     }
 
-    let mut modules = gather_modules(&collection, &target_fact_id, &target);
+    let mut modules = gather_modules(collection, &target_fact_id, &target);
     if opts.max_results > 0 && modules.len() > opts.max_results {
         modules.truncate(opts.max_results);
     }
 
-    let mut packages = gather_packages(&collection, &target_fact_id, &target);
+    let mut packages = gather_packages(collection, &target_fact_id, &target);
     if opts.max_results > 0 && packages.len() > opts.max_results {
         packages.truncate(opts.max_results);
     }
 
-    let mut completeness = build_completeness(&collection, &target);
+    let mut completeness = build_completeness(collection, &target);
     if traversal_meta.truncated {
         if completeness.status == "complete" {
             completeness.status = "partial".to_string();
@@ -431,9 +431,7 @@ fn compute_impact_freshness(
     workspace_root: Option<&std::path::Path>,
 ) -> Option<FreshnessStatus> {
     let gen_state = store.collection().model().generation_repo_state();
-    let Some(root) = workspace_root else {
-        return None;
-    };
+    let root = workspace_root?;
     let current = crate::sandbox::RepoState::capture(&root.to_path_buf());
     match (gen_state, current) {
         (Some(prev), Some(cur)) => {
@@ -487,10 +485,11 @@ struct GraphEdge {
 /// Run a bounded BFS from `start` over the relationship/reference graph.
 ///
 /// Returns `(direct_relationships, transitive_relationships, provenance_summary, traversal_metadata)`.
+#[allow(clippy::too_many_arguments)] // BFS options surface; grouping would obscure call sites
 fn traverse(
     collection: &crate::fact_store::collection::FactCollection,
     start: &FactId,
-    start_info: &ImpactTargetInfo,
+    _start_info: &ImpactTargetInfo,
     depth: usize,
     direction: &str,
     type_filter: &[String],
@@ -535,24 +534,20 @@ fn traverse(
         // Determine which adjacency list(s) to follow.
         let neighbors: Vec<GraphEdge> = match direction {
             "outgoing" => outgoing
-                .get(&current_id)
-                .map(|v| v.clone())
+                .get(&current_id).cloned()
                 .unwrap_or_default(),
             "incoming" => incoming
-                .get(&current_id)
-                .map(|v| v.clone())
+                .get(&current_id).cloned()
                 .unwrap_or_default(),
             _ => {
                 // "both": merge outgoing and incoming, deduplicating by target.
                 let out: Vec<GraphEdge> = outgoing
-                    .get(&current_id)
-                    .map(|v| v.clone())
+                    .get(&current_id).cloned()
                     .unwrap_or_default();
                 let inc: Vec<GraphEdge> = incoming
-                    .get(&current_id)
-                    .map(|v| v.clone())
+                    .get(&current_id).cloned()
                     .unwrap_or_default();
-                let mut merged: Vec<GraphEdge> = out.into_iter().chain(inc.into_iter()).collect();
+                let mut merged: Vec<GraphEdge> = out.into_iter().chain(inc).collect();
                 merged.sort_by_key(|e| e.target_id.to_string());
                 merged.dedup_by_key(|e| e.target_id.to_string());
                 merged
@@ -789,7 +784,7 @@ fn build_adjacency(
         };
         let edge_in = GraphEdge {
             target_id: r.referrer.clone(),
-            kind: kind,
+            kind,
             provenance: prov,
             location: r.location.clone(),
         };
@@ -855,8 +850,7 @@ fn resolve_target(
 ) -> Option<ResolvedTarget> {
     match target {
         ImpactTarget::Symbol(sym_id) => {
-            if let Some(sym) = collection.symbol(sym_id) {
-                Some((
+            collection.symbol(sym_id).map(|sym| (
                     FactId::Symbol(sym.id.clone()),
                     ImpactTargetInfo {
                         id: sym.id.to_string(),
@@ -865,9 +859,6 @@ fn resolve_target(
                         path: sym.location.file.clone(),
                     },
                 ))
-            } else {
-                None
-            }
         }
         ImpactTarget::File(path) => {
             for m in collection.modules() {
@@ -903,8 +894,7 @@ fn resolve_target(
             None
         }
         ImpactTarget::Module(mod_id) => {
-            if let Some(m) = collection.module(mod_id) {
-                Some((
+            collection.module(mod_id).map(|m| (
                     FactId::Module(m.id.clone()),
                     ImpactTargetInfo {
                         id: m.id.to_string(),
@@ -913,13 +903,9 @@ fn resolve_target(
                         path: m.path.clone(),
                     },
                 ))
-            } else {
-                None
-            }
         }
         ImpactTarget::Package(pkg_id) => {
-            if let Some(p) = collection.package(pkg_id) {
-                Some((
+            collection.package(pkg_id).map(|p| (
                     FactId::Package(p.id.clone()),
                     ImpactTargetInfo {
                         id: p.id.to_string(),
@@ -928,9 +914,6 @@ fn resolve_target(
                         path: None,
                     },
                 ))
-            } else {
-                None
-            }
         }
     }
 }
@@ -956,7 +939,7 @@ fn file_path_opt(target: &ImpactTarget) -> Option<String> {
 fn gather_relationships(
     collection: &crate::fact_store::collection::FactCollection,
     target_id: &FactId,
-    target_info: &ImpactTargetInfo,
+    _target_info: &ImpactTargetInfo,
     direction: &str,
 ) -> Vec<ImpactRelationship> {
     let mut out = Vec::new();
@@ -1057,8 +1040,8 @@ fn fact_provenance(metadata: &crate::engineering_facts::metadata::FactMetadata) 
     }
 }
 
-fn fact_name_loc<'a>(
-    collection: &'a crate::fact_store::collection::FactCollection,
+fn fact_name_loc(
+    collection: &crate::fact_store::collection::FactCollection,
     id: &FactId,
     loc: Option<&crate::engineering_facts::location::SourceLocation>,
 ) -> (String, Option<String>) {
@@ -1084,7 +1067,7 @@ fn fact_name_loc<'a>(
 
 fn gather_tests(
     collection: &crate::fact_store::collection::FactCollection,
-    target_id: &FactId,
+    _target_id: &FactId,
     target: &ImpactTarget,
 ) -> Vec<TestReference> {
     let mut tests = Vec::new();
@@ -1364,19 +1347,23 @@ fn gather_packages(
         }
         ImpactTarget::Package(pkg_id) => {
             for dep in collection.dependencies() {
-                if dep.target == *target_id {
-                    if let Some(src) = collection.find(&dep.source) {
-                        if let crate::engineering_facts::FactRef::Package(p) = src {
-                            if !packages.iter().any(|pk| pk.id == p.id.to_string()) {
-                                packages.push(PackageInfo {
-                                    id: p.id.to_string(),
-                                    name: p.name.clone(),
-                                    relation: "depends_on".to_string(),
-                                });
-                            }
-                        }
-                    }
+                if dep.target != *target_id {
+                    continue;
                 }
+                let Some(src) = collection.find(&dep.source) else {
+                    continue;
+                };
+                let crate::engineering_facts::FactRef::Package(p) = src else {
+                    continue;
+                };
+                if packages.iter().any(|pk| pk.id == p.id.to_string()) {
+                    continue;
+                }
+                packages.push(PackageInfo {
+                    id: p.id.to_string(),
+                    name: p.name.clone(),
+                    relation: "depends_on".to_string(),
+                });
             }
             if let Some(p) = collection.package(pkg_id) {
                 packages.push(PackageInfo {
@@ -1500,7 +1487,7 @@ mod tests {
             }
             builder.add_module(mf);
         }
-        for (_, pid) in &pkg_map {
+        for pid in pkg_map.values() {
             let mut pf = PackageFact::new(pid.clone(), pid.as_str().replace("pkg::", ""));
             pf.workspace = Some(ws_id.clone());
             builder.add_package(pf);
@@ -1533,7 +1520,7 @@ mod tests {
             };
             let rf = RelationshipFact::new(
                 RelationshipId::new(rel_id.to_string()),
-                kind.clone(),
+                *kind,
                 src_id,
                 tgt_id,
             );
@@ -1565,7 +1552,7 @@ mod tests {
         // that have no explicit relationship or reference facts.
         let mut existing_refs: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
-        for (ref_id, referrer, target) in references {
+        for (_ref_id, referrer, target) in references {
             existing_refs.insert((referrer.to_string(), target.to_string()));
             existing_refs.insert((target.to_string(), referrer.to_string()));
         }
@@ -1664,7 +1651,7 @@ mod tests {
             .filter(|r| r.direction == "incoming")
             .collect();
         assert!(
-            incoming.len() >= 1,
+            !incoming.is_empty(),
             "expected at least 1 incoming relationship, got {}",
             incoming.len()
         );
@@ -1961,7 +1948,7 @@ mod tests {
             })
             .collect();
         assert!(
-            heur_refs.len() >= 1,
+            !heur_refs.is_empty(),
             "expected heuristic reference from name coincidence"
         );
     }
@@ -2151,8 +2138,8 @@ mod tests {
     /// depth exceeding MAX_DEPTH is rejected as invalid parameters.
     #[test]
     fn depth_exceeding_max_is_rejected() {
-        let store = make_chain_store();
-        let target = ImpactTarget::Symbol(SymbolId::new("sym::mod::chain::a_function@1"));
+        let _store = make_chain_store();
+        let _target = ImpactTarget::Symbol(SymbolId::new("sym::mod::chain::a_function@1"));
         let opts = ImpactOptions {
             depth: 10,
             ..Default::default()

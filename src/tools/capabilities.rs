@@ -169,11 +169,7 @@ pub enum PermissionPolicy {
 impl ToolCapabilities {
     /// Determine the default permission policy for this capability set.
     pub fn permission_policy(&self) -> PermissionPolicy {
-        if self.is_read_only() && !self.requires_confirmation {
-            PermissionPolicy::AutoAllow
-        } else if self.is_high_risk() {
-            PermissionPolicy::RequireConfirmation
-        } else if self.requires_confirmation {
+        if self.is_high_risk() || self.requires_confirmation {
             PermissionPolicy::RequireConfirmation
         } else {
             PermissionPolicy::AutoAllow

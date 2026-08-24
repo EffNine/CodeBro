@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Sandbox execution abstraction for CodeBro.
 //!
 //! The sandbox module provides a trait-based execution backend that the MCP
@@ -13,6 +12,7 @@
 //! The MCP `sandbox_exec` tool routes through this abstraction so that
 //! OpenSandbox-specific details never leak into the MCP layer.
 
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod local;
 pub mod opensandbox;
 
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Digest};
 use std::collections::HashMap;
 use std::hash::Hasher;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The operational mode for sandbox execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -178,6 +178,7 @@ pub struct ExecutionResult {
 
 impl ExecutionResult {
     /// Constructed by the sandbox runtime after execution completes.
+    #[allow(clippy::too_many_arguments)] // mirrors the evidence-envelope field set
     pub fn from_local(
         command: &str,
         working_directory: &str,
@@ -386,11 +387,10 @@ impl VerificationResult {
 
         // When no explicit success expectation is set but exit_code != 0,
         // treat non-zero as a failure violation (common default).
-        if expected_success.is_none() && expected_exit_code.is_none() {
-            if !execution.success {
+        if expected_success.is_none() && expected_exit_code.is_none()
+            && !execution.success {
                 violations.push(format!("non-zero exit: {}", execution.exit_code));
             }
-        }
 
         let verified = violations.is_empty();
         let summary = if verified {
@@ -449,11 +449,10 @@ impl VerificationResult {
 
         // When no explicit success expectation is set but exit_code != 0,
         // treat non-zero as a failure violation (common default).
-        if expected_success.is_none() && expected_exit_code.is_none() {
-            if !execution.success {
+        if expected_success.is_none() && expected_exit_code.is_none()
+            && !execution.success {
                 violations.push(format!("non-zero exit: {}", execution.exit_code));
             }
-        }
 
         let verified = violations.is_empty();
         let summary = if verified {
@@ -505,7 +504,7 @@ pub struct RepoIdentity {
 
 impl RepoIdentity {
     /// Derive from a workspace root. Uses project_identity runtime where available.
-    pub fn from_workspace(workspace_root: &PathBuf) -> Self {
+    pub fn from_workspace(workspace_root: &Path) -> Self {
         let root = workspace_root.to_string_lossy().to_string();
         let repository_type = if workspace_root.join("Cargo.toml").exists() {
             "cargo".to_string()
@@ -636,6 +635,7 @@ impl RepoState {
 /// Reproducibility classification for an execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Reproducibility {
     /// Deterministic: same inputs always produce same output (e.g. cargo test
     /// on a dependency-free fixture with no parallelism).
@@ -647,14 +647,10 @@ pub enum Reproducibility {
     /// network-dependent commands, wall-clock timers).
     NonDeterministic,
     /// Unknown: cannot classify from available information.
+    #[default]
     Unknown,
 }
 
-impl Default for Reproducibility {
-    fn default() -> Self {
-        Reproducibility::Unknown
-    }
-}
 
 impl std::fmt::Display for Reproducibility {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -887,7 +883,7 @@ pub trait SandboxBackend: Send + Sync {
     /// Execute a command in the sandbox and return the structured result.
     fn execute(
         &self,
-        workspace_root: &PathBuf,
+        workspace_root: &Path,
         cmd: SandboxCommand,
         policy: &SandboxPolicy,
     ) -> ExecutionResult;
@@ -939,7 +935,7 @@ impl SandboxRuntime {
         } else {
             SandboxMode::Local
         };
-        let opensandbox = url.map(|u| OpenSandboxBackend::new(u));
+        let opensandbox = url.map(OpenSandboxBackend::new);
         SandboxRuntime {
             mode,
             local: LocalSandboxBackend::new(),
@@ -1398,7 +1394,7 @@ mod tests {
     fn test_repo_identity_from_workspace() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
-        let identity = RepoIdentity::from_workspace(&dir.path().to_path_buf());
+        let identity = RepoIdentity::from_workspace(dir.path());
         assert_eq!(identity.repository_type, "cargo");
         assert!(!identity.project_id.is_empty());
         assert!(!identity.root.is_empty());
@@ -1407,7 +1403,7 @@ mod tests {
     #[test]
     fn test_repo_identity_unknown_type() {
         let dir = tempfile::tempdir().unwrap();
-        let identity = RepoIdentity::from_workspace(&dir.path().to_path_buf());
+        let identity = RepoIdentity::from_workspace(dir.path());
         assert_eq!(identity.repository_type, "unknown");
     }
 
