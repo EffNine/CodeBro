@@ -39,6 +39,7 @@
 //! EngineeringMemoryContext → Prompt Builder (unchanged)
 //! ```
 
+pub mod memory_context;
 pub mod provider;
 pub mod resolver;
 pub mod runtime;

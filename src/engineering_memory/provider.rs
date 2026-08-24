@@ -5,7 +5,7 @@
 
 use super::resolver::EngineeringMemoryResolver;
 use super::types::EngineeringMemoryEntry;
-use crate::engineering_context::memory::EngineeringMemoryContext;
+use crate::engineering_memory::memory_context::EngineeringMemoryContext;
 
 /// Provider trait for engineering memory.
 pub trait EngineeringMemoryProvider {

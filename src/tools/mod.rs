@@ -1,93 +1,40 @@
-//! Tool Platform Module
+//! Runtime tool support for the CodeBro MCP runtime.
 //!
-//! The P3 Tool Platform provides a scalable architecture for managing tools
-//! across built-in, external, MCP, and plugin providers.
+//! This is the SLIM live surface of the old tool platform. Only what the
+//! production path needs survives here:
 //!
-//! # Architecture
+//! - [`shell`] — policy-gated command execution (PTY-backed) and secret
+//!   redaction; used by `sandbox` backends and MCP redaction.
+//! - [`patch`] — `ChangePlan` / `PatchEngine`, the diff machinery behind the
+//!   change engine (`coding::change_engine`).
+//! - [`context`] / [`streaming`] / [`capabilities`] — shared execution types
+//!   (`ToolContext`, streaming traits) used by both the live shell tool and
+//!   the legacy registry via `legacy::tools`.
 //!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────┐
-//! │                    ToolRegistry                         │
-//! │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
-//! │  │ Metadata │  │Lifecycle │  │ Hooks    │              │
-//! │  └──────────┘  └──────────┘  └──────────┘              │
-//! │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
-//! │  │Diagnostics│ │Provider  │  │ Discovery│              │
-//! │  └──────────┘  └──────────┘  └──────────┘              │
-//! └─────────────────────────────────────────────────────────┘
-//!                          │
-//!          ┌───────────────┼───────────────┐
-//!          ▼               ▼               ▼
-//!    ┌───────────┐  ┌───────────┐  ┌───────────┐
-//!    │ BuiltIn   │  │ MCP       │  │ Plugin    │
-//!    │ Provider  │  │ Provider  │  │ Provider  │
-//!    └───────────┘  └───────────┘  └───────────┘
-//! ```
-//!
-//! # Core Concepts
-//!
-//! - **Tool**: A unit of work (reads files, runs commands, etc.)
-//! - **ToolCapabilities**: Typed flags describing what a tool can do
-//! - **ToolMetadata**: Rich, serializable metadata for each tool
-//! - **ToolLifecycleState**: State machine for tool registration and enablement
-//! - **ToolContext**: Execution context with workspace, session, and permissions
-//! - **PermissionHook**: Pre-execution permission checks
-//! - **RollbackHook**: Post-execution state tracking
-//! - **AsyncTool**: Streaming output support
-//! - **ToolDiagnostics**: Health and performance tracking
-//! - **ToolProvider**: Abstraction for tool sources (built-in, MCP, plugin)
-//! - **ToolDiscovery**: Finding available tools across providers
+//! The full historical tool platform (registry, hooks, lifecycle, discovery,
+//! filesystem/git/playwright tools) lives in `crate::legacy::tools`.
 
-// Suppress clippy warnings for the new module structure
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 
 pub mod capabilities;
-pub mod context;
-pub mod diagnostics;
-pub mod discovery;
-pub mod hooks;
-pub mod lifecycle;
-pub mod metadata;
-pub mod provider;
-pub mod streaming;
-
-// Existing tool modules
 pub mod change;
-pub mod executor;
-pub mod filesystem;
-pub mod git;
+pub mod context;
 pub mod patch;
-pub mod playwright;
 pub mod pty;
-pub mod router;
 pub mod shell;
+pub mod streaming;
 
 // Re-export core types
 pub use capabilities::{PermissionPolicy, ToolCapabilities, ToolCategory};
 pub use context::{ExecutionId, ToolContext, ToolContextBuilder, ToolResult};
-pub use diagnostics::{DiagnosticCollector, ExecutionTrace, ToolDiagnostics, ToolHealth};
-pub use discovery::{DiscoveredTool, DiscoveryResult, ToolDiscovery};
-pub use hooks::{
-    CapabilityPermissionHook, DefaultRollbackHook, PermissionDecision, RollbackHook, ToolHooks,
-};
-pub use lifecycle::{LifecycleError, LifecycleManager, ToolLifecycleState};
-pub use metadata::{ToolDefinition, ToolMetadata};
-pub use provider::{BuiltInProvider, ProviderRegistry, ToolProvider};
+pub use patch::{FilePatch, PatchEngine, PatchSet};
+pub use change::ChangePlan;
+pub use shell::{RunCommand, ShellCommandRecord, ShellHistory};
 pub use streaming::{
     channel_stream, channel_stream_factory, sync_to_stream, AsyncTool, StreamChunk, StreamResult,
 };
 
-// Re-export existing types
-pub use change::ChangePlan;
-pub use executor::{detect_workspace_root, is_toolable, run_tool_pipeline};
-pub use filesystem::{CreateFile, EditFile, ListFiles, ReadFile};
-pub use git::{GitDiff, GitStatus};
-pub use patch::{FilePatch, PatchEngine, PatchSet};
-pub use playwright::PlaywrightTool;
-pub use router::{SmartToolRouter, ToolSelection};
-pub use shell::{RunCommand, ShellCommandRecord, ShellHistory};
-
-// Core trait
+/// Core tool trait.
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
@@ -96,13 +43,8 @@ pub trait Tool: Send + Sync {
     /// If this tool supports streaming output (e.g. PTY-backed processes),
     /// return a handle to its [`AsyncTool`] implementation. The default is
     /// `None`; tools that stream override this. This is the single discovery
-    /// seam the registry uses to route to [`streaming::AsyncTool`].
+    /// seam the registry uses to route to [`AsyncTool`].
     fn as_async(&self) -> Option<&dyn AsyncTool> {
         None
     }
 }
-
-/// Dispatcher for executing tools (re-exported from dispatcher).
-pub use crate::dispatcher::ToolDispatcher;
-/// Registry for managing tools (re-exported from dispatcher).
-pub use crate::dispatcher::ToolRegistry;

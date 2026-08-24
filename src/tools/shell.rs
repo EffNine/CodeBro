@@ -252,6 +252,15 @@ impl RunCommand {
             cmd.env(key, value);
         }
 
+        // Verification commands must observe the WORKSPACE they run in, not
+        // CodeBro's own build configuration. Ambient build-env variables
+        // (CARGO_TARGET_DIR, RUSTFLAGS, ...) would otherwise redirect fixture
+        // builds into CodeBro's target directory — contending with parallel
+        // sessions and breaking reproducibility of captured evidence.
+        cmd.env_remove("CARGO_TARGET_DIR");
+        cmd.env_remove("RUSTFLAGS");
+        cmd.env_remove("CARGO_BUILD_TARGET");
+
         // The child becomes its own process-group leader so the whole tree
         // (sh + descendants) can be signalled together on timeout. Unix-only;
         // on other platforms `terminate_group` degrades to killing the child.

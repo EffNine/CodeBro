@@ -372,7 +372,7 @@ impl CodeBroMcpServer {
     ) -> Result<CallToolResult, McpError> {
         // Plan-less, non-strict engine: boundary + staleness enforcement only.
         let engine =
-            crate::coding::permissions::ChangeEngine::new(&self.workspace_root, &[], false);
+            crate::coding::change_engine::ChangeEngine::new(&self.workspace_root, &[], false);
 
         let prepared = engine
             .prepare(&args.path, &args.old, &args.new)

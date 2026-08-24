@@ -8,7 +8,7 @@ use super::types::{
     EngineeringMemoryEntry, EngineeringMemoryMetadata, EngineeringMemoryResolveError,
     EngineeringMemoryResolveResult,
 };
-use crate::engineering_context::memory::{
+use crate::engineering_memory::memory_context::{
     EngineeringMemoryContext, MemoryEntry as ContextMemoryEntry, MemoryTier as ContextMemoryTier,
 };
 

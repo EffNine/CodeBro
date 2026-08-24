@@ -221,6 +221,11 @@ fn run_pty(
     for (key, value) in &config.environment {
         builder.env(key, value);
     }
+    // See tools::shell — verification commands must not inherit CodeBro's
+    // own build configuration.
+    builder.env_remove("CARGO_TARGET_DIR");
+    builder.env_remove("RUSTFLAGS");
+    builder.env_remove("CARGO_BUILD_TARGET");
 
     // Fatal setup failures below return an error *without* emitting an event;
     // the worker body emits the single terminal `Error`. No failure is ever

@@ -17,7 +17,7 @@ use super::types::{
     EngineeringMemoryEntry, EngineeringMemoryFile, EngineeringMemoryMetadata,
     EngineeringMemoryResolveError,
 };
-use crate::engineering_context::memory::EngineeringMemoryContext;
+use crate::engineering_memory::memory_context::EngineeringMemoryContext;
 use crate::memory_runtime::{
     MemoryEntry as RuntimeMemoryEntry, MemoryPolicy, MemoryRuntime, MemoryTier,
 };
@@ -348,14 +348,14 @@ impl<P: ProjectIdentityProvider + Clone> EngineeringMemoryProvider for Engineeri
 
     fn snapshot(&self) -> EngineeringMemoryContext {
         // Return all project-tier entries without filtering.
-        let context_entries: Vec<crate::engineering_context::memory::MemoryEntry> = self
+        let context_entries: Vec<crate::engineering_memory::memory_context::MemoryEntry> = self
             .entries
             .iter()
-            .map(|e| crate::engineering_context::memory::MemoryEntry {
+            .map(|e| crate::engineering_memory::memory_context::MemoryEntry {
                 key: e.key.clone(),
                 value: e.value.clone(),
                 confidence: e.metadata.confidence,
-                tier: crate::engineering_context::memory::MemoryTier::Project,
+                tier: crate::engineering_memory::memory_context::MemoryTier::Project,
             })
             .collect();
         EngineeringMemoryContext::new().with_entries(context_entries)
