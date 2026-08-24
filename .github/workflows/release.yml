@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -27,19 +28,23 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: Resolve version from workspace manifest
+        id: ver
+        shell: bash
+        run: echo "version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "codebro-mcp-server") | .version')" >> "$GITHUB_OUTPUT"
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../codebro-${{ github.ref_name }}-${{ matrix.target }}.tar.gz codebro
+          tar czf ../../../codebro-v${{ steps.ver.outputs.version }}-${{ matrix.target }}.tar.gz codebro
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           Compress-Archive -Path target/${{ matrix.target }}/release/codebro.exe `
-            -DestinationPath codebro-${{ github.ref_name }}-${{ matrix.target }}.zip
+            -DestinationPath codebro-v${{ steps.ver.outputs.version }}-${{ matrix.target }}.zip
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -51,10 +56,22 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            V=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "codebro-mcp-server") | .version')
+            echo "tag=v${V}" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
       - name: Attach to GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
           files: codebro-*
