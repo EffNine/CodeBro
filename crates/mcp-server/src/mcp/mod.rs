@@ -484,6 +484,13 @@ impl CodeBroMcpServer {
         if let Some(source) = args.source.as_deref() {
             metadata = metadata.with_source(source);
         }
+        if let Some(secs) = args.expires_in_secs {
+            if secs > 0 {
+                metadata = metadata.with_ttl(secs);
+            }
+        }
+        metadata.provenance =
+            crate::engineering_memory::types::MemoryProvenance::agent(args.session.clone());
 
         let identity = crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
         let mut memory = crate::engineering_memory::EngineeringMemoryRuntime::new(
@@ -516,6 +523,7 @@ impl CodeBroMcpServer {
         // Deterministic id from the key: upsert semantics.
         let id = format!("mem::{key}");
         let exists = memory.snapshot().iter().any(|e| e.id == id);
+        let mut conflicts_reported: Vec<String> = Vec::new();
 
         if exists {
             // Full logical update: value AND metadata (confidence,
@@ -531,18 +539,34 @@ impl CodeBroMcpServer {
                 value,
             )
             .with_metadata(metadata);
-            memory
+            let outcome = memory
                 .record(entry)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            conflicts_reported = outcome
+                .conflicts
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}:{}",
+                        c.kind_str(),
+                        c.prior_key
+                    )
+                })
+                .collect();
         }
         memory
             .persist()
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let action = if exists { "updated" } else { "recorded" };
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "memory {action}: {key}"
-        ))]))
+        let mut summary = format!("memory {action}: {key}");
+        if !conflicts_reported.is_empty() {
+            summary.push_str(&format!(
+                "; conflicts: {}",
+                conflicts_reported.join(", ")
+            ));
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::text(summary)]))
     }
 
     // ── Tool 6: delete engineering memory (guarded write) ─────────────
@@ -1446,6 +1470,13 @@ pub struct RecordMemoryArgs {
     /// Optional provenance source (e.g. "sprint-31-review").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Optional entry lifetime in seconds; the entry expires (and stops
+    /// resolving) after this window. Omit for no expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_secs: Option<u64>,
+    /// Optional session identifier recorded in structured provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// Argument schema for `delete_memory`.

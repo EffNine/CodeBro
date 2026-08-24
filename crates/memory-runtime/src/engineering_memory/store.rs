@@ -117,7 +117,10 @@ impl EngineeringMemoryStore {
             }
         };
 
-        if file.schema_version != CURRENT_SCHEMA_VERSION {
+        // Accept known 1.x schemas: stores written by older releases must
+        // keep loading (backwards compatibility guarantee).
+        let accepted = ["1.0.0", CURRENT_SCHEMA_VERSION];
+        if !accepted.contains(&file.schema_version.as_str()) {
             return Err(StorageError::WrongSchemaVersion(file.schema_version));
         }
 

@@ -5,7 +5,69 @@ use serde::{Deserialize, Serialize};
 use crate::memory_runtime::MemoryTier;
 
 /// Schema version for `engineering_memory.json`.
-pub const CURRENT_SCHEMA_VERSION: &str = "1.0.0";
+///
+/// 1.1.0 adds optional lifecycle/provenance fields to entry metadata
+/// (`expires_at`, `status`, `provenance`, `supersedes`, `adjustments`).
+/// All new fields carry serde defaults, so stores written by 1.0.0 load
+/// unchanged and vice versa.
+pub const CURRENT_SCHEMA_VERSION: &str = "1.1.0";
+
+/// Lifecycle status of a memory entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryStatus {
+    /// In normal use; eligible for resolution.
+    #[default]
+    Active,
+    /// Past its expiry; excluded from resolution, retained for audit.
+    Expired,
+    /// Replaced by a newer entry under the same key.
+    Superseded,
+}
+
+impl MemoryStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryStatus::Active => "active",
+            MemoryStatus::Expired => "expired",
+            MemoryStatus::Superseded => "superseded",
+        }
+    }
+}
+
+/// Structured provenance: who/what produced this memory and how.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MemoryProvenance {
+    /// Logical origin class of the memory.
+    #[serde(default)]
+    pub origin: String,
+    /// Identifier of the producing agent/session when known.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Tool or path used to record it.
+    #[serde(default)]
+    pub created_via: Option<String>,
+}
+
+impl MemoryProvenance {
+    pub fn agent(session: Option<String>) -> Self {
+        MemoryProvenance {
+            origin: "agent".to_string(),
+            session,
+            created_via: Some("record_memory".to_string()),
+        }
+    }
+}
+
+/// One confidence adjustment event (audit trail).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfidenceAdjustment {
+    /// Epoch seconds when the adjustment happened.
+    pub at: u64,
+    pub from: f64,
+    pub to: f64,
+    pub reason: Option<String>,
+}
 
 /// A single engineering memory entry persisted at project tier.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,6 +121,18 @@ impl EngineeringMemoryEntry {
         self.access_count += 1;
     }
 
+    /// True when the entry has an expiry in the past relative to `now`
+    /// (epoch seconds).
+    pub fn is_expired_at(&self, now: u64) -> bool {
+        matches!(self.metadata.expires_at, Some(at) if at <= now)
+    }
+
+    /// True when the entry is eligible for resolution: active lifecycle
+    /// status and not past its expiry.
+    pub fn is_resolvable_at(&self, now: u64) -> bool {
+        self.metadata.status == MemoryStatus::Active && !self.is_expired_at(now)
+    }
+
     /// Returns true if the entry's key or value contains the given keyword
     /// (case-insensitive).
     pub fn matches_keyword(&self, keyword: &str) -> bool {
@@ -86,6 +160,21 @@ pub struct EngineeringMemoryMetadata {
     pub tags: Vec<String>,
     /// Source of the memory (e.g. "sprint-23-review").
     pub source: Option<String>,
+    /// Epoch seconds after which the entry is expired (None = never).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    /// Lifecycle status (defaults to Active for pre-1.1 stores).
+    #[serde(default)]
+    pub status: MemoryStatus,
+    /// Structured provenance record.
+    #[serde(default)]
+    pub provenance: MemoryProvenance,
+    /// Id of the entry this one supersedes (key-conflict lineage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// Bounded audit trail of confidence adjustments (most recent last).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adjustments: Vec<ConfidenceAdjustment>,
 }
 
 impl Default for EngineeringMemoryMetadata {
@@ -95,6 +184,11 @@ impl Default for EngineeringMemoryMetadata {
             confidence: 0.5,
             tags: Vec::new(),
             source: None,
+            expires_at: None,
+            status: MemoryStatus::Active,
+            provenance: MemoryProvenance::default(),
+            supersedes: None,
+            adjustments: Vec::new(),
         }
     }
 }
@@ -129,6 +223,22 @@ impl EngineeringMemoryMetadata {
     /// Set the source label.
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
+        self
+    }
+
+    /// Set expiry relative to now (seconds). Zero means no expiry.
+    pub fn with_ttl(mut self, seconds: u64) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.expires_at = if seconds == 0 { None } else { Some(now + seconds) };
+        self
+    }
+
+    /// Set absolute expiry (epoch seconds).
+    pub fn with_expires_at(mut self, at: u64) -> Self {
+        self.expires_at = Some(at);
         self
     }
 }

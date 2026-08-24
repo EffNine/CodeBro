@@ -121,6 +121,16 @@ impl EngineeringMemoryResolver {
                 .collect()
         };
 
+        // Step 1.5: lifecycle — only active, unexpired entries resolve.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let keyword_matches: Vec<&EngineeringMemoryEntry> = keyword_matches
+            .into_iter()
+            .filter(|e| e.is_resolvable_at(now))
+            .collect();
+
         // Step 2: filter by active-file tags.
         let tag_matches: Vec<&EngineeringMemoryEntry> = if active_file_tags.is_empty() {
             keyword_matches

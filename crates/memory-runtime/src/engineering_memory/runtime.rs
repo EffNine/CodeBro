@@ -8,6 +8,7 @@
 //! Operations are explicit only: load, record, update, delete, snapshot, resolve.
 //! No automatic learning, reflection, or LLM-driven writes.
 
+use crate::engineering_memory::types::{ConfidenceAdjustment, MemoryStatus};
 use std::path::PathBuf;
 
 use super::provider::{EmptyEngineeringMemoryProvider, EngineeringMemoryProvider};
@@ -135,8 +136,10 @@ impl<P: ProjectIdentityProvider + Clone> EngineeringMemoryRuntime<P> {
         let expected_root = self.workspace_root.to_string_lossy().to_string();
         let file = self.store.load(&expected_root)?;
 
-        // Validate schema version.
-        if file.schema_version != super::types::CURRENT_SCHEMA_VERSION {
+        // Validate schema version: accept known 1.x schemas so stores
+        // written by older releases keep loading (backwards compatibility).
+        let accepted = ["1.0.0", super::types::CURRENT_SCHEMA_VERSION];
+        if !accepted.contains(&file.schema_version.as_str()) {
             return Err(EngineeringMemoryError::WrongSchema(file.schema_version));
         }
 
@@ -151,6 +154,8 @@ impl<P: ProjectIdentityProvider + Clone> EngineeringMemoryRuntime<P> {
         // Sync with the underlying MemoryRuntime (project tier only).
         self.sync_to_runtime();
 
+        // Lifecycle: expire anything past its TTL before it can resolve.
+        self.sweep_expired();
         Ok(self.entries.len())
     }
 
@@ -166,16 +171,122 @@ impl<P: ProjectIdentityProvider + Clone> EngineeringMemoryRuntime<P> {
     /// The entry is stored at project tier in both the in-memory store and
     /// the underlying `MemoryRuntime`. The file is NOT persisted automatically;
     /// call `persist()` to write to disk.
-    pub fn record(&mut self, entry: EngineeringMemoryEntry) -> Result<(), EngineeringMemoryError> {
+    pub fn record(&mut self, entry: EngineeringMemoryEntry) -> Result<RecordOutcome, EngineeringMemoryError> {
         if self.entries.iter().any(|e| e.id == entry.id) {
             return Err(EngineeringMemoryError::Generic(format!(
                 "entry already exists: {}",
                 entry.id
             )));
         }
-        self.entries.push(entry.clone());
+        // Conflict detection: an ACTIVE entry with the same key but a
+        // different value is a key conflict. The new entry supersedes it;
+        // the prior entry is retained (status = Superseded) for lineage.
+        let mut conflicts: Vec<MemoryConflict> = Vec::new();
+        let same_key: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.key == entry.key
+                    && e.metadata.status == MemoryStatus::Active
+                    && e.value != entry.value
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for idx in same_key {
+            let prior_id = self.entries[idx].id.clone();
+            self.entries[idx].metadata.status = MemoryStatus::Superseded;
+            conflicts.push(MemoryConflict {
+                kind: ConflictKind::KeyReplaced,
+                prior_id,
+                prior_key: self.entries[idx].key.clone(),
+            });
+        }
+
+        // Near-duplicate detection across DIFFERENT keys: high token overlap
+        // on values suggests the same knowledge stored twice. Same-key
+        // different-value conflicts are handled above as key replacement.
+        for e in self.entries.iter() {
+            if e.key != entry.key
+                && e.metadata.status == MemoryStatus::Active
+                && e.value != entry.value
+                && token_overlap(&e.value, &entry.value) >= 0.7
+            {
+                conflicts.push(MemoryConflict {
+                    kind: ConflictKind::NearDuplicate,
+                    prior_id: e.id.clone(),
+                    prior_key: e.key.clone(),
+                });
+            }
+        }
+
+        let mut stored = entry.clone();
+        stored.metadata.supersedes = conflicts
+            .iter()
+            .find(|c| matches!(c.kind, ConflictKind::KeyReplaced))
+            .map(|c| c.prior_id.clone());
+        self.entries.push(stored);
         self.sync_to_runtime();
-        Ok(())
+        Ok(RecordOutcome {
+            id: entry.id,
+            conflicts,
+        })
+    }
+
+    /// Mark every expired entry (`expires_at` in the past) as `Expired`.
+    /// Returns the number of transitions. Called automatically on load.
+    pub fn sweep_expired(&mut self) -> usize {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut n = 0;
+        for e in self.entries.iter_mut() {
+            if e.is_expired_at(now) && e.metadata.status == MemoryStatus::Active {
+                e.metadata.status = MemoryStatus::Expired;
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.sync_to_runtime();
+        }
+        n
+    }
+
+    /// Adjust an entry's confidence with an auditable trail entry. The new
+    /// value is clamped to [0.0, 1.0]. Returns the applied adjustment.
+    pub fn adjust_confidence(
+        &mut self,
+        id: &str,
+        to: f64,
+        reason: Option<String>,
+    ) -> Result<ConfidenceAdjustment, EngineeringMemoryError> {
+        let to = to.clamp(0.0, 1.0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        const MAX_ADJUSTMENTS: usize = 16;
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| EngineeringMemoryError::Generic(format!("entry not found: {}", id)))?;
+        let adjustment = ConfidenceAdjustment {
+            at: now,
+            from: entry.metadata.confidence,
+            to,
+            reason,
+        };
+        entry.metadata.adjustments.push(adjustment.clone());
+        if entry.metadata.adjustments.len() > MAX_ADJUSTMENTS {
+            let overflow = entry.metadata.adjustments.len() - MAX_ADJUSTMENTS;
+            entry.metadata.adjustments.drain(0..overflow);
+        }
+        entry.metadata.confidence = to;
+        entry.record_access();
+        self.sync_to_runtime();
+        Ok(adjustment)
     }
 
     // ── Update ───────────────────────────────────────────────────────────
@@ -714,4 +825,200 @@ mod tests {
         let resolved = provider.resolve_for_task(&["auth".to_string()], &[]);
         assert!(resolved.is_empty());
     }
+// ── Memory V2: lifecycle, expiry, provenance, conflicts ────────────
+
+    #[test]
+    fn key_conflict_supersedes_prior_entry_with_lineage() {
+        let mut runtime = empty_runtime();
+        runtime.record(make_entry("e1", "auth:token", "jwt based")).unwrap();
+        let outcome = runtime
+            .record(make_entry("e2", "auth:token", "oauth2 with rotation"))
+            .unwrap();
+
+        assert_eq!(outcome.conflicts.len(), 1);
+        assert_eq!(outcome.conflicts[0].kind_str(), "key_replaced");
+        assert_eq!(outcome.conflicts[0].prior_id, "e1");
+
+        let snap = runtime.snapshot();
+        let e1 = snap.iter().find(|e| e.id == "e1").unwrap();
+        assert_eq!(e1.metadata.status, crate::engineering_memory::types::MemoryStatus::Superseded);
+        let e2 = snap.iter().find(|e| e.id == "e2").unwrap();
+        assert_eq!(e2.metadata.supersedes.as_deref(), Some("e1"));
+    }
+
+    #[test]
+    fn identical_key_and_value_is_not_a_conflict() {
+        let mut runtime = empty_runtime();
+        runtime.record(make_entry("e1", "build:cmd", "cargo test --workspace")).unwrap();
+        let outcome = runtime
+            .record(make_entry("e2", "build:cmd", "cargo test --workspace"))
+            .unwrap();
+        // Same value under the same key is a benign restatement, not a conflict.
+        assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+    }
+
+    #[test]
+    fn expired_entries_are_swept_and_excluded_from_resolution() {
+        let mut runtime = empty_runtime();
+        // Distinct keys so key-replacement conflicts don't interfere with
+        // the lifecycle being tested.
+        let mut entry = make_entry("stale", "deploy:old-region", "eu-west-1");
+        entry.metadata.expires_at = Some(1); // epoch second 1: long past
+        runtime.record(entry).unwrap();
+        runtime
+            .record(make_entry("fresh", "deploy:new-region", "us-east-2 (current)"))
+            .unwrap();
+
+        let swept = runtime.sweep_expired();
+        assert_eq!(swept, 1);
+        let swept_snapshot = runtime.snapshot();
+        let stale = swept_snapshot.iter().find(|e| e.id == "stale").unwrap();
+        assert_eq!(
+            stale.metadata.status,
+            crate::engineering_memory::types::MemoryStatus::Expired
+        );
+
+        // Resolution must not surface the expired entry even though the
+        // keyword matches both entries' keys.
+        let context = runtime.resolve_for_task(&["deploy".to_string()], &[]);
+        // MemoryContext entries carry key/value pairs; join values for checks.
+        let joined = context
+            .entries
+            .iter()
+            .map(|m| m.value.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("eu-west-1"), "expired entry leaked: {joined}");
+        assert!(joined.contains("us-east-2"), "active entry missing: {joined}");
+    }
+
+    #[test]
+    fn confidence_adjustments_leave_an_auditable_trail() {
+        let mut runtime = empty_runtime();
+        runtime.record(make_entry("adj", "risk:rollback", "feature-flagged")).unwrap();
+        let a1 = runtime.adjust_confidence("adj", 0.7, Some("verified in prod".into())).unwrap();
+        assert_eq!((a1.from, a1.to), (0.9, 0.7));
+        let _ = runtime.adjust_confidence("adj", 1.5, None).unwrap(); // clamped to 1.0
+
+        let adj_snapshot = runtime.snapshot();
+        let entry = adj_snapshot.iter().find(|e| e.id == "adj").unwrap();
+        assert_eq!(entry.metadata.confidence, 1.0);
+        assert_eq!(entry.metadata.adjustments.len(), 2);
+        assert_eq!(entry.metadata.adjustments[0].reason.as_deref(), Some("verified in prod"));
+
+        let missing = runtime.adjust_confidence("ghost", 0.5, None);
+        assert!(missing.is_err());
+    }
+
+    #[test]
+    fn near_duplicate_detection_flags_high_overlap_values() {
+        let mut runtime = empty_runtime();
+        runtime.record(make_entry(
+            "orig",
+            "api:limit",
+            "rate limit is 100 requests per minute per token",
+        )).unwrap();
+        let outcome = runtime
+            .record(make_entry(
+                "dup",
+                "api:limits-doc",
+                "rate limit is 100 requests per minute per token, enforced at gateway",
+            ))
+            .unwrap();
+        assert!(
+            outcome.conflicts.iter().any(|c| c.kind_str() == "near_duplicate"),
+            "expected near-duplicate conflict, got {:?}",
+            outcome.conflicts
+        );
+    }
+
+    #[test]
+    fn pre_v11_memory_store_loads_with_defaults() {
+        use crate::engineering_memory::{EngineeringMemoryFile, store::EngineeringMemoryStore};
+        let dir = tempfile::tempdir().unwrap();
+        let codebro_dir = dir.path().join(".codebro");
+        std::fs::create_dir_all(&codebro_dir).unwrap();
+        let root_str = dir.path().to_string_lossy().to_string();
+        let legacy = format!(
+            r#"{{
+            "schema_version": "1.0.0",
+            "workspace_root": "{root_str}",
+            "entries": [{{
+                "id": "old", "key": "k", "value": "v",
+                "metadata": {{"importance": 0.4, "confidence": 0.6, "tags": [], "source": null}},
+                "created_at": 100, "last_accessed": 100, "access_count": 0
+            }}],
+            "updated_at": 100
+        }}"#
+        );
+        std::fs::write(codebro_dir.join("engineering_memory.json"), legacy).unwrap();
+        let store = EngineeringMemoryStore::new(dir.path());
+        let file: EngineeringMemoryFile =
+            store.load(&root_str).expect("legacy store must load");
+        assert_eq!(file.entries.len(), 1);
+        assert_eq!(
+            file.entries[0].metadata.status,
+            crate::engineering_memory::types::MemoryStatus::Active
+        );
+        assert!(file.entries[0].metadata.expires_at.is_none());
+    }
+
+}
+
+
+/// The result of recording a memory entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordOutcome {
+    /// Id of the newly stored entry.
+    pub id: String,
+    /// Conflicts detected and how they were handled.
+    pub conflicts: Vec<MemoryConflict>,
+}
+
+/// A conflict detected while recording a memory entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryConflict {
+    pub kind: ConflictKind,
+    /// Id of the pre-existing entry involved.
+    pub prior_id: String,
+    pub prior_key: String,
+}
+
+impl MemoryConflict {
+    pub fn kind_str(&self) -> &'static str {
+        match self.kind {
+            ConflictKind::KeyReplaced => "key_replaced",
+            ConflictKind::NearDuplicate => "near_duplicate",
+        }
+    }
+}
+
+/// The kind of memory conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictKind {
+    /// Same key existed with a different value; the prior entry is now
+    /// `Superseded` and the new entry carries its id in `supersedes`.
+    KeyReplaced,
+    /// Same key with a highly similar value; both entries remain active.
+    NearDuplicate,
+}
+
+/// Deterministic token-overlap similarity on whitespace-split lowercase
+/// tokens (Jaccard index).
+fn token_overlap(a: &str, b: &str) -> f64 {
+    let norm = |s: &str| -> std::collections::HashSet<String> {
+        s.to_lowercase()
+            .split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '.')
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let sa = norm(a);
+    let sb = norm(b);
+    if sa.is_empty() && sb.is_empty() {
+        return 1.0;
+    }
+    let inter = sa.intersection(&sb).count();
+    let union = sa.union(&sb).count();
+    if union == 0 { 0.0 } else { inter as f64 / union as f64 }
 }
