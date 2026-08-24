@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.7.0-mcp-rc2"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 description = "CodeBro — engineering intelligence runtime for AI coding agents"

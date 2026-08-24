@@ -1,0 +1,23 @@
+# cargo-audit policy for CodeBro v1.0.0
+#
+# Findings listed here are reviewed accepted risks with recorded rationale.
+# Each entry must state why the finding does not block release and what the
+# remediation path is.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2025-0009 — ring 0.17.9: some AES functions may panic when
+    # overflow checking is enabled.
+    #
+    # Rationale for acceptance at v1.0.0:
+    # - Release profiles do not enable overflow checks, so the panicking
+    #   code path is not reached in shipped binaries.
+    # - Upgrading to ring >= 0.17.12 requires a newer `cc`, which conflicts
+    #   with the tree-sitter 0.20 grammar pins (`cc ~1.0.90`) used by the
+    #   parsers crate. Resolving it means upgrading the whole tree-sitter
+    #   stack — deferred deliberately to keep the v1.0 surface frozen.
+    #
+    # Remediation path: upgrade grammars + tree-sitter to a current major,
+    # then lift this ignore entry.
+    "RUSTSEC-2025-0009",
+]

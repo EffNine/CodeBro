@@ -247,7 +247,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codebro-change-engine"
-version = "0.7.0-mcp-rc2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "codebro-core",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-core"
-version = "0.7.0-mcp-rc2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-fact-store"
-version = "0.7.0-mcp-rc2"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "codebro-core",
@@ -298,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-identity-runtime"
-version = "0.7.0-mcp-rc2"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "codebro-core",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-impact-engine"
-version = "0.7.0-mcp-rc2"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "codebro-core",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-indexer"
-version = "0.7.0-mcp-rc2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-mcp-server"
-version = "0.7.0-mcp-rc2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-memory-runtime"
-version = "0.7.0-mcp-rc2"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "codebro-core",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-parsers"
-version = "0.7.0-mcp-rc2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-sandbox-runtime"
-version = "0.7.0-mcp-rc2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -838,9 +838,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.15"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2806,7 +2806,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
