@@ -1,6 +1,8 @@
 # CodeBro v1.0 Roadmap
 
-Status: ACTIVE — baseline locked on branch `cleanup/runtime-consolidation`.
+Status: **DELIVERED** — all phases 0–10 implemented on branch
+`cleanup/runtime-consolidation`; see `git log` phase commits and
+`docs/MCP_API_V1.md` for the frozen contract.
 Target: **CodeBro v1.0** — *"The engineering intelligence runtime layer for AI coding agents."*
 
 ---
