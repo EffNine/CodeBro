@@ -28,6 +28,7 @@ use crate::engineering_facts::{
 
 /// Run the population pipeline for a workspace root and persist the model.
 pub mod cache;
+pub mod graph_edges;
 pub mod repo_intel;
 
 pub fn run(workspace_root: &Path) -> Result<()> {
@@ -68,6 +69,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     let mut all_calls: Vec<crate::intelligence::parser::ParseCall> = Vec::new();
     let mut all_imports: Vec<crate::intelligence::parser::ParseImport> = Vec::new();
     let mut impl_scopes: Vec<crate::impact::relationships::ImplScope> = Vec::new();
+    let mut collected_routes: Vec<SymbolFact> = Vec::new();
     let mut skipped_oversized: usize = 0;
     let mut lang_stats: repo_intel::LangStats = Default::default();
     // Machine-generated "source" files that embed datasets (common in ML
@@ -172,6 +174,14 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         }
         all_calls.extend(parsed.calls.iter().cloned());
         all_imports.extend(parsed.import_targets.iter().cloned());
+
+        // HTTP/API route declarations become first-class Route symbols so
+        // the impact engine can reason about them like any other symbol.
+        let mut route_syms =
+            graph_edges::route_symbols(&ws_id, &rel, language, &source);
+        if !route_syms.is_empty() {
+            collected_routes.append(&mut route_syms);
+        }
 
         // Record impl block extents so method calls can be attributed to
         // their self type during relationship resolution.
@@ -353,6 +363,91 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     );
     if rel_count > 0 {
         println!("  relationships: {rel_count}");
+    }
+
+    // ── Engineering dependency graph edges ───────────────────────────
+    for sym in &collected_routes {
+        builder.add_symbol(sym.clone());
+    }
+    {
+        // Documentation references: docs become modules whose Documents
+        // edges resolve to uniquely-named symbols.
+        let mut docs: Vec<(String, String)> = Vec::new();
+        const MAX_DOC_BYTES: u64 = 256 * 1024;
+        for entry in WalkDir::new(&root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| !repo_intel::skip_dir(&e.file_name().to_string_lossy()))
+        {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_file() || !graph_edges::is_doc_file(entry.path()) {
+                continue;
+            }
+            if std::fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(u64::MAX)
+                > MAX_DOC_BYTES
+            {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let doc_rel = entry
+                .path()
+                .strip_prefix(&root)
+                .unwrap_or(entry.path())
+                .to_string_lossy()
+                .to_string();
+            let mid = ModuleId::new(format!("mod::{doc_rel}"));
+            let mut mf = ModuleFact::new(mid, doc_rel.clone());
+            mf.path = Some(doc_rel.clone());
+            mf.visibility = Visibility::Public;
+            mf.location = SourceLocation::new()
+                .with_workspace(ws_id.clone())
+                .with_file(doc_rel.clone());
+            builder.add_module(mf);
+            docs.push((doc_rel, content));
+        }
+        docs.sort();
+
+        let mut symbols_by_name: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut all_syms: Vec<&SymbolFact> = collected_symbols.iter().collect();
+        all_syms.extend(collected_routes.iter());
+        for s in all_syms {
+            symbols_by_name
+                .entry(s.name.clone())
+                .or_default()
+                .push(s.id.as_str().to_string());
+        }
+        for edge in graph_edges::doc_reference_edges(&docs, &symbols_by_name, 50) {
+            builder.add_relationship(edge);
+        }
+
+        // Configuration artifacts: package-scoped modules with Configures
+        // edges, so manifests participate in the dependency graph.
+        for pkg in packages.iter().filter(|p| !p.id.as_str().ends_with("::external")) {
+            let manifests: &[&str] = match pkg.language.as_str() {
+                "rust" => &["Cargo.toml"],
+                "go" => &["go.mod"],
+                "javascript" | "typescript" => &["package.json"],
+                "python" => &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"],
+                _ => &[],
+            };
+            for m in manifests {
+                let abs = pkg.path.join(m);
+                if !abs.is_file() {
+                    continue;
+                }
+                let rel = abs
+                    .strip_prefix(&root)
+                    .unwrap_or(&abs)
+                    .to_string_lossy()
+                    .to_string();
+                let (mf, edge) =
+                    graph_edges::config_module_and_edge(&ws_id, &rel, &pkg.id);
+                builder.add_module(mf);
+                builder.add_relationship(edge);
+            }
+        }
     }
 
     // Derive a deterministic architecture summary and the top modules by
@@ -1722,10 +1817,16 @@ mod tests {
             !model.relationships().is_empty(),
             "expected AST-derived relationships"
         );
+        let pkg_ids: std::collections::HashSet<String> = model
+            .packages()
+            .iter()
+            .map(|p| p.id.as_str().to_string())
+            .collect();
         for r in model.relationships() {
             let endpoint_ok = |e: &crate::engineering_facts::FactId| match e {
                 crate::engineering_facts::FactId::Symbol(s) => sym_ids.contains(s.as_str()),
                 crate::engineering_facts::FactId::Module(m) => mod_ids.contains(m.as_str()),
+                crate::engineering_facts::FactId::Package(p) => pkg_ids.contains(p.as_str()),
                 _ => false,
             };
             let src = format!("{:?}", r.source);
@@ -2228,6 +2329,108 @@ mod tests {
         assert_eq!(report.modules_affected, 1);
         assert!(report.symbols_affected >= 1);
         assert_eq!(report.tests_related, 1);
+    }
+
+    // ── Phase 6: engineering dependency graph edges ────────────────────
+
+    #[test]
+    fn route_extraction_across_language_families() {
+        use crate::init::graph_edges;
+        let rust = graph_edges::extract_routes(
+            "rust",
+            "#[get(\"/users\")]\nasync fn list() {}\n#[post(\"/users\")]\nasync fn create() {}\n",
+        );
+        assert_eq!(rust.len(), 2);
+        assert_eq!(rust[0].method, "GET");
+        assert_eq!(rust[0].path, "/users");
+
+        let ts = graph_edges::extract_routes(
+            "typescript",
+            "app.get('/orders', handler);\nrouter.delete(\"/orders/:id\", h);\n",
+        );
+        assert_eq!(ts.len(), 2);
+        assert_eq!((ts[0].method.as_str(), ts[0].path.as_str()), ("GET", "/orders"));
+        assert_eq!(ts[1].path, "/orders/:id");
+
+        let py = graph_edges::extract_routes(
+            "python",
+            "@app.get(\"/items\")\ndef list(): ...\n@router.post(\"/items\")\ndef create(): ...\n",
+        );
+        assert_eq!(py.len(), 2);
+
+        let go = graph_edges::extract_routes(
+            "go",
+            "http.HandleFunc(\"/healthz\", handler)\n",
+        );
+        assert_eq!(go.len(), 1);
+        assert_eq!(go[0].path, "/healthz");
+
+        // Non-route text produces nothing.
+        assert!(graph_edges::extract_routes("rust", "let x = 1;\n").is_empty());
+    }
+
+    #[test]
+    fn init_indexes_route_symbols_and_doc_references() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"routes-probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "#[get(\"/widgets\")]\npub async fn list_widgets() {}\nfn main() {}\n",
+        )
+        .unwrap();
+        // README references the uniquely-named function and an unknown name.
+        std::fs::write(
+            dir.path().join("README.md"),
+            "# Demo\n\nSee `list_widgets` for details; `not_a_real_symbol` is ignored.\n",
+        )
+        .unwrap();
+
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+
+        let routes: Vec<&str> = model
+            .symbols()
+            .iter()
+            .filter(|s| s.kind == codebro_fact_store::engineering_facts::SymbolKind::Route)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            routes.iter().any(|n| n.contains("/widgets")),
+            "routes: {routes:?}"
+        );
+
+        let docs_edges: Vec<_> = model
+            .relationships()
+            .iter()
+            .filter(|r| {
+                r.kind == codebro_fact_store::engineering_facts::RelationshipKind::Documents
+            })
+            .collect();
+        assert_eq!(docs_edges.len(), 1, "docs edges: {docs_edges:?}");
+
+        // The manifest itself became a config module wired to its package.
+        let config_modules: Vec<_> = model
+            .modules()
+            .iter()
+            .filter(|m| m.path.as_deref() == Some("Cargo.toml"))
+            .collect();
+        assert_eq!(config_modules.len(), 1);
+        let configures: Vec<_> = model
+            .relationships()
+            .iter()
+            .filter(|r| {
+                r.kind == codebro_fact_store::engineering_facts::RelationshipKind::Configures
+            })
+            .collect();
+        assert!(!configures.is_empty());
     }
 }
 

@@ -34,11 +34,15 @@ pub enum RelationshipKind {
     Owns,
     Contains,
     Friend,
+    /// A documentation artifact references the target symbol/module.
+    Documents,
+    /// A configuration artifact configures the target package/module.
+    Configures,
     Unknown,
 }
 
 impl RelationshipKind {
-    pub const ALL: [RelationshipKind; 15] = [
+    pub const ALL: [RelationshipKind; 17] = [
         RelationshipKind::Defines,
         RelationshipKind::Declares,
         RelationshipKind::Calls,
@@ -53,6 +57,8 @@ impl RelationshipKind {
         RelationshipKind::Owns,
         RelationshipKind::Contains,
         RelationshipKind::Friend,
+        RelationshipKind::Documents,
+        RelationshipKind::Configures,
         RelationshipKind::Unknown,
     ];
 
@@ -72,6 +78,8 @@ impl RelationshipKind {
             RelationshipKind::Owns => "owns",
             RelationshipKind::Contains => "contains",
             RelationshipKind::Friend => "friend",
+            RelationshipKind::Documents => "documents",
+            RelationshipKind::Configures => "configures",
             RelationshipKind::Unknown => "unknown",
         }
     }
@@ -92,6 +100,8 @@ impl RelationshipKind {
             "owns" => Some(RelationshipKind::Owns),
             "contains" => Some(RelationshipKind::Contains),
             "friend" => Some(RelationshipKind::Friend),
+            "documents" => Some(RelationshipKind::Documents),
+            "configures" => Some(RelationshipKind::Configures),
             "unknown" => Some(RelationshipKind::Unknown),
             _ => None,
         }

@@ -63,7 +63,7 @@ pub struct AmbiguityMatch {
 }
 
 /// A single directed relationship edge discovered during analysis.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImpactRelationship {
     pub target_id: String,
     pub target_name: String,
@@ -73,10 +73,39 @@ pub struct ImpactRelationship {
     pub provenance: Provenance,
     /// Graph distance from the original target (1 = direct, 2+ = transitive).
     pub depth: usize,
+    /// Derived confidence in [0,1]: provenance quality decayed by graph
+    /// distance. Verified direct edges are highest; heuristic transitive
+    /// edges lowest. Descriptive signal — not a probability.
+    #[serde(default = "default_confidence")]
+    pub confidence: f64,
+    /// Human-readable reason this relationship appears in the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Edges forming the path from the target to this relationship's source,
     /// present only when depth >= 2.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path: Vec<PathEdge>,
+}
+
+fn default_confidence() -> f64 {
+    1.0
+}
+
+/// Provenance quality base for confidence computation.
+pub fn provenance_base(provenance: &Provenance) -> f64 {
+    match provenance {
+        Provenance::Verified => 0.95,
+        Provenance::Heuristic => 0.55,
+        Provenance::Unknown => 0.35,
+    }
+}
+
+/// Confidence for an edge: provenance quality decayed per hop of graph
+/// distance (0.85 per level beyond depth 1), clamped to [0, 1].
+pub fn edge_confidence(provenance: &Provenance, depth: usize) -> f64 {
+    let hops = depth.saturating_sub(1);
+    let decayed = provenance_base(provenance) * 0.85f64.powi(hops as i32);
+    decayed.clamp(0.0, 1.0)
 }
 
 /// A single edge in a traversal path from the original target to a transitive node.
@@ -137,7 +166,7 @@ pub struct Completeness {
 }
 
 /// The full impact analysis result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImpactResult {
     pub target: ImpactTargetInfo,
     pub status: ImpactStatus,
@@ -611,6 +640,11 @@ fn traverse(
                 source_location: edge.location.as_ref().and_then(|l| l.file.clone()),
                 provenance: edge.provenance.clone(),
                 depth: new_depth,
+                confidence: edge_confidence(&edge.provenance, new_depth),
+                reason: Some(format!(
+                    "{} edge ({}) at depth {}",
+                    edge.kind, edge_direction, new_depth
+                )),
                 path: if new_depth >= 2 {
                     new_path.clone()
                 } else {
@@ -958,6 +992,8 @@ fn gather_relationships(
                     source_location: loc,
                     provenance: fact_provenance(&rel.metadata),
                     depth: 1,
+                    confidence: edge_confidence(&fact_provenance(&rel.metadata), 1),
+                    reason: Some(format!("{} edge", rel.kind.as_str())),
                     path: Vec::new(),
                 });
             }
@@ -974,6 +1010,8 @@ fn gather_relationships(
                     source_location: loc,
                     provenance: fact_provenance(&r.metadata),
                     depth: 1,
+                    confidence: edge_confidence(&fact_provenance(&r.metadata), 1),
+                    reason: Some("cross-reference".to_string()),
                     path: Vec::new(),
                 });
             }
@@ -992,6 +1030,8 @@ fn gather_relationships(
                     source_location: loc,
                     provenance: fact_provenance(&rel.metadata),
                     depth: 1,
+                    confidence: edge_confidence(&fact_provenance(&rel.metadata), 1),
+                    reason: Some(format!("{} edge", rel.kind.as_str())),
                     path: Vec::new(),
                 });
             }
@@ -1008,6 +1048,8 @@ fn gather_relationships(
                     source_location: loc,
                     provenance: fact_provenance(&r.metadata),
                     depth: 1,
+                    confidence: edge_confidence(&fact_provenance(&r.metadata), 1),
+                    reason: Some("cross-reference".to_string()),
                     path: Vec::new(),
                 });
             }
@@ -2614,5 +2656,61 @@ mod tests {
             Some(FreshnessStatus::Stale),
             "freshness should be Stale when repo state changed"
         );
+    }
+
+    // ── Phase 6: confidence semantics ──────────────────────────────────
+
+    #[test]
+    fn edge_confidence_decays_with_depth_and_provenance() {
+        use crate::impact::{edge_confidence, provenance_base, Provenance};
+        let v1 = edge_confidence(&Provenance::Verified, 1);
+        let v3 = edge_confidence(&Provenance::Verified, 3);
+        let h1 = edge_confidence(&Provenance::Heuristic, 1);
+        assert!((v1 - 0.95).abs() < 1e-9);
+        assert!(v3 < v1, "deeper must be less confident: {v3} vs {v1}");
+        assert!(h1 < v1, "heuristic must be less confident than verified");
+        let u = provenance_base(&Provenance::Unknown);
+        assert!((0.0..=1.0).contains(&u));
+    }
+
+    #[test]
+    fn impact_result_relationships_carry_confidence_and_reason() {
+        // Build a tiny store: module A calls into module B.
+        let mut builder = FactsBuilder::new();
+        let ws = WorkspaceFact::new(WorkspaceId::new("ws::t"), "t");
+        builder.add_workspace(ws);
+        for (id, path) in [("mod::a.rs", "a.rs"), ("mod::b.rs", "b.rs")] {
+            let mut m = ModuleFact::new(ModuleId::new(id), path.to_string());
+            m.path = Some(path.to_string());
+            m.location =
+                crate::engineering_facts::SourceLocation::new().with_workspace(WorkspaceId::new("ws::t")).with_file(path);
+            builder.add_module(m);
+        }
+        let fa = SymbolFact::new(SymbolId::new("sym::a"), "fa", crate::engineering_facts::SymbolKind::Function);
+        let fb = SymbolFact::new(SymbolId::new("sym::b"), "fb", crate::engineering_facts::SymbolKind::Function);
+        builder.add_symbol(fa);
+        builder.add_symbol(fb);
+        let mut call = RelationshipFact::new(
+            RelationshipId::new("rel::c1"),
+            RelationshipKind::Calls,
+            FactId::Symbol(SymbolId::new("sym::a")),
+            FactId::Symbol(SymbolId::new("sym::b")),
+        );
+        call.metadata = crate::engineering_facts::FactMetadata::builder()
+            .attr("provenance", "heuristic")
+            .build();
+        builder.add_relationship(call);
+
+        let store = FactStore::build(builder.build());
+        let target = ImpactTarget::Symbol(SymbolId::new("sym::b"));
+        let result = crate::impact::analyze(&store, target, &ImpactOptions::default(), None);
+        assert!(
+            !result.direct_relationships.is_empty(),
+            "expected direct relationships"
+        );
+        for rel in result.direct_relationships.iter().chain(result.transitive_relationships.iter()) {
+            assert!((0.0..=1.0).contains(&rel.confidence), "confidence out of range: {:?}", rel);
+            assert!(rel.reason.is_some(), "reason missing on {:?}", rel.target_id);
+        }
     }
 }

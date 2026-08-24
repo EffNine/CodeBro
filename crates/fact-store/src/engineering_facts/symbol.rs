@@ -34,11 +34,13 @@ pub enum SymbolKind {
     Namespace,
     Import,
     Export,
+    /// HTTP/API route declaration (e.g. `#[get("/users")]`, `app.get("/x")`).
+    Route,
     Unknown,
 }
 
 impl SymbolKind {
-    pub const ALL: [SymbolKind; 19] = [
+    pub const ALL: [SymbolKind; 20] = [
         SymbolKind::Function,
         SymbolKind::Method,
         SymbolKind::Class,
@@ -57,6 +59,7 @@ impl SymbolKind {
         SymbolKind::Namespace,
         SymbolKind::Import,
         SymbolKind::Export,
+        SymbolKind::Route,
         SymbolKind::Unknown,
     ];
 
@@ -80,6 +83,7 @@ impl SymbolKind {
             SymbolKind::Namespace => "namespace",
             SymbolKind::Import => "import",
             SymbolKind::Export => "export",
+            SymbolKind::Route => "route",
             SymbolKind::Unknown => "unknown",
         }
     }
@@ -104,6 +108,7 @@ impl SymbolKind {
             "namespace" => Some(SymbolKind::Namespace),
             "import" => Some(SymbolKind::Import),
             "export" => Some(SymbolKind::Export),
+            "route" => Some(SymbolKind::Route),
             "unknown" => Some(SymbolKind::Unknown),
             _ => None,
         }

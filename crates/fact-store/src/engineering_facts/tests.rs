@@ -126,8 +126,10 @@ fn all_visibility_values_round_trip() {
 
 #[test]
 fn all_relationship_kinds_round_trip() {
-    // The full 15-kind language-neutral set, including Declares.
-    assert_eq!(RelationshipKind::ALL.len(), 15);
+    // The full 17-kind language-neutral set, including Declares.
+    assert_eq!(RelationshipKind::ALL.len(), 17);
+    assert!(RelationshipKind::ALL.contains(&RelationshipKind::Documents));
+    assert!(RelationshipKind::ALL.contains(&RelationshipKind::Configures));
     assert!(RelationshipKind::ALL.contains(&RelationshipKind::Declares));
     assert!(RelationshipKind::ALL.contains(&RelationshipKind::Defines));
     for k in RelationshipKind::ALL {
