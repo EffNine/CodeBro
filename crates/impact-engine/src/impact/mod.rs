@@ -2560,7 +2560,8 @@ mod tests {
             .ok();
         std::process::Command::new("git")
             .current_dir(&dir)
-            .args(["commit", "-m", "init"])
+            // CI runners have no global git identity; provide one inline.
+            .args(["-c", "user.email=codebro@test", "-c", "user.name=codebro", "commit", "-m", "init"])
             .output()
             .ok();
 
@@ -2615,7 +2616,8 @@ mod tests {
             .ok();
         std::process::Command::new("git")
             .current_dir(&dir)
-            .args(["commit", "-m", "init"])
+            // CI runners have no global git identity; provide one inline.
+            .args(["-c", "user.email=codebro@test", "-c", "user.name=codebro", "commit", "-m", "init"])
             .output()
             .ok();
 
