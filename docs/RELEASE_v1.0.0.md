@@ -147,6 +147,12 @@ Stated plainly, without optimism bias:
   there is no operator configuration surface yet.
 - **Single-writer assumption.** Concurrent `codebro init` runs against one
   workspace are serialized only by filesystem atomicity, not by locking.
+  Similarly, MCP mutating calls (`record_memory`, `delete_memory`,
+  `update_identity`, `apply_*`) are safe when issued sequentially — the
+  normal agent pattern of awaiting each response — but a client that
+  pipelines multiple mutations without waiting may observe last-writer-
+  wins on the affected state file. Remediation path: a per-workspace
+  mutation lock in the server.
 - **One accepted security advisory.** `cargo audit` is clean at release
   except RUSTSEC-2025-0009 (`ring` 0.17.9: AES functions may panic when
   overflow checking is enabled — not reachable in release builds where
