@@ -1951,7 +1951,20 @@ fn resolve_test_command(workspace: &std::path::Path, explicit: Option<&str>) -> 
         return "go test ./...".to_string();
     }
     if workspace.join("package.json").exists() {
+        // Package-manager preference by lockfile.
+        if workspace.join("pnpm-lock.yaml").exists() {
+            return "pnpm test".to_string();
+        }
+        if workspace.join("yarn.lock").exists() {
+            return "yarn test".to_string();
+        }
         return "npm test".to_string();
+    }
+    if workspace.join("pyproject.toml").exists()
+        || workspace.join("pytest.ini").exists()
+        || workspace.join("setup.py").exists()
+    {
+        return "python -m pytest -q".to_string();
     }
     "echo no project manifest detected use sandbox_exec with explicit command".to_string()
 }
@@ -1968,6 +1981,13 @@ fn resolve_build_command(workspace: &std::path::Path, explicit: Option<&str>) ->
         return "go build ./...".to_string();
     }
     if workspace.join("package.json").exists() {
+        // Package-manager preference by lockfile.
+        if workspace.join("pnpm-lock.yaml").exists() {
+            return "pnpm run build".to_string();
+        }
+        if workspace.join("yarn.lock").exists() {
+            return "yarn build".to_string();
+        }
         return "npm run build".to_string();
     }
     "echo no project manifest detected use sandbox_exec with explicit command".to_string()
@@ -1975,6 +1995,53 @@ fn resolve_build_command(workspace: &std::path::Path, explicit: Option<&str>) ->
 
 fn default_half() -> f64 {
     0.5
+}
+
+#[cfg(test)]
+mod phase8_tests {
+    use super::*;
+
+    #[test]
+    fn command_resolution_prefers_lockfiles_and_python() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        assert_eq!(resolve_test_command(dir.path(), None), "npm test");
+
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(resolve_test_command(dir.path(), None), "pnpm test");
+        assert_eq!(resolve_build_command(dir.path(), None), "pnpm run build");
+        std::fs::remove_file(dir.path().join("pnpm-lock.yaml")).unwrap();
+
+        std::fs::write(dir.path().join("yarn.lock"), "").unwrap();
+        assert_eq!(resolve_test_command(dir.path(), None), "yarn test");
+        assert_eq!(resolve_build_command(dir.path(), None), "yarn build");
+        std::fs::remove_file(dir.path().join("yarn.lock")).unwrap();
+
+        // Python project without node/cargo manifests.
+        let py = tempfile::tempdir().unwrap();
+        std::fs::write(py.path().join("pyproject.toml"), "[project]").unwrap();
+        assert_eq!(
+            resolve_test_command(py.path(), None),
+            "python -m pytest -q"
+        );
+
+        // Explicit commands always win.
+        assert_eq!(
+            resolve_test_command(dir.path(), Some("custom runner")),
+            "custom runner"
+        );
+    }
+
+    #[test]
+    fn execution_evidence_carries_environment_capture() {
+        let env = crate::sandbox::ExecutionEnvironment::capture();
+        assert!(!env.os.is_empty());
+        assert!(!env.arch.is_empty());
+        let json = serde_json::to_value(&env).unwrap();
+        assert!(json["os"].is_string());
+        assert!(json["arch"].is_string());
+        assert!(json["family"].is_string());
+    }
 }
 
 fn default_true() -> bool {

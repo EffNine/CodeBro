@@ -111,6 +111,28 @@ pub struct SandboxCommand {
     pub metadata: HashMap<String, String>,
 }
 
+/// Static environment description captured with every execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ExecutionEnvironment {
+    /// Operating system (`std::env::consts::OS`).
+    pub os: String,
+    /// CPU architecture (`std::env::consts::ARCH`).
+    pub arch: String,
+    /// OS family (`std::env::consts::FAMILY`).
+    pub family: String,
+}
+
+impl ExecutionEnvironment {
+    /// Capture the host environment description.
+    pub fn capture() -> Self {
+        ExecutionEnvironment {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            family: std::env::consts::FAMILY.to_string(),
+        }
+    }
+}
+
 /// The authoritative structured result of a sandbox execution.
 ///
 /// This is the machine-fact record: exit code, duration, output, denial
@@ -179,6 +201,9 @@ pub struct ExecutionResult {
     /// Arbitrary metadata echoed back from the request.
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+    /// Host environment captured at execution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<ExecutionEnvironment>,
 }
 
 impl ExecutionResult {
@@ -221,6 +246,7 @@ impl ExecutionResult {
             artifacts: Vec::new(),
             freshness: None,
             metadata,
+            environment: Some(ExecutionEnvironment::capture()),
         }
     }
 
@@ -256,6 +282,7 @@ impl ExecutionResult {
             artifacts: Vec::new(),
             freshness: None,
             metadata,
+            environment: Some(ExecutionEnvironment::capture()),
         }
     }
 
@@ -878,6 +905,7 @@ impl SandboxRuntime {
                             artifacts: Vec::new(),
                             freshness: None,
                             metadata: cmd.metadata,
+                            environment: Some(ExecutionEnvironment::capture()),
                         };
                     }
                     let mut result = backend.execute(workspace_root, cmd, policy);
@@ -915,6 +943,7 @@ impl SandboxRuntime {
                         artifacts: Vec::new(),
                         freshness: None,
                         metadata: cmd.metadata,
+                        environment: Some(ExecutionEnvironment::capture()),
                     }
                 }
             }

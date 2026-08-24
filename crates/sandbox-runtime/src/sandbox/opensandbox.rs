@@ -271,6 +271,7 @@ impl OpenSandboxBackend {
             Err(e) => {
                 let duration = start.elapsed().as_millis();
                 ExecutionResult {
+                    environment: Some(crate::sandbox::ExecutionEnvironment::capture()),
                     command,
                     requested_command: String::new(),
                     resolved_command: String::new(),
@@ -374,6 +375,7 @@ impl OpenSandboxBackend {
 
         let duration = start.elapsed().as_millis();
         Ok(ExecutionResult {
+            environment: Some(crate::sandbox::ExecutionEnvironment::capture()),
             command: command.to_string(),
             requested_command: String::new(),
             resolved_command: command.to_string(),

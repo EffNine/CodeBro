@@ -296,6 +296,7 @@ impl SandboxBackend for LocalSandboxBackend {
                 let stderr = crate::tools::shell::redact_secrets_public(&run_result.stderr);
                 let success = run_result.exit_code == 0;
                 ExecutionResult {
+                    environment: Some(crate::sandbox::ExecutionEnvironment::capture()),
                     command,
                     requested_command: String::new(),
                     resolved_command: String::new(),
@@ -326,6 +327,7 @@ impl SandboxBackend for LocalSandboxBackend {
                 let error_msg = e.to_string();
                 let is_timeout = error_msg.contains("timed out");
                 ExecutionResult {
+                    environment: Some(crate::sandbox::ExecutionEnvironment::capture()),
                     command,
                     requested_command: String::new(),
                     resolved_command: String::new(),
