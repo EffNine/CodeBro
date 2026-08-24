@@ -2,12 +2,12 @@
 
 ## Repo at a glance
 
-- **Language / toolchain:** Rust, edition 2021, single `[[bin]]` crate (`codebro`). No library target.
+- **Language / toolchain:** Rust 2021 workspace. Ten domain crates under `crates/` (core, parsers, fact-store, identity-runtime, memory-runtime, sandbox-runtime, impact-engine, indexer, change-engine, mcp-server); the binary target `codebro` lives in `codebro-mcp-server`. Dependency direction is enforced by `scripts/check_workspace_deps.sh` (mcp-server → services → parsers/core).
 - **Positioning:** Engineering context & memory layer for AI coding agents, exposed as an MCP server.
 - **Entry point:** `src/main.rs` → `cli::run()` → dispatches to `serve`, `init`, `doctor`, or `list-models`.
 - **Tests:** `cargo test`. Run focused: `cargo test <module_name>`. Test counts evolve — trust the current output rather than hardcoding numbers.
 - **Build:** `cargo build --release && cargo install --path .`
-- **CLI commands:** `codebro serve --root <path>`, `codebro init --root <path>`, `codebro doctor --root <path>`, `codebro list-models`.
+- **CLI commands:** `codebro serve --root <path>`, `codebro init --root <path>`, `codebro doctor --root <path>`, `codebro list-models`, `codebro facts diff --root <path>`.
 - **Config:** Optional `~/.codebro/config.toml` (provider, base_url, model, api_key). Env vars honoured: `CODEBRO_API_KEY`, `CODEBRO_BASE_URL`, `CODEBRO_MODEL`.
 - **Sandbox config:** `OPEN_SANDBOX_URL` activates the OpenSandbox backend (lifecycle API: create sandbox → SSE command → delete). Optional: `OPEN_SANDBOX_API_KEY`, `OPEN_SANDBOX_TIMEOUT_SECS`, `OPEN_SANDBOX_MAX_OUTPUT_BYTES`, `OPEN_SANDBOX_IMAGE`, `OPEN_SANDBOX_RESOURCE_CPU`, `OPEN_SANDBOX_RESOURCE_MEMORY`. When configured but unavailable, execution fails closed — no silent Local fallback.
 - **Project state:** `.codebro/` directory inside the workspace root (facts.json, engineering_memory.json, project_identity.json, metadata.json). Not part of the source tree; ignored by git.
@@ -34,11 +34,11 @@ CodeBro owns: project/workspace identity, structured engineering facts, persiste
 
 The MCP-first architecture is the production path. The old TUI was removed from `main` (ADR-012) and is preserved only on the `tui-legacy` branch.
 
-Core subsystem directories (all under `src/`):
+Core subsystem modules (paths relative to their owning crate under `crates/<crate>/src/`):
 
 | Directory | Role |
 |-----------|------|
-| `mcp/` | MCP server: 16 tools over stdio (the public interface) |
+| `crates/mcp-server/src/mcp/` | MCP server: 17 tools over stdio (the public interface) |
 | `mcp/facts.rs` | Deterministic relevance-ranked fact retrieval engine |
 | `sandbox/` | Sandbox execution abstraction (trait + local + OpenSandbox backends + VerificationResult contracts) |
 | `init/` | Fact-store population pipeline (`codebro init`) |
@@ -78,7 +78,7 @@ Core subsystem directories (all under `src/`):
 
 ## MCP contract
 
-The server exposes exactly 16 tools over stdio (`rmcp` transport). MCP handlers are thin adapters — they do not duplicate business logic; they construct runtime instances and delegate.
+The server exposes exactly 17 tools over stdio (`rmcp` transport; the v1 contract is frozen in `docs/MCP_API_V1.md`). MCP handlers are thin adapters — they do not duplicate business logic; they construct runtime instances and delegate.
 
 ### Tool inventory
 
@@ -92,6 +92,7 @@ The server exposes exactly 16 tools over stdio (`rmcp` transport). MCP handlers 
 | `delete_memory` | write | Delete an engineering memory entry by exact key. **Requires `confirm=true`** — omitting it is a no-op. Prevents accidental or speculative deletion. Deleting a missing key errors. |
 | `update_identity` | write | Update the persistent project identity (`.codebro/project_identity.json`): description, constraints, engineering decisions, roadmap items, sprint, conventions, patterns, architecture summary. This is the medium-high-trust "declared intent" store — distinct from agent-recorded memory. Requires an existing identity (`codebro init` creates one). List fields append new unique entries; duplicate decisions/roadmap titles are reported as skipped, not errors. Decision ids are derived from titles; agent-recorded decisions default to status `accepted`. |
 | `apply_change` | write *(optional)* | Guarded single-file mutation through the ChangeEngine. Enforces workspace boundary, refuses stale or ambiguous edits. For new files pass `old=""`. Agents should use their native editing tools for normal coding edits; this is available for controlled/autonomous workflows. |
+| `apply_changes` | write | Transactional multi-file mutation through the ChangeEngine: validate all → conflict pass (staleness across the set) → sequential apply with automatic rollback on first failure. All-or-nothing. |
 | `sandbox_exec` | write | Execute a command in an isolated sandbox. Returns structured evidence with provenance: `exit_code`, `stdout`, `stderr`, `duration_ms`, `success`, `timeout`, `denied`, `execution_id`, `timestamp`, `repo_identity`, `repo_state`, `sandbox_capabilities`, `reproducibility`, `resolved_command`. Only read-only build/test/lint commands are permitted. Secret-redacted output. |
 | `sandbox_test` | write | Run the project's tests with structured verification. Auto-detects project type (cargo → `cargo test`, go → `go test`, npm → `npm test`). Returns `execution` + `verification` (pass/fail + violations). Execution evidence includes provenance envelope. Optional `expected_exit_code` and `expected_success` contracts. |
 | `sandbox_build` | write | Build/check the project with structured verification. Auto-detects project type (cargo → `cargo check`, go → `go build`, npm → `npm run build`). Returns `execution` + `verification`. Execution evidence includes provenance envelope. |
@@ -303,18 +304,15 @@ AGENTS.md is an operational guide, not a duplicate of ADRs or design docs. When 
 - Future changes after RC2 use new commits and new tags.
 - Release build: `cargo build --release` produces `target/release/codebro`.
 
-## Legacy TUI
+## Legacy architecture
 
-The old TUI is preserved on the `tui-legacy` branch. It is historical/legacy code and is **NOT** the canonical architecture of `main`.
-
-Do **not**:
-- Port TUI assumptions back into `main`.
-- Add TUI dependencies to the MCP-first runtime.
-- Make runtime code depend on TUI.
-- Treat TUI code as required for MCP functionality.
-- Modify `tui-legacy` unless explicitly requested.
-
-The TUI was removed from `main` in commit `dec9227` (refactor!: remove TUI from main — MCP-first engineering runtime).
+The retired pre-MCP architecture (~110k lines: TUI agent loop, Adaptive
+Developer Platform experiments) was deleted in v1 (Phase 2). Evaluation and
+preservation mapping: `docs/LEGACY_RETIREMENT.md`; history remains on tags
+`v0.7.0-mcp-rc1/rc2` and branch `tui-legacy`. Guards in
+`crates/mcp-server/tests/legacy_isolation.rs` prevent reintroduction.
+Do not recreate legacy concepts (agent loops, prompt assembly, plugin SDKs,
+tool registries) — external agents own those concerns.
 
 ## When to stop and ask
 
