@@ -20,8 +20,10 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+          # windows-x64 is intentionally not built yet: core/src/tools/pty.rs
+          # relies on POSIX process-group signals (SIGKILL) and does not
+          # compile against msvc libc. Add it together with a Windows port
+          # of the PTY backend.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

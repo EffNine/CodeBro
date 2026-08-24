@@ -20,8 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      # rust-toolchain.toml pins 1.97; install lint components into THAT
+      # toolchain (dtolnay's `components:` input applies to its own install).
+      - name: Install pinned-toolchain components
+        run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
