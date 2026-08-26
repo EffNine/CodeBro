@@ -8,11 +8,11 @@
 //! - [`patch`] — `ChangePlan` / `PatchEngine`, the diff machinery behind the
 //!   change engine (`coding::change_engine`).
 //! - [`context`] / [`streaming`] / [`capabilities`] — shared execution types
-//!   (`ToolContext`, streaming traits) used by both the live shell tool and
-//!   the legacy registry via `legacy::tools`.
+//!   (`ToolContext`, streaming traits) used by the live PTY-backed shell tool.
 //!
-//! The full historical tool platform (registry, hooks, lifecycle, discovery,
-//! filesystem/git/playwright tools) lives in `crate::legacy::tools`.
+//! The historical tool platform (registry, hooks, lifecycle, discovery,
+//! filesystem/git/playwright tools) was deleted with the legacy architecture
+//! (see docs/LEGACY_RETIREMENT.md); only this slim live surface remains.
 
 #![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod capabilities;
@@ -27,7 +27,7 @@ pub mod streaming;
 pub use capabilities::{PermissionPolicy, ToolCapabilities, ToolCategory};
 pub use change::ChangePlan;
 pub use context::{ExecutionId, ToolContext, ToolContextBuilder, ToolResult};
-pub use patch::{FilePatch, PatchEngine, PatchSet};
+pub use patch::{FilePatch, PatchEngine};
 pub use shell::{RunCommand, ShellCommandRecord, ShellHistory};
 pub use streaming::{
     channel_stream, channel_stream_factory, sync_to_stream, AsyncTool, StreamChunk, StreamResult,

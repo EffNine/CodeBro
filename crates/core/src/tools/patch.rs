@@ -20,31 +20,6 @@ pub struct FilePatch {
 }
 
 #[derive(Debug, Clone)]
-pub struct PatchSet {
-    pub patches: Vec<FilePatch>,
-}
-
-impl PatchSet {
-    pub fn new() -> Self {
-        PatchSet {
-            patches: Vec::new(),
-        }
-    }
-
-    pub fn add_patch(&mut self, patch: FilePatch) {
-        self.patches.push(patch);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.patches.is_empty()
-    }
-}
-
-impl Default for PatchSet {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 pub struct PatchEngine;
 

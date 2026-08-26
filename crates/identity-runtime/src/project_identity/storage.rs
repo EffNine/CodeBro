@@ -16,7 +16,7 @@
 //! | `metadata.json` | Metadata (version, timestamps) |
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -156,11 +156,7 @@ impl ProjectIdentityStorage {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(identity)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(self.identity_path())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.flush()
+        codebro_core::persistence::write_atomic(&self.identity_path(), json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         Ok(())
     }
@@ -193,11 +189,7 @@ impl ProjectIdentityStorage {
         };
         let json = serde_json::to_string_pretty(&meta)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(self.workspace_path())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.flush()
+        codebro_core::persistence::write_atomic(&self.workspace_path(), json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         Ok(())
     }
@@ -222,11 +214,7 @@ impl ProjectIdentityStorage {
         };
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(self.architecture_path())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.flush()
+        codebro_core::persistence::write_atomic(&self.architecture_path(), json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         Ok(())
     }
@@ -236,11 +224,7 @@ impl ProjectIdentityStorage {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(decisions)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(self.decisions_path())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.flush()
+        codebro_core::persistence::write_atomic(&self.decisions_path(), json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         Ok(())
     }
@@ -250,11 +234,7 @@ impl ProjectIdentityStorage {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(constraints)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(self.constraints_path())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.flush()
+        codebro_core::persistence::write_atomic(&self.constraints_path(), json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         Ok(())
     }
@@ -264,11 +244,7 @@ impl ProjectIdentityStorage {
         self.ensure_directory()?;
         let json = serde_json::to_string_pretty(items)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(self.roadmap_path())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.flush()
+        codebro_core::persistence::write_atomic(&self.roadmap_path(), json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         Ok(())
     }
@@ -287,11 +263,7 @@ impl ProjectIdentityStorage {
         };
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file =
-            fs::File::create(self.sprint_path()).map_err(|e| StorageError::Write(e.to_string()))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.flush()
+        codebro_core::persistence::write_atomic(&self.sprint_path(), json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         Ok(())
     }
@@ -311,11 +283,7 @@ impl ProjectIdentityStorage {
         };
         let json = serde_json::to_string_pretty(&meta)
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let mut file = fs::File::create(self.metadata_path())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-        file.flush()
+        codebro_core::persistence::write_atomic(&self.metadata_path(), json.as_bytes())
             .map_err(|e| StorageError::Write(e.to_string()))?;
         Ok(())
     }
@@ -325,9 +293,11 @@ impl ProjectIdentityStorage {
     /// This is the canonical internal storage operation used after
     /// create, create_minimal, successful updates, and successful
     /// migrations. The canonical file (`project_identity.json`) and all
-    /// seven supplementary projections are written sequentially (not
-    /// atomically). Subsequent loads read only from the canonical file;
-    /// the supplementary files are derived, inspectable views.
+    /// seven supplementary projections are written sequentially, each
+    /// through atomic write-rename persistence, so a crash can never leave
+    /// a truncated file behind. Subsequent loads read only from the
+    /// canonical file; the supplementary files are derived, inspectable
+    /// views.
     pub fn save_all(&self, identity: &ProjectIdentity) -> Result<(), StorageError> {
         self.save_identity(identity)?;
         self.save_workspace(identity.workspace_root.as_deref().unwrap_or_default())?;

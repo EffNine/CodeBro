@@ -187,6 +187,12 @@ impl ChangeEngine {
     /// new content from a file's on-disk base, which cannot exist for a file
     /// being created.
     pub fn apply(&self, prepared: &PreparedChange) -> crate::error::Result<String> {
+        // Re-validate containment against the CURRENT filesystem state:
+        // a path (or one of its parents) may have been swapped to a
+        // symlink after prepare, which would redirect the write outside
+        // the workspace root even though the prepared content still
+        // matches byte-for-byte.
+        ensure_symlink_safe(&self.workspace_root, &prepared.path)?;
         let current = if prepared.created {
             if prepared.path.exists() {
                 return Err(crate::error::CodeBroError::Patch(format!(
@@ -232,6 +238,10 @@ impl ChangeEngine {
     /// [`ChangeEngine::apply`] (a file created by someone else between prepare
     /// and apply is never clobbered).
     fn create_file(&self, prepared: &PreparedChange) -> crate::error::Result<String> {
+        // The file did not exist at prepare time; a parent directory may
+        // have been swapped to a symlink since. Re-check that the creation
+        // target still resolves inside the workspace before writing.
+        ensure_symlink_safe(&self.workspace_root, &prepared.path)?;
         if let Some(parent) = prepared.path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -288,6 +298,19 @@ fn resolve_path(workspace_root: &Path, argument: &str) -> crate::error::Result<P
     // Canonicalize the workspace root once (e.g. macOS /var -> /private/var)
     // and compare canonicalized targets against it, so a workspace behind a
     // symlink does not false-positive.
+    ensure_symlink_safe(workspace_root, &candidate)?;
+    Ok(candidate)
+}
+
+/// Verify that `candidate` still resolves inside the canonicalized
+/// workspace root on the CURRENT filesystem, rejecting any path whose
+/// target escapes via a symlinked file or parent directory.
+///
+/// Shared by prepare-time resolution ([`resolve_path`]) and apply-time
+/// re-validation ([`ChangeEngine::apply`]/[`ChangeEngine::create_file`]),
+/// closing the prepare→apply window in which a path component could be
+/// swapped to a link pointing outside the root.
+fn ensure_symlink_safe(workspace_root: &Path, candidate: &Path) -> crate::error::Result<()> {
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
@@ -298,7 +321,7 @@ fn resolve_path(workspace_root: &Path, argument: &str) -> crate::error::Result<P
             // Create path: the file does not exist yet; canonicalize the
             // nearest existing ancestor so a symlinked parent is resolved,
             // then re-append the missing tail.
-            let mut existing = candidate.as_path();
+            let mut existing = candidate;
             let mut tail: Vec<std::ffi::OsString> = Vec::new();
             while !existing.exists() {
                 if let Some(name) = existing.file_name() {
@@ -311,14 +334,14 @@ fn resolve_path(workspace_root: &Path, argument: &str) -> crate::error::Result<P
                 .ok()
                 .map(|base| tail.into_iter().rev().fold(base, |p, n| p.join(n)))
         })
-        .unwrap_or_else(|| candidate.clone());
+        .unwrap_or_else(|| candidate.to_path_buf());
     if !canonical_candidate.starts_with(&canonical_root) {
         return Err(crate::error::CodeBroError::Permission(format!(
             "symlink escape denied: '{}' resolves outside the workspace root",
-            trimmed
+            candidate.display()
         )));
     }
-    Ok(candidate)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -442,6 +465,65 @@ mod tests {
             std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
             "someone else's content\n"
         );
+    }
+
+    /// TOCTOU regression: if the target file is swapped for a symlink to
+    /// an identical-content file OUTSIDE the workspace between prepare and
+    /// apply, the staleness check alone would pass (bytes match through
+    /// the link) and the write would land outside the root. Apply-time
+    /// re-validation must deny it.
+    #[test]
+    fn test_engine_apply_refuses_symlink_swap_after_prepare() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("main.rs"), "original line\n");
+        let engine = ChangeEngine::new(dir.path(), &[], false);
+        let prepared = engine
+            .prepare("main.rs", "original line", "changed line")
+            .unwrap();
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("victim.txt");
+        std::fs::write(&outside_file, "original line\n").unwrap();
+        std::fs::remove_file(dir.path().join("main.rs")).unwrap();
+        std::os::unix::fs::symlink(&outside_file, dir.path().join("main.rs")).unwrap();
+
+        let err = engine
+            .apply(&prepared)
+            .expect_err("apply must re-validate the path at apply time");
+        assert!(
+            err.to_string().contains("symlink escape denied"),
+            "got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).unwrap(),
+            "original line\n"
+        );
+    }
+
+    /// TOCTOU regression: if a creation target's parent directory is
+    /// swapped to a symlink pointing outside the root after prepare, the
+    /// controlled creation seam must refuse instead of writing outside.
+    #[test]
+    fn test_engine_apply_refuses_parent_symlink_swap_for_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ChangeEngine::new(dir.path(), &[], false);
+        let prepared = engine.prepare("nested/new.txt", "", "payload").unwrap();
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        // Swap strategy: replace the directory with a symlink to an
+        // outside directory (same trick as the file-swap case).
+        std::fs::remove_dir(dir.path().join("nested")).unwrap();
+        std::os::unix::fs::symlink(outside_dir.path(), dir.path().join("nested")).unwrap();
+
+        let err = engine
+            .apply(&prepared)
+            .expect_err("creation must re-validate parents at apply time");
+        assert!(
+            err.to_string().contains("symlink escape denied"),
+            "got: {err}"
+        );
+        assert!(!outside_dir.path().join("new.txt").exists());
     }
 
     #[test]
