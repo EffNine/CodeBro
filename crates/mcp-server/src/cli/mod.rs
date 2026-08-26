@@ -92,8 +92,6 @@ enum FactsCommands {
     },
 }
 
-const FALLBACK_MODEL: &str = "gpt-4o";
-
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
 

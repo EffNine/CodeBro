@@ -13,11 +13,14 @@
 //! OpenSandbox-specific details never leak into the MCP layer.
 
 #![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
+pub mod diagnostics;
 pub mod local;
 
 /// Repository state primitive now lives in `codebro-core` (shared with
 /// facts, impact, and the indexer); re-exported for path compatibility.
 pub use codebro_core::{RepoIdentity, RepoState};
+
+pub use diagnostics::ParsedDiagnostic;
 
 pub mod opensandbox;
 
@@ -329,6 +332,48 @@ pub struct VerificationResult {
     /// supply correlation context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impacted_fact_ids: Option<Vec<String>>,
+    /// Structured diagnostics parsed from build/test output (compiler
+    /// errors/warnings with spans, test failures, panic locations).
+    /// Heuristic interpretation of the raw evidence above — never a
+    /// replacement for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<ParsedDiagnostic>,
+    /// Coarse outcome classification: `success`, `compile_error`,
+    /// `test_failure`, `timeout`, `denied`, or `unknown_failure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
+}
+
+/// Shared tail for every constructor: attach structured diagnostics and a
+/// failure classification derived from the execution evidence.
+fn finish_verification(
+    execution: ExecutionResult,
+    verified: bool,
+    summary: String,
+    violations: Vec<String>,
+    impacted_fact_ids: Option<Vec<String>>,
+) -> VerificationResult {
+    let (diagnostics, classification) = if execution.denied {
+        (Vec::new(), Some("denied".to_string()))
+    } else {
+        let mut output = String::with_capacity(execution.stdout.len() + execution.stderr.len() + 1);
+        output.push_str(&execution.stdout);
+        output.push('\n');
+        output.push_str(&execution.stderr);
+        let diags = diagnostics::parse_diagnostics(&output);
+        let class =
+            diagnostics::classify_failure(execution.success, false, execution.timeout, &diags);
+        (diags, Some(class.to_string()))
+    };
+    VerificationResult {
+        execution,
+        verified,
+        summary,
+        violations,
+        impacted_fact_ids,
+        diagnostics,
+        classification,
+    }
 }
 
 impl VerificationResult {
@@ -379,13 +424,7 @@ impl VerificationResult {
             }
             v
         };
-        VerificationResult {
-            execution,
-            verified,
-            summary,
-            violations,
-            impacted_fact_ids: None,
-        }
+        VerificationResult::finish(execution, verified, summary, violations, None)
     }
 
     /// Build a verification result with explicit expectations.
@@ -437,13 +476,7 @@ impl VerificationResult {
             )
         };
 
-        VerificationResult {
-            execution,
-            verified,
-            summary,
-            violations,
-            impacted_fact_ids: None,
-        }
+        VerificationResult::finish(execution, verified, summary, violations, None)
     }
 
     /// Build a verification result with explicit expectations and optional
@@ -498,13 +531,19 @@ impl VerificationResult {
             )
         };
 
-        VerificationResult {
-            execution,
-            verified,
-            summary,
-            violations,
-            impacted_fact_ids,
-        }
+        VerificationResult::finish(execution, verified, summary, violations, impacted_fact_ids)
+    }
+}
+
+impl VerificationResult {
+    fn finish(
+        execution: ExecutionResult,
+        verified: bool,
+        summary: String,
+        violations: Vec<String>,
+        impacted_fact_ids: Option<Vec<String>>,
+    ) -> VerificationResult {
+        finish_verification(execution, verified, summary, violations, impacted_fact_ids)
     }
 }
 

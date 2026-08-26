@@ -35,6 +35,12 @@ pub struct InvalidationAdvisory {
     /// Existing module IDs whose location or path matches the changed path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub affected_modules: Vec<String>,
+    /// Test names recommended for re-running after this change: tests
+    /// located in the changed file, plus tests exercising any affected
+    /// symbol via `TestFact.tested`. Deterministically sorted, capped at
+    /// [`MAX_RECOMMENDED_TESTS`]. Advisory only — never executed implicitly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommended_tests: Vec<String>,
     /// True when a successful source-file mutation could make current facts
     /// stale. Always true for source-file mutations; the agent decides whether
     /// to re-index.
@@ -43,6 +49,10 @@ pub struct InvalidationAdvisory {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub recommendation: String,
 }
+
+/// Upper bound on `recommended_tests` so a change to a heavily-exercised
+/// core module cannot flood the response.
+pub const MAX_RECOMMENDED_TESTS: usize = 32;
 
 impl InvalidationAdvisory {
     /// Scan the fact store for existing facts whose source location matches
@@ -53,6 +63,22 @@ impl InvalidationAdvisory {
     /// `needs_reindex` is still true because new symbols will not appear until
     /// re-indexing.
     pub fn analyze(store: &FactStore, changed_path: &str, created: bool) -> Self {
+        Self::analyze_with_range(store, changed_path, created, None)
+    }
+
+    /// Like [`Self::analyze`], but with the edited line range when the
+    /// caller knows it (from the prepared change's `old` text position).
+    ///
+    /// Staleness semantics (affected facts) always cover the whole file;
+    /// only test RECOMMENDATION narrows to symbols overlapping the range,
+    /// so editing one function cannot recommend sibling tests that never
+    /// touch it. `None` treats every symbol in the file as edited.
+    pub fn analyze_with_range(
+        store: &FactStore,
+        changed_path: &str,
+        created: bool,
+        edited_range: Option<(u32, u32)>,
+    ) -> Self {
         let norm = normalize_path(changed_path);
         let collection = store.collection();
 
@@ -97,18 +123,17 @@ impl InvalidationAdvisory {
         let mut fact_ids: Vec<String> = Vec::new();
         let mut fact_set: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // Symbols themselves are facts.
+        // Symbols themselves are facts. IDs already carry their kind prefix
+        // (e.g. `sym::src/lib.rs::foo_function@1`) — do not re-prefix.
         for sid in &sym_ids {
-            let key = format!("sym::{sid}");
-            if fact_set.insert(key.clone()) {
-                fact_ids.push(key);
+            if fact_set.insert(sid.clone()) {
+                fact_ids.push(sid.clone());
             }
         }
         // Modules themselves are facts.
         for mid in &mod_ids {
-            let key = format!("mod::{mid}");
-            if fact_set.insert(key.clone()) {
-                fact_ids.push(key);
+            if fact_set.insert(mid.clone()) {
+                fact_ids.push(mid.clone());
             }
         }
 
@@ -226,6 +251,63 @@ impl InvalidationAdvisory {
             }
         }
 
+        // Recommended tests: those exercising an EDITED symbol through
+        // `TestFact.tested`, plus tests whose own function body was edited.
+        // When the caller supplied the edited line range, "edited" means
+        // overlapping it; otherwise every symbol in the file counts (the
+        // conservative default for callers without range information).
+        let sym_lines = |loc: &crate::engineering_facts::SourceLocation| {
+            let start = loc.line.unwrap_or(0);
+            let end = loc.span.as_ref().map(|sp| sp.end.line).unwrap_or(start);
+            (start, end)
+        };
+        let edited_syms: std::collections::HashSet<String> = match edited_range {
+            None => sym_set.iter().map(|s| s.to_string()).collect(),
+            Some((range_start, range_end)) => collection
+                .symbols()
+                .iter()
+                .filter(|s| {
+                    s.location
+                        .file
+                        .as_deref()
+                        .map(|f| normalize_path(f) == norm)
+                        .unwrap_or(false)
+                })
+                .filter(|s| {
+                    let (s_start, s_end) = sym_lines(&s.location);
+                    s_start <= range_end && s_end >= range_start
+                })
+                .map(|s| s.id.as_str().to_string())
+                .collect(),
+        };
+        let mut recommended_tests: Vec<String> = Vec::new();
+        let mut rec_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for test in collection.tests() {
+            let self_affected = test
+                .target
+                .as_ref()
+                .map(|t| match t {
+                    FactId::Symbol(s) => edited_syms.contains(s.as_str()),
+                    _ => false,
+                })
+                .unwrap_or(false);
+            let exercises_affected = test.tested.iter().any(|t| edited_syms.contains(t.as_str()));
+            if !(self_affected || exercises_affected) {
+                continue;
+            }
+            // Anonymous symbols (name "unknown", e.g. JS arrow callbacks)
+            // cannot be targeted by any runner's filter — recommending them
+            // would be noise.
+            if test.name == "unknown" || test.name.is_empty() {
+                continue;
+            }
+            if rec_set.insert(test.name.as_str()) {
+                recommended_tests.push(test.name.clone());
+            }
+        }
+        recommended_tests.sort();
+        recommended_tests.truncate(MAX_RECOMMENDED_TESTS);
+
         let recommendation = if created {
             if sym_ids.is_empty() {
                 "Run codebro init to register new symbols from this file.".to_string()
@@ -244,6 +326,7 @@ impl InvalidationAdvisory {
             affected_fact_ids: fact_ids,
             affected_symbols: sym_ids,
             affected_modules: mod_ids,
+            recommended_tests,
             needs_reindex: true,
             recommendation,
         }
@@ -306,7 +389,191 @@ mod tests {
         assert!(symbols.contains("sym::src/lib.rs::foo_0"));
         assert!(symbols.contains("sym::src/lib.rs::bar_1"));
         assert_eq!(adv.affected_modules.len(), 1);
+        // Fact ids carry the id verbatim — no double kind-prefix.
+        assert!(adv
+            .affected_fact_ids
+            .iter()
+            .all(|id| !id.starts_with("sym::sym::") && !id.starts_with("mod::mod::")));
         assert!(adv.needs_reindex);
+    }
+
+    fn make_store_with_tested_symbol(
+        file_path: &str,
+        symbol_name: &str,
+        test_file: &str,
+        test_name: &str,
+    ) -> FactStore {
+        let ws_id = WorkspaceId::new("ws::m2");
+        let mut builder = FactsBuilder::new();
+        builder.add_workspace(WorkspaceFact::new(ws_id.clone(), "m2"));
+
+        let mod_id = ModuleId::new(format!("mod::{file_path}"));
+        let mut mf = ModuleFact::new(mod_id.clone(), file_path);
+        mf.path = Some(file_path.to_string());
+        mf.location = SourceLocation::new().with_file(file_path);
+        builder.add_module(mf);
+
+        let sym_id = format!("sym::{file_path}::{symbol_name}_0");
+        let mut sf = SymbolFact::new(
+            SymbolId::new(sym_id.clone()),
+            symbol_name.to_string(),
+            SymbolKind::Function,
+        );
+        sf.location = SourceLocation::new().with_file(file_path).with_point(1, 0);
+        builder.add_symbol(sf);
+
+        let mut tf = TestFact::new(
+            TestId::new(format!("test::{test_file}::{test_name}")),
+            test_name.to_string(),
+        );
+        tf.tested.push(SymbolId::new(sym_id));
+        tf.location = Some(SourceLocation::new().with_file(test_file).with_point(1, 0));
+        builder.add_test(tf);
+
+        FactStore::build(builder.build())
+    }
+
+    #[test]
+    fn recommends_tests_exercising_affected_symbols() {
+        let store = make_store_with_tested_symbol("src/lib.rs", "add", "src/lib.rs", "adds");
+        let adv = InvalidationAdvisory::analyze(&store, "src/lib.rs", false);
+        assert_eq!(adv.recommended_tests, vec!["adds".to_string()]);
+    }
+
+    #[test]
+    fn recommends_tests_whose_own_body_was_edited() {
+        // The test's OWN function symbol is among the changed symbols.
+        let ws_id = WorkspaceId::new("ws::m2");
+        let mut builder = FactsBuilder::new();
+        builder.add_workspace(WorkspaceFact::new(ws_id.clone(), "m2"));
+        let own = "sym::src/util.rs::local_case_function@1";
+        let mut sf = SymbolFact::new(
+            SymbolId::new(own.to_string()),
+            "local_case",
+            SymbolKind::Function,
+        );
+        sf.location = SourceLocation::new()
+            .with_file("src/util.rs")
+            .with_point(1, 0);
+        builder.add_symbol(sf);
+        let mut tf = TestFact::new(
+            TestId::new("test::src/util.rs::local_case"),
+            "local_case".to_string(),
+        );
+        tf.target = Some(crate::engineering_facts::FactId::Symbol(SymbolId::new(own)));
+        tf.location = Some(
+            SourceLocation::new()
+                .with_file("src/util.rs")
+                .with_point(1, 0),
+        );
+        builder.add_test(tf);
+        let store = FactStore::build(builder.build());
+
+        let adv = InvalidationAdvisory::analyze(&store, "src/util.rs", false);
+        assert_eq!(adv.recommended_tests, vec!["local_case".to_string()]);
+    }
+
+    #[test]
+    fn co_located_unrelated_tests_are_not_recommended() {
+        // Two tests in one file; the edit touches only `add`. A sibling
+        // test that neither exercises `add` nor was itself edited must
+        // NOT be recommended.
+        let ws_id = WorkspaceId::new("ws::m2");
+        let mut builder = FactsBuilder::new();
+        builder.add_workspace(WorkspaceFact::new(ws_id.clone(), "m2"));
+        let add_sym = "sym::src/lib.rs::add_0";
+        let mut sf = SymbolFact::new(
+            SymbolId::new(add_sym.to_string()),
+            "add",
+            SymbolKind::Function,
+        );
+        sf.location = SourceLocation::new()
+            .with_file("src/lib.rs")
+            .with_point(1, 0);
+        builder.add_symbol(sf);
+        let other_sym = "sym::src/lib.rs::unrelated_1";
+        let mut of = SymbolFact::new(
+            SymbolId::new(other_sym.to_string()),
+            "unrelated",
+            SymbolKind::Function,
+        );
+        of.location = SourceLocation::new()
+            .with_file("src/lib.rs")
+            .with_point(9, 0);
+        builder.add_symbol(of);
+
+        let mut t_add = TestFact::new(TestId::new("test::f::adds"), "adds".to_string());
+        t_add.tested.push(SymbolId::new(add_sym.to_string()));
+        t_add.location = Some(
+            SourceLocation::new()
+                .with_file("src/lib.rs")
+                .with_point(3, 0),
+        );
+        builder.add_test(t_add);
+
+        let mut t_other = TestFact::new(
+            TestId::new("test::f::unrelated_test"),
+            "unrelated_test".to_string(),
+        );
+        t_other.target = Some(crate::engineering_facts::FactId::Symbol(SymbolId::new(
+            other_sym.to_string(),
+        )));
+        t_other.location = Some(
+            SourceLocation::new()
+                .with_file("src/lib.rs")
+                .with_point(11, 0),
+        );
+        builder.add_test(t_other);
+        let store = FactStore::build(builder.build());
+
+        // Range-less analysis is deliberately conservative (whole file).
+        let adv_all = InvalidationAdvisory::analyze(&store, "src/lib.rs", false);
+        assert_eq!(
+            adv_all.recommended_tests,
+            vec!["adds".to_string(), "unrelated_test".to_string()]
+        );
+
+        // With the edited range (add() spans lines 1-2), only `adds`
+        // qualifies: precise recommendation from precise edit knowledge.
+        let adv =
+            InvalidationAdvisory::analyze_with_range(&store, "src/lib.rs", false, Some((1, 2)));
+        assert_eq!(adv.recommended_tests, vec!["adds".to_string()]);
+    }
+
+    #[test]
+    fn recommendations_are_capped_and_sorted() {
+        let ws_id = WorkspaceId::new("ws::m2");
+        let mut builder = FactsBuilder::new();
+        builder.add_workspace(WorkspaceFact::new(ws_id.clone(), "m2"));
+        for i in 0..(MAX_RECOMMENDED_TESTS + 10) {
+            let name = format!("t_{:03}", MAX_RECOMMENDED_TESTS + 9 - i);
+            let own_sym = format!("sym::src/f.rs::{}_function@{}", name, i + 1);
+            let mut sf = SymbolFact::new(
+                SymbolId::new(own_sym.clone()),
+                name.clone(),
+                SymbolKind::Function,
+            );
+            sf.location = SourceLocation::new()
+                .with_file("src/f.rs")
+                .with_point((i + 1) as u32, 0);
+            builder.add_symbol(sf);
+            let mut tf = TestFact::new(TestId::new(format!("test::src/f.rs::{name}")), name);
+            tf.target = Some(crate::engineering_facts::FactId::Symbol(SymbolId::new(
+                own_sym,
+            )));
+            tf.location = Some(
+                SourceLocation::new()
+                    .with_file("src/f.rs")
+                    .with_point((i + 1) as u32, 0),
+            );
+            builder.add_test(tf);
+        }
+        let store = FactStore::build(builder.build());
+        let adv = InvalidationAdvisory::analyze(&store, "src/f.rs", false);
+        assert_eq!(adv.recommended_tests.len(), MAX_RECOMMENDED_TESTS);
+        let mut sorted = adv.recommended_tests.clone();
+        sorted.sort();
+        assert_eq!(adv.recommended_tests, sorted);
     }
 
     #[test]

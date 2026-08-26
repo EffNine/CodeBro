@@ -20,6 +20,7 @@ pub struct LocalCommandPolicy {
     is_cargo: bool,
     is_node: bool,
     is_go: bool,
+    is_python: bool,
     has_makefile: bool,
 }
 
@@ -29,6 +30,7 @@ impl LocalCommandPolicy {
             is_cargo: workspace_root.join("Cargo.toml").exists(),
             is_node: workspace_root.join("package.json").exists(),
             is_go: workspace_root.join("go.mod").exists(),
+            is_python: PY_MARKERS.iter().any(|m| workspace_root.join(m).exists()),
             has_makefile: workspace_root.join("Makefile").exists()
                 || workspace_root.join("makefile").exists(),
         }
@@ -61,6 +63,7 @@ impl LocalCommandPolicy {
             "npx" => self.check_npx(&tokens[1..]),
             "make" => self.check_make(&tokens[1..]),
             "git" => self.check_git(&tokens[1..]),
+            "python" | "python3" => self.check_python(&tokens[1..]),
             _ => false,
         }
     }
@@ -91,6 +94,26 @@ impl LocalCommandPolicy {
         }
         matches!(args[0], "test" | "build" | "vet" | "mod")
             && !args[1..].iter().any(|a| MUTATING_TOKENS.contains(a))
+    }
+
+    /// Only `python -m pytest [flags] [names/paths]` is permitted, and only
+    /// in Python workspaces. Flags are restricted to harmless selectors.
+    fn check_python(&self, args: &[&str]) -> bool {
+        if !self.is_python || args.len() < 3 {
+            return false;
+        }
+        if args[0] != "-m" || args[1] != "pytest" {
+            return false;
+        }
+        args[2..].len() <= 30
+            && args[2..].iter().all(|a| {
+                !MUTATING_TOKENS.contains(a)
+                    && (*a == "-q"
+                        || *a == "-x"
+                        || *a == "-k"
+                        || *a == "--tb=long"
+                        || !a.starts_with('-'))
+            })
     }
 
     fn check_npm(&self, args: &[&str]) -> bool {
@@ -144,6 +167,14 @@ impl LocalCommandPolicy {
         !args[1..].iter().any(|a| MUTATING_TOKENS.contains(a))
     }
 }
+
+const PY_MARKERS: &[&str] = &[
+    "pyproject.toml",
+    "pytest.ini",
+    "setup.py",
+    "setup.cfg",
+    "requirements.txt",
+];
 
 const MUTATING_TOKENS: &[&str] = &[
     "commit",
@@ -396,6 +427,37 @@ mod tests {
         ] {
             assert!(policy.check(cmd), "'{cmd}' must be allowed");
         }
+    }
+
+    #[test]
+    fn test_policy_allows_go_test_with_run_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module fx\n").unwrap();
+        let policy = LocalCommandPolicy::for_workspace(dir.path());
+        assert!(policy.check("go test ./..."));
+        assert!(policy.check("go test -run TestAdd ./..."));
+        // Regex alternation needs `|`, a shell metachar — multi-name go
+        // filtering stays unsupported at the policy layer by design.
+        assert!(!policy.check("go test -run TestAdd|TestOther ./..."));
+    }
+
+    #[test]
+    fn test_policy_allows_python_pytest_only_in_python_workspaces() {
+        let py = tempfile::tempdir().unwrap();
+        std::fs::write(py.path().join("pyproject.toml"), "[project]").unwrap();
+        let policy = LocalCommandPolicy::for_workspace(py.path());
+        assert!(policy.check("python -m pytest -q"));
+        assert!(policy.check("python3 -m pytest -q tests/test_add.py"));
+        // -k keyword selection (used by targeted test filtering).
+        assert!(policy.check("python -m pytest -q -k test_add"));
+        assert!(policy.check("python -m pytest -q --tb=long -k test_add"));
+        // Arbitrary python execution is not a test runner.
+        assert!(!policy.check("python -c 'print(1)'"));
+        assert!(!policy.check("python script.py"));
+
+        let non_py = tempfile::tempdir().unwrap();
+        let bare = LocalCommandPolicy::for_workspace(non_py.path());
+        assert!(!bare.check("python -m pytest -q"));
     }
 
     #[test]
