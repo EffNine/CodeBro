@@ -69,6 +69,9 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     let mut all_calls: Vec<crate::intelligence::parser::ParseCall> = Vec::new();
     let mut all_imports: Vec<crate::intelligence::parser::ParseImport> = Vec::new();
     let mut impl_scopes: Vec<crate::impact::relationships::ImplScope> = Vec::new();
+    // Tests are staged until relationship construction resolves the calls
+    // each test makes; `tested` is then filled and the facts are added.
+    let mut pending_tests: Vec<TestFact> = Vec::new();
     let mut collected_routes: Vec<SymbolFact> = Vec::new();
     let mut skipped_oversized: usize = 0;
     let mut lang_stats: repo_intel::LangStats = Default::default();
@@ -230,12 +233,13 @@ pub fn run(workspace_root: &Path) -> Result<()> {
             builder.add_symbol(sf.clone());
             collected_symbols.push(sf);
 
-            // Test detection (heuristic MVP): function/method names that
-            // look like tests, or files whose path mentions "test".
+            // Test detection: explicit markers first (rust `#[test]`-style
+            // attributes, go `Test` prefix), falling back to the heuristic
+            // MVP (test-ish names or files whose path mentions "test").
             let looks_like_test_file = rel.contains("test");
             let looks_like_test_fn = (sym.name.starts_with("test_") || sym.name.ends_with("_test"))
                 && matches!(sym.kind, crate::intelligence::parser::SymbolKind::Function);
-            if looks_like_test_file || looks_like_test_fn {
+            if looks_like_test_file || looks_like_test_fn || sym.is_test {
                 let mut tf = TestFact::new(
                     TestId::new(format!(
                         "test::{}::{}_{}@{}",
@@ -264,7 +268,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
                             Position::new(sym.line_end, sym.column_end),
                         )),
                 );
-                builder.add_test(tf);
+                pending_tests.push(tf);
             }
         }
     }
@@ -352,7 +356,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     builder.add_workspace(ws);
 
     // ── Build cross-module relationship facts ────────────────────────
-    let rel_count = crate::impact::relationships::build_relationships(
+    let (rel_count, verified_call_edges) = crate::impact::relationships::build_relationships(
         &mut builder,
         &collected_modules,
         &collected_symbols,
@@ -362,6 +366,39 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     );
     if rel_count > 0 {
         println!("  relationships: {rel_count}");
+    }
+
+    // ── Link tests to the symbols they exercise ───────────────────────
+    // A verified call edge whose caller is the test's own function symbol
+    // records the callee as exercised by that test (`TestFact.tested`),
+    // giving impact analysis a direct change→test mapping. Sorted for
+    // byte-identical determinism regardless of edge iteration order.
+    {
+        use std::collections::HashMap;
+        let mut edges_by_caller: HashMap<&str, Vec<&crate::engineering_facts::FactId>> =
+            HashMap::new();
+        for (src, tgt) in &verified_call_edges {
+            edges_by_caller.entry(src.as_str()).or_default().push(tgt);
+        }
+        for mut tf in pending_tests {
+            if let Some(crate::engineering_facts::FactId::Symbol(owner)) = &tf.target {
+                let mut tested: Vec<SymbolId> = edges_by_caller
+                    .get(owner.as_str())
+                    .map(|tgts| {
+                        tgts.iter()
+                            .filter_map(|t| match t {
+                                crate::engineering_facts::FactId::Symbol(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                tested.sort();
+                tested.dedup();
+                tf.tested = tested;
+            }
+            builder.add_test(tf);
+        }
     }
 
     // ── Engineering dependency graph edges ───────────────────────────
@@ -1728,6 +1765,162 @@ mod tests {
         assert_eq!(first, second, "re-init must be byte-identical");
     }
 
+    /// Regression: fact correctness pipeline — parser visibility vocabulary
+    /// reaches facts intact, `#[test]` markers drive test discovery, calls
+    /// made by a test populate `TestFact.tested`, and same-kind same-name
+    /// symbols across call-connected modules yield heuristic references.
+    #[test]
+    fn fact_correctness_visibility_tested_and_references() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub struct Config {\n    pub id: u32,\n}\npub(crate) fn internal() {}\npub fn run() -> i32 {\n    setup()\n}\n#[test]\nfn verify_run() {\n    let _ = run();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/helper.rs"),
+            "pub struct Config {\n    pub id: u32,\n}\npub fn setup() -> i32 {\n    42\n}\n",
+        )
+        .unwrap();
+
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+
+        let visibility_of = |name: &str| {
+            model
+                .symbols()
+                .iter()
+                .filter(|s| s.name == name)
+                .map(|s| s.visibility)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(visibility_of("run"), vec![Visibility::Public]);
+        assert_eq!(visibility_of("internal"), vec![Visibility::Internal]);
+        assert!(
+            visibility_of("Config")
+                .iter()
+                .all(|v| *v == Visibility::Public),
+            "both Config structs must be Public"
+        );
+
+        let t = model
+            .tests()
+            .iter()
+            .find(|t| t.name == "verify_run")
+            .expect("marker-based test discovery must register #[test]");
+        let tested_names: Vec<&str> = t
+            .tested
+            .iter()
+            .map(|id| {
+                model
+                    .symbols()
+                    .iter()
+                    .find(|s| s.id.as_str() == id.as_str())
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("?")
+            })
+            .collect();
+        assert!(
+            tested_names.contains(&"run"),
+            "verify_run must exercise run(), got {tested_names:?}"
+        );
+
+        assert!(
+            !model.references().is_empty(),
+            "expected heuristic references between same-named symbols in call-connected modules"
+        );
+    }
+
+    /// Regression: Python flows through the full intelligence pipeline —
+    /// structured imports, cross-module verified call edges, and test
+    /// linkage via `TestFact.tested`.
+    #[test]
+    fn python_call_graph_flows_through_the_pipeline() {
+        use crate::engineering_facts::{FactId, RelationshipKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("helpers.py"),
+            "def setup() -> int:\n    return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("main.py"),
+            "import helpers\n\n\ndef run() -> int:\n    return setup()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("test_main.py"),
+            "from main import run\n\n\ndef test_run():\n    assert run() == 1\n",
+        )
+        .unwrap();
+
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+
+        let sym = |name: &str| {
+            model
+                .symbols()
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing symbol {name}"))
+                .id
+                .clone()
+        };
+        let run_id = sym("run");
+        let setup_id = sym("setup");
+
+        // Verified cross-module call edge: main.run → helpers.setup.
+        let edge = model
+            .relationships()
+            .iter()
+            .find(|r| {
+                r.kind == RelationshipKind::Calls
+                    && r.source == FactId::Symbol(run_id.clone())
+                    && r.target == FactId::Symbol(setup_id.clone())
+            })
+            .expect("cross-module python call edge must exist");
+        assert!(
+            edge.metadata.get("provenance") == Some("verified"),
+            "python call edges are AST-derived: {:?}",
+            edge.metadata
+        );
+
+        // Test linkage: test_run exercises run via a resolved call.
+        let t = model
+            .tests()
+            .iter()
+            .find(|t| t.name == "test_run")
+            .expect("python test discovered");
+        assert!(
+            t.tested.iter().any(|id| id.as_str() == run_id.as_str()),
+            "test_run must exercise run(), got {:?}",
+            t.tested
+        );
+
+        // Structured import: main.py's `import helpers` yields an edge.
+        assert!(model.relationships().iter().any(|r| {
+            r.kind == RelationshipKind::Imports && r.metadata.get("provenance") == Some("verified")
+        }));
+    }
+
     #[test]
     fn generation_repo_state_captured_before_fact_generation() {
         // Regression test: generation_repo_state must represent the repo
@@ -2273,12 +2466,13 @@ mod tests {
                 .any(|(s, t)| s == "caller" && t == "unique_helper"),
             "unqualified unique fn must resolve, got {extra_calls:?}"
         );
-        // Untyped variable receivers (`p.ping_hit()`, `x.abs()`) stay
-        // honestly unresolved — no edge is invented from bare-name
-        // coincidence. Typed calls (`Ping::new()`) still resolve. Let-
-        // binding type inference is tracked separately in the roadmap.
+        // Untyped variable receivers stay honestly unresolved — no edge is
+        // invented from bare-name coincidence (`x.abs()`: x bound to a
+        // literal, so no type). Let-bound receivers DO resolve via type
+        // inference: `p = Ping::new()` types p, disambiguating ping_hit
+        // (which exists on both Ping and Pong) to Ping's method.
         let allowed: std::collections::HashSet<&str> =
-            ["unique_helper", "new"].into_iter().collect();
+            ["unique_helper", "new", "ping_hit"].into_iter().collect();
         let invented: Vec<&(String, String)> = extra_calls
             .iter()
             .filter(|(s, t)| s == "caller" && !allowed.contains(t.as_str()))
@@ -2286,6 +2480,21 @@ mod tests {
         assert!(
             invented.is_empty(),
             "untyped receivers must not invent edges, got {invented:?} in {extra_calls:?}"
+        );
+        // The inferred-type edge must target Ping::ping_hit specifically.
+        let ping_hit_target = model
+            .symbols()
+            .iter()
+            .find(|s| s.name == "ping_hit" && s.location.file.as_deref() == Some("src/lib.rs"))
+            .map(|s| s.id.clone())
+            .expect("ping_hit symbol");
+        assert!(
+            model.relationships().iter().any(|r| {
+                r.kind == crate::engineering_facts::RelationshipKind::Calls
+                    && endpoint_name(&r.source) == Some("caller")
+                    && r.target == crate::engineering_facts::FactId::Symbol(ping_hit_target.clone())
+            }),
+            "let-bound receiver must resolve to Ping::ping_hit"
         );
     }
 

@@ -51,7 +51,9 @@ fn symbol_impl<'a>(scopes: &'a [ImplScope], sym: &SymbolFact) -> Option<&'a str>
 /// Build relationship and reference facts from module/symbol data plus
 /// AST-derived calls and imports.
 ///
-/// Returns the count of new facts added.
+/// Returns the count of new facts added plus the set of verified call
+/// edges as `(caller, callee)` symbol-id pairs. Callers (e.g. the init
+/// pipeline) use these to link tests to the symbols they exercise.
 pub fn build_relationships(
     builder: &mut FactsBuilder,
     modules: &[crate::engineering_facts::ModuleFact],
@@ -59,8 +61,9 @@ pub fn build_relationships(
     calls: &[ParseCall],
     imports: &[ParseImport],
     impl_scopes: &[ImplScope],
-) -> usize {
+) -> (usize, Vec<(FactId, FactId)>) {
     let mut count = 0u64;
+    let mut verified_call_edges: Vec<(FactId, FactId)> = Vec::new();
 
     // ── Verified edges from AST data ──────────────────────────────────
 
@@ -79,7 +82,7 @@ pub fn build_relationships(
         modules.iter().map(|m| (&m.id, m)).collect();
 
     // ── Calls from AST ────────────────────────────────────────────────
-    let mut verified_call_edges: std::collections::HashSet<(FactId, FactId)> =
+    let mut verified_call_set: std::collections::HashSet<(FactId, FactId)> =
         std::collections::HashSet::new();
     let mut verified_import_edges: std::collections::HashSet<(FactId, FactId)> =
         std::collections::HashSet::new();
@@ -103,7 +106,8 @@ pub fn build_relationships(
             };
             let callee_fact_id = FactId::Symbol(callee_sym_id.clone());
             let edge = (caller_fact_id.clone(), callee_fact_id);
-            if verified_call_edges.insert(edge) {
+            if verified_call_set.insert(edge.clone()) {
+                verified_call_edges.push(edge.clone());
                 // Disambiguator from the resolved target: two calls can
                 // share file+line+name (`Ping::new(); Pong::new();`) yet
                 // resolve to different symbols; the id must not collide.
@@ -119,6 +123,13 @@ pub fn build_relationships(
                     line = call.line_start,
                     h = h,
                 );
+                // Macro-text calls are syntactic recovery, not AST nodes —
+                // they carry heuristic provenance so trust math stays honest.
+                let provenance = if call.from_macro_text {
+                    "heuristic"
+                } else {
+                    "verified"
+                };
                 let mut rf = RelationshipFact::new(
                     RelationshipId::new(rel_id),
                     RelationshipKind::Calls,
@@ -126,7 +137,7 @@ pub fn build_relationships(
                     FactId::Symbol(callee_sym_id),
                 );
                 rf.metadata = crate::engineering_facts::metadata::FactMetadata::builder()
-                    .attr("provenance", "verified")
+                    .attr("provenance", provenance)
                     .build();
                 builder.add_relationship(rf);
                 count += 1;
@@ -143,9 +154,12 @@ pub fn build_relationships(
                 continue;
             };
             if &caller_mod != &target_mod_id {
+                // Direction convention: source imports target — the
+                // importer module is the edge source, mirroring `Calls`
+                // (caller → callee) and `dep::<a>-><b>` dependency ids.
                 let edge = (
-                    FactId::Module(target_mod_id.clone()),
                     FactId::Module(caller_mod.clone()),
+                    FactId::Module(target_mod_id.clone()),
                 );
                 if verified_import_edges.insert(edge) {
                     let rel_id = format!(
@@ -156,8 +170,8 @@ pub fn build_relationships(
                     let mut rf = RelationshipFact::new(
                         RelationshipId::new(rel_id),
                         RelationshipKind::Imports,
-                        FactId::Module(target_mod_id.clone()),
                         FactId::Module(caller_mod),
+                        FactId::Module(target_mod_id.clone()),
                     );
                     rf.metadata = crate::engineering_facts::metadata::FactMetadata::builder()
                         .attr("provenance", "verified")
@@ -172,17 +186,13 @@ pub fn build_relationships(
     // ── Heuristic edges (name-coincidence fallback) ───────────────────
     // Only add heuristic edges for edges NOT already covered by verified
     // AST extraction. This prevents duplicate/contradictory evidence.
-    let heuristic_refs = build_heuristic_references(
-        builder,
-        symbols,
-        &verified_call_edges,
-        &verified_import_edges,
-    );
+    let heuristic_refs =
+        build_heuristic_references(builder, symbols, &verified_call_set, &verified_import_edges);
     let heuristic_rels = build_heuristic_imports(
         builder,
         symbols,
         modules,
-        &verified_call_edges,
+        &verified_call_set,
         &verified_import_edges,
     );
 
@@ -193,7 +203,7 @@ pub fn build_relationships(
         count - (heuristic_refs + heuristic_rels) as u64,
         (heuristic_refs + heuristic_rels) as u64,
     );
-    count as usize
+    (count as usize, verified_call_edges)
 }
 
 // ── Call resolution ───────────────────────────────────────────────────
@@ -370,32 +380,36 @@ fn find_module_for_file(
     None
 }
 
-/// Overload: find module for a symbol's location file.
-fn find_module_for_file_sym(
-    symbols: &[SymbolFact],
-    mod_id: &ModuleId,
-    file: &Option<String>,
-) -> bool {
-    let _ = symbols;
-    let _ = mod_id;
-    let _ = file;
-    false
-}
-
 // ── Heuristic edges ───────────────────────────────────────────────────
 
 /// Build a set of module-pair edges that have verified AST-derived
 /// relationships (calls or imports). Heuristic references are only created
 /// between symbols in modules that already have some verified connection,
 /// preventing combinatorial explosion on common symbol names.
+///
+/// Verified calls connect *symbols*, so they are projected into module
+/// space via each symbol's owning module before gating module-pair checks.
 fn build_module_relationship_map(
+    symbols: &[SymbolFact],
     verified_calls: &std::collections::HashSet<(FactId, FactId)>,
     verified_imports: &std::collections::HashSet<(FactId, FactId)>,
 ) -> std::collections::HashSet<(FactId, FactId)> {
+    let module_of: std::collections::HashMap<&str, &ModuleId> = symbols
+        .iter()
+        .filter_map(|s| s.module.as_ref().map(|m| (s.id.as_str(), m)))
+        .collect();
     let mut connected = std::collections::HashSet::new();
     for (src, tgt) in verified_calls {
-        connected.insert((src.clone(), tgt.clone()));
-        connected.insert((tgt.clone(), src.clone()));
+        if let (FactId::Symbol(s), FactId::Symbol(t)) = (src, tgt) {
+            if let (Some(sm), Some(tm)) = (module_of.get(s.as_str()), module_of.get(t.as_str())) {
+                if sm != tm {
+                    connected
+                        .insert((FactId::Module((*sm).clone()), FactId::Module((*tm).clone())));
+                    connected
+                        .insert((FactId::Module((*tm).clone()), FactId::Module((*sm).clone())));
+                }
+            }
+        }
     }
     for (src, tgt) in verified_imports {
         connected.insert((src.clone(), tgt.clone()));
@@ -422,7 +436,7 @@ fn build_heuristic_references(
     }
 
     // Build the set of module pairs with verified relationships.
-    let module_connected = build_module_relationship_map(verified_calls, verified_imports);
+    let module_connected = build_module_relationship_map(symbols, verified_calls, verified_imports);
 
     // Reference ids are keyed by (source module, name, target module,
     // name); several same-name symbol facts in one module would otherwise
@@ -505,7 +519,7 @@ fn build_heuristic_imports(
         std::collections::HashSet::new();
 
     // Build the set of module pairs with verified relationships.
-    let module_connected = build_module_relationship_map(verified_calls, verified_imports);
+    let module_connected = build_module_relationship_map(symbols, verified_calls, verified_imports);
 
     for sym in symbols {
         let sym_mod = match &sym.module {
@@ -525,37 +539,44 @@ fn build_heuristic_imports(
                 if sym.kind != candidate.kind {
                     continue;
                 }
-                let sym_mod_edge = sym_mod.clone();
-                let edge = (cand_mod.clone(), sym_mod_edge.clone());
+                // Name coincidence carries no true direction; orient the
+                // edge deterministically (lexicographically smaller module
+                // id first) so the id string matches the stored direction.
+                let (src_mod, tgt_mod) = if cand_mod.as_str() <= sym_mod.as_str() {
+                    (cand_mod.clone(), sym_mod.clone())
+                } else {
+                    (sym_mod.clone(), cand_mod.clone())
+                };
+                let edge = (src_mod.clone(), tgt_mod.clone());
                 if seen_edges.contains(&edge) {
                     continue;
                 }
                 // Only create heuristic imports between modules that
                 // already have a verified relationship.
-                let sym_mod_fact = FactId::Module(sym_mod_edge.clone());
-                let cand_mod_fact = FactId::Module(cand_mod.clone());
-                if !module_connected.contains(&(sym_mod_fact.clone(), cand_mod_fact.clone()))
-                    && !module_connected.contains(&(cand_mod_fact.clone(), sym_mod_fact.clone()))
+                let src_fact = FactId::Module(src_mod.clone());
+                let tgt_fact = FactId::Module(tgt_mod.clone());
+                if !module_connected.contains(&(src_fact.clone(), tgt_fact.clone()))
+                    && !module_connected.contains(&(tgt_fact.clone(), src_fact.clone()))
                 {
                     continue;
                 }
-                // Check if this edge is already verified.
-                let vert_id = FactId::Module(cand_mod.clone());
-                let vert_tgt = FactId::Module(sym_mod_edge.clone());
-                if verified_imports.contains(&(vert_id, vert_tgt)) {
+                // Check if this edge is already verified (either orientation).
+                if verified_imports.contains(&(src_fact.clone(), tgt_fact.clone()))
+                    || verified_imports.contains(&(tgt_fact.clone(), src_fact.clone()))
+                {
                     continue;
                 }
                 seen_edges.insert(edge);
                 let rel_id = format!(
-                    "rel::{cand_mod}→{sym_mod}::heuristic_import",
-                    cand_mod = cand_mod.as_str(),
-                    sym_mod = sym_mod_edge.as_str(),
+                    "rel::{src_mod}→{tgt_mod}::heuristic_import",
+                    src_mod = src_mod.as_str(),
+                    tgt_mod = tgt_mod.as_str(),
                 );
                 let mut rf = RelationshipFact::new(
                     RelationshipId::new(rel_id),
                     RelationshipKind::Imports,
-                    FactId::Module(cand_mod),
-                    FactId::Module(sym_mod_edge),
+                    FactId::Module(src_mod),
+                    FactId::Module(tgt_mod),
                 );
                 rf.metadata = crate::engineering_facts::metadata::FactMetadata::builder()
                     .attr("provenance", "heuristic")

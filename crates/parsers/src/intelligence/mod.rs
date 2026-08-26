@@ -17,39 +17,19 @@
 //! | `diagnostics` | Platform health monitoring |
 
 #![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
-pub mod context;
 pub mod diagnostics;
-pub mod graph;
-pub mod index;
-pub mod lsp;
 pub mod parser;
-pub mod reasoning;
-pub mod search;
 
 // =========================================================================
 // Re-exports
 // =========================================================================
 
-pub use context::{CodeSnippet, IntelligenceContext, IntelligentContextBuilder};
 pub use diagnostics::{
     ContextMetric, GraphEvent, GraphIntegrity, GraphIntegrityStatus, IndexEvent, IndexHealth,
     IndexHealthStatus, IntelligenceDiagnostics, IntelligenceDiagnosticsTrait, ParseMetric,
     SearchMetric,
 };
-pub use graph::{DependencyGraph, DependencyGraphTrait, DependencyNode};
-pub use index::{
-    CodeIndexer, CodeIndexerTrait, FileInfo, Symbol, SymbolDatabase, SymbolDatabaseTrait,
-    SymbolKind, SymbolRelationship,
-};
-pub use lsp::{
-    create_lsp_foundation, DiagnosticSeverity, LspDiagnostic, LspFoundation, LspFoundationTrait,
-    LspHover, LspLocation, LspParameterInformation, LspPosition, LspRange, LspSignatureInformation,
-    LspSymbolInformation, LspSymbolKind, LspTextDocumentIdentifier, LspTextDocumentItem,
-    LspTextEdit, LspWorkspaceEdit,
-};
 pub use parser::{
     create_parser, create_parser_trait, parse_file, parse_source, CodeParserTrait, ParseResult,
     ParsedSymbol, ParserSymbolKind, TreeSitterParser,
 };
-pub use reasoning::{AgentReasoningEngine, ReasoningEngineTrait, ReasoningResult, ReasoningStep};
-pub use search::{MatchType, SearchResult, SemanticSearch, SemanticSearchTrait};

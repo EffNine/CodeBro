@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::intelligence::parser::tree_sitter::ParseResult;
 
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedParse {

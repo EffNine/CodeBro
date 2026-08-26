@@ -67,6 +67,8 @@ pub struct ParsedSymbol {
     pub visibility: Option<String>,
     pub signature: Option<String>,
     pub doc_comment: Option<String>,
+    #[serde(default)]
+    pub is_test: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -97,6 +99,12 @@ pub struct ParseCall {
     /// Receiver type hint: the qualifier of a path call (`User` in
     /// `User::new()`), `"self"`/`"Self"` for self-calls, else `None`.
     pub receiver_type: Option<String>,
+    /// True when this call was recovered from macro token text rather
+    /// than a real AST call node (tree-sitter 0.20 models macro bodies as
+    /// opaque tokens). Such calls are syntactic evidence only and are
+    /// tagged `provenance=heuristic` downstream.
+    #[serde(default)]
+    pub from_macro_text: bool,
 }
 
 /// A structured import target extracted from an import/use statement.
@@ -151,7 +159,8 @@ impl CodeParser {
         };
 
         let root = tree.root_node();
-        self.extract_symbols(root, source, file_path, &mut result, None)?;
+        let mut bindings = std::collections::HashMap::new();
+        self.extract_symbols(root, source, file_path, &mut result, None, &mut bindings)?;
 
         Ok(result)
     }
@@ -172,11 +181,20 @@ impl CodeParser {
         };
 
         let root = tree.root_node();
-        self.extract_symbols(root, source, &Path::new(file_path), &mut result, None)?;
+        let mut bindings = std::collections::HashMap::new();
+        self.extract_symbols(
+            root,
+            source,
+            &Path::new(file_path),
+            &mut result,
+            None,
+            &mut bindings,
+        )?;
 
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn extract_symbols(
         &mut self,
         node: Node,
@@ -184,6 +202,7 @@ impl CodeParser {
         file_path: &Path,
         result: &mut ParseResult,
         parent: Option<&str>,
+        bindings: &mut std::collections::HashMap<String, String>,
     ) -> Result<()> {
         let _node_kind = node.kind();
         let file_name = file_path
@@ -191,23 +210,57 @@ impl CodeParser {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        // Let-binding scopes reset at callable boundaries so a binding from
+        // one function can never resolve a receiver in a sibling function.
+        if matches!(
+            node.kind(),
+            "fn" | "function_item"
+                | "function_definition"
+                | "function_declaration"
+                | "method_declaration"
+                | "method_definition"
+        ) {
+            bindings.clear();
+        }
+
         match self.language_name.as_str() {
-            "rust" => self.extract_rust_symbols(node, source, &file_name, result, parent)?,
-            "python" => self.extract_python_symbols(node, source, &file_name, result, parent)?,
+            "rust" => {
+                self.extract_rust_symbols(node, source, &file_name, result, parent, bindings)?
+            }
+            "python" => {
+                self.extract_python_symbols(node, source, &file_name, result, parent, bindings)?
+            }
             "javascript" | "jsx" => {
-                self.extract_js_symbols(node, source, &file_name, result, parent)?
+                self.extract_js_symbols(node, source, &file_name, result, parent, bindings)?
             }
             "typescript" | "tsx" => {
-                self.extract_ts_symbols(node, source, &file_name, result, parent)?
+                self.extract_ts_symbols(node, source, &file_name, result, parent, bindings)?
             }
-            "go" => self.extract_go_symbols(node, source, &file_name, result, parent)?,
+            "go" => self.extract_go_symbols(node, source, &file_name, result, parent, bindings)?,
+            _ => {}
+        }
+
+        // Same-body let-binding capture (see receiver resolution inside
+        // extract_call). Node kinds are language-unique, so this central
+        // dispatch stays unambiguous.
+        match node.kind() {
+            "let_declaration" => self.capture_rust_let(node, source, bindings),
+            "assignment" => self.capture_python_binding(node, source, bindings),
+            "variable_declarator" => self.capture_js_binding(node, source, bindings),
             _ => {}
         }
 
         let enclosing = self.enclosing_callable(node, source, parent);
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
-                self.extract_symbols(child, source, file_path, result, enclosing.as_deref())?;
+                self.extract_symbols(
+                    child,
+                    source,
+                    file_path,
+                    result,
+                    enclosing.as_deref(),
+                    bindings,
+                )?;
             }
         }
         Ok(())
@@ -223,9 +276,17 @@ impl CodeParser {
             | "function_item"
             | "function_definition"
             | "function_declaration"
-            | "method_declaration"
-            | "method_definition" => {
+            | "method_declaration" => {
                 let name = self.name_of(node, source, "identifier");
+                (name != "unknown").then_some(name)
+            }
+            // JS/TS method names are `property_identifier`, not `identifier`.
+            "method_definition" => {
+                let name = self
+                    .get_node_by_kind(node, "identifier")
+                    .or_else(|| self.get_node_by_kind(node, "property_identifier"))
+                    .and_then(|n| self.node_name(n, source))
+                    .unwrap_or_else(|| "unknown".to_string());
                 (name != "unknown").then_some(name)
             }
             _ => parent.map(|p| p.to_string()),
@@ -290,14 +351,38 @@ impl CodeParser {
     }
 
     fn visibility_from_modifiers(&self, node: Node, source: &str) -> Option<String> {
-        let text = self.node_text(node, source);
-        if text.contains("pub") {
-            Some("public".to_string())
-        } else if text.contains("priv") || text.contains("pub(crate)") {
-            Some("crate".to_string())
+        let vis = self.get_node_by_kind(node, "visibility_modifier")?;
+        let text = self.node_text(vis, source);
+        if text.starts_with("pub(") {
+            Some(text)
+        } else if text.starts_with("pub") {
+            Some("pub".to_string())
         } else {
             None
         }
+    }
+
+    /// Rust test marker: a `#[test]` / `#[tokio::test]`-style attribute on
+    /// the item directly above the function. Attribute items are siblings,
+    /// so walk backwards until a non-attribute sibling appears.
+    fn rust_fn_is_test(&self, node: Node, source: &str) -> bool {
+        let mut cur = node.prev_sibling();
+        while let Some(n) = cur {
+            match n.kind() {
+                "attribute_item" => {
+                    let text = self.node_text(n, source);
+                    if text.contains("#[test]")
+                        || text.trim_end().trim_end_matches(']').rsplit("::").next() == Some("test")
+                    {
+                        return true;
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            cur = n.prev_sibling();
+        }
+        false
     }
 
     fn line_to_u32(&self, point: Point) -> u32 {
@@ -311,6 +396,7 @@ impl CodeParser {
         file_name: &str,
         result: &mut ParseResult,
         parent: Option<&str>,
+        bindings: &mut std::collections::HashMap<String, String>,
     ) -> Result<()> {
         // Skip unnamed nodes (keywords, punctuation, operators). Without this,
         // the keyword children of item nodes (e.g. `struct`, `fn`, `impl`)
@@ -345,6 +431,7 @@ impl CodeParser {
                     visibility,
                     signature: sig,
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: self.rust_fn_is_test(node, source),
                 });
             }
             "struct" | "struct_item" => {
@@ -365,6 +452,7 @@ impl CodeParser {
                     visibility,
                     signature: None,
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "enum" | "enum_item" => {
@@ -385,6 +473,7 @@ impl CodeParser {
                     visibility,
                     signature: None,
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "trait" | "trait_item" => {
@@ -405,6 +494,7 @@ impl CodeParser {
                     visibility,
                     signature: None,
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "impl" | "impl_item" => {
@@ -431,6 +521,7 @@ impl CodeParser {
                     visibility: None,
                     signature: None,
                     doc_comment: None,
+                    is_test: false,
                 });
             }
             "type" | "type_alias" | "type_item" => {
@@ -449,6 +540,7 @@ impl CodeParser {
                     visibility: None,
                     signature: None,
                     doc_comment: None,
+                    is_test: false,
                 });
             }
             "macro" | "macro_item" => {
@@ -467,6 +559,7 @@ impl CodeParser {
                     visibility: None,
                     signature: None,
                     doc_comment: None,
+                    is_test: false,
                 });
             }
             "mod" | "mod_item" => {
@@ -485,6 +578,7 @@ impl CodeParser {
                     visibility: None,
                     signature: None,
                     doc_comment: None,
+                    is_test: false,
                 });
             }
             "use" | "use_item" | "use_declaration" => {
@@ -502,7 +596,10 @@ impl CodeParser {
                 }
             }
             "call_expression" => {
-                self.extract_call(node, source, file_name, result, parent);
+                self.extract_call(node, source, file_name, result, parent, bindings);
+            }
+            "token_tree" => {
+                self.extract_macro_text_calls(node, source, file_name, result, parent);
             }
             _ => {}
         }
@@ -517,6 +614,7 @@ impl CodeParser {
         file_name: &str,
         result: &mut ParseResult,
         parent: Option<&str>,
+        bindings: &mut std::collections::HashMap<String, String>,
     ) -> Result<()> {
         let kind = node.kind();
 
@@ -539,6 +637,7 @@ impl CodeParser {
                     visibility: None,
                     signature: sig,
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "class_definition" => {
@@ -557,20 +656,92 @@ impl CodeParser {
                     visibility: None,
                     signature: None,
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "import_statement" => {
                 let text = self.node_text(node, source);
                 result.imports.push(text);
+                self.parse_python_import_statement(node, source, file_name, result);
             }
             "import_from_statement" => {
                 let text = self.node_text(node, source);
                 result.imports.push(text);
+                self.parse_python_import_from(node, source, file_name, result);
+            }
+            "call" => {
+                self.extract_call(node, source, file_name, result, parent, bindings);
             }
             _ => {}
         }
 
         Ok(())
+    }
+
+    /// `import a.b.c as x, y` — one structured target per dotted name.
+    fn parse_python_import_statement(
+        &self,
+        node: Node,
+        source: &str,
+        file_name: &str,
+        result: &mut ParseResult,
+    ) {
+        for i in 0..node.child_count() {
+            let Some(child) = node.child(i) else { continue };
+            match child.kind() {
+                "dotted_name" => {
+                    let path = self.node_text(child, source);
+                    result.import_targets.push(ParseImport {
+                        file: file_name.to_string(),
+                        line_start: self.line_to_u32(node.start_position()),
+                        path,
+                        alias: None,
+                    });
+                }
+                "aliased_import" => {
+                    let Some(name) = child.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let alias = child
+                        .child_by_field_name("alias")
+                        .and_then(|a| self.node_name(a, source));
+                    result.import_targets.push(ParseImport {
+                        file: file_name.to_string(),
+                        line_start: self.line_to_u32(node.start_position()),
+                        path: self.node_text(name, source),
+                        alias,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `from X import y` — resolve the MODULE (X) as the import target; the
+    /// imported names are symbols inside it and do not map to module files.
+    /// Relative imports keep their dots (`".helpers"`); last-segment module
+    /// matching still resolves them.
+    fn parse_python_import_from(
+        &self,
+        node: Node,
+        source: &str,
+        file_name: &str,
+        result: &mut ParseResult,
+    ) {
+        for i in 0..node.child_count() {
+            let Some(child) = node.child(i) else { continue };
+            if matches!(child.kind(), "dotted_name" | "relative_import") {
+                // Only the FIRST module reference counts; later dotted names
+                // are the imported symbol list.
+                result.import_targets.push(ParseImport {
+                    file: file_name.to_string(),
+                    line_start: self.line_to_u32(node.start_position()),
+                    path: self.node_text(child, source),
+                    alias: None,
+                });
+                return;
+            }
+        }
     }
 
     fn extract_js_symbols(
@@ -580,6 +751,7 @@ impl CodeParser {
         file_name: &str,
         result: &mut ParseResult,
         parent: Option<&str>,
+        bindings: &mut std::collections::HashMap<String, String>,
     ) -> Result<()> {
         let kind = node.kind();
 
@@ -602,6 +774,7 @@ impl CodeParser {
                     visibility: None,
                     signature: sig,
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "class_declaration" | "class_expression" => {
@@ -620,10 +793,15 @@ impl CodeParser {
                     visibility: None,
                     signature: None,
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "method_definition" => {
-                let name = self.name_of(node, source, "identifier");
+                let name = self
+                    .get_node_by_kind(node, "identifier")
+                    .or_else(|| self.get_node_by_kind(node, "property_identifier"))
+                    .and_then(|n| self.node_name(n, source))
+                    .unwrap_or_else(|| "unknown".to_string());
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -638,20 +816,91 @@ impl CodeParser {
                     visibility: None,
                     signature: self.extract_signature(node, source),
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "import_statement" => {
                 let text = self.node_text(node, source);
                 result.imports.push(text);
+                self.push_js_module_import(node, source, file_name, result);
             }
             "export_statement" => {
                 let text = self.node_text(node, source);
                 result.exports.push(text);
+                self.push_js_module_import(node, source, file_name, result);
+            }
+            "call_expression" => {
+                self.extract_call(node, source, file_name, result, parent, bindings);
+            }
+            "new_expression" => {
+                self.extract_js_new_call(node, source, file_name, result, parent);
             }
             _ => {}
         }
 
         Ok(())
+    }
+
+    /// Extract an `import`/`export ... from "<module>"` source specifier.
+    fn push_js_module_import(
+        &self,
+        node: Node,
+        source: &str,
+        file_name: &str,
+        result: &mut ParseResult,
+    ) {
+        let Some(src) = node.child_by_field_name("source") else {
+            return;
+        };
+        let raw = self.node_text(src, source);
+        let path = raw
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim()
+            .to_string();
+        if path.is_empty() {
+            return;
+        }
+        // Bare external specifiers ("react", "lodash-es") cannot resolve to
+        // a workspace module; only relative/scoped/path-ish targets are
+        // worth structured tracking.
+        if !(path.starts_with('.') || path.contains('/') || path.starts_with('@')) {
+            return;
+        }
+        let cleaned = path.strip_prefix("./").unwrap_or(&path).to_string();
+        result.import_targets.push(ParseImport {
+            file: file_name.to_string(),
+            line_start: self.line_to_u32(node.start_position()),
+            path: cleaned,
+            alias: None,
+        });
+    }
+
+    /// `new Foo()` / `new ns.Bar()` — constructors are impact-relevant
+    /// callees; capture them like calls on the constructor identifier.
+    fn extract_js_new_call(
+        &mut self,
+        node: Node,
+        source: &str,
+        file_name: &str,
+        result: &mut ParseResult,
+        parent: Option<&str>,
+    ) {
+        let Some(ctor) = node.child_by_field_name("constructor") else {
+            return;
+        };
+        let callee_name = self.extract_callee_name(ctor, source);
+        if callee_name.is_empty() {
+            return;
+        }
+        result.calls.push(ParseCall {
+            caller_file: file_name.to_string(),
+            caller_symbol: parent.map(|s| s.to_string()),
+            line_start: self.line_to_u32(node.start_position()),
+            callee_name,
+            is_qualified: ctor.kind() == "member_expression",
+            receiver_type: self.extract_receiver_type(ctor, source),
+            from_macro_text: false,
+        });
     }
 
     fn extract_ts_symbols(
@@ -661,6 +910,7 @@ impl CodeParser {
         file_name: &str,
         result: &mut ParseResult,
         parent: Option<&str>,
+        bindings: &mut std::collections::HashMap<String, String>,
     ) -> Result<()> {
         let kind = node.kind();
 
@@ -681,6 +931,7 @@ impl CodeParser {
                     visibility: None,
                     signature: self.extract_signature(node, source),
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "class_declaration" | "class_expression" => {
@@ -699,10 +950,15 @@ impl CodeParser {
                     visibility: None,
                     signature: None,
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "method_definition" => {
-                let name = self.name_of(node, source, "identifier");
+                let name = self
+                    .get_node_by_kind(node, "identifier")
+                    .or_else(|| self.get_node_by_kind(node, "property_identifier"))
+                    .and_then(|n| self.node_name(n, source))
+                    .unwrap_or_else(|| "unknown".to_string());
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -717,6 +973,7 @@ impl CodeParser {
                     visibility: None,
                     signature: self.extract_signature(node, source),
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "interface_declaration" => {
@@ -735,15 +992,18 @@ impl CodeParser {
                     visibility: None,
                     signature: None,
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "import_statement" => {
                 let text = self.node_text(node, source);
                 result.imports.push(text);
+                self.push_js_module_import(node, source, file_name, result);
             }
             "export_statement" => {
                 let text = self.node_text(node, source);
                 result.exports.push(text);
+                self.push_js_module_import(node, source, file_name, result);
             }
             "type_alias_declaration" => {
                 let name = self.name_of(node, source, "identifier");
@@ -761,7 +1021,14 @@ impl CodeParser {
                     visibility: None,
                     signature: None,
                     doc_comment: None,
+                    is_test: false,
                 });
+            }
+            "call_expression" => {
+                self.extract_call(node, source, file_name, result, parent, bindings);
+            }
+            "new_expression" => {
+                self.extract_js_new_call(node, source, file_name, result, parent);
             }
             _ => {}
         }
@@ -776,12 +1043,14 @@ impl CodeParser {
         file_name: &str,
         result: &mut ParseResult,
         parent: Option<&str>,
+        bindings: &mut std::collections::HashMap<String, String>,
     ) -> Result<()> {
         let kind = node.kind();
 
         match kind {
             "function_declaration" => {
                 let name = self.name_of(node, source, "identifier");
+                let is_test = name.starts_with("Test");
 
                 result.symbols.push(ParsedSymbol {
                     name,
@@ -796,6 +1065,7 @@ impl CodeParser {
                     visibility: None,
                     signature: self.extract_signature(node, source),
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test,
                 });
             }
             "method_declaration" => {
@@ -849,6 +1119,7 @@ impl CodeParser {
                     visibility: None,
                     signature: self.extract_signature(node, source),
                     doc_comment: self.extract_doc_comment(node, source),
+                    is_test: false,
                 });
             }
             "type_declaration" => {
@@ -887,6 +1158,7 @@ impl CodeParser {
                         visibility: None,
                         signature: None,
                         doc_comment: self.extract_doc_comment(node, source),
+                        is_test: false,
                     });
                 }
             }
@@ -910,6 +1182,7 @@ impl CodeParser {
                         visibility: None,
                         signature: None,
                         doc_comment: None,
+                        is_test: false,
                     });
                 }
             }
@@ -933,6 +1206,7 @@ impl CodeParser {
                         visibility: None,
                         signature: None,
                         doc_comment: None,
+                        is_test: false,
                     });
                 }
             }
@@ -950,7 +1224,7 @@ impl CodeParser {
                 }
             }
             "call_expression" => {
-                self.extract_call(node, source, file_name, result, parent);
+                self.extract_call(node, source, file_name, result, parent, bindings);
             }
             _ => {}
         }
@@ -1050,6 +1324,7 @@ impl CodeParser {
         file_name: &str,
         result: &mut ParseResult,
         parent: Option<&str>,
+        bindings: &std::collections::HashMap<String, String>,
     ) {
         // The callee is the first child of a call_expression.
         let Some(callee) = node.child(0) else {
@@ -1065,20 +1340,272 @@ impl CodeParser {
                 | "selector_expression"
                 | "qualified_identifier"
                 | "scoped_identifier"
+                | "attribute"
+                | "member_expression"
         );
+        let mut receiver_type = self.extract_receiver_type(callee, source);
+        // Same-body let-binding inference: `let p = User::new(); p.save()`
+        // resolves `p` to `User` when the binding was captured from a
+        // constructor-shaped initializer. Plain variables stay untyped
+        // otherwise — never invent a type from a bare name.
+        if receiver_type.is_none() && is_qualified {
+            if let Some(object) = self.receiver_object_text(callee, source) {
+                if let Some(bound) = bindings.get(&object) {
+                    receiver_type = Some(bound.clone());
+                }
+            }
+        }
         result.calls.push(ParseCall {
             caller_file: file_name.to_string(),
             caller_symbol: parent.map(|s| s.to_string()),
             line_start: self.line_to_u32(node.start_position()),
             callee_name,
             is_qualified,
-            receiver_type: self.extract_receiver_type(callee, source),
+            receiver_type,
+            from_macro_text: false,
         });
     }
 
+    /// `let p = Type::new(…)` binds `p → Type` from the scoped-path
+    /// qualifier. Any other initializer shape carries no trustworthy type.
+    fn capture_rust_let(
+        &self,
+        node: Node,
+        source: &str,
+        bindings: &mut std::collections::HashMap<String, String>,
+    ) {
+        // Grammar 0.20 gives let_declaration no field names — extract
+        // positionally: the binding pattern is the first identifier child,
+        // the initializer the (single) call_expression child.
+        let mut pattern = None;
+        let mut init = None;
+        for i in 0..node.child_count() {
+            let Some(c) = node.child(i) else { continue };
+            match c.kind() {
+                "identifier" if pattern.is_none() => pattern = Some(c),
+                "call_expression" => init = Some(c),
+                _ => {}
+            }
+        }
+        let (Some(name), Some(value)) = (pattern, init) else {
+            return;
+        };
+        if value.kind() != "call_expression" {
+            return;
+        }
+        let Some(callee) = value.child(0) else {
+            return;
+        };
+        if callee.kind() != "scoped_identifier" {
+            return;
+        }
+        let Some(path) = callee.child_by_field_name("path") else {
+            return;
+        };
+        bindings.insert(self.node_text(name, source), self.node_text(path, source));
+    }
+
+    /// `p = User()` binds `p → User` by constructor naming convention
+    /// (capitalized callee only — lowercase calls are plain functions).
+    fn capture_python_binding(
+        &self,
+        node: Node,
+        source: &str,
+        bindings: &mut std::collections::HashMap<String, String>,
+    ) {
+        let (Some(left), Some(right)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) else {
+            return;
+        };
+        if right.kind() != "call" {
+            return;
+        }
+        let Some(func) = right.child_by_field_name("function") else {
+            return;
+        };
+        if func.kind() != "identifier" {
+            return;
+        }
+        let name = self.node_text(func, source);
+        if !name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return;
+        }
+        bindings.insert(self.node_text(left, source), name);
+    }
+
+    /// `const p = new Widget()` binds via the constructor; a TS type
+    /// annotation (`let p: User`) binds even without an initializer.
+    fn capture_js_binding(
+        &self,
+        node: Node,
+        source: &str,
+        bindings: &mut std::collections::HashMap<String, String>,
+    ) {
+        // Positional extraction (grammar 0.20 may omit field names):
+        // `name` = first identifier child; initializer = the child after
+        // the "=" token, when present.
+        let mut name_node = None;
+        let mut value_node = None;
+        let mut seen_eq = false;
+        for i in 0..node.child_count() {
+            let Some(c) = node.child(i) else { continue };
+            match c.kind() {
+                "identifier" if name_node.is_none() && !seen_eq && !c.has_error() => {
+                    name_node = Some(c)
+                }
+                "=" => seen_eq = true,
+                _ if seen_eq && value_node.is_none() && c.is_named() => value_node = Some(c),
+                _ => {}
+            }
+        }
+        let Some(name_node) = name_node else { return };
+        let key = self.node_text(name_node, source);
+        match value_node.as_ref().map(|v| v.kind()) {
+            Some("new_expression") => {
+                let v = value_node.unwrap();
+                let Some(ctor) = v.child_by_field_name("constructor") else {
+                    return;
+                };
+                let ctor_name = self.extract_callee_name(ctor, source);
+                if !ctor_name.is_empty() {
+                    bindings.insert(key, ctor_name);
+                }
+            }
+            _ => {
+                let mut cursor = node.walk();
+                let ty = node
+                    .children(&mut cursor)
+                    .find(|c| c.kind() == "type_identifier")
+                    .or_else(|| {
+                        // TS: the annotation is wrapped in a
+                        // `type_annotation` node.
+                        node.children(&mut node.walk())
+                            .find(|c| c.kind() == "type_annotation")
+                            .and_then(|ta| {
+                                ta.child_by_field_name("type").or_else(|| {
+                                    ta.children(&mut ta.walk())
+                                        .find(|c| c.kind() == "type_identifier")
+                                })
+                            })
+                            .map(|t| t.child_by_field_name("type").unwrap_or(t))
+                    });
+                if let Some(ty) = ty {
+                    let ty = match ty.child_by_field_name("type") {
+                        Some(inner) => inner,
+                        None => ty,
+                    };
+                    bindings.insert(key, self.node_text(ty, source));
+                }
+            }
+        }
+    }
+
+    const RUST_RESERVED: &[&str] = &[
+        "if",
+        "while",
+        "for",
+        "match",
+        "return",
+        "fn",
+        "let",
+        "unsafe",
+        "loop",
+        "macro_rules",
+        "else",
+        "move",
+        "ref",
+    ];
+
+    /// Recover syntactic calls from macro token text (`assert_eq!(add(2,
+    /// 3), 5)`). Tree-sitter 0.20 gives macro bodies no AST, so this scans
+    /// the token text for `name(` and `Path::name(` shapes. Reserved
+    /// keywords are skipped; results are flagged `from_macro_text` so
+    /// relationship building tags them heuristic instead of verified.
+    fn extract_macro_text_calls(
+        &mut self,
+        node: Node,
+        source: &str,
+        file_name: &str,
+        result: &mut ParseResult,
+        parent: Option<&str>,
+    ) {
+        let text = self.node_text(node, source);
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if !(bytes[i] == b'_' || bytes[i].is_ascii_alphabetic()) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            let word = &text[start..i];
+            // Look ahead past whitespace for an opening paren.
+            let mut j = i;
+            while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() || bytes[j] != b'(' {
+                continue;
+            }
+            // Look behind for a `::` qualifier (skip leading whitespace).
+            let mut k = start;
+            while k > 0 && (bytes[k - 1] as char).is_whitespace() {
+                k -= 1;
+            }
+            let (receiver, qualified) = if k >= 2 && &text[k - 2..k] == "::" {
+                let mut e = k - 2;
+                while e > 0 && (bytes[e - 1] as char).is_whitespace() {
+                    e -= 1;
+                }
+                let mut s2 = e;
+                while s2 > 0 && (bytes[s2 - 1] == b'_' || bytes[s2 - 1].is_ascii_alphanumeric()) {
+                    s2 -= 1;
+                }
+                if s2 < e {
+                    (Some(text[s2..e].to_string()), true)
+                } else {
+                    (None, true)
+                }
+            } else {
+                (None, false)
+            };
+            if Self::RUST_RESERVED.contains(&word) || word == "self" {
+                continue;
+            }
+            result.calls.push(ParseCall {
+                caller_file: file_name.to_string(),
+                caller_symbol: parent.map(|s| s.to_string()),
+                line_start: self.line_to_u32(node.start_position()),
+                callee_name: word.to_string(),
+                is_qualified: qualified,
+                receiver_type: receiver,
+                from_macro_text: true,
+            });
+        }
+    }
+
+    /// The receiver expression text of a qualified callee (`p` in
+    /// `p.save()` across languages), used for let-binding lookups.
+    fn receiver_object_text(&self, callee: Node, source: &str) -> Option<String> {
+        let field = match callee.kind() {
+            "attribute" | "member_expression" => "object",
+            "field_expression" => "value",
+            _ => return None,
+        };
+        let object = callee.child_by_field_name(field)?;
+        Some(self.node_text(object, source))
+    }
+
     /// Receiver-type hint for a call: the qualifier segment of a path call
-    /// (`User` in `User::new()`, including `Self`), or `"self"` for
-    /// instance calls on self. Plain variable receivers yield `None` —
+    /// (`User` in `User::new()`, including `Self`), `"self"` for
+    /// instance calls on self, and the equivalent trustworthy receivers in
+    /// other languages (`self`/`cls` for Python attributes, `this` for JS/TS
+    /// member expressions). Plain variable receivers yield `None` —
     /// without binding information they carry no trustworthy type.
     fn extract_receiver_type(&self, callee: Node, source: &str) -> Option<String> {
         match callee.kind() {
@@ -1090,6 +1617,16 @@ impl CodeParser {
                 let value = callee.child_by_field_name("value")?;
                 let text = self.node_text(value, source);
                 (text == "self").then(|| "self".to_string())
+            }
+            "attribute" => {
+                let object = callee.child_by_field_name("object")?;
+                let text = self.node_text(object, source);
+                (text == "self" || text == "cls").then_some(text)
+            }
+            "member_expression" => {
+                let object = callee.child_by_field_name("object")?;
+                let text = self.node_text(object, source);
+                (text == "this").then(|| "this".to_string())
             }
             _ => None,
         }
@@ -1110,10 +1647,12 @@ impl CodeParser {
     /// Walk a callee node tree and return the final identifier text.
     fn extract_callee_name(&self, node: Node, source: &str) -> String {
         match node.kind() {
-            "identifier" | "field_identifier" => self.node_name(node, source).unwrap_or_default(),
-            "field_expression" | "selector_expression" => {
-                // For qualified calls like `pkg::func()` or `obj.method()`,
-                // the final child is the actual callee name.
+            "identifier" | "field_identifier" | "property_identifier" => {
+                self.node_name(node, source).unwrap_or_default()
+            }
+            "field_expression" | "selector_expression" | "attribute" | "member_expression" => {
+                // For qualified calls like `pkg::func()`, `obj.method()`, or
+                // `self.helper()`, the final child is the actual callee name.
                 let last = node.child(node.child_count().saturating_sub(1));
                 last.map(|n| self.extract_callee_name(n, source))
                     .unwrap_or_default()
@@ -1237,5 +1776,315 @@ mod receiver_tests {
         assert_eq!(find("helper").receiver_type, None);
         // Plain variable receivers carry no trustworthy type.
         assert_eq!(find("method").receiver_type, None);
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+
+    fn rust_symbols(src: &str) -> Vec<ParsedSymbol> {
+        let mut p = CodeParser::new("rust").unwrap();
+        p.parse_file(std::path::Path::new("lib.rs"), src)
+            .unwrap()
+            .symbols
+    }
+
+    #[test]
+    fn rust_visibility_maps_to_indexer_vocabulary() {
+        let syms = rust_symbols(
+            "pub fn open_fn() {}\npub(crate) fn crate_fn() {}\npub(super) fn super_fn() {}\nfn private_fn() {}\n",
+        );
+        let vis = |name: &str| {
+            syms.iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .visibility
+                .clone()
+        };
+        assert_eq!(vis("open_fn").as_deref(), Some("pub"));
+        assert_eq!(vis("crate_fn").as_deref(), Some("pub(crate)"));
+        assert_eq!(vis("super_fn").as_deref(), Some("pub(super)"));
+        // No modifier node: stays unknown rather than misclassified.
+        assert_eq!(vis("private_fn"), None);
+    }
+
+    #[test]
+    fn pub_crate_does_not_shadow_pub() {
+        let syms = rust_symbols("pub(crate) struct Inner;\npub struct Outer;\n");
+        let vis = |name: &str| {
+            syms.iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .visibility
+                .clone()
+        };
+        assert_eq!(vis("Inner").as_deref(), Some("pub(crate)"));
+        assert_eq!(vis("Outer").as_deref(), Some("pub"));
+    }
+
+    #[test]
+    fn rust_test_attributes_mark_functions() {
+        let syms = rust_symbols(
+            "#[test]\nfn marked() {}\n#[tokio::test]\nasync fn tokio_marked() {}\nfn plain() {}\n",
+        );
+        let is_test = |name: &str| syms.iter().find(|s| s.name == name).unwrap().is_test;
+        assert!(is_test("marked"));
+        assert!(is_test("tokio_marked"));
+        assert!(!is_test("plain"));
+    }
+
+    #[test]
+    fn go_exported_test_functions_are_marked() {
+        let mut p = CodeParser::new("go").unwrap();
+        let r = p
+            .parse_file(
+                std::path::Path::new("main_test.go"),
+                "func TestBreaker(t *testing.T) {}\nfunc helper() {}\n",
+            )
+            .unwrap();
+        let is_test = |name: &str| r.symbols.iter().find(|s| s.name == name).unwrap().is_test;
+        assert!(is_test("TestBreaker"));
+        assert!(!is_test("helper"));
+    }
+}
+
+#[cfg(test)]
+mod cross_language_call_tests {
+    use super::*;
+
+    fn parse(lang: &str, file: &str, src: &str) -> ParseResult {
+        CodeParser::new(lang)
+            .unwrap()
+            .parse_file(std::path::Path::new(file), src)
+            .unwrap()
+    }
+
+    fn call<'a>(r: &'a ParseResult, callee: &str) -> &'a ParseCall {
+        r.calls
+            .iter()
+            .find(|c| c.callee_name == callee)
+            .unwrap_or_else(|| panic!("no call to {callee} in {:?}", r.calls))
+    }
+
+    #[test]
+    fn python_calls_and_receivers() {
+        let r = parse(
+            "python",
+            "mod.py",
+            "\
+class Greeter:
+    def greet(self):
+        self.hello()
+        helper()
+        mod.util()
+",
+        );
+        assert_eq!(call(&r, "hello").receiver_type.as_deref(), Some("self"));
+        assert!(call(&r, "hello").is_qualified);
+        // Caller attribution reaches into methods.
+        assert_eq!(call(&r, "hello").caller_symbol.as_deref(), Some("greet"));
+        assert_eq!(call(&r, "helper").receiver_type, None);
+        assert!(!call(&r, "helper").is_qualified);
+        // Plain variable receivers carry no type hint.
+        assert_eq!(call(&r, "util").receiver_type, None);
+        assert!(call(&r, "util").is_qualified);
+    }
+
+    #[test]
+    fn python_import_targets() {
+        let r = parse(
+            "python",
+            "mod.py",
+            "\
+import a.b.c
+import x as y
+from .helpers import util, other
+from pkg import thing
+",
+        );
+        let paths: Vec<&str> = r.import_targets.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"a.b.c"), "{paths:?}");
+        let aliased = r.import_targets.iter().find(|i| i.alias.is_some()).unwrap();
+        assert_eq!(aliased.path, "x");
+        assert_eq!(aliased.alias.as_deref(), Some("y"));
+        // `from` imports resolve the MODULE (first dotted name only).
+        assert!(paths.contains(&".helpers"), "{paths:?}");
+        assert!(paths.contains(&"pkg"), "{paths:?}");
+        assert!(!paths.contains(&"pkg.thing"), "{paths:?}");
+    }
+
+    #[test]
+    fn javascript_calls_constructors_and_import_sources() {
+        let r = parse(
+            "javascript",
+            "app.js",
+            "\
+import { util } from './utils.js';
+import react from 'react';
+export { x } from '../shared/helpers.js';
+
+function run(obj) {
+    obj.method();
+    this.setup();
+    helper();
+    const u = new User();
+    const n = new ns.Widget();
+}
+",
+        );
+        assert_eq!(call(&r, "method").receiver_type, None);
+        assert!(call(&r, "method").is_qualified);
+        assert_eq!(call(&r, "setup").receiver_type.as_deref(), Some("this"));
+        assert_eq!(call(&r, "User").callee_name, "User");
+        assert_eq!(call(&r, "Widget").callee_name, "Widget");
+        assert!(call(&r, "Widget").is_qualified);
+        let paths: Vec<&str> = r.import_targets.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"utils.js"), "{paths:?}");
+        assert!(paths.contains(&"../shared/helpers.js"), "{paths:?}");
+        // Bare external specifier is excluded from structured targets.
+        assert!(!paths.contains(&"react"), "{paths:?}");
+    }
+
+    #[test]
+    fn typescript_calls_route_through_the_shared_extractor() {
+        let r = parse(
+            "typescript",
+            "svc.ts",
+            "\
+import { db } from './db';
+interface Repo { find(): void }
+class Svc implements Repo {
+    find(): void {
+        this.query();
+        db.query();
+        load();
+    }
+}
+",
+        );
+        assert_eq!(call(&r, "query").receiver_type.as_deref(), Some("this"));
+        assert_eq!(call(&r, "query").caller_symbol.as_deref(), Some("find"));
+        assert!(!call(&r, "load").is_qualified);
+        let paths: Vec<&str> = r.import_targets.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"db"), "{paths:?}");
+    }
+}
+
+#[cfg(test)]
+mod let_binding_inference_tests {
+    use super::*;
+
+    fn call<'a>(r: &'a ParseResult, callee: &str) -> &'a ParseCall {
+        r.calls
+            .iter()
+            .find(|c| c.callee_name == callee)
+            .unwrap_or_else(|| panic!("no call to {callee} in {:?}", r.calls))
+    }
+
+    #[test]
+    fn rust_let_bound_receiver_resolves_to_type() {
+        let mut p = CodeParser::new("rust").unwrap();
+        let r = p
+            .parse_file(
+                std::path::Path::new("lib.rs"),
+                "fn go() {\n    let p = User::new();\n    p.save();\n    other();\n}\n",
+            )
+            .unwrap();
+        assert_eq!(call(&r, "save").receiver_type.as_deref(), Some("User"));
+        assert_eq!(call(&r, "save").caller_symbol.as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn bindings_do_not_leak_across_functions() {
+        let mut p = CodeParser::new("rust").unwrap();
+        let r = p
+            .parse_file(
+                std::path::Path::new("lib.rs"),
+                "fn a() {\n    let p = User::new();\n}\nfn b() {\n    p.save();\n}\n",
+            )
+            .unwrap();
+        assert_eq!(call(&r, "save").receiver_type, None);
+    }
+
+    #[test]
+    fn non_constructor_initializers_stay_untyped() {
+        let mut p = CodeParser::new("rust").unwrap();
+        let r = p
+            .parse_file(
+                std::path::Path::new("lib.rs"),
+                "fn go() -> u32 {\n    let n = make_thing();\n    n.save();\n    1\n}\n",
+            )
+            .unwrap();
+        assert_eq!(call(&r, "save").receiver_type, None);
+    }
+
+    #[test]
+    fn python_constructor_assignment_binds_by_convention() {
+        let r = CodeParser::new("python")
+            .unwrap()
+            .parse_file(
+                std::path::Path::new("mod.py"),
+                "def go():\n    p = Parser()\n    p.parse()\n    q = helper()\n    q.run()\n",
+            )
+            .unwrap();
+        assert_eq!(call(&r, "parse").receiver_type.as_deref(), Some("Parser"));
+        // Lowercase callee is a plain function — no binding invented.
+        assert_eq!(call(&r, "run").receiver_type, None);
+    }
+
+    #[test]
+    fn js_new_expression_binding_and_ts_annotation() {
+        let js = CodeParser::new("javascript")
+            .unwrap()
+            .parse_file(
+                std::path::Path::new("app.js"),
+                "function go() {\n  const w = new Widget();\n  w.render();\n}\n",
+            )
+            .unwrap();
+        assert_eq!(call(&js, "render").receiver_type.as_deref(), Some("Widget"));
+
+        let ts = CodeParser::new("typescript")
+            .unwrap()
+            .parse_file(
+                std::path::Path::new("svc.ts"),
+                "function go(u: unknown) {\n  let s: Store = load();\n  s.open();\n}\n",
+            )
+            .unwrap();
+        assert_eq!(call(&ts, "open").receiver_type.as_deref(), Some("Store"));
+    }
+}
+
+#[cfg(test)]
+mod macro_text_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn calls_inside_macros_are_recovered_and_flagged() {
+        let mut p = CodeParser::new("rust").unwrap();
+        let r = p
+            .parse_file(
+                std::path::Path::new("lib.rs"),
+                "#[test]\nfn adds() {\n    assert_eq!(add(2, 3), 5);\n    assert_eq!(Ping::probe(), 1);\n}\n",
+            )
+            .unwrap();
+        let add = r
+            .calls
+            .iter()
+            .find(|c| c.callee_name == "add")
+            .expect("macro-wrapped call recovered");
+        assert!(add.from_macro_text);
+        assert!(!add.is_qualified);
+        assert_eq!(add.caller_symbol.as_deref(), Some("adds"));
+        let probe = r
+            .calls
+            .iter()
+            .find(|c| c.callee_name == "probe")
+            .expect("qualified macro call recovered");
+        assert!(probe.from_macro_text);
+        assert!(probe.is_qualified);
+        assert_eq!(probe.receiver_type.as_deref(), Some("Ping"));
+        // assert_eq! itself must not be recorded as a callee.
+        assert!(r.calls.iter().all(|c| c.callee_name != "assert_eq"));
     }
 }
