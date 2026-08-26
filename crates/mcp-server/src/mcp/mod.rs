@@ -45,6 +45,31 @@ pub struct CodeBroMcpServer {
     tool_router: ToolRouter<Self>,
     facts_cache: FactsCache,
     sandbox_runtime: crate::sandbox::SandboxRuntime,
+    /// Serializes mutating tool calls (`apply_change`, `apply_changes`,
+    /// `record_memory`, `delete_memory`, `update_identity`, `reindex`)
+    /// within this server process. Pipelined concurrent mutations would
+    /// otherwise race on the same `.codebro` state files
+    /// last-writer-wins; holding this lock for the whole handler body
+    /// makes them sequential. Scope is one server process — a separate
+    /// `codebro init` process is still picked up via facts.json mtime.
+    mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Ring of recently applied changes (path, instant, recommended test
+    /// names), capped and pruned, used to correlate execution failures
+    /// with this session's edits. In-memory only — never persisted.
+    recent_edits: Arc<std::sync::Mutex<Vec<RecentEdit>>>,
+    /// Most recent root-cause analysis from a failing sandbox run, kept in
+    /// memory only so consult mode=debugging can inject it as context.
+    last_rca: Arc<std::sync::Mutex<Option<crate::debugging::types::RootCauseAnalysis>>>,
+}
+
+/// One recently applied change, with the tests the advisory recommended
+/// for it (the precise causal hint used during failure correlation).
+#[derive(Clone)]
+struct RecentEdit {
+    path: String,
+    at: std::time::Instant,
+    #[allow(dead_code)]
+    recommended_tests: Vec<String>,
 }
 
 #[tool_router]
@@ -56,6 +81,9 @@ impl CodeBroMcpServer {
             tool_router: Self::tool_router(),
             facts_cache: Arc::new(std::sync::Mutex::new(None)),
             sandbox_runtime: crate::sandbox::SandboxRuntime::from_env(),
+            mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            recent_edits: Arc::new(std::sync::Mutex::new(Vec::new())),
+            last_rca: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -69,6 +97,9 @@ impl CodeBroMcpServer {
             tool_router: Self::tool_router(),
             facts_cache: Arc::new(std::sync::Mutex::new(None)),
             sandbox_runtime: runtime,
+            mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            recent_edits: Arc::new(std::sync::Mutex::new(Vec::new())),
+            last_rca: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -132,6 +163,199 @@ impl CodeBroMcpServer {
         };
         *guard = Some((mtime, store.clone()));
         store
+    }
+
+    /// Serialize a verification result for tool responses, adding structured
+    /// diagnostics, the outcome classification, and the workspace modules
+    /// owning any diagnostic files (via the cached fact store).
+    fn verification_object(
+        &self,
+        verification: &crate::sandbox::VerificationResult,
+    ) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("verified".to_string(), json!(verification.verified));
+        obj.insert("summary".to_string(), json!(verification.summary));
+        obj.insert("violations".to_string(), json!(verification.violations));
+        if let Some(ref ids) = verification.impacted_fact_ids {
+            obj.insert("impacted_fact_ids".to_string(), json!(ids));
+        }
+        if !verification.diagnostics.is_empty() {
+            obj.insert("diagnostics".to_string(), json!(verification.diagnostics));
+        }
+        if let Some(ref class) = verification.classification {
+            obj.insert("classification".to_string(), json!(class));
+        }
+        let affected_modules = self.affected_modules_for(verification);
+        if !affected_modules.is_empty() {
+            obj.insert("affected_modules".to_string(), json!(affected_modules));
+        }
+        let related = self.related_recent_changes(verification);
+        if !related.is_empty() {
+            obj.insert("related_recent_changes".to_string(), json!(related));
+        }
+        // Root-cause hypotheses for failures: deterministic ranking over
+        // diagnostics + fact-store linkage + this session's recent edits.
+        if !verification.verified && verification.classification.as_deref() != Some("denied") {
+            let fresh = match crate::mcp::facts::compute_freshness(
+                &self.fact_store(),
+                &self.workspace_root,
+            ) {
+                crate::mcp::facts::FreshnessStatus::Fresh => "fresh",
+                crate::mcp::facts::FreshnessStatus::Stale => "stale",
+                _ => "unknown",
+            };
+            let recent_edits = self.recent_edits_snapshot();
+            let rca = crate::debugging::analyze_root_cause(crate::debugging::RootCauseInput {
+                verification,
+                store: &self.fact_store(),
+                workspace_root: &self.workspace_root.clone(),
+                freshness: fresh,
+                recent_edits: &recent_edits,
+            });
+            self.store_last_rca(&rca);
+            obj.insert(
+                "root_cause".to_string(),
+                serde_json::to_value(&rca).unwrap_or(json!({})),
+            );
+        }
+        json!(obj)
+    }
+
+    /// Snapshot the session's recent edits as debugging input.
+    fn recent_edits_snapshot(&self) -> Vec<crate::debugging::candidates::RecentEditInput> {
+        self.recent_edits
+            .lock()
+            .expect("recent edits lock")
+            .iter()
+            .map(|e| crate::debugging::candidates::RecentEditInput {
+                path: e.path.clone(),
+                seconds_ago: e.at.elapsed().as_secs(),
+                recommended_tests: e.recommended_tests.clone(),
+            })
+            .collect()
+    }
+
+    /// Stash the latest analysis so consult mode=debugging can inject it.
+    fn store_last_rca(&self, rca: &crate::debugging::types::RootCauseAnalysis) {
+        *self.last_rca.lock().expect("last rca lock") = Some(rca.clone());
+    }
+
+    /// Attach the latest deterministic root-cause hypotheses to a debugging
+    /// consult as an additive file context — the LLM reasons OVER CodeBro's
+    /// structured evidence rather than re-deriving it.
+    fn inject_debugging_hypotheses(
+        &self,
+        request: &mut crate::consultant::types::ConsultantRequest,
+        mode: &crate::consultant::types::ConsultantMode,
+    ) {
+        if !matches!(mode, crate::consultant::types::ConsultantMode::Debugging) {
+            return;
+        }
+        let guard = self.last_rca.lock().expect("last rca lock");
+        if let Some(rca) = guard.as_ref() {
+            let payload = serde_json::to_string(rca).unwrap_or_default();
+            request
+                .files
+                .push(crate::consultant::types::ConsultantFileContext {
+                    path: "codebro://root-cause-hypotheses".to_string(),
+                    content: payload,
+                });
+        }
+    }
+
+    /// Record a successfully applied change (path + the tests the advisory
+    /// recommended for it) for failure correlation.
+    fn remember_edit(&self, path: &str, recommended_tests: Vec<String>) {
+        const MAX_RECENT_EDITS: usize = 50;
+        const RELEVANCE_WINDOW_SECS: u64 = 3600;
+        let mut guard = self.recent_edits.lock().expect("recent edits lock");
+        guard.retain(|e| e.at.elapsed().as_secs() < RELEVANCE_WINDOW_SECS);
+        guard.push(RecentEdit {
+            path: path.to_string(),
+            at: std::time::Instant::now(),
+            recommended_tests,
+        });
+        if guard.len() > MAX_RECENT_EDITS {
+            let overflow = guard.len() - MAX_RECENT_EDITS;
+            guard.drain(0..overflow);
+        }
+    }
+
+    /// Intersect failing diagnostics with this session's recent edits:
+    /// files that were just changed AND now fail are prime debugging
+    /// suspects. Correlation is circumstantial evidence, never proof.
+    fn related_recent_changes(
+        &self,
+        verification: &crate::sandbox::VerificationResult,
+    ) -> Vec<serde_json::Value> {
+        if verification.verified || verification.diagnostics.is_empty() {
+            return Vec::new();
+        }
+        let guard = self.recent_edits.lock().expect("recent edits lock");
+        let diag_files: std::collections::HashSet<&str> = verification
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.file.as_deref())
+            .collect();
+        // Failing test names from parsed diagnostics.
+        let failing_tests: std::collections::HashSet<&str> = verification
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.test.as_deref())
+            .collect();
+
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for edit in guard.iter().rev() {
+            // Two independent correlation channels:
+            //  a) a diagnostic points INTO the edited file;
+            //  b) the failing test was among the tests this edit's advisory
+            //     recommended (the causal chain from targeted selection).
+            let via_file = diag_files.contains(edit.path.as_str());
+            let via_recommended = !edit.recommended_tests.is_empty()
+                && edit
+                    .recommended_tests
+                    .iter()
+                    .any(|t| failing_tests.contains(t.as_str()));
+            let via = match (via_file, via_recommended) {
+                (true, true) => "diagnostic_file+recommended_tests",
+                (true, false) => "diagnostic_file",
+                (false, true) => "recommended_tests",
+                (false, false) => continue,
+            };
+            if seen.insert(edit.path.clone()) {
+                out.push(json!({
+                    "path": edit.path,
+                    "seconds_ago": edit.at.elapsed().as_secs(),
+                    "via": via,
+                }));
+            }
+        }
+        out
+    }
+
+    /// Map diagnostic file paths onto owning module ids from the fact store.
+    fn affected_modules_for(
+        &self,
+        verification: &crate::sandbox::VerificationResult,
+    ) -> Vec<String> {
+        if verification.diagnostics.is_empty() {
+            return Vec::new();
+        }
+        let store = self.fact_store();
+        let mut out = std::collections::BTreeSet::new();
+        for d in &verification.diagnostics {
+            let Some(file) = d.file.as_deref() else {
+                continue;
+            };
+            for m in store.collection().modules() {
+                if m.path.as_deref() == Some(file) {
+                    out.insert(m.id.to_string());
+                    break;
+                }
+            }
+        }
+        out.into_iter().collect()
     }
 
     // ── Tool 1: workspace context ─────────────────────────────────────
@@ -378,6 +602,7 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<ChangeArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         // Plan-less, non-strict engine: boundary + staleness enforcement only.
         let engine =
             crate::coding::change_engine::ChangeEngine::new(&self.workspace_root, &[], false);
@@ -388,14 +613,32 @@ impl CodeBroMcpServer {
         let _apply_result = engine
             .apply(&prepared)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
         // Analyze which existing facts may be stale due to this mutation.
+        // The edited line range (from the old-text position in the
+        // pre-change content) narrows test recommendations to symbols the
+        // edit actually touched.
+        let edited_range = if prepared.created || prepared.old.is_empty() {
+            None
+        } else {
+            prepared.backup.find(&prepared.old).map(|offset| {
+                let start_line = prepared.backup.as_bytes()[..offset]
+                    .iter()
+                    .filter(|b| **b == b'\n')
+                    .count() as u32
+                    + 1;
+                let span_lines = prepared.old.split('\n').count() as u32;
+                (start_line, start_line + span_lines.saturating_sub(1))
+            })
+        };
         let store = self.fact_store();
-        let advisory = change_invalidation::InvalidationAdvisory::analyze(
+        let advisory = change_invalidation::InvalidationAdvisory::analyze_with_range(
             &store,
             &args.path,
             prepared.created,
+            edited_range,
         );
+
+        self.remember_edit(&args.path, advisory.recommended_tests.clone());
 
         let response = json!({
             "applied": true,
@@ -404,6 +647,7 @@ impl CodeBroMcpServer {
             "affected_fact_ids": advisory.affected_fact_ids,
             "affected_symbols": advisory.affected_symbols,
             "affected_modules": advisory.affected_modules,
+            "recommended_tests": advisory.recommended_tests,
             "needs_reindex": advisory.needs_reindex,
             "recommendation": advisory.recommendation,
         });
@@ -425,6 +669,7 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<ApplyChangesArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let engine =
             crate::coding::change_engine::ChangeEngine::new(&self.workspace_root, &[], false);
 
@@ -445,6 +690,11 @@ impl CodeBroMcpServer {
         let report = engine
             .apply_transaction(&prepared)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if report.success() {
+            for change in &args.changes {
+                self.remember_edit(&change.path, Vec::new());
+            }
+        }
 
         let response = json!({
             "applied": report.success(),
@@ -472,6 +722,7 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<RecordMemoryArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let key = args.key.trim();
         if key.is_empty() {
             return Err(McpError::invalid_params("key must not be empty", None));
@@ -616,10 +867,13 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<DeleteMemoryArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let key = args.key.trim();
         if key.is_empty() {
             return Err(McpError::invalid_params("key must not be empty", None));
         }
+        // Fast-fail on missing confirmation before touching state; the
+        // memory runtime re-enforces this independently as a backstop.
         if !args.confirm {
             return Err(McpError::invalid_params(
                 format!("delete rejected: set confirm=true to delete '{key}'"),
@@ -633,7 +887,26 @@ impl CodeBroMcpServer {
             &self.workspace_root,
             identity,
         );
-        let _ = memory.load();
+        // Fail closed: a corrupt/unloadable store must never be treated as
+        // an empty one, or deletion would persist a store missing entries.
+        if let Err(load_err) = memory.load() {
+            let absent = matches!(
+                load_err,
+                crate::engineering_memory::runtime::EngineeringMemoryError::Storage(
+                    crate::engineering_memory::store::StorageError::NotFound(_)
+                )
+            );
+            if !absent {
+                return Err(McpError::internal_error(
+                    format!(
+                        "refusing to delete: existing memory store could not be loaded \
+                         ({load_err}). Recover the quarantined file or fix the store, \
+                         then retry."
+                    ),
+                    None,
+                ));
+            }
+        }
 
         let exists = memory.snapshot().iter().any(|e| e.id == id);
         if !exists {
@@ -642,9 +915,14 @@ impl CodeBroMcpServer {
                 None,
             ));
         }
-        memory
-            .delete(&id)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if let Err(e) = memory.delete(&id, args.confirm) {
+            return match e {
+                crate::engineering_memory::runtime::EngineeringMemoryError::ConfirmationRequired(
+                    msg,
+                ) => Err(McpError::invalid_params(msg, None)),
+                other => Err(McpError::internal_error(other.to_string(), None)),
+            };
+        }
         memory
             .persist()
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -661,12 +939,13 @@ impl CodeBroMcpServer {
     /// Changes are validated before persistence; authored data is never
     /// overwritten by init's inference.
     #[tool(
-        description = "Update the persistent project identity (.codebro/project_identity.json): record goals, constraints, engineering decisions, roadmap items, the current sprint, coding conventions, or an architecture summary. This is the medium-high-trust 'declared intent' store — distinct from agent-recorded memory. Requires an existing identity (run codebro init once if absent)."
+        description = "Update the persistent project identity (.codebro/project_identity.json): record goals, constraints, decisions, roadmap items, sprint, conventions, or an architecture summary. This is the medium-high-trust declared-intent store. Requires an existing identity."
     )]
     async fn update_identity(
         &self,
         Parameters(args): Parameters<UpdateIdentityArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         use crate::project_identity::{
             DecisionStatus, EngineeringDecision, IdentityChanges, ProjectIdentityRuntime,
             ProjectIdentityUpdater, RoadmapItem, RoadmapStatus,
@@ -984,7 +1263,11 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<SandboxTestArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let command = resolve_test_command(&self.workspace_root, args.command.as_deref());
+        let command = resolve_test_command_filtered(
+            &self.workspace_root,
+            args.command.as_deref(),
+            args.test_filter.as_deref().unwrap_or(&[]),
+        );
         let cmd = crate::sandbox::SandboxCommand {
             command: command.clone(),
             working_directory: args.working_directory,
@@ -1003,13 +1286,7 @@ impl CodeBroMcpServer {
                 args.expected_success,
                 args.affected_fact_ids,
             );
-        let mut verification_obj = serde_json::Map::new();
-        verification_obj.insert("verified".to_string(), json!(verification.verified));
-        verification_obj.insert("summary".to_string(), json!(verification.summary));
-        verification_obj.insert("violations".to_string(), json!(verification.violations));
-        if let Some(ref ids) = verification.impacted_fact_ids {
-            verification_obj.insert("impacted_fact_ids".to_string(), json!(ids));
-        }
+        let verification_obj = self.verification_object(&verification);
         let payload = json!({
             "execution": verification.execution,
             "verification": verification_obj,
@@ -1051,13 +1328,7 @@ impl CodeBroMcpServer {
                 args.expected_success,
                 args.affected_fact_ids,
             );
-        let mut verification_obj = serde_json::Map::new();
-        verification_obj.insert("verified".to_string(), json!(verification.verified));
-        verification_obj.insert("summary".to_string(), json!(verification.summary));
-        verification_obj.insert("violations".to_string(), json!(verification.violations));
-        if let Some(ref ids) = verification.impacted_fact_ids {
-            verification_obj.insert("impacted_fact_ids".to_string(), json!(ids));
-        }
+        let verification_obj = self.verification_object(&verification);
         let payload = json!({
             "execution": verification.execution,
             "verification": verification_obj,
@@ -1172,6 +1443,7 @@ impl CodeBroMcpServer {
         description = "Perform a full engineering fact reindex: regenerate .codebro/facts.json by re-scanning the entire workspace. Use after source changes when apply_change.needs_reindex=true. This is a full rebuild, not incremental."
     )]
     async fn reindex(&self) -> Result<CallToolResult, McpError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let start = std::time::Instant::now();
 
         // The init pipeline is fully synchronous (filesystem walk +
@@ -1396,6 +1668,22 @@ impl CodeBroMcpServer {
         }
         if args.include_git_diff.unwrap_or(false) {
             inject_git_diff(&mut request, &self.workspace_root);
+        }
+
+        // Debugging mode: inject the latest deterministic root-cause
+        // hypotheses (if any) so the external LLM reasons OVER CodeBro's
+        // structured evidence rather than re-deriving it.
+        if matches!(mode, crate::consultant::types::ConsultantMode::Debugging) {
+            let guard = self.last_rca.lock().expect("last rca lock");
+            if let Some(rca) = guard.as_ref() {
+                let payload = serde_json::to_string(rca).unwrap_or_default();
+                request
+                    .files
+                    .push(crate::consultant::types::ConsultantFileContext {
+                        path: "codebro://root-cause-hypotheses".to_string(),
+                        content: payload,
+                    });
+            }
         }
 
         // Resolve provider and call consult.
@@ -1711,6 +1999,12 @@ pub struct SandboxTestArgs {
     /// independently verified by sandbox execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affected_fact_ids: Option<Vec<String>>,
+    /// Optional test-name filters (e.g. taken from `apply_change`'s
+    /// `recommended_tests`). Applied when the project's test runner supports
+    /// name selection (cargo, go, pytest); ignored for runners without a
+    /// standard selection mechanism, and when an explicit command overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_filter: Option<Vec<String>>,
 }
 
 /// Argument schema for `sandbox_build`.
@@ -1924,17 +2218,66 @@ fn inject_git_diff(
 
 /// Resolve a test command for the given workspace.
 fn resolve_test_command(workspace: &std::path::Path, explicit: Option<&str>) -> String {
+    resolve_test_command_filtered(workspace, explicit, &[])
+}
+
+/// Sanitize a test name for embedding in a runner selection expression
+/// (go's `-run` takes a regexp; identifiers need no escaping, anything
+/// else is dropped rather than guessed).
+fn sanitize_go_test_name(name: &str) -> Option<String> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Resolve a test command, optionally narrowed to specific test names.
+/// Filters are honored for runners with a standard selection mechanism
+/// (cargo passes multiple filters to libtest, go uses `-run`, pytest takes
+/// node ids); runners without one (npm/pnpm/yarn scripts) ignore them. An
+/// explicit command always wins untouched.
+fn resolve_test_command_filtered(
+    workspace: &std::path::Path,
+    explicit: Option<&str>,
+    filters: &[String],
+) -> String {
     if let Some(cmd) = explicit {
         return cmd.to_string();
     }
+    let filters: Vec<String> = filters
+        .iter()
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
     if workspace.join("Cargo.toml").exists() {
-        return "cargo test".to_string();
+        return match filters.is_empty() {
+            true => "cargo test".to_string(),
+            false => format!("cargo test {}", filters.join(" ")),
+        };
     }
     if workspace.join("go.mod").exists() {
-        return "go test ./...".to_string();
+        return match filters.is_empty() {
+            true => "go test ./...".to_string(),
+            false => {
+                let names: Vec<String> = filters
+                    .iter()
+                    .filter_map(|f| sanitize_go_test_name(f))
+                    .collect();
+                match names.len() {
+                    0 => "go test ./...".to_string(),
+                    // Single-name targeting only: Go regex alternation
+                    // needs `|`, which the local command policy blocks as
+                    // a shell metachar. Multi-filter falls back to the
+                    // honest full-suite run.
+                    1 => format!("go test -run {} ./...", names[0]),
+                    _ => "go test ./...".to_string(),
+                }
+            }
+        };
     }
     if workspace.join("package.json").exists() {
-        // Package-manager preference by lockfile.
+        // Package-manager preference by lockfile. No standard per-test
+        // selection mechanism — filters are ignored.
         if workspace.join("pnpm-lock.yaml").exists() {
             return "pnpm test".to_string();
         }
@@ -1947,7 +2290,14 @@ fn resolve_test_command(workspace: &std::path::Path, explicit: Option<&str>) -> 
         || workspace.join("pytest.ini").exists()
         || workspace.join("setup.py").exists()
     {
-        return "python -m pytest -q".to_string();
+        return match filters.is_empty() {
+            true => "python -m pytest -q --tb=long".to_string(),
+            // `-k` keyword selection matches test names as substrings
+            // (identifier-safe, no shell metacharacters); --tb=long keeps
+            // source frames in tracebacks so failures attribute to the
+            // mutated file, not just the test file.
+            false => format!("python -m pytest -q --tb=long -k {}", filters.join(" or ")),
+        };
     }
     "echo no project manifest detected use sandbox_exec with explicit command".to_string()
 }
@@ -2003,7 +2353,10 @@ mod phase8_tests {
         // Python project without node/cargo manifests.
         let py = tempfile::tempdir().unwrap();
         std::fs::write(py.path().join("pyproject.toml"), "[project]").unwrap();
-        assert_eq!(resolve_test_command(py.path(), None), "python -m pytest -q");
+        assert_eq!(
+            resolve_test_command(py.path(), None),
+            "python -m pytest -q --tb=long"
+        );
 
         // Explicit commands always win.
         assert_eq!(
@@ -2022,10 +2375,6 @@ mod phase8_tests {
         assert!(json["arch"].is_string());
         assert!(json["family"].is_string());
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[tool_handler]
@@ -2124,6 +2473,7 @@ mod tests {
             "engineering_facts",
             "engineering_memory",
             "apply_change",
+            "apply_changes",
             "record_memory",
             "delete_memory",
             "memory_stats",
@@ -2134,6 +2484,7 @@ mod tests {
             "impact_analyze",
             "reindex",
             "repository_health",
+            "update_identity",
             "consult",
         ];
 
@@ -2189,6 +2540,7 @@ mod tests {
             "engineering_facts",
             "engineering_memory",
             "apply_change",
+            "apply_changes",
             "record_memory",
             "delete_memory",
             "memory_stats",
@@ -2199,6 +2551,7 @@ mod tests {
             "impact_analyze",
             "reindex",
             "repository_health",
+            "update_identity",
             "consult",
         ] {
             assert!(
@@ -3108,6 +3461,108 @@ mod tests {
     }
 
     /// M2: failed apply_change must not return a success advisory.
+    /// Integration: `apply_changes` transaction semantics at the MCP layer.
+    /// Success applies every change (including nested creation); one stale
+    /// entry aborts the whole set with zero mutations.
+    #[tokio::test]
+    async fn apply_changes_transaction_applies_or_rolls_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server(&dir);
+
+        std::fs::write(dir.path().join("a.txt"), "alpha").expect("write");
+        let out = call_tool_text(
+            &server,
+            "apply_changes",
+            json!({"changes": [
+                {"path": "a.txt", "old": "alpha", "new": "beta"},
+                {"path": "nested/c.txt", "old": "", "new": "gamma"},
+            ]}),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["applied_count"], 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt"))
+                .unwrap()
+                .trim(),
+            "beta"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nested/c.txt"))
+                .unwrap()
+                .trim(),
+            "gamma"
+        );
+
+        // A stale old-text in one entry must reject preparation up front,
+        // leaving both files untouched.
+        let err = call_tool_err(
+            &server,
+            "apply_changes",
+            json!({"changes": [
+                {"path": "a.txt", "old": "stale", "new": "x"},
+                {"path": "b.txt", "old": "", "new": "fresh"},
+            ]}),
+        )
+        .await;
+        assert!(err.contains("stale"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt"))
+                .unwrap()
+                .trim(),
+            "beta"
+        );
+        assert!(!dir.path().join("b.txt").exists());
+    }
+
+    /// Integration: targeted test selection loop — `apply_change` returns
+    /// `recommended_tests` from the fact store's tested-linkage, and
+    /// `sandbox_test` narrows the run to exactly those tests.
+    #[tokio::test]
+    async fn apply_change_recommends_tests_and_sandbox_test_runs_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server(&dir);
+
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"targeted\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src").join("lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn adds() {\n        assert_eq!(add(2, 3), 5);\n    }\n}\n",
+        )
+        .unwrap();
+        crate::init::run(dir.path()).expect("init succeeds");
+
+        // Edit the function body; the advisory must recommend `adds`.
+        let out = call_tool_text(
+            &server,
+            "apply_change",
+            json!({"path": "src/lib.rs", "old": "    a + b", "new": "    a + b + 0"}),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let recommended = v["recommended_tests"]
+            .as_array()
+            .expect("recommended_tests present");
+        assert!(
+            recommended.iter().any(|t| t.as_str() == Some("adds")),
+            "expected 'adds' in {recommended:?}"
+        );
+
+        // Run only the recommended tests through the filter.
+        let run = call_tool_text(&server, "sandbox_test", json!({"test_filter": ["adds"]})).await;
+        let rv: serde_json::Value = serde_json::from_str(&run).expect("valid json");
+        assert_eq!(rv["execution"]["command"], "cargo test adds");
+        assert_eq!(rv["execution"]["exit_code"], 0);
+        assert_eq!(rv["verification"]["verified"], true);
+        let stdout = rv["execution"]["stdout"].as_str().unwrap_or_default();
+        assert!(stdout.contains("running 1 test"), "got: {stdout}");
+    }
+
     #[tokio::test]
     async fn apply_change_failure_returns_error_not_advisory() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3213,6 +3668,15 @@ mod tests {
                     .map_err(|e| e.to_string())?;
                 text_of(r)
             }
+            "apply_changes" => {
+                let p: ApplyChangesArgs =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .apply_changes(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
             "workspace_context" => {
                 let r = server
                     .workspace_context()
@@ -3300,6 +3764,79 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // ── Mutation-safety hardening: per-workspace mutation lock ───────────
+
+    /// A mutating tool call must block while the workspace mutation lock is
+    /// held by another caller, and complete once it is released. This pins
+    /// the serialization guarantee directly instead of relying on timing.
+    #[tokio::test]
+    async fn mutating_calls_serialize_on_the_workspace_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = std::sync::Arc::new(local_sandbox_server(&dir));
+
+        let guard = server.mutation_lock.lock().await;
+        let s2 = server.clone();
+        let mut task = tokio::spawn(async move {
+            call_tool_text(
+                &s2,
+                "record_memory",
+                json!({"key": "lock:blocked", "value": "v"}),
+            )
+            .await
+        });
+
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(100), &mut task)
+            .await
+            .is_err();
+        assert!(blocked, "mutating call must wait while the lock is held");
+
+        drop(guard);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("task must finish after the lock is released")
+            .expect("join ok");
+        assert!(out.contains("memory recorded"), "got: {out}");
+    }
+
+    /// Pipelined concurrent record_memory calls must not lose entries to
+    /// last-writer-wins persistence races: every entry survives a reload.
+    #[tokio::test]
+    async fn concurrent_record_memory_storm_preserves_every_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = std::sync::Arc::new(local_sandbox_server(&dir));
+
+        let mut tasks = Vec::new();
+        for i in 0..16 {
+            let s = server.clone();
+            tasks.push(tokio::spawn(async move {
+                call_tool_text(
+                    &s,
+                    "record_memory",
+                    json!({"key": format!("storm:t{i}"), "value": "v"}),
+                )
+                .await
+            }));
+        }
+        for t in tasks {
+            let out = t.await.expect("join ok");
+            assert!(out.contains("memory recorded"), "got: {out}");
+        }
+
+        let fresh = CodeBroMcpServer::new(dir.path().to_path_buf());
+        let resolved = call_tool_text(
+            &fresh,
+            "engineering_memory",
+            json!({"task_keywords": ["storm:t"]}),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&resolved).expect("valid json");
+        assert_eq!(
+            v["entries"].as_array().map(|a| a.len()),
+            Some(16),
+            "every concurrently recorded entry must survive"
+        );
     }
 
     // ── RC.1 hardening: delete_memory confirm guard ──────────────────────
@@ -3725,14 +4262,108 @@ mod tests {
         assert!(!v["success"].as_bool().unwrap_or(false));
     }
 
+    /// Integration: a failing build yields structured diagnostics, a
+    /// compile_error classification, and module attribution from the fact
+    /// store — validation intelligence on top of raw evidence.
+    #[tokio::test]
+    async fn sandbox_build_reports_structured_diagnostics_for_compile_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"broken\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src").join("lib.rs"),
+            "pub fn broken() {\n    let x: i32 = \"not a number\";\n}\n",
+        )
+        .unwrap();
+        let server = local_sandbox_server(&dir);
+
+        // The fact store needs a facts.json for module attribution.
+        crate::init::run(dir.path()).expect("init succeeds");
+
+        let out = call_tool_text(&server, "sandbox_build", json!({})).await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(v["verification"]["verified"], false);
+        assert_eq!(
+            v["verification"]["classification"].as_str(),
+            Some("compile_error"),
+            "got: {v}"
+        );
+        let diags = v["verification"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics present");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d["code"].as_str().is_some_and(|c| c.starts_with('E'))),
+            "expected a coded compiler diagnostic: {diags:?}"
+        );
+        let affected = v["verification"]["affected_modules"]
+            .as_array()
+            .expect("affected modules present");
+        assert!(
+            affected
+                .iter()
+                .any(|m| m.as_str().unwrap_or("").contains("src/lib.rs")),
+            "lib.rs diagnostic must map to its module: {affected:?}"
+        );
+    }
+
+    /// Integration: failure↔change correlation — a file edited moments ago
+    /// that now fails to compile is surfaced as `related_recent_changes`.
+    #[tokio::test]
+    async fn sandbox_build_correlates_failures_with_recent_edits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server(&dir);
+
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"corr\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src").join("lib.rs"),
+            "pub fn ok() -> i32 {\n    1\n}\n",
+        )
+        .unwrap();
+        crate::init::run(dir.path()).expect("init succeeds");
+
+        // Break the file through the guarded mutation seam.
+        call_tool_text(
+            &server,
+            "apply_change",
+            json!({"path": "src/lib.rs", "old": "    1", "new": "    \"not a number\""}),
+        )
+        .await;
+
+        let out = call_tool_text(&server, "sandbox_build", json!({})).await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(v["verification"]["verified"], false);
+        assert_eq!(
+            v["verification"]["classification"].as_str(),
+            Some("compile_error")
+        );
+        let related = v["verification"]["related_recent_changes"]
+            .as_array()
+            .expect("correlation present");
+        assert!(
+            related
+                .iter()
+                .any(|r| r["path"].as_str() == Some("src/lib.rs")),
+            "edited file must be correlated: {related:?}"
+        );
+        assert!(related[0]["seconds_ago"].is_u64());
+    }
+
     /// Integration: sandbox_build against the real cargo fixture.
     #[tokio::test]
     async fn sandbox_build_fixture_passes() {
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/cargo-project");
-        if !fixture.exists() {
-            return;
-        }
+            .join("../../tests/fixtures/cargo-project");
         let server = local_sandbox_server_for_path(&fixture);
         let out = call_tool_text(&server, "sandbox_build", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -3745,10 +4376,7 @@ mod tests {
     #[tokio::test]
     async fn sandbox_test_fixture_passes() {
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/cargo-project");
-        if !fixture.exists() {
-            return;
-        }
+            .join("../../tests/fixtures/cargo-project");
         let server = local_sandbox_server_for_path(&fixture);
         let out = call_tool_text(&server, "sandbox_test", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -3765,10 +4393,7 @@ mod tests {
     #[tokio::test]
     async fn sandbox_test_fixture_failing_reports_verification_failure() {
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/cargo-project-failing");
-        if !fixture.exists() {
-            return;
-        }
+            .join("../../tests/fixtures/cargo-project-failing");
         let server = local_sandbox_server_for_path(&fixture);
         let out = call_tool_text(&server, "sandbox_test", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -5504,5 +6129,51 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod debugging_consult_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn debugging_mode_injects_latest_hypotheses() {
+        use crate::consultant::types::{ConsultantMode, ConsultantRequest};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = CodeBroMcpServer::new(dir.path().to_path_buf());
+
+        // No analysis yet → no injection.
+        let mut req = ConsultantRequest {
+            provider: Default::default(),
+            mode: ConsultantMode::Debugging,
+            question: "q".into(),
+            context: None,
+            files: vec![],
+            include_git_diff: false,
+            include_project_context: false,
+            max_answer_length: 0,
+        };
+        server.inject_debugging_hypotheses(&mut req, &ConsultantMode::Debugging);
+        assert!(req.files.is_empty());
+
+        // Store an analysis → injected exactly once in debugging mode.
+        *server.last_rca.lock().unwrap() = Some(crate::debugging::types::RootCauseAnalysis {
+            status: crate::debugging::types::AnalysisStatus::Hypotheses,
+            failure_classification: "test_failure".into(),
+            hypotheses: vec![],
+            evidence_summary: vec![],
+            freshness: "stale".into(),
+            limitations: vec![],
+        });
+        server.inject_debugging_hypotheses(&mut req, &ConsultantMode::Debugging);
+        assert_eq!(req.files.len(), 1);
+        assert_eq!(req.files[0].path, "codebro://root-cause-hypotheses");
+        assert!(req.files[0].content.contains("test_failure"));
+
+        // Non-debugging modes never receive it.
+        let mut req2 = req.clone();
+        req2.files.clear();
+        server.inject_debugging_hypotheses(&mut req2, &ConsultantMode::Planning);
+        assert!(req2.files.is_empty());
     }
 }

@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **Phase-7 stabilization findings (all verified through the live MCP stdio runtime)**:
+  - `recommended_tests` over-matched: sibling tests in the edited file were recommended even when they never touch the edited code. Recommendations now use the edited line range (from the prepared change) against symbol spans — a test qualifies only if it exercises an *edited* symbol or its own body was edited. Unnamed (`unknown`) tests are never recommended.
+  - libtest panic lines with thread ids (`thread 't' (12345) panicked at f.rs:1:2:`) now parse; cargo runner summaries ("error: test failed, to rerun pass…") no longer leak in as compiler diagnostics.
+  - `classify_failure` precedence: synthetic `panic` codes and column-less runtime assertion frames (pytest long tracebacks) no longer count as compile evidence; genuine compiler shapes (E-codes, columns, "could not compile") still win.
+  - Go single-colon log lines (`file.go:14: msg`) parse as file+line evidence.
+  - Local sandbox policy: `go test -run <Name>` accepted (single name; regex alternation needs `|`, a blocked shell metachar — multi-filter falls back to the full suite); `python`/`python3 -m pytest [-q|-x|-k|--tb=long …]` accepted in Python workspaces only (closes the gap where auto-detected pytest runs were always denied).
+  - pytest runs synthesize `--tb=long` so failures attribute to the mutated file; generic source-frame lines (`helpers.py:3: AssertionError`) parse for known source extensions.
+  - `related_recent_changes`: deduplicated paths, dual correlation channels with explicit `via` provenance (`diagnostic_file`, `recommended_tests`), so value-mismatch failures whose tracebacks stay inside the test file still correlate to the edit that caused them.
+
+### Added
+- **Let-binding type inference** — same-body bindings now resolve variable receivers without inventing types: Rust `let p = User::new(); p.save()`, Python `p = User(); p.save()` (constructor naming convention), JS/TS `const w = new Widget()` and TS annotations (`let s: Store`). Bindings reset at callable boundaries; anything not constructor-shaped stays untyped. Roadmap item `let-binding-type-inference` completed.
+- **Failure↔change correlation** — the server keeps an in-memory ring of recently applied change paths; when a verification fails with parsed diagnostics, responses include `related_recent_changes` (edited files ∩ failing files, with age). Circumstantial by design, never persisted.
+- **Python/JS/TS call-graph parity** — the parser platform now extracts calls and structured imports for all six supported languages:
+  - Python: `call` expressions (bare, `self.`/`cls.` receivers) and `import` / `from … import` statements (module-level resolution; relative imports keep their dots; aliases captured).
+  - JavaScript/TypeScript: `call_expression` (bare, `this.` receiver), `new` constructors, and `import`/`export … from` source specifiers (relative/path-scoped only; bare external packages excluded).
+  - These feed the existing verified-edge pipeline: cross-module call edges, `TestFact.tested` linkage, and impact analysis now work for Python and JS/TS projects.
+- **Targeted test selection** — `apply_change` responses now carry `recommended_tests`: tests located in the changed file plus tests exercising any affected symbol via `TestFact.tested`, deterministically sorted and capped at 32. `sandbox_test` accepts an additive optional `test_filter` argument that narrows the auto-detected run to exactly those tests (`cargo test n1 n2`, `go test -run '^(n1|n2)$' ./...`, `pytest n1 n2`); runners without a standard selection mechanism ignore it, and an explicit `command` always wins.
+- **Validation intelligence** — `sandbox_test` / `sandbox_build` / `sandbox_exec` verification results now include structured `diagnostics` parsed from build/test output (rustc errors/warnings with source spans, cargo test failures with panic locations, Go compile errors and `--- FAIL` markers, pytest summary lines) plus a coarse `classification` (`success` | `compile_error` | `test_failure` | `timeout` | `denied` | `unknown_failure`) with deterministic precedence. New module: `crates/sandbox-runtime/src/sandbox/diagnostics.rs`.
+- **Module attribution for failures** — tool responses add `affected_modules`, mapping diagnostic file paths to owning modules via the cached fact store.
+- Parser is bounded (50k lines) and evidence-conservative: it never invents facts; bare `error:` lines without code/span/compile-summary evidence classify as `unknown_failure`, not `compile_error`.
+
+### Fixed
+- **JS/TS method names were "unknown"** — `method_definition` names live in `property_identifier`, not `identifier`; method symbols (and call-caller attribution inside methods) now carry real names.
+- **Pipelined mutation race** — mutating MCP tools (`apply_change`, `apply_changes`, `record_memory`, `delete_memory`, `update_identity`, `reindex`) now serialize on a per-workspace lock, so a client that pipelines calls without awaiting can no longer lose writes to last-writer-wins persistence races. Scope is one server process; cross-process writers still rely on the documented single-writer assumption.
+- **Prepare→apply TOCTOU windows in ChangeEngine** — apply-time re-validation of canonical path containment: a target file (or creation parent directory) swapped to a symlink after preparation is now refused instead of writing through the link outside the workspace root.
+- **`delete_memory` fail-closed load** — deletion over an unloadable store now refuses instead of proceeding from an empty view; the confirmation gate additionally lives in the memory runtime itself (`EngineeringMemoryError::ConfirmationRequired`), so every caller is protected rather than only the MCP handler.
+- **Non-atomic project-identity writes** — all eight identity files are persisted via atomic write-rename (`codebro_core::persistence::write_atomic`), matching the durability mandate in core.
+
+### Removed
+- Dead `ChangePlan::apply_and_verify` post-apply verification seam (zero callers; verification evidence lives in `sandbox_test`/`sandbox_build`).
+- **Dead parser sub-platforms** — `intelligence/{index,graph,search,context,reasoning,lsp}` (zero external consumers since the legacy retirement) deleted, dropping the unused `rusqlite`, `uuid`, and `walkdir` dependencies from `codebro-parsers`.
+- Dead `ChangeReview` / `PatchSet` primitives, `FALLBACK_MODEL` CLI constant, and an unreferenced serde default helper.
+
+### Fixed
+
+### Added
+- Regression coverage: lock serialization pinned directly (blocked-while-held), 16-way concurrent `record_memory` storm preserves every entry, and both symlink-swap-after-prepare escapes are denied at apply time.
+- **Symbol visibility end-to-end** — the Rust parser emitted `"public"`/`"crate"` while the indexer expected `"pub"`/`"pub(crate)"` (and `pub(crate)` was shadowed by the `contains("pub")` branch). Visibility now derives from the precise `visibility_modifier` AST node and flows through as `Public`/`Internal`; private items remain `Unknown` rather than misclassified.
+- **Heuristic references gating** — `build_module_relationship_map` probed module-id pairs against a set containing raw symbol-id pairs from verified calls, so references almost never fired. Verified calls are now projected into module space via each symbol's owning module. References flow again (839 on this repo, previously 0).
+- **Imports edge direction convention** — verified and heuristic `Imports` relationships previously stored source=imported/target=importer, contradicting their id strings, `Calls`, dependency ids, and what `gather_modules` assumes. Edges now consistently store source=importer → target=imported; heuristic pairs are oriented lexicographically for determinism.
+- **Sandbox fixture integration tests silently skipping** — tests resolved fixtures at `crates/mcp-server/tests/fixtures/` while they live at the repo root `tests/fixtures/`. Paths corrected and skip guards removed; both fixture manifests gained an empty `[workspace]` table so they build standalone.
+- **Stale tool-enumeration regression lists** — description/router tests covered 15 of 17 tools; `apply_changes` and `update_identity` added (surfacing an over-long `update_identity` description, now shortened).
+
+### Added
+- **Marker-based test discovery** — Rust functions with `#[test]`/`#[tokio::test]` attributes and Go `Test*` functions are registered as test facts without relying on path/name heuristics (`ParsedSymbol.is_test`).
+- **Test↔symbol linkage** — `build_relationships` returns verified call edges and the init pipeline populates `TestFact.tested` from calls made by a test's own function symbol, giving `impact_analyze` a real change→test mapping (666/826 tests linked on this repo).
+- **MCP-level `apply_changes` coverage** — transaction dispatch in the test helper plus an applies-or-aborts-with-zero-mutations integration test.
+
+### Changed
+- Parse-cache schema bumped 1→2; existing caches are invalidated once and files re-parsed (required by the visibility vocabulary change).
+
+---
+
 ## [0.7.0-mcp-rc2] - 2026-08-17
 
 > **Status:** Release candidate for real-world agent dogfooding and stabilization.

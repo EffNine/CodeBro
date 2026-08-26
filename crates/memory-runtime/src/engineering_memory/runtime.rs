@@ -35,6 +35,8 @@ pub enum EngineeringMemoryError {
     WrongSchema(String),
     /// Resolution error.
     Resolution(EngineeringMemoryResolveError),
+    /// A destructive operation was attempted without explicit confirmation.
+    ConfirmationRequired(String),
     /// Generic error.
     Generic(String),
 }
@@ -50,6 +52,7 @@ impl std::fmt::Display for EngineeringMemoryError {
                 write!(f, "wrong schema version: {}", v)
             }
             EngineeringMemoryError::Resolution(e) => write!(f, "resolution: {}", e),
+            EngineeringMemoryError::ConfirmationRequired(msg) => write!(f, "{}", msg),
             EngineeringMemoryError::Generic(msg) => write!(f, "generic: {}", msg),
         }
     }
@@ -337,7 +340,16 @@ impl<P: ProjectIdentityProvider + Clone> EngineeringMemoryRuntime<P> {
     // ── Delete ───────────────────────────────────────────────────────────
 
     /// Delete an entry by id.
-    pub fn delete(&mut self, id: &str) -> Result<(), EngineeringMemoryError> {
+    ///
+    /// The confirmation gate lives HERE, not only at the tool layer: every
+    /// caller must pass `confirm = true`, so a destructive delete can never
+    /// be triggered accidentally by a new call site that forgets the guard.
+    pub fn delete(&mut self, id: &str, confirm: bool) -> Result<(), EngineeringMemoryError> {
+        if !confirm {
+            return Err(EngineeringMemoryError::ConfirmationRequired(format!(
+                "delete rejected: set confirm=true to delete '{id}'"
+            )));
+        }
         let pos = self
             .entries
             .iter()
@@ -545,19 +557,33 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_requires_explicit_confirmation() {
+        let (mut runtime, _tmp) = setup();
+        runtime
+            .record(make_entry("e1", "language", "rust"))
+            .unwrap();
+        assert!(matches!(
+            runtime.delete("e1", false),
+            Err(EngineeringMemoryError::ConfirmationRequired(_))
+        ));
+        runtime.delete("e1", true).unwrap();
+        assert_eq!(runtime.entry_count(), 0);
+    }
+
+    #[test]
     fn test_delete_removes_entry() {
         let (mut runtime, _tmp) = setup();
         runtime
             .record(make_entry("e1", "language", "rust"))
             .unwrap();
-        runtime.delete("e1").unwrap();
+        runtime.delete("e1", true).unwrap();
         assert_eq!(runtime.entry_count(), 0);
     }
 
     #[test]
     fn test_delete_missing_entry_fails() {
         let (mut runtime, _tmp) = setup();
-        let result = runtime.delete("nonexistent");
+        let result = runtime.delete("nonexistent", true);
         assert!(result.is_err());
     }
 

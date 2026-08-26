@@ -153,6 +153,11 @@ Stated plainly, without optimism bias:
   pipelines multiple mutations without waiting may observe last-writer-
   wins on the affected state file. Remediation path: a per-workspace
   mutation lock in the server.
+  > **Update (2026-08-25):** the server-side remediation has shipped —
+  > mutating MCP tools now serialize on a per-workspace lock, and
+  > ChangeEngine re-validates path containment at apply time (closing the
+  > prepare→apply symlink-swap window). The cross-process `codebro init`
+  > assumption above still applies.
 - **One accepted security advisory.** `cargo audit` is clean at release
   except RUSTSEC-2025-0009 (`ring` 0.17.9: AES functions may panic when
   overflow checking is enabled — not reachable in release builds where

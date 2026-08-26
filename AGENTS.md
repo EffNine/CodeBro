@@ -2,321 +2,149 @@
 
 ## Repo at a glance
 
-- **Language / toolchain:** Rust 2021 workspace. Ten domain crates under `crates/` (core, parsers, fact-store, identity-runtime, memory-runtime, sandbox-runtime, impact-engine, indexer, change-engine, mcp-server); the binary target `codebro` lives in `codebro-mcp-server`. Dependency direction is enforced by `scripts/check_workspace_deps.sh` (mcp-server → services → parsers/core).
+- **Language / toolchain:** Rust 2021 workspace. Ten crates under `crates/` (core, parsers, fact-store, identity-runtime, memory-runtime, sandbox-runtime, impact-engine, indexer, change-engine, mcp-server). No `src/` leaf code — all sources live in `crates/<crate>/src/`. Dependency direction is enforced by `scripts/check_workspace_deps.sh` (mcp-server → services → parsers/core).
+- **Binary entry point:** `crates/mcp-server/src/main.rs` → `codebro_mcp_server::run()`.
 - **Positioning:** Engineering context & memory layer for AI coding agents, exposed as an MCP server.
-- **Entry point:** `src/main.rs` → `cli::run()` → dispatches to `serve`, `init`, `doctor`, or `list-models`.
-- **Tests:** `cargo test`. Run focused: `cargo test <module_name>`. Test counts evolve — trust the current output rather than hardcoding numbers.
-- **Build:** `cargo build --release && cargo install --path .`
-- **CLI commands:** `codebro serve --root <path>`, `codebro init --root <path>`, `codebro doctor --root <path>`, `codebro list-models`, `codebro facts diff --root <path>`.
-- **Config:** Optional `~/.codebro/config.toml` (provider, base_url, model, api_key). Env vars honoured: `CODEBRO_API_KEY`, `CODEBRO_BASE_URL`, `CODEBRO_MODEL`.
-- **Sandbox config:** `OPEN_SANDBOX_URL` activates the OpenSandbox backend (lifecycle API: create sandbox → SSE command → delete). Optional: `OPEN_SANDBOX_API_KEY`, `OPEN_SANDBOX_TIMEOUT_SECS`, `OPEN_SANDBOX_MAX_OUTPUT_BYTES`, `OPEN_SANDBOX_IMAGE`, `OPEN_SANDBOX_RESOURCE_CPU`, `OPEN_SANDBOX_RESOURCE_MEMORY`. When configured but unavailable, execution fails closed — no silent Local fallback.
-- **Project state:** `.codebro/` directory inside the workspace root (facts.json, engineering_memory.json, project_identity.json, metadata.json). Not part of the source tree; ignored by git.
+- **Tests:** `cargo test`. Focused: `cargo test <module_name>`. Trust current output — test counts evolve.
+- **Build:** `cargo build --release && cargo install --path crates/mcp-server`
+- **CLI:** `codebro serve --root <path>`, `codebro init --root <path>`, `codebro doctor --root <path>`, `codebro list-models`, `codebro facts diff --root <path>`.
+- **Config:** Optional `~/.codebro/config.toml`. Env vars honoured: `CODEBRO_API_KEY`, `CODEBRO_BASE_URL`, `CODEBRO_MODEL`.
+- **Sandbox config:** `OPEN_SANDBOX_URL` activates the OpenSandbox backend. When configured but unavailable, execution fails closed — no silent Local fallback.
+- **Project state:** `.codebro/` inside the workspace root (facts.json, engineering_memory.json, project_identity.json, metadata.json). Git-ignored; not part of the source tree.
 
-## Product identity
+## Core architecture
 
-CodeBro is:
-- Persistent engineering context and memory for AI coding agents.
-- An MCP server that answers "where am I, what are this project's verified facts, and what do we know from prior sessions."
-- An isolated execution runtime with policy-gated command execution via sandbox tools.
+MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` branch.
 
-CodeBro is NOT:
-- A replacement coding agent.
-- A model provider.
-- A chat UI or TUI.
-- A generic filesystem / shell / Git MCP.
-- An autonomous agent loop.
-- A vector database or embedding service.
-
-The host agent owns: model, conversation, planning, tool selection, native Read/Grep/Edit tools, execution strategy, UX.
-CodeBro owns: project/workspace identity, structured engineering facts, persistent engineering memory, optional guarded mutation, sandbox execution.
-
-## Canonical architecture
-
-The MCP-first architecture is the production path. The old TUI was removed from `main` (ADR-012) and is preserved only on the `tui-legacy` branch.
-
-Core subsystem modules (paths relative to their owning crate under `crates/<crate>/src/`):
-
-| Directory | Role |
-|-----------|------|
-| `crates/mcp-server/src/mcp/` | MCP server: 17 tools over stdio (the public interface) |
-| `mcp/facts.rs` | Deterministic relevance-ranked fact retrieval engine |
-| `sandbox/` | Sandbox execution abstraction (trait + local + OpenSandbox backends + VerificationResult contracts) |
-| `init/` | Fact-store population pipeline (`codebro init`) |
-| `doctor/` | Diagnostics (`codebro doctor`) |
-| `engineering_facts/` | Canonical facts model (symbols, modules, packages, tests, build targets, dependencies, relationships, references, diagnostics, architecture rules) |
-| `fact_store/` | Immutable indexed fact store + validation, lookup, query, snapshot, statistics |
-| `engineering_memory/` | Persistent engineering memory runtime (load, record, update, delete, snapshot, resolve) |
-| `project_identity/` | Project identity runtime (workspace language, frameworks, constraints) |
-| `coding/` | ChangeEngine: guarded mutation seam (permissions, limits, contract, runtime) |
-| `cli/` | CLI parsing (serve, init, doctor, list-models) |
-| `intelligence/` | Tree-sitter parser platform (Rust, Python, JavaScript, TypeScript, Go) |
-| `memory_runtime/` | Generic memory runtime (used by engineering_memory) |
-| `provider_runtime/` | Provider registry, health, circuit breaker, cost tracking |
-| `config/` | Configuration loading / persistence |
-| `workspace_runtime/` | Workspace discovery, metadata, environment detection |
+| Crate / path | Role |
+|---|---|
+| `crates/mcp-server/src/mcp/mod.rs` | MCP server: 17 tools over stdio (`rmcp` transport) |
+| `crates/mcp-server/src/mcp/facts.rs` | Relevance-ranked fact retrieval engine |
+| `crates/sandbox-runtime/src/sandbox/` | Sandbox execution abstraction (trait + local + OpenSandbox backends) |
+| `crates/indexer/src/init/` | Fact-store population pipeline (`codebro init`) |
+| `crates/mcp-server/src/doctor/` | Diagnostics (`codebro doctor`) |
+| `crates/fact-store/src/engineering_facts/` | Canonical facts model (symbols, modules, packages, tests, build targets, dependencies, relationships, references, diagnostics, architecture rules) |
+| `crates/fact-store/src/fact_store/` | Immutable indexed fact store + validation, lookup, query, snapshot |
+| `crates/memory-runtime/src/engineering_memory/` | Persistent engineering memory runtime (load, record, update, delete, snapshot, resolve) |
+| `crates/identity-runtime/src/project_identity/` | Project identity runtime |
+| `crates/change-engine/src/coding/` | ChangeEngine: guarded mutation seam |
+| `crates/parsers/src/intelligence/` | Tree-sitter parser platform (Rust, Go, Python, JS, TS) |
+| `crates/core/src/` | Shared primitives (provenance, error, config, persistence, tools) |
 
 ## Things that are easy to get wrong
 
-1. **Legacy modules were removed in ADR-012.** Do not reference or recreate:
-   - `src/context/` — superseded by `engineering_context` + `assembly`
-   - `src/prompt/` — superseded by `prompt_builder`
-   - `src/indexer/` (`RepositoryIndex`) — dead after context removal
-   - `intelligence/memory/` (`IntelligenceMemory`) — superseded by `project_identity` / `engineering_facts`
-   - `reliability/health.rs` and `reliability/circuit_breaker.rs` — moved to `provider_runtime`
-
-2. **The `#[allow(...)]` blanket at the top of every module.** Every source file starts with `#![allow(dead_code, unused_imports, unused_variables, clippy::all)]`. This is intentional and not a signal to remove them.
-
-3. **The pre-existing clippy warning is known.** `src/intelligence/parser/tree_sitter.rs:813` has an unreachable pattern (`method_declaration` appears twice). It generates a warning but does not affect correctness. Do not paper over it with a structural change unless the duplication is genuinely a bug.
-
-4. **Async throughout.** `tokio` with `#[tokio::main]` and `#[tokio::test]`. Never block on futures at the top level; use `std::thread::spawn` + dedicated runtime when a sync context is required (see `cli::run` model discovery).
-
-5. **Tool arguments are passed as JSON strings, not typed structs.** The MCP handler deserializes at runtime.
-
-6. **Mock providers are the standard for integration tests.** Implement the `Provider` trait directly (see `src/planning/tests.rs` for the `PlanningMockProvider` pattern).
-
-7. **Temp directories via `tempfile::tempdir()` for all filesystem tests.** Do not write to `/tmp` directly.
+1. **No `src/` leaf code.** All Rust sources live under `crates/<crate>/src/`. Don't look for `src/main.rs` or `src/coding/` at the workspace root.
+2. **`#![allow(...)]` at the top of every module.** This is intentional — the crates expose deliberate product surface beyond current callers. Do not remove these.
+3. **Async throughout.** `tokio` with `#[tokio::main]` and `#[tokio::test]`. Never block on futures at top level.
+4. **Tool arguments are typed structs.** Handlers take `Parameters<T>` where `T` derives `Deserialize + Serialize + schemars::JsonSchema`; rmcp generates each tool's input schema from it. The test helper `call_tool` deserializes JSON into these types — keep both in sync when adding tools.
+5. **Mock providers in tests.** Implement the `Provider` trait directly (see `crates/mcp-server/src/consultant/providers/mock.rs`).
+6. **Temp directories via `tempfile::tempdir()` for all filesystem tests.** Never write to `/tmp` directly.
+7. **Imports edge direction.** `RelationshipKind::Imports` facts store source=importer → target=imported, matching `Calls` (caller→callee) and `dep::<a>-><b>`. Do not flip orientation in producers or consumers.
 
 ## MCP contract
 
-The server exposes exactly 17 tools over stdio (`rmcp` transport; the v1 contract is frozen in `docs/MCP_API_V1.md`). MCP handlers are thin adapters — they do not duplicate business logic; they construct runtime instances and delegate.
+17 tools over stdio (`rmcp`). Handlers are thin adapters — construct runtimes and delegate, do not duplicate logic. Full design: `docs/design/MCP_SERVER.md`.
 
-### Tool inventory
-
-| Tool | Read/Write | Description |
-|------|------------|-------------|
-| `workspace_context` | read | Compact workspace orientation: project identity, workspace root, fact-store counts. Call first to understand the project. |
-| `engineering_facts` | read | Relevance-ranked fact retrieval over verified facts (symbols, modules, tests, packages, build targets, dependencies). Supports `query`, `kind`, `path`, `limit` filters. Returns compact fact records with locations and provenance (not raw ids). Zero-result responses include deterministic recovery hints. |
-| `engineering_memory` | read | Resolve persistent engineering memory (decisions, constraints, prior context) by task keywords. Entries carry confidence, source, and tags so the agent can judge trustworthiness. Memory is bounded by the resolver's entry/token budget. |
-| `memory_stats` | read | Read-only statistics about the engineering memory store: entry count, configured token budget, tag distribution, average confidence, oldest/newest timestamps. |
-| `record_memory` | write | Upsert a persistent engineering memory entry. Values are secret-redacted before storage. Updating an existing key updates the full logical entry (value AND confidence, importance, tags, source). Keys are capped at 256 chars; values at 64 KB; tags at 32 entries, 64 chars each. |
-| `delete_memory` | write | Delete an engineering memory entry by exact key. **Requires `confirm=true`** — omitting it is a no-op. Prevents accidental or speculative deletion. Deleting a missing key errors. |
-| `update_identity` | write | Update the persistent project identity (`.codebro/project_identity.json`): description, constraints, engineering decisions, roadmap items, sprint, conventions, patterns, architecture summary. This is the medium-high-trust "declared intent" store — distinct from agent-recorded memory. Requires an existing identity (`codebro init` creates one). List fields append new unique entries; duplicate decisions/roadmap titles are reported as skipped, not errors. Decision ids are derived from titles; agent-recorded decisions default to status `accepted`. |
-| `apply_change` | write *(optional)* | Guarded single-file mutation through the ChangeEngine. Enforces workspace boundary, refuses stale or ambiguous edits. For new files pass `old=""`. Agents should use their native editing tools for normal coding edits; this is available for controlled/autonomous workflows. |
-| `apply_changes` | write | Transactional multi-file mutation through the ChangeEngine: validate all → conflict pass (staleness across the set) → sequential apply with automatic rollback on first failure. All-or-nothing. |
-| `sandbox_exec` | write | Execute a command in an isolated sandbox. Returns structured evidence with provenance: `exit_code`, `stdout`, `stderr`, `duration_ms`, `success`, `timeout`, `denied`, `execution_id`, `timestamp`, `repo_identity`, `repo_state`, `sandbox_capabilities`, `reproducibility`, `resolved_command`. Only read-only build/test/lint commands are permitted. Secret-redacted output. |
-| `sandbox_test` | write | Run the project's tests with structured verification. Auto-detects project type (cargo → `cargo test`, go → `go test`, npm → `npm test`). Returns `execution` + `verification` (pass/fail + violations). Execution evidence includes provenance envelope. Optional `expected_exit_code` and `expected_success` contracts. |
-| `sandbox_build` | write | Build/check the project with structured verification. Auto-detects project type (cargo → `cargo check`, go → `go build`, npm → `npm run build`). Returns `execution` + `verification`. Execution evidence includes provenance envelope. |
-| `sandbox_status` | read | Return sandbox runtime status: `backend` (local/opensandbox), `mode`, `available`, and formal `capabilities` descriptor. Call before sandbox tools to understand execution guarantees (isolation level, filesystem scope, network access, timeouts). Also returns `opensandbox_configured` to distinguish explicit config from default local. |
-| `impact_analyze` | read | Structural impact analysis: given a symbol, file, module, or package, returns directed relationship edges (callers, importers, references), related tests, owning module/package, and provenance metadata. Descriptive evidence only — no risk scores or prescriptions. |
-| `reindex` | write | Perform a full engineering fact reindex: regenerate `.codebro/facts.json` by re-scanning the entire workspace via the existing `codebro init` pipeline. Use after source changes when `apply_change.needs_reindex=true`. Returns `status`, `fact_counts`, `generation_repo_state`, `validation`, and `duration_ms`. This is a full rebuild, not incremental. |
-| `repository_health` | read | Return a structured read-only health report for the CodeBro workspace (exit code, status, per-check results, summary). Delegates to the existing `codebro doctor` implementation. Checks: workspace_root, .codebro, project_identity, facts, engineering_memory, git. |
-| `consult` | write | Ask an AI consultant (Conductor gateway) for opinions on architecture, debugging, code review, planning, research, or second opinions. Supports provider selection (`auto`/`conductor`), mode shaping, and automatic injection of CodeBro engineering context (facts, memory, git diff). |
-
-Full design: [`docs/design/MCP_SERVER.md`](docs/design/MCP_SERVER.md).
-
-### Server instructions
-
-The `ServerInfo.instructions` field (embedded in `#[tool_handler]`) tells connected agents when and how to use each tool. These instructions are part of the public contract and must stay accurate.
+| Tool | R/W | Description |
+|---|---|---|
+| `workspace_context` | read | Project orientation: identity, root, fact counts |
+| `engineering_facts` | read | Relevance-ranked fact retrieval (lexical matching, not embeddings). Filters: `query`, `kind`, `path`, `limit` |
+| `engineering_memory` | read | Resolve persistent memory by task keywords. Entries carry confidence, source, tags |
+| `memory_stats` | read | Store stats: entry count, token budget, tag distribution, confidence, recency |
+| `record_memory` | write | Upsert a memory entry (secret-redacted). Updating a key replaces the full logical entry |
+| `delete_memory` | write | Delete by exact key. **Requires `confirm=true`** — omitting is a no-op |
+| `update_identity` | write | Update project identity (`.codebro/project_identity.json`). Requires existing identity |
+| `apply_change` | write | Guarded single-file mutation via ChangeEngine. For new files pass `old=""` |
+| `apply_changes` | write | Transactional multi-file mutation: validate → conflict check → apply with rollback |
+| `sandbox_exec` | write | Execute command in isolated sandbox. Read-only build/test/lint only |
+| `sandbox_test` | write | Run tests with structured verification. Auto-detects project type |
+| `sandbox_build` | write | Build/check with structured verification |
+| `sandbox_status` | read | Sandbox runtime status and capabilities |
+| `impact_analyze` | read | Structural impact: directed edges, related tests, provenance |
+| `reindex` | write | Full fact reindex via `codebro init` pipeline |
+| `repository_health` | read | Workspace health report (delegates to `codebro doctor`) |
+| `consult` | write | Ask Conductor gateway for opinions (provider/mode shaped) |
 
 ## Engineering facts
 
-### How facts are generated
-
-`codebro init` scans the workspace with tree-sitter parsers and freezes results into `.codebro/facts.json`. Supported languages (verified in `src/init/mod.rs`):
-- Rust (via `Cargo.toml` manifest + tree-sitter-rust)
-- Go (via `go.mod` manifest + tree-sitter-go)
-
-The init pipeline also builds cross-module **relationship facts** and **reference facts**:
-- **Verified edges** — AST-derived from actual `call_expression` nodes (Rust/Go) and `use`/`import` statements. Tagged `provenance=verified`.
-- **Heuristic edges** — symbol name + kind co-occurrence across modules when no AST evidence exists. Tagged `provenance=heuristic` in metadata.
-- Deduplication: verified edges win over heuristic duplicates for the same `(source, target, kind)` tuple.
-
-Other tree-sitter parsers are available (Python, JavaScript, TypeScript) but `init` currently only auto-detects Rust and Go manifests.
-
-### Storage
-
-Facts are stored in `.codebro/facts.json` as a `FactsModel`. The MCP server loads this into an immutable `FactStore` once per server process (cached by mtime). After `build()`, the store is frozen — no mutation path.
-
-### Retrieval
-
-`engineering_facts` uses deterministic lexical string matching (exact name 100, prefix 80, substring 60, path 30, summary 15), NOT embeddings or vector search. Results are sorted deterministically: score desc, kind asc, name asc, path asc. Limit defaults to 10, hard cap is 50.
-
-An empty query without `kind` or `path` filter is rejected (would enumerate the whole store ambiguously).
-
-### Source of truth
-
-The authoritative source for verified facts is `.codebro/facts.json`, produced by `codebro init`. The fact store validates for duplicates, broken indexes, missing ids, and orphan records. `codebro doctor` surfaces validation issues.
+- `codebro init` scans with tree-sitter and persists to `.codebro/facts.json`. Auto-detects Rust (`Cargo.toml`), Go (`go.mod`), Node (`package.json`) and Python (`pyproject.toml` / `setup.py` / `setup.cfg` / `requirements.txt`) manifests.
+- Verified edges come from AST (`call_expression`, `use`/`import`). Heuristic edges from symbol co-occurrence. Verified wins over heuristic for the same `(source, target, kind)` tuple.
+- Test facts: Rust `#[test]`-style attributes and Go `Test*` prefixes mark tests; `TestFact.tested` lists symbols exercised by verified calls from the test's own function.
+- Parse cache is content-addressed (SHA-256) and schema-versioned — bump `SCHEMA` in `crates/indexer/src/init/cache.rs` when parse output shape changes.
+- `engineering_facts` uses deterministic lexical matching (exact 100, prefix 80, substring 60, path 30, summary 15), NOT embeddings. Limit defaults to 10, hard cap 50.
+- An empty query without `kind` or `path` is rejected.
+- The fact store is immutable once loaded (cached by mtime). `.codebro/facts.json` is the source of truth.
 
 ## Engineering memory
 
-### Operational model
-
-Agents should:
-- Use `workspace_context` for initial project orientation.
-- Use `engineering_facts` for structured, project-wide questions about code.
-- Use `engineering_memory` when prior engineering decisions or context matter.
-- Use `record_memory` for durable decisions worth preserving across sessions.
-- Use `memory_stats` to judge whether the store holds meaningful state before relying on it.
-
-Agents should NOT:
-- Treat every memory entry as verified truth.
-- Overwrite memory casually (use explicit keys; upsert is intended for updates).
-- Delete memory casually (`confirm=true` gate prevents accidents).
-- Bypass the memory runtime (no direct file writes to `.codebro/engineering_memory.json`).
-- Create a parallel memory store.
-- Assume memory is unlimited.
-
-### Resolution behaviour
-
-Memory resolution is bounded:
-- Max entries: 20 (`DEFAULT_MAX_ENTRIES`)
-- Token budget: 500 (`DEFAULT_TOKEN_BUDGET`)
-- Min confidence: 0.3 (`DEFAULT_MIN_CONFIDENCE`)
-
-Entries are ranked by importance desc, confidence desc, key asc, id asc. Oversized entries that exceed the remaining budget are returned as explicit excerpts (truncated at a sentence/paragraph boundary when possible, otherwise hard-cut) with the marker `…[truncated for memory budget]`. Truncation is always explicit — never silent.
-
-### Persistence
-
-Memory is persisted to `.codebro/engineering_memory.json` with schema version `1.0.0`. The file includes `workspace_root`, `schema_version`, `entries`, and `updated_at`. Updates (via `record_memory` on an existing key) replace the full logical entry — value, confidence, importance, tags, and source — while preserving id, key, and created_at.
-
-## Trust model
-
-Three distinct classes of information are never blurred:
-
-| Class | Source | Trust level | Surface |
-|-------|--------|-------------|---------|
-| **Verified facts** | `codebro init` (tree-sitter scan of real source) | High — deterministic, provenance-carrying, validated (0-issue store) | `engineering_facts`, `workspace_context` |
-| **Engineering decisions / identity** | Human-authored project identity and constraints | Medium-high — declared intent | `workspace_context` (identity), `record_memory` with explicit source |
-| **Agent-recorded memory** | Agents calling `record_memory` | **Low — unverified, self-declared confidence** | `engineering_memory`, `memory_stats` |
-
-Critical invariant: agent-recorded memory is **never** promoted to the verified fact store. There is no promotion path. The two stores are structurally separate.
+- Resolution bounded: max 20 entries, 500-token budget, min confidence 0.3.
+- Oversized entries are returned as explicit excerpts with `…[truncated for memory budget]` marker — never silently truncated.
+- **Critical invariant:** agent-recorded memory is never promoted to the verified fact store. The two stores are structurally separate.
+- Persistence schema version: `1.1.0` (adds lifecycle/provenance) in `.codebro/engineering_memory.json`; `1.0.0` stores load unchanged.
 
 ## Mutation safety
 
-The ChangeEngine (`src/coding/permissions.rs`) is the **only** mutation seam for the MCP `apply_change` tool and for the Coding subagent. It enforces:
+The ChangeEngine (`crates/change-engine/src/coding/change_engine.rs`) is the **only** mutation seam for `apply_change` and the Coding subagent. It enforces:
 
-- **Workspace boundary:** Paths resolving outside the workspace root are denied.
-- **Path traversal denial:** Literal `..` components are rejected outright.
-- **Symlink escape prevention:** Canonicalized paths are checked against the canonical workspace root. A symlink inside the root pointing outside is denied; a symlinked parent escaping the root is also denied.
-- **No blind overwrite:** Existing files require a non-empty `old` text. Passing `old=""` for an existing file is rejected.
-- **Ambiguous replacement rejection:** If `old` occurs more than once in the file, the change is denied — the caller must supply more context for a unique match.
-- **Stale-content protection:** The prepare phase reads current content; apply refuses if the file changed between prepare and apply.
-- **Plan adherence (strict mode):** The ChangeEngine supports strict plan adherence — when `strict=true`, changes to files not in the plan are denied. The current MCP `apply_change` handler uses the plan-less/non-strict path, so plan adherence is not enforced by the MCP tool itself.
-- **Controlled file creation:** New files use a dedicated creation path (PatchEngine cannot reconstruct from a non-existent base). Creation still goes through the prepare/apply seam and is subject to staleness checks.
+- Workspace boundary: paths outside root denied.
+- Path traversal denial: literal `..` rejected outright.
+- Symlink escape prevention: canonicalized paths checked against canonical root — at prepare time AND again at apply time (a path swapped to a symlink between prepare and apply is refused, not written through).
+- No blind overwrite: existing files require non-empty `old`.
+- Ambiguous replacement rejection: duplicate `old` text denied.
+- Stale-content protection: prepare snapshots file; apply refuses if content changed.
+- Controlled file creation: dedicated path for new files (PatchEngine cannot reconstruct).
 
-For normal coding edits, agents should use their native editing tools. `apply_change` is optional and intended for controlled/autonomous workflows.
+Within one server process, all mutating MCP tools (`apply_change`, `apply_changes`, `record_memory`, `delete_memory`, `update_identity`, `reindex`) serialize on a per-workspace lock (`CodeBroMcpServer::mutation_lock`); new mutating tools must acquire it as their first statement. Cross-process writers still rely on the single-writer assumption.
+
+## Root-cause hypotheses
+
+`crates/mcp-server/src/debugging/` turns failure evidence (parsed diagnostics, failing-test linkage, recent-edit correlation, bounded impact context) into deterministic ranked hypotheses embedded additively in `sandbox_test`/`sandbox_build` responses as `root_cause`. Invariants: hypotheses are derived runtime evidence — never persisted, never written to the fact store or engineering memory; ranking is transparent heuristic weights with dedup by (kind, source); correlated representations of one event cannot stack (weaker location channels are subsumed by stronger ones, and a diagnostic without line precision never earns exact-location weight); serialized evidence is exactly what was scored; freshness/ambiguity reduce confidence; "changed recently" is never claimed as "caused". Consult `mode=debugging` injects the latest analysis as `codebro://root-cause-hypotheses` file context.
+
+For normal coding edits use your native editing tools. `apply_change` is for controlled/autonomous workflows.
 
 ## Development workflow
 
-### Commands
-
 ```bash
-# Build release
-cargo build --release
-
-# Install locally
-cargo install --path .
-
-# Run all tests
-cargo test
-
-# Run focused tests
-cargo test <module_name>
-
-# MCP tool lifecycle tests
-cargo test mcp::tests
-
-# Coding subagent tests
-cargo test coding::tests
-
-# Init / doctor tests
-cargo test init
-cargo test doctor
+cargo build --release          # build
+cargo install --path crates/mcp-server  # install
+cargo test                     # all tests
+cargo test <module_name>       # focused
+cargo test mcp::tests          # MCP tool lifecycle
+cargo test coding::tests       # ChangeEngine
+cargo test init                # init pipeline
+cargo test doctor              # diagnostics
+scripts/check_workspace_deps.sh # verify dependency direction
 ```
 
-### Known issues
-
-- `cargo clippy -- -D warnings` fails on a pre-existing unreachable pattern at `src/intelligence/parser/tree_sitter.rs:813`. This is a known cosmetic warning, not a correctness issue.
-- Some modules have ignored tests. Run `cargo test` and trust the output.
-
-### Conventions
-
+Conventions:
 - Add regression tests for behavioural changes.
 - Run targeted tests first, then the full suite before declaring completion.
+- Targeted test selection: `apply_change` responses carry `recommended_tests` (tests whose own body was edited or which exercise an edited symbol via `TestFact.tested`, determined from the edited line range, sorted, capped at 32); pass them to `sandbox_test` as `test_filter` to run exactly those. Filters are honored for cargo/go/pytest runners and ignored where no standard selection exists; go supports single-name targeting only (multi-filter falls back to the full suite); an explicit `command` overrides filtering entirely.
+- `sandbox_test` / `sandbox_build` responses include structured `diagnostics`, a coarse `classification` (`success` | `compile_error` | `test_failure` | `timeout` | `denied` | `unknown_failure`), and `affected_modules` attribution from the fact store. Diagnostics are heuristic interpretations of raw output — never treat them as a replacement for the raw evidence, and never write them into the fact store (facts are repository structure; diagnostics are execution evidence).
 - Never fabricate test results or claims about security properties.
-- Keep MCP handlers thin — delegate to the canonical runtime, do not duplicate logic.
-- Use `tempfile::tempdir()` for all filesystem tests.
+- Keep MCP handlers thin — delegate to the canonical runtime.
+- `tempfile::tempdir()` for all filesystem tests.
 
 ## Repository safety
 
-### Source of truth
+- `crates/` — canonical source. `Cargo.toml` — package metadata and version. `docs/design/` and `docs/ADR/` — design docs.
+- `.codebro/` — runtime state. Use CodeBro commands (`codebro init`, `codebro doctor`, MCP tools) for intentional state changes.
+- `CHANGELOG.md` — authoritative change history. `Cargo.lock` — committed lockfile.
+- Do not commit: `.codebro/*.json`, `target/`.
+- Destructive ops to avoid without approval: `git clean`, `git gc`, destructive rewrites, deleting `.codebro/` contents, modifying release commits or tags.
 
-- `src/` — canonical source code.
-- `Cargo.toml` — package metadata, dependencies, version.
-- `docs/design/` — current design documentation.
-- `docs/ADR/` — Architecture Decision Records.
-- `.codebro/` — runtime state (facts, memory, identity). Do not delete or rewrite casually; use CodeBro runtime commands (`codebro init`, `codebro doctor`, MCP tools) for intentional state changes.
-- `CHANGELOG.md` — authoritative change history.
-- `Cargo.lock` — committed dependency lockfile.
-
-### Generated / runtime state (do not commit)
-
-- `.codebro/facts.json` — produced by `codebro init`.
-- `.codebro/engineering_memory.json` — produced by `record_memory`.
-- `.codebro/project_identity.json` — produced by project identity runtime.
-- `target/` — build artifacts.
-
-### Destructive operations to avoid
-
-Do **not** run without explicit approval and understanding of consequences:
-- `git clean`
-- `git gc`
-- destructive repository rewrites
-- deletion of `.codebro/` contents (destroys project state)
-- modification of release commits or tags
-
-Before important operations, verify Git integrity:
+Before important operations:
 ```bash
 git status
 git log --oneline -5
 ```
 
-## Testing & verification policy
-
-"Test passed" means the command actually ran successfully. Never fabricate:
-- test counts
-- build status
-- benchmark results
-- security verification
-- MCP availability
-
-To verify MCP startup after changes:
-```bash
-cargo build --release
-# Then test with a real agent or use:
-cargo test mcp::tests
-```
-
-## Documentation
-
-- `docs/design/MCP_SERVER.md` — MCP architecture, tool contracts, verified tests.
-- `docs/ADR/` — Architecture Decision Records (historical context on structural changes).
-- `CHANGELOG.md` — recent changes and sprint notes.
-- `README.md` — user-facing documentation.
-
-AGENTS.md is an operational guide, not a duplicate of ADRs or design docs. When detailed documentation already exists, reference it.
-
-## Release discipline
-
-- **Current version:** `v0.7.0-mcp-rc2` (see `Cargo.toml` and tag `v0.7.0-mcp-rc2`).
-- **Release commit:** TBD — this will be the v0.7.0-mcp-rc2 release commit. `origin/main` may contain post-RC2 commits.
-- The RC2 tag must not be modified or moved.
-- Future changes after RC2 use new commits and new tags.
-- Release build: `cargo build --release` produces `target/release/codebro`.
-
 ## Legacy architecture
 
-The retired pre-MCP architecture (~110k lines: TUI agent loop, Adaptive
-Developer Platform experiments) was deleted in v1 (Phase 2). Evaluation and
-preservation mapping: `docs/LEGACY_RETIREMENT.md`; history remains on tags
-`v0.7.0-mcp-rc1/rc2` and branch `tui-legacy`. Guards in
-`crates/mcp-server/tests/legacy_isolation.rs` prevent reintroduction.
-Do not recreate legacy concepts (agent loops, prompt assembly, plugin SDKs,
-tool registries) — external agents own those concerns.
+Pre-MCP architecture (~110k lines: TUI agent loop, Adaptive Developer Platform) was deleted. See `docs/LEGACY_RETIREMENT.md`. History on tags `v0.7.0-mcp-rc1/rc2` and branch `tui-legacy`. Guards in `crates/mcp-server/tests/legacy_isolation.rs` prevent reintroduction. Do not recreate legacy concepts (agent loops, prompt assembly, plugin SDKs, tool registries).
 
 ## When to stop and ask
 
-Agents should stop and ask for clarification when:
 - A change would alter the core MCP/runtime boundary.
 - A change would introduce a second source of truth.
 - A change would require weakening security guarantees.

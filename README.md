@@ -116,7 +116,7 @@ codebro auth status # Check consultant provider auth
 
 ---
 
-*Current public release: v0.7.0-mcp-rc2 (release candidate).*
+*Current public release: 1.0.0.*
 
 The former chat TUI is preserved on the `tui-legacy` branch; the current
 `main` branch is MCP-first.

@@ -13,6 +13,7 @@
 pub mod cli;
 pub mod consultant;
 pub mod credentials;
+pub mod debugging;
 pub mod doctor;
 pub mod mcp;
 pub mod providers;
