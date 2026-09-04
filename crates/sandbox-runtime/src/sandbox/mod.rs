@@ -14,6 +14,7 @@
 
 #![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod diagnostics;
+pub mod evidence_journal;
 pub mod local;
 
 /// Repository state primitive now lives in `codebro-core` (shared with
@@ -21,6 +22,7 @@ pub mod local;
 pub use codebro_core::{RepoIdentity, RepoState};
 
 pub use diagnostics::ParsedDiagnostic;
+pub use evidence_journal::{ExecutionEvidenceRecord, JournalStatus, PriorEvidence};
 
 pub mod opensandbox;
 

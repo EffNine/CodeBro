@@ -201,7 +201,47 @@ pub fn report(workspace_root: &Path) -> Result<(i32, Vec<Check>)> {
         }
     }
 
-    // ── 6. Git repository state ───────────────────────────────────────
+    // ── 6. Execution evidence journal ─────────────────────────────────
+    // Advisory validation history. Absence is normal for a fresh workspace
+    // (pass, not warn). Corruption is a warning, never an error: the
+    // journal is historical context, not structural truth, and a corrupt
+    // file is quarantined lazily on the next validation run — health
+    // checks themselves never mutate the workspace.
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let st = crate::sandbox::evidence_journal::status(&root, now);
+        if !st.exists {
+            checks.push(Check::pass(
+                "execution_evidence",
+                "absent (no executions recorded yet)",
+            ));
+        } else if !st.valid {
+            checks.push(Check::warn(
+                "execution_evidence",
+                "present but unparseable (will be quarantined on next validation run)",
+            ));
+            warnings += 1;
+        } else if st.records == 0 {
+            checks.push(Check::pass(
+                "execution_evidence",
+                format!("present but empty ({} bytes)", st.bytes),
+            ));
+        } else {
+            let age = match st.newest_age_secs {
+                Some(a) => format!(", newest {a}s ago"),
+                None => String::new(),
+            };
+            checks.push(Check::pass(
+                "execution_evidence",
+                format!("{} records, {} bytes{age}", st.records, st.bytes),
+            ));
+        }
+    }
+
+    // ── 7. Git repository state ───────────────────────────────────────
     let git_status = std::process::Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(&root)
@@ -323,5 +363,94 @@ mod tests {
         // its absence is only a warning -> exit is at most WARN, never
         // ERROR (exit 2).
         assert!(code <= EXIT_WARN, "got {code}");
+    }
+
+    #[test]
+    fn execution_evidence_absent_is_pass_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (code, checks) = report(dir.path()).unwrap();
+        let check = checks
+            .iter()
+            .find(|c| c.name == "execution_evidence")
+            .expect("execution_evidence check must exist");
+        assert!(check.ok, "absent journal must pass: {check:?}");
+        assert!(
+            check
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("no executions"),
+            "{check:?}"
+        );
+        // Health checks never mutate: no journal file may appear.
+        assert!(!dir.path().join(".codebro/execution_evidence.json").exists());
+        // Absence alone must not escalate beyond WARN (other missing state warns).
+        assert!(code <= EXIT_WARN, "got {code}");
+    }
+
+    #[test]
+    fn execution_evidence_present_reports_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let diags: Vec<crate::sandbox::ParsedDiagnostic> = Vec::new();
+        let modules: Vec<String> = Vec::new();
+        let input = crate::sandbox::evidence_journal::JournalInput {
+            execution_id: "e1",
+            project_id: None,
+            tree_hash: "treeA",
+            command: "cargo test",
+            test_filter: &[],
+            exit_code: 0,
+            classification: "success",
+            success: true,
+            timed_out: false,
+            duration_ms: 10,
+            diagnostics: &diags,
+            affected_modules: &modules,
+        };
+        crate::sandbox::evidence_journal::record(dir.path(), &input, now).unwrap();
+        let (_, checks) = report(dir.path()).unwrap();
+        let check = checks
+            .iter()
+            .find(|c| c.name == "execution_evidence")
+            .expect("execution_evidence check must exist");
+        assert!(check.ok, "{check:?}");
+        assert!(
+            check.detail.as_deref().unwrap_or("").contains("1 records"),
+            "{check:?}"
+        );
+    }
+
+    #[test]
+    fn execution_evidence_corrupt_is_warn_not_error_and_not_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let cb = dir.path().join(".codebro");
+        std::fs::create_dir_all(&cb).unwrap();
+        std::fs::write(cb.join("execution_evidence.json"), b"{not valid json!!").unwrap();
+        let (code, checks) = report(dir.path()).unwrap();
+        let check = checks
+            .iter()
+            .find(|c| c.name == "execution_evidence")
+            .expect("execution_evidence check must exist");
+        assert!(!check.ok, "{check:?}");
+        assert!(
+            check.detail.as_deref().unwrap_or("").starts_with("WARN"),
+            "{check:?}"
+        );
+        // A corrupt journal alone must not escalate to ERROR.
+        assert!(code <= EXIT_WARN, "got {code}");
+        // Health checks never quarantine: no .corrupt-* sidecar may appear.
+        let entries: Vec<String> = std::fs::read_dir(&cb)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !entries.iter().any(|n| n.contains(".corrupt-")),
+            "{entries:?}"
+        );
     }
 }

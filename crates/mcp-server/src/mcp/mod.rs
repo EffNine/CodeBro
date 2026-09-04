@@ -60,6 +60,10 @@ pub struct CodeBroMcpServer {
     /// Most recent root-cause analysis from a failing sandbox run, kept in
     /// memory only so consult mode=debugging can inject it as context.
     last_rca: Arc<std::sync::Mutex<Option<crate::debugging::types::RootCauseAnalysis>>>,
+    /// Serializes journal read-modify-write cycles within this process.
+    /// Cross-process writers rely on the documented single-writer
+    /// assumption plus atomic rename (last complete write wins).
+    journal_lock: Arc<std::sync::Mutex<()>>,
 }
 
 /// One recently applied change, with the tests the advisory recommended
@@ -84,6 +88,7 @@ impl CodeBroMcpServer {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             recent_edits: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_rca: Arc::new(std::sync::Mutex::new(None)),
+            journal_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -100,6 +105,7 @@ impl CodeBroMcpServer {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             recent_edits: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_rca: Arc::new(std::sync::Mutex::new(None)),
+            journal_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -166,11 +172,14 @@ impl CodeBroMcpServer {
     }
 
     /// Serialize a verification result for tool responses, adding structured
-    /// diagnostics, the outcome classification, and the workspace modules
-    /// owning any diagnostic files (via the cached fact store).
+    /// diagnostics, the outcome classification, the workspace modules
+    /// owning any diagnostic files (via the cached fact store), prior
+    /// execution evidence from the journal, and — for failures — root-cause
+    /// hypotheses.
     fn verification_object(
         &self,
         verification: &crate::sandbox::VerificationResult,
+        test_filter: &[String],
     ) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
         obj.insert("verified".to_string(), json!(verification.verified));
@@ -192,6 +201,77 @@ impl CodeBroMcpServer {
         let related = self.related_recent_changes(verification);
         if !related.is_empty() {
             obj.insert("related_recent_changes".to_string(), json!(related));
+        }
+        // Execution evidence journal: surface HISTORICAL context for this
+        // (tree hash, command, filter) and then record what was observed.
+        // Order matters: the summary must describe history BEFORE this run.
+        //
+        // Semantic rules:
+        // - denied runs never executed anything: nothing to record, nothing
+        //   to compare against;
+        // - runs without a capturable tree hash (e.g. non-git workspaces)
+        //   cannot be associated with repository state, so they are neither
+        //   recorded nor answered — historical evidence is always bound to
+        //   a tree hash by contract;
+        // - prior evidence is ADVISORY. It never skips or short-circuits
+        //   execution; the current run's outcome still governs.
+        let resolved_cmd = if verification.execution.resolved_command.is_empty() {
+            verification.execution.command.as_str()
+        } else {
+            verification.execution.resolved_command.as_str()
+        };
+        let tree_hash = verification
+            .execution
+            .repo_state
+            .as_ref()
+            .map(|rs| rs.working_tree_hash.clone());
+        if !verification.execution.denied {
+            if let Some(tree_hash) = &tree_hash {
+                let _guard = self.journal_lock.lock().expect("journal lock");
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let prior = crate::sandbox::evidence_journal::summarize_prior(
+                    &self.workspace_root,
+                    tree_hash,
+                    resolved_cmd,
+                    test_filter,
+                    now,
+                );
+                if let Some(prior) = prior {
+                    obj.insert(
+                        "prior_evidence".to_string(),
+                        serde_json::to_value(&prior).unwrap_or(json!({})),
+                    );
+                }
+                let record_input = crate::sandbox::evidence_journal::JournalInput {
+                    execution_id: &verification.execution.execution_id,
+                    project_id: verification
+                        .execution
+                        .repo_identity
+                        .as_ref()
+                        .map(|ri| ri.project_id.as_str()),
+                    tree_hash,
+                    command: resolved_cmd,
+                    test_filter,
+                    exit_code: verification.execution.exit_code,
+                    classification: verification.classification.as_deref().unwrap_or("unknown"),
+                    success: verification.execution.success,
+                    timed_out: verification.execution.timeout,
+                    duration_ms: u64::try_from(verification.execution.duration_ms)
+                        .unwrap_or(u64::MAX),
+                    diagnostics: &verification.diagnostics,
+                    affected_modules: &affected_modules,
+                };
+                if let Err(e) = crate::sandbox::evidence_journal::record(
+                    &self.workspace_root,
+                    &record_input,
+                    now,
+                ) {
+                    tracing::warn!("execution journal record failed (non-fatal): {e}");
+                }
+            }
         }
         // Root-cause hypotheses for failures: deterministic ranking over
         // diagnostics + fact-store linkage + this session's recent edits.
@@ -1286,7 +1366,8 @@ impl CodeBroMcpServer {
                 args.expected_success,
                 args.affected_fact_ids,
             );
-        let verification_obj = self.verification_object(&verification);
+        let verification_obj =
+            self.verification_object(&verification, args.test_filter.as_deref().unwrap_or(&[]));
         let payload = json!({
             "execution": verification.execution,
             "verification": verification_obj,
@@ -1328,7 +1409,7 @@ impl CodeBroMcpServer {
                 args.expected_success,
                 args.affected_fact_ids,
             );
-        let verification_obj = self.verification_object(&verification);
+        let verification_obj = self.verification_object(&verification, &[]);
         let payload = json!({
             "execution": verification.execution,
             "verification": verification_obj,
@@ -6005,6 +6086,80 @@ mod tests {
         assert_eq!(mcp_names, doctor_names);
     }
 
+    /// Execution evidence is a health signal: a fresh workspace with no
+    /// journal reports `execution_evidence` as ok (absent is normal) and
+    /// the health call creates no files.
+    #[tokio::test]
+    async fn repository_health_reports_execution_evidence_absent_as_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server(&dir);
+
+        let out = call_tool_text(&server, "repository_health", json!({})).await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+
+        let check = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "execution_evidence")
+            .expect("execution_evidence check must exist");
+        assert_eq!(check["status"], "ok");
+        assert!(
+            check["detail"].as_str().unwrap().contains("no executions"),
+            "{}",
+            check["detail"]
+        );
+        // Fresh workspace: no journal file may be created by a read-only check.
+        assert!(!dir.path().join(".codebro/execution_evidence.json").exists());
+    }
+
+    /// After a validation run records evidence, repository_health surfaces
+    /// the journal state (record count) without failing.
+    #[tokio::test]
+    async fn repository_health_reports_execution_evidence_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server(&dir);
+
+        // Seed one journal record through the real verification path using
+        // a synthetic execution with a capturable tree hash.
+        let execution = crate::sandbox::ExecutionResult {
+            repo_state: Some(crate::sandbox::RepoState {
+                commit_sha: "c".into(),
+                working_tree_dirty: false,
+                working_tree_hash: "treeH".into(),
+            }),
+            ..crate::sandbox::ExecutionResult::from_local(
+                "cargo test",
+                "/tmp/nowhere",
+                "",
+                "",
+                0,
+                25,
+                false,
+                false,
+                std::collections::HashMap::new(),
+            )
+        };
+        let verification = crate::sandbox::VerificationResult::from_execution(execution);
+        let _ = server.verification_object(&verification, &[]);
+
+        let out = call_tool_text(&server, "repository_health", json!({})).await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+
+        let check = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "execution_evidence")
+            .expect("execution_evidence check must exist");
+        assert_eq!(check["status"], "ok");
+        assert!(
+            check["detail"].as_str().unwrap().contains("1 records"),
+            "{}",
+            check["detail"]
+        );
+    }
+
     fn collect_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut paths = Vec::new();
         for entry in walkdir::WalkDir::new(dir)
@@ -6175,5 +6330,104 @@ mod debugging_consult_tests {
         req2.files.clear();
         server.inject_debugging_hypotheses(&mut req2, &ConsultantMode::Planning);
         assert!(req2.files.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod evidence_journal_wiring_tests {
+    use super::*;
+
+    fn server_at(root: &std::path::Path) -> CodeBroMcpServer {
+        CodeBroMcpServer::with_sandbox_runtime(
+            root.to_path_buf(),
+            crate::sandbox::SandboxRuntime::from_env(),
+        )
+    }
+
+    fn verification_with(
+        tree_hash: Option<&str>,
+        denied: bool,
+        success: bool,
+    ) -> crate::sandbox::VerificationResult {
+        let execution = crate::sandbox::ExecutionResult::from_local(
+            "cargo test",
+            "/tmp/nowhere",
+            "",
+            "",
+            if success { 0 } else { 1 },
+            25,
+            false,
+            denied,
+            std::collections::HashMap::new(),
+        );
+        let execution = crate::sandbox::ExecutionResult {
+            // from_local hardcodes denied=false (its 8th arg is cancelled);
+            // set the policy-denial flag explicitly for this scenario.
+            denied,
+            repo_state: tree_hash.map(|h| crate::sandbox::RepoState {
+                commit_sha: "c".into(),
+                working_tree_dirty: false,
+                working_tree_hash: h.into(),
+            }),
+            ..execution
+        };
+        let mut v = crate::sandbox::VerificationResult::from_execution(execution);
+        v.classification = Some(
+            if denied {
+                "denied"
+            } else if success {
+                "success"
+            } else {
+                "test_failure"
+            }
+            .into(),
+        );
+        v
+    }
+
+    /// Denied runs never execute: nothing is recorded and nothing surfaces.
+    #[test]
+    fn denied_runs_are_never_journaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = server_at(dir.path());
+        let v = verification_with(Some("treeX"), true, false);
+        let obj = server.verification_object(&v, &[]);
+        assert!(obj.get("prior_evidence").is_none());
+        assert!(!dir.path().join(".codebro/execution_evidence.json").exists());
+    }
+
+    /// Without a capturable tree hash, runs are neither recorded nor answered:
+    /// historical evidence is always bound to repository state.
+    #[test]
+    fn runs_without_tree_state_are_not_journaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = server_at(dir.path());
+        // from_local leaves repo_state None (non-git workspace analog).
+        let v = verification_with(None, false, true);
+        let obj = server.verification_object(&v, &[]);
+        assert!(obj.get("prior_evidence").is_none());
+        assert!(!dir.path().join(".codebro/execution_evidence.json").exists());
+    }
+
+    /// A run WITH a tree hash records; the next identical context sees the
+    /// same-tree prior. Lookup happens before recording, so the first run's
+    /// own record can never be mistaken for prior history.
+    #[test]
+    fn recording_then_lookup_respects_ordering() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = server_at(dir.path());
+
+        let v1 = verification_with(Some("treeQ"), false, true);
+        let obj1 = server.verification_object(&v1, &[]);
+        assert!(
+            obj1.get("prior_evidence").is_none(),
+            "first run has no history"
+        );
+        assert!(dir.path().join(".codebro/execution_evidence.json").exists());
+
+        let v2 = verification_with(Some("treeQ"), false, true);
+        let obj2 = server.verification_object(&v2, &[]);
+        let prior = obj2.get("prior_evidence").expect("second run must surface");
+        assert_eq!(prior["same_tree"]["outcome"], "success");
     }
 }
