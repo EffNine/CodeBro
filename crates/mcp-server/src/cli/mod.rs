@@ -22,21 +22,21 @@ enum Commands {
 
     /// Run the engineering runtime as an MCP server over stdio.
     Serve {
-        /// Workspace root to serve; defaults to the current directory.
+        /// Workspace root to serve; defaults to CODEBRO_WORKSPACE_ROOT or the current directory.
         #[arg(long)]
         root: Option<PathBuf>,
     },
 
     /// Scan the workspace and populate .codebro/facts.json.
     Init {
-        /// Workspace root to scan; defaults to the current directory.
+        /// Workspace root to scan; defaults to CODEBRO_WORKSPACE_ROOT or the current directory.
         #[arg(long)]
         root: Option<PathBuf>,
     },
 
     /// Diagnose the engineering-runtime state of the workspace.
     Doctor {
-        /// Workspace root to check; defaults to the current directory.
+        /// Workspace root to check; defaults to CODEBRO_WORKSPACE_ROOT or the current directory.
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -69,7 +69,7 @@ enum Commands {
         /// Whether to include the current git diff in the request context.
         #[arg(long, default_value_t = false)]
         include_git_diff: bool,
-        /// Workspace root; defaults to the current directory.
+        /// Workspace root; defaults to CODEBRO_WORKSPACE_ROOT or the current directory.
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -86,7 +86,7 @@ enum FactsCommands {
     /// Diff the current repository state against the last indexed state and
     /// project the engineering impact (modules, symbols, tests).
     Diff {
-        /// Workspace root; defaults to the current directory.
+        /// Workspace root; defaults to CODEBRO_WORKSPACE_ROOT or the current directory.
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -129,10 +129,12 @@ pub async fn run() -> Result<()> {
             }
         }
         Some(Commands::Serve { root }) => {
-            let workspace_root = match root {
-                Some(p) => p,
-                None => std::env::current_dir()?,
-            };
+            let (workspace_root, source) = crate::workspace::resolve_with_source(root)?;
+            tracing::info!(
+                "CodeBro serving workspace {} (via {})",
+                workspace_root.display(),
+                source
+            );
 
             let mcp_result = crate::mcp::serve(workspace_root).await;
             if let Err(e) = &mcp_result {
@@ -142,23 +144,17 @@ pub async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Commands::Init { root }) => {
-            let workspace_root = match root {
-                Some(p) => p,
-                None => std::env::current_dir()?,
-            };
+            let workspace_root = crate::workspace::resolve_workspace_root(root)?;
             crate::init::run(&workspace_root)?;
         }
         Some(Commands::Facts { command }) => match command {
             FactsCommands::Diff { root } => {
-                let root = root.unwrap_or_else(|| std::env::current_dir().unwrap());
+                let root = crate::workspace::resolve_workspace_root(root)?;
                 crate::init::facts_diff(&root)?;
             }
         },
         Some(Commands::Doctor { root }) => {
-            let workspace_root = match root {
-                Some(p) => p,
-                None => std::env::current_dir()?,
-            };
+            let workspace_root = crate::workspace::resolve_workspace_root(root)?;
             let code = crate::doctor::run(&workspace_root)?;
             std::process::exit(code);
         }
@@ -184,10 +180,7 @@ pub async fn run() -> Result<()> {
             include_git_diff,
             root,
         }) => {
-            let workspace_root = match root {
-                Some(p) => p,
-                None => std::env::current_dir()?,
-            };
+            let workspace_root = crate::workspace::resolve_workspace_root(root)?;
 
             let provider_choice = match provider.as_str() {
                 "auto" => crate::consultant::types::ConsultantProvider::Auto,

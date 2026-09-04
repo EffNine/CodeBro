@@ -15,8 +15,10 @@ pub mod consultant;
 pub mod credentials;
 pub mod debugging;
 pub mod doctor;
+pub mod engineering_context;
 pub mod mcp;
 pub mod providers;
+pub mod workspace;
 
 // ---- path-compatibility re-exports (workspace split) --------------------
 pub use codebro_change_engine::coding;
