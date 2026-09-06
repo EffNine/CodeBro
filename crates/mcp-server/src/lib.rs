@@ -19,6 +19,7 @@ pub mod engineering_context;
 pub mod mcp;
 pub mod providers;
 pub mod workspace;
+pub mod workspace_registry;
 
 // ---- path-compatibility re-exports (workspace split) --------------------
 pub use codebro_change_engine::coding;

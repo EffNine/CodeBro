@@ -38,6 +38,11 @@ impl LocalCommandPolicy {
 
     /// Check a raw command string against the policy.
     pub fn check(&self, command: &str) -> bool {
+        self.check_in(command, None)
+    }
+
+    /// Policy check with workspace confinement for path-bearing arguments.
+    pub fn check_in(&self, command: &str, workspace_root: Option<&Path>) -> bool {
         let normalized = normalize(command);
         if normalized.is_empty() {
             return false;
@@ -54,6 +59,13 @@ impl LocalCommandPolicy {
         let tokens: Vec<&str> = normalized.split(' ').collect();
         let program = tokens[0];
 
+        // Workspace escape gate: path-bearing flags must stay inside root.
+        if let Some(root) = workspace_root {
+            if !check_path_args_confined(&tokens, root) {
+                return false;
+            }
+        }
+
         match program {
             "true" | "false" | "echo" | "printf" => tokens.len() <= 20,
             "sleep" => tokens.len() == 2 && tokens[1].parse::<u64>().is_ok(),
@@ -64,6 +76,16 @@ impl LocalCommandPolicy {
             "make" => self.check_make(&tokens[1..]),
             "git" => self.check_git(&tokens[1..]),
             "python" | "python3" => self.check_python(&tokens[1..]),
+            "rustc" => self.check_rustc(&tokens[1..]),
+            // Read-only inspection commands — no workspace manifest required.
+            "pwd" => true,
+            "ls" | "head" | "tail" | "wc" | "find" | "file" | "which" => true,
+            // `cat` is read-only but path confinement matters when a workspace
+            // root is provided.
+            "cat" => check_path_args_confined(
+                &tokens,
+                workspace_root.unwrap_or(std::path::Path::new("")),
+            ),
             _ => false,
         }
     }
@@ -73,6 +95,10 @@ impl LocalCommandPolicy {
             return false;
         }
         let sub = args[0];
+        // Global flags that don't require a subcommand.
+        if sub == "--version" || sub == "-V" {
+            return true;
+        }
         if !matches!(
             sub,
             "check" | "test" | "build" | "clippy" | "fmt" | "doc" | "metadata" | "tree"
@@ -166,6 +192,21 @@ impl LocalCommandPolicy {
         }
         !args[1..].iter().any(|a| MUTATING_TOKENS.contains(a))
     }
+
+    fn check_rustc(&self, args: &[&str]) -> bool {
+        if args.is_empty() {
+            return false;
+        }
+        // Only allow version-printing and target-info queries.
+        let sub = args[0];
+        if sub == "--version" || sub == "-V" {
+            return true;
+        }
+        if sub.starts_with("--print") {
+            return true;
+        }
+        false
+    }
 }
 
 const PY_MARKERS: &[&str] = &[
@@ -255,6 +296,144 @@ fn normalize(command: &str) -> String {
     command.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Classify a denied command into a brief human-readable reason.
+fn classify_denial(command: &str) -> &'static str {
+    let normalized = normalize(command);
+    // Shell metacharacters are checked first (they short-circuit the match).
+    const METACHARS: &[char] = &[
+        ';', '&', '|', '>', '<', '$', '`', '\n', '\r', '{', '}', '*', '!', '(', ')', '~', '#',
+    ];
+    if normalized.chars().any(|c| METACHARS.contains(&c)) {
+        return "shell_metacharacter_detected";
+    }
+    let tokens: Vec<&str> = normalized.split(' ').collect();
+    let program = tokens[0];
+    match program {
+        "true" | "false" | "echo" | "printf" | "sleep" | "cargo" | "go" | "npm" | "pnpm"
+        | "yarn" | "npx" | "make" | "git" | "python" | "python3" | "rustc" | "pwd" | "ls"
+        | "cat" | "head" | "tail" | "wc" | "find" | "file" | "which" => {
+            // Known program but disallowed variant/args — context-specific.
+            match program {
+                "cargo" | "go" | "npm" | "pnpm" | "yarn" | "npx" | "make" | "python"
+                | "python3"
+                    if tokens.len() > 1 =>
+                {
+                    "mutating_operation_blocked"
+                }
+                "rustc" => "mutating_operation_blocked",
+                _ => "mutating_operation_blocked",
+            }
+        }
+        _ => "executable_not_allowlisted",
+    }
+}
+
+/// Path-bearing flags whose values must stay inside the workspace root.
+/// Covers `--flag value` and `--flag=value` forms for the allowlisted
+/// command model (cargo/go/npm/pytest). Returns false when any path value
+/// escapes the workspace.
+fn check_path_args_confined(tokens: &[&str], workspace_root: &Path) -> bool {
+    // Flags that take a path value as the NEXT token.
+    const PATH_FLAGS_NEXT: &[&str] = &[
+        "--manifest-path",
+        "-p",
+        "--package",
+        "--target-dir",
+        "--config",
+        "-C",
+        "--directory",
+        "--prefix",
+        "--cache-dir",
+    ];
+    // Flags with `--flag=value` inline form.
+    const PATH_FLAGS_INLINE: &[&str] = &["--manifest-path=", "--target-dir=", "--config="];
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        let mut path_val: Option<&str> = None;
+        if PATH_FLAGS_NEXT.contains(&tok) {
+            if i + 1 >= tokens.len() {
+                return false;
+            }
+            path_val = Some(tokens[i + 1]);
+        } else {
+            for prefix in PATH_FLAGS_INLINE {
+                if let Some(v) = tok.strip_prefix(prefix) {
+                    path_val = Some(v);
+                    break;
+                }
+            }
+            // `-p<value>` attached form (e.g. `-pfoo`).
+            if path_val.is_none()
+                && tok.starts_with("-p")
+                && tok.len() > 2
+                && !tok.starts_with("--")
+            {
+                path_val = Some(&tok[2..]);
+            }
+        }
+        if let Some(p) = path_val {
+            if !is_path_confined(p, workspace_root) {
+                return false;
+            }
+        }
+        // Bare `..` path components outside a flag value (e.g. `cargo test
+        // ../../evil`) are also rejected when they look like paths.
+        // Flag values starting with `-` are not paths.
+        if !tok.starts_with('-')
+            && tok != tokens[0]
+            && (tok.contains("../") || tok == ".." || tok.starts_with("../"))
+        {
+            if !is_path_confined(tok, workspace_root) {
+                return false;
+            }
+        }
+        i += 1;
+    }
+    true
+}
+
+/// True when `candidate` resolves inside `workspace_root`. Absolute paths
+/// must have the canonical root as a prefix; relative paths are joined to
+/// the root and lexically checked for `..` escape (no symlink resolution
+/// here — execution also validates the canonical path at spawn time).
+fn is_path_confined(candidate: &str, workspace_root: &Path) -> bool {
+    if candidate.is_empty() {
+        return false;
+    }
+    // Reject absolute escape trivially.
+    let cand_path = Path::new(candidate);
+    if cand_path.is_absolute() {
+        // Canonicalize root when possible; fall back to lexical prefix.
+        if let (Ok(root_c), Ok(cand_c)) = (workspace_root.canonicalize(), cand_path.canonicalize())
+        {
+            return cand_c.starts_with(&root_c);
+        }
+        return cand_path.starts_with(workspace_root);
+    }
+    // Relative: join + lexical normalization, reject `..` escape.
+    let mut depth: i32 = 0;
+    for comp in Path::new(candidate).components() {
+        use std::path::Component;
+        match comp {
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            Component::CurDir => {}
+            _ => depth += 1,
+        }
+    }
+    // Also resolve against root when both exist (symlink-aware).
+    let joined = workspace_root.join(candidate);
+    if let (Ok(root_c), Ok(join_c)) = (workspace_root.canonicalize(), joined.canonicalize()) {
+        return join_c.starts_with(&root_c);
+    }
+    true
+}
+
 /// The local sandbox backend: runs commands in-process via PTY.
 #[derive(Debug, Clone, Default)]
 pub struct LocalSandboxBackend {
@@ -304,11 +483,14 @@ impl SandboxBackend for LocalSandboxBackend {
 
         let cmd_policy = LocalCommandPolicy::for_workspace(workspace_root);
 
-        if !cmd_policy.check(&command) {
+        if !cmd_policy.check_in(&command, Some(workspace_root)) {
             return ExecutionResult::denied(
                 &command,
                 &ws_root_str,
-                "command denied by sandbox policy",
+                &format!(
+                    "command denied by sandbox policy: {}",
+                    classify_denial(&command)
+                ),
                 cmd.metadata,
             );
         }
@@ -486,12 +668,7 @@ mod tests {
     #[test]
     fn test_policy_denies_arbitrary_programs() {
         let policy = LocalCommandPolicy::for_workspace(std::path::Path::new("/tmp"));
-        for cmd in [
-            "rm -rf /",
-            "python3 -c 'print(1)'",
-            "cat file.txt",
-            "grep foo src/",
-        ] {
+        for cmd in ["rm -rf /", "python3 -c 'print(1)'", "grep foo src/"] {
             assert!(!policy.check(cmd), "'{cmd}' must be denied");
         }
     }
@@ -741,5 +918,75 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.metadata.get("run_id").unwrap(), "abc-123");
         assert_eq!(result.metadata.get("intent").unwrap(), "verify-build");
+    }
+
+    #[test]
+    fn test_policy_allows_readonly_inspection_commands() {
+        let policy = LocalCommandPolicy::for_workspace(std::path::Path::new("/tmp"));
+        for cmd in [
+            "pwd",
+            "ls",
+            "ls -la",
+            "head file.txt",
+            "tail file.txt",
+            "wc file.txt",
+            "find . -name x",
+            "file some_file",
+            "which rustc",
+            "rustc --version",
+            "rustc -V",
+            "rustc --print cfg",
+            "cat file.txt",
+            "cat src/lib.rs",
+        ] {
+            assert!(policy.check(cmd), "'{cmd}' must be allowed");
+        }
+        // rustc with disallowed subcommand is denied.
+        assert!(!policy.check("rustc src/lib.rs"));
+        assert!(!policy.check("rustc -o out src/lib.rs"));
+    }
+
+    #[test]
+    fn test_policy_allows_cargo_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        let policy = LocalCommandPolicy::for_workspace(dir.path());
+        assert!(
+            policy.check("cargo --version"),
+            "cargo --version must be allowed"
+        );
+        assert!(
+            policy.check("cargo metadata"),
+            "cargo metadata must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_policy_denies_cat_outside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        let policy = LocalCommandPolicy::for_workspace(dir.path());
+        // cat with a path that escapes the workspace must be denied.
+        assert!(
+            !policy.check_in("cat ../../etc/passwd", Some(dir.path())),
+            "cat with parent-dir escape must be denied"
+        );
+    }
+
+    #[test]
+    fn test_classify_denial_produces_reasonable_strings() {
+        assert_eq!(classify_denial("rm -rf /"), "executable_not_allowlisted");
+        assert_eq!(
+            classify_denial("python script.py"),
+            "mutating_operation_blocked"
+        );
+        assert_eq!(
+            classify_denial("rustc src/lib.rs"),
+            "mutating_operation_blocked"
+        );
+        assert_eq!(
+            classify_denial("cargo test; rm -rf /"),
+            "shell_metacharacter_detected"
+        );
     }
 }

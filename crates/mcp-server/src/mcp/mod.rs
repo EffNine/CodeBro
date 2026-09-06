@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::provenance::{compute_trust, FreshnessStatus, SourceKind};
+use crate::workspace_registry::{WorkspaceRegistry, WorkspaceState};
 
 /// The CodeBro MCP server: a router over the engineering context layer.
 ///
@@ -39,56 +40,29 @@ use crate::provenance::{compute_trust, FreshnessStatus, SourceKind};
 type FactsCache =
     Arc<std::sync::Mutex<Option<(Option<std::time::SystemTime>, crate::fact_store::FactStore)>>>;
 
+/// The CodeBro MCP server: a router over the engineering context layer.
+///
+/// A single server process can serve multiple workspaces via
+/// [`WorkspaceRegistry`]. Each workspace has independent runtime state
+/// (fact store, mutation lock, recent edits, RCA cache, journal lock).
+/// When a tool call omits `workspace_root`, the server's configured
+/// default workspace is used for backward compatibility.
 #[derive(Clone)]
 pub struct CodeBroMcpServer {
-    workspace_root: PathBuf,
+    registry: WorkspaceRegistry,
     tool_router: ToolRouter<Self>,
-    facts_cache: FactsCache,
     sandbox_runtime: crate::sandbox::SandboxRuntime,
-    /// Serializes mutating tool calls (`apply_change`, `apply_changes`,
-    /// `record_memory`, `delete_memory`, `update_identity`, `reindex`)
-    /// within this server process. Pipelined concurrent mutations would
-    /// otherwise race on the same `.codebro` state files
-    /// last-writer-wins; holding this lock for the whole handler body
-    /// makes them sequential. Scope is one server process — a separate
-    /// `codebro init` process is still picked up via facts.json mtime.
-    mutation_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Ring of recently applied changes (path, instant, recommended test
-    /// names), capped and pruned, used to correlate execution failures
-    /// with this session's edits. In-memory only — never persisted.
-    recent_edits: Arc<std::sync::Mutex<Vec<RecentEdit>>>,
-    /// Most recent root-cause analysis from a failing sandbox run, kept in
-    /// memory only so consult mode=debugging can inject it as context.
-    last_rca: Arc<std::sync::Mutex<Option<crate::debugging::types::RootCauseAnalysis>>>,
-    /// Serializes journal read-modify-write cycles within this process.
-    /// Cross-process writers rely on the documented single-writer
-    /// assumption plus atomic rename (last complete write wins).
-    journal_lock: Arc<std::sync::Mutex<()>>,
-}
-
-/// One recently applied change, with the tests the advisory recommended
-/// for it (the precise causal hint used during failure correlation).
-#[derive(Clone)]
-struct RecentEdit {
-    path: String,
-    at: std::time::Instant,
-    #[allow(dead_code)]
-    recommended_tests: Vec<String>,
 }
 
 #[tool_router]
 impl CodeBroMcpServer {
     /// Create a server bound to a workspace root.
     pub fn new(workspace_root: PathBuf) -> Self {
+        let registry = WorkspaceRegistry::new(workspace_root);
         Self {
-            workspace_root,
+            registry,
             tool_router: Self::tool_router(),
-            facts_cache: Arc::new(std::sync::Mutex::new(None)),
             sandbox_runtime: crate::sandbox::SandboxRuntime::from_env(),
-            mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
-            recent_edits: Arc::new(std::sync::Mutex::new(Vec::new())),
-            last_rca: Arc::new(std::sync::Mutex::new(None)),
-            journal_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -97,78 +71,111 @@ impl CodeBroMcpServer {
         workspace_root: PathBuf,
         runtime: crate::sandbox::SandboxRuntime,
     ) -> Self {
+        let registry = WorkspaceRegistry::new(workspace_root);
         Self {
-            workspace_root,
+            registry,
             tool_router: Self::tool_router(),
-            facts_cache: Arc::new(std::sync::Mutex::new(None)),
             sandbox_runtime: runtime,
-            mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
-            recent_edits: Arc::new(std::sync::Mutex::new(Vec::new())),
-            last_rca: Arc::new(std::sync::Mutex::new(None)),
-            journal_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
+    /// Resolve the workspace for a tool call.
+    fn resolve_workspace(&self, raw: Option<&str>) -> Result<Arc<WorkspaceState>, McpError> {
+        self.registry
+            .resolve(raw)
+            .map_err(|e| McpError::invalid_params(e, None))
+    }
+
     /// Load the project identity for the workspace, tolerating absence.
-    fn identity_snapshot(&self) -> (bool, Option<crate::project_identity::ProjectIdentity>) {
-        let mut identity =
-            crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
+    fn identity_snapshot(
+        &self,
+        ws: &WorkspaceState,
+    ) -> (bool, Option<crate::project_identity::ProjectIdentity>) {
+        let mut identity = crate::project_identity::ProjectIdentityRuntime::new(&ws.canonical_root);
         match identity.load() {
             Ok(_) => (true, Some(identity.snapshot())),
             Err(e) => {
                 tracing::debug!(
                     "no project identity for {}: {e}",
-                    self.workspace_root.display()
+                    ws.canonical_root.display()
                 );
                 (false, None)
             }
         }
     }
 
-    /// Build the fact store for the workspace. Facts are frozen models;
-    /// a persisted `.codebro/facts.json` is restored if present.
-    ///
-    /// The store is cached per server process (immutable once built) and
-    /// refreshed only when the file's mtime changes — a concurrent
-    /// `codebro init` is picked up, but a steady-state agent session does
-    /// not re-parse a 20+ MB JSON file on every tool call.
-    fn fact_store(&self) -> crate::fact_store::FactStore {
-        let path = self.workspace_root.join(".codebro/facts.json");
-        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    /// Build the fact store for the workspace.
+    fn fact_store(&self, ws: &WorkspaceState) -> crate::fact_store::FactStore {
+        ws.fact_store()
+    }
 
-        let mut guard = self.facts_cache.lock().expect("facts cache lock");
-        if let Some((cached_mtime, store)) = guard.as_ref() {
-            if *cached_mtime == mtime {
-                return store.clone();
+    /// Snapshot recent edits for debugging input.
+    fn recent_edits_snapshot(
+        &self,
+        ws: &WorkspaceState,
+    ) -> Vec<crate::debugging::candidates::RecentEditInput> {
+        ws.recent_edits_snapshot()
+    }
+
+    /// Stash the latest RCA for debugging consult injection.
+    fn store_last_rca(
+        &self,
+        ws: &WorkspaceState,
+        rca: &crate::debugging::types::RootCauseAnalysis,
+    ) {
+        ws.store_last_rca(rca);
+    }
+
+    /// Record a successfully applied change for failure correlation.
+    fn remember_edit(&self, ws: &WorkspaceState, path: &str, recommended_tests: Vec<String>) {
+        ws.remember_edit(path, recommended_tests);
+    }
+
+    /// Intersect failing diagnostics with recent edits.
+    fn related_recent_changes(
+        &self,
+        ws: &WorkspaceState,
+        verification: &crate::sandbox::VerificationResult,
+    ) -> Vec<serde_json::Value> {
+        if verification.verified || verification.diagnostics.is_empty() {
+            return Vec::new();
+        }
+        let guard = ws.recent_edits.lock().expect("recent edits lock");
+        let diag_files: std::collections::HashSet<&str> = verification
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.file.as_deref())
+            .collect();
+        let failing_tests: std::collections::HashSet<&str> = verification
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.test.as_deref())
+            .collect();
+
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for edit in guard.iter().rev() {
+            let via_file = diag_files.contains(edit.path.as_str());
+            let via_recommended = !edit.recommended_tests.is_empty()
+                && edit
+                    .recommended_tests
+                    .iter()
+                    .any(|t| failing_tests.contains(t.as_str()));
+            let via = match (via_file, via_recommended) {
+                (true, true) => "diagnostic_file+recommended_tests",
+                (true, false) => "diagnostic_file",
+                (false, true) => "recommended_tests",
+                (false, false) => continue,
+            };
+            if seen.insert(edit.path.clone()) {
+                out.push(json!({
+                    "path": edit.path,
+                    "seconds_ago": edit.at.elapsed().as_secs(),
+                    "via": via,
+                }));
             }
         }
-        let store = match std::fs::read(&path) {
-            Ok(bytes) => {
-                match serde_json::from_slice::<crate::engineering_facts::FactsModel>(&bytes) {
-                    Ok(model) => crate::fact_store::FactStore::from_model(&model),
-                    Err(e) => {
-                        // Quarantine the corrupt store so the raw bytes are
-                        // preserved for recovery instead of being clobbered
-                        // by the next init. The fact store is derived state
-                        // (regenerable via `codebro init`), so we degrade to
-                        // an empty store — but never silently destroy data.
-                        let quarantined = crate::persistence::quarantine_file(&path).ok().flatten();
-                        tracing::warn!(
-                            "quarantining unparseable {}: {e} (moved to {})",
-                            path.display(),
-                            quarantined
-                                .as_ref()
-                                .map(|q| q.display().to_string())
-                                .unwrap_or_else(|| "<quarantine failed>".to_string())
-                        );
-                        crate::fact_store::FactStore::empty()
-                    }
-                }
-            }
-            Err(_) => crate::fact_store::FactStore::empty(),
-        };
-        *guard = Some((mtime, store.clone()));
-        store
+        out
     }
 
     /// Serialize a verification result for tool responses, adding structured
@@ -176,8 +183,9 @@ impl CodeBroMcpServer {
     /// owning any diagnostic files (via the cached fact store), prior
     /// execution evidence from the journal, and — for failures — root-cause
     /// hypotheses.
-    fn verification_object(
+    pub(crate) fn verification_object(
         &self,
+        ws: &WorkspaceState,
         verification: &crate::sandbox::VerificationResult,
         test_filter: &[String],
     ) -> serde_json::Value {
@@ -194,11 +202,11 @@ impl CodeBroMcpServer {
         if let Some(ref class) = verification.classification {
             obj.insert("classification".to_string(), json!(class));
         }
-        let affected_modules = self.affected_modules_for(verification);
+        let affected_modules = self.affected_modules_for(ws, verification);
         if !affected_modules.is_empty() {
             obj.insert("affected_modules".to_string(), json!(affected_modules));
         }
-        let related = self.related_recent_changes(verification);
+        let related = self.related_recent_changes(ws, verification);
         if !related.is_empty() {
             obj.insert("related_recent_changes".to_string(), json!(related));
         }
@@ -227,13 +235,13 @@ impl CodeBroMcpServer {
             .map(|rs| rs.working_tree_hash.clone());
         if !verification.execution.denied {
             if let Some(tree_hash) = &tree_hash {
-                let _guard = self.journal_lock.lock().expect("journal lock");
+                let _guard = ws.journal_lock.lock().expect("journal lock");
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let prior = crate::sandbox::evidence_journal::summarize_prior(
-                    &self.workspace_root,
+                    &ws.canonical_root,
                     tree_hash,
                     resolved_cmd,
                     test_filter,
@@ -264,11 +272,9 @@ impl CodeBroMcpServer {
                     diagnostics: &verification.diagnostics,
                     affected_modules: &affected_modules,
                 };
-                if let Err(e) = crate::sandbox::evidence_journal::record(
-                    &self.workspace_root,
-                    &record_input,
-                    now,
-                ) {
+                if let Err(e) =
+                    crate::sandbox::evidence_journal::record(&ws.canonical_root, &record_input, now)
+                {
                     tracing::warn!("execution journal record failed (non-fatal): {e}");
                 }
             }
@@ -276,23 +282,21 @@ impl CodeBroMcpServer {
         // Root-cause hypotheses for failures: deterministic ranking over
         // diagnostics + fact-store linkage + this session's recent edits.
         if !verification.verified && verification.classification.as_deref() != Some("denied") {
-            let fresh = match crate::mcp::facts::compute_freshness(
-                &self.fact_store(),
-                &self.workspace_root,
-            ) {
-                crate::mcp::facts::FreshnessStatus::Fresh => "fresh",
-                crate::mcp::facts::FreshnessStatus::Stale => "stale",
-                _ => "unknown",
-            };
-            let recent_edits = self.recent_edits_snapshot();
+            let fresh =
+                match crate::mcp::facts::compute_freshness(&ws.fact_store(), &ws.canonical_root) {
+                    crate::mcp::facts::FreshnessStatus::Fresh => "fresh",
+                    crate::mcp::facts::FreshnessStatus::Stale => "stale",
+                    _ => "unknown",
+                };
+            let recent_edits = self.recent_edits_snapshot(ws);
             let rca = crate::debugging::analyze_root_cause(crate::debugging::RootCauseInput {
                 verification,
-                store: &self.fact_store(),
-                workspace_root: &self.workspace_root.clone(),
+                store: &ws.fact_store(),
+                workspace_root: &ws.canonical_root,
                 freshness: fresh,
                 recent_edits: &recent_edits,
             });
-            self.store_last_rca(&rca);
+            self.store_last_rca(ws, &rca);
             obj.insert(
                 "root_cause".to_string(),
                 serde_json::to_value(&rca).unwrap_or(json!({})),
@@ -301,128 +305,16 @@ impl CodeBroMcpServer {
         json!(obj)
     }
 
-    /// Snapshot the session's recent edits as debugging input.
-    fn recent_edits_snapshot(&self) -> Vec<crate::debugging::candidates::RecentEditInput> {
-        self.recent_edits
-            .lock()
-            .expect("recent edits lock")
-            .iter()
-            .map(|e| crate::debugging::candidates::RecentEditInput {
-                path: e.path.clone(),
-                seconds_ago: e.at.elapsed().as_secs(),
-                recommended_tests: e.recommended_tests.clone(),
-            })
-            .collect()
-    }
-
-    /// Stash the latest analysis so consult mode=debugging can inject it.
-    fn store_last_rca(&self, rca: &crate::debugging::types::RootCauseAnalysis) {
-        *self.last_rca.lock().expect("last rca lock") = Some(rca.clone());
-    }
-
-    /// Attach the latest deterministic root-cause hypotheses to a debugging
-    /// consult as an additive file context — the LLM reasons OVER CodeBro's
-    /// structured evidence rather than re-deriving it.
-    fn inject_debugging_hypotheses(
-        &self,
-        request: &mut crate::consultant::types::ConsultantRequest,
-        mode: &crate::consultant::types::ConsultantMode,
-    ) {
-        if !matches!(mode, crate::consultant::types::ConsultantMode::Debugging) {
-            return;
-        }
-        let guard = self.last_rca.lock().expect("last rca lock");
-        if let Some(rca) = guard.as_ref() {
-            let payload = serde_json::to_string(rca).unwrap_or_default();
-            request
-                .files
-                .push(crate::consultant::types::ConsultantFileContext {
-                    path: "codebro://root-cause-hypotheses".to_string(),
-                    content: payload,
-                });
-        }
-    }
-
-    /// Record a successfully applied change (path + the tests the advisory
-    /// recommended for it) for failure correlation.
-    fn remember_edit(&self, path: &str, recommended_tests: Vec<String>) {
-        const MAX_RECENT_EDITS: usize = 50;
-        const RELEVANCE_WINDOW_SECS: u64 = 3600;
-        let mut guard = self.recent_edits.lock().expect("recent edits lock");
-        guard.retain(|e| e.at.elapsed().as_secs() < RELEVANCE_WINDOW_SECS);
-        guard.push(RecentEdit {
-            path: path.to_string(),
-            at: std::time::Instant::now(),
-            recommended_tests,
-        });
-        if guard.len() > MAX_RECENT_EDITS {
-            let overflow = guard.len() - MAX_RECENT_EDITS;
-            guard.drain(0..overflow);
-        }
-    }
-
-    /// Intersect failing diagnostics with this session's recent edits:
-    /// files that were just changed AND now fail are prime debugging
-    /// suspects. Correlation is circumstantial evidence, never proof.
-    fn related_recent_changes(
-        &self,
-        verification: &crate::sandbox::VerificationResult,
-    ) -> Vec<serde_json::Value> {
-        if verification.verified || verification.diagnostics.is_empty() {
-            return Vec::new();
-        }
-        let guard = self.recent_edits.lock().expect("recent edits lock");
-        let diag_files: std::collections::HashSet<&str> = verification
-            .diagnostics
-            .iter()
-            .filter_map(|d| d.file.as_deref())
-            .collect();
-        // Failing test names from parsed diagnostics.
-        let failing_tests: std::collections::HashSet<&str> = verification
-            .diagnostics
-            .iter()
-            .filter_map(|d| d.test.as_deref())
-            .collect();
-
-        let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for edit in guard.iter().rev() {
-            // Two independent correlation channels:
-            //  a) a diagnostic points INTO the edited file;
-            //  b) the failing test was among the tests this edit's advisory
-            //     recommended (the causal chain from targeted selection).
-            let via_file = diag_files.contains(edit.path.as_str());
-            let via_recommended = !edit.recommended_tests.is_empty()
-                && edit
-                    .recommended_tests
-                    .iter()
-                    .any(|t| failing_tests.contains(t.as_str()));
-            let via = match (via_file, via_recommended) {
-                (true, true) => "diagnostic_file+recommended_tests",
-                (true, false) => "diagnostic_file",
-                (false, true) => "recommended_tests",
-                (false, false) => continue,
-            };
-            if seen.insert(edit.path.clone()) {
-                out.push(json!({
-                    "path": edit.path,
-                    "seconds_ago": edit.at.elapsed().as_secs(),
-                    "via": via,
-                }));
-            }
-        }
-        out
-    }
-
     /// Map diagnostic file paths onto owning module ids from the fact store.
     fn affected_modules_for(
         &self,
+        ws: &WorkspaceState,
         verification: &crate::sandbox::VerificationResult,
     ) -> Vec<String> {
         if verification.diagnostics.is_empty() {
             return Vec::new();
         }
-        let store = self.fact_store();
+        let store = ws.fact_store();
         let mut out = std::collections::BTreeSet::new();
         for d in &verification.diagnostics {
             let Some(file) = d.file.as_deref() else {
@@ -446,13 +338,17 @@ impl CodeBroMcpServer {
     #[tool(
         description = "Return the workspace context: project identity, workspace root, and engineering runtime state. Call this first to orient the agent in the project."
     )]
-    async fn workspace_context(&self) -> Result<CallToolResult, McpError> {
-        let (identity_loaded, identity) = self.identity_snapshot();
-        let store = self.fact_store();
+    async fn workspace_context(
+        &self,
+        Parameters(args): Parameters<WorkspaceContextArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let (identity_loaded, identity) = self.identity_snapshot(&ws);
+        let store = self.fact_store(&ws);
         let counts = store.collection().counts();
 
         let payload = json!({
-            "workspace_root": self.workspace_root.display().to_string(),
+            "workspace_root": ws.canonical_root.display().to_string(),
             "identity_loaded": identity_loaded,
             "project_identity": identity,
             "fact_counts": {
@@ -494,7 +390,8 @@ impl CodeBroMcpServer {
     ) -> Result<CallToolResult, McpError> {
         use crate::engineering_facts::FactKind;
 
-        let store = self.fact_store();
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let store = self.fact_store(&ws);
         let counts = store.collection().counts();
 
         let kind = match args.kind.as_deref() {
@@ -534,13 +431,13 @@ impl CodeBroMcpServer {
                 path: args.path.as_deref(),
                 limit: args.limit.unwrap_or(crate::mcp::facts::DEFAULT_LIMIT),
             },
-            crate::mcp::facts::compute_freshness(&store, &self.workspace_root),
+            crate::mcp::facts::compute_freshness(&store, &ws.canonical_root),
         )
         .map_err(|e| McpError::invalid_params(e, None))?;
 
         let returned = facts.len();
         let provenance_summary = crate::mcp::facts::provenance_summary(&store);
-        let freshness = crate::mcp::facts::compute_freshness(&store, &self.workspace_root);
+        let freshness = crate::mcp::facts::compute_freshness(&store, &ws.canonical_root);
         // When zero facts match, attach deterministic recovery guidance so an
         // LLM can retry productively instead of looping on a dead query.
         let recovery = if returned == 0 {
@@ -613,7 +510,29 @@ impl CodeBroMcpServer {
         )]))
     }
 
-    // ── Tool 3: engineering memory ────────────────────────────────────
+    /// Attach the latest deterministic root-cause hypotheses to a debugging
+    /// consult as an additive file context — the LLM reasons OVER CodeBro's
+    /// structured evidence rather than re-deriving it.
+    pub(crate) fn inject_debugging_hypotheses(
+        &self,
+        ws: &WorkspaceState,
+        request: &mut crate::consultant::types::ConsultantRequest,
+        mode: &crate::consultant::types::ConsultantMode,
+    ) {
+        if !matches!(mode, crate::consultant::types::ConsultantMode::Debugging) {
+            return;
+        }
+        let guard = ws.last_rca.lock().expect("last rca lock");
+        if let Some(rca) = guard.as_ref() {
+            let payload = serde_json::to_string(rca).unwrap_or_default();
+            request
+                .files
+                .push(crate::consultant::types::ConsultantFileContext {
+                    path: "codebro://root-cause-hypotheses".to_string(),
+                    content: payload,
+                });
+        }
+    }
 
     /// Resolve engineering memory (decisions, constraints, prior context)
     /// relevant to a task query.
@@ -624,11 +543,10 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<MemoryArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let identity = crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
-        let mut memory = crate::engineering_memory::EngineeringMemoryRuntime::new(
-            &self.workspace_root,
-            identity,
-        );
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let identity = crate::project_identity::ProjectIdentityRuntime::new(&ws.canonical_root);
+        let mut memory =
+            crate::engineering_memory::EngineeringMemoryRuntime::new(&ws.canonical_root, identity);
         let _ = memory.load(); // absent store is not an error for a read query
 
         let context = memory.resolve_for_task(&args.task_keywords, &args.active_file_tags);
@@ -682,10 +600,11 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<ChangeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let _mutation_guard = ws.mutation_lock.lock().await;
         // Plan-less, non-strict engine: boundary + staleness enforcement only.
         let engine =
-            crate::coding::change_engine::ChangeEngine::new(&self.workspace_root, &[], false);
+            crate::coding::change_engine::ChangeEngine::new(&ws.canonical_root, &[], false);
 
         let prepared = engine
             .prepare(&args.path, &args.old, &args.new)
@@ -710,7 +629,7 @@ impl CodeBroMcpServer {
                 (start_line, start_line + span_lines.saturating_sub(1))
             })
         };
-        let store = self.fact_store();
+        let store = self.fact_store(&ws);
         let advisory = change_invalidation::InvalidationAdvisory::analyze_with_range(
             &store,
             &args.path,
@@ -718,7 +637,7 @@ impl CodeBroMcpServer {
             edited_range,
         );
 
-        self.remember_edit(&args.path, advisory.recommended_tests.clone());
+        self.remember_edit(&ws, &args.path, advisory.recommended_tests.clone());
 
         let response = json!({
             "applied": true,
@@ -749,9 +668,10 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<ApplyChangesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let _mutation_guard = ws.mutation_lock.lock().await;
         let engine =
-            crate::coding::change_engine::ChangeEngine::new(&self.workspace_root, &[], false);
+            crate::coding::change_engine::ChangeEngine::new(&ws.canonical_root, &[], false);
 
         let requests: Vec<crate::coding::transaction::TransactionRequest> = args
             .changes
@@ -772,7 +692,7 @@ impl CodeBroMcpServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         if report.success() {
             for change in &args.changes {
-                self.remember_edit(&change.path, Vec::new());
+                self.remember_edit(&ws, &change.path, Vec::new());
             }
         }
 
@@ -802,7 +722,8 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<RecordMemoryArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let _mutation_guard = ws.mutation_lock.lock().await;
         let key = args.key.trim();
         if key.is_empty() {
             return Err(McpError::invalid_params("key must not be empty", None));
@@ -869,11 +790,9 @@ impl CodeBroMcpServer {
         metadata.provenance =
             crate::engineering_memory::types::MemoryProvenance::agent(args.session.clone());
 
-        let identity = crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
-        let mut memory = crate::engineering_memory::EngineeringMemoryRuntime::new(
-            &self.workspace_root,
-            identity,
-        );
+        let identity = crate::project_identity::ProjectIdentityRuntime::new(&ws.canonical_root);
+        let mut memory =
+            crate::engineering_memory::EngineeringMemoryRuntime::new(&ws.canonical_root, identity);
         // Fail closed: if an existing store cannot be loaded (corrupt,
         // wrong schema, wrong workspace), refuse to write. Proceeding on
         // an empty runtime would persist a file containing only this new
@@ -947,7 +866,8 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<DeleteMemoryArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let _mutation_guard = ws.mutation_lock.lock().await;
         let key = args.key.trim();
         if key.is_empty() {
             return Err(McpError::invalid_params("key must not be empty", None));
@@ -962,11 +882,9 @@ impl CodeBroMcpServer {
         }
         let id = format!("mem::{key}");
 
-        let identity = crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
-        let mut memory = crate::engineering_memory::EngineeringMemoryRuntime::new(
-            &self.workspace_root,
-            identity,
-        );
+        let identity = crate::project_identity::ProjectIdentityRuntime::new(&ws.canonical_root);
+        let mut memory =
+            crate::engineering_memory::EngineeringMemoryRuntime::new(&ws.canonical_root, identity);
         // Fail closed: a corrupt/unloadable store must never be treated as
         // an empty one, or deletion would persist a store missing entries.
         if let Err(load_err) = memory.load() {
@@ -1025,7 +943,8 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<UpdateIdentityArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let _mutation_guard = ws.mutation_lock.lock().await;
         use crate::project_identity::{
             DecisionStatus, EngineeringDecision, IdentityChanges, ProjectIdentityRuntime,
             ProjectIdentityUpdater, RoadmapItem, RoadmapStatus,
@@ -1060,7 +979,7 @@ impl CodeBroMcpServer {
             }
         };
 
-        let mut runtime = ProjectIdentityRuntime::new(&self.workspace_root);
+        let mut runtime = ProjectIdentityRuntime::new(&ws.canonical_root);
         let current = runtime.load().map_err(|e| {
             McpError::invalid_params(
                 format!("no project identity for this workspace (run `codebro init` first): {e}"),
@@ -1179,7 +1098,7 @@ impl CodeBroMcpServer {
             )]));
         }
 
-        let mut updater = ProjectIdentityUpdater::new(&self.workspace_root);
+        let mut updater = ProjectIdentityUpdater::new(&ws.canonical_root);
         let result = updater
             .update(&current, changes)
             .ok_or_else(|| McpError::internal_error("identity update produced no result", None))?;
@@ -1234,12 +1153,14 @@ impl CodeBroMcpServer {
     #[tool(
         description = "Return read-only statistics about the engineering memory store: number of entries, total token budget, tag distribution, average confidence, and oldest/newest entry timestamps. Call this to judge whether engineering memory holds meaningful state before relying on it."
     )]
-    async fn memory_stats(&self) -> Result<CallToolResult, McpError> {
-        let identity = crate::project_identity::ProjectIdentityRuntime::new(&self.workspace_root);
-        let mut memory = crate::engineering_memory::EngineeringMemoryRuntime::new(
-            &self.workspace_root,
-            identity,
-        );
+    async fn memory_stats(
+        &self,
+        Parameters(args): Parameters<MemoryStatsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let identity = crate::project_identity::ProjectIdentityRuntime::new(&ws.canonical_root);
+        let mut memory =
+            crate::engineering_memory::EngineeringMemoryRuntime::new(&ws.canonical_root, identity);
         let _ = memory.load(); // absent store is not an error for a read query
 
         let total_budget = crate::engineering_memory::resolver::DEFAULT_TOKEN_BUDGET;
@@ -1315,6 +1236,7 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<SandboxExecArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
         let cmd = crate::sandbox::SandboxCommand {
             command: args.command,
             working_directory: args.working_directory,
@@ -1325,7 +1247,7 @@ impl CodeBroMcpServer {
             crate::sandbox::SandboxPolicy::new().with_timeout(args.timeout.unwrap_or(120) as u64);
         let result = self
             .sandbox_runtime
-            .execute(&self.workspace_root, cmd, &policy);
+            .execute(&ws.canonical_root, cmd, &policy);
         let payload = serde_json::to_string_pretty(&result)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
@@ -1343,8 +1265,9 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<SandboxTestArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
         let command = resolve_test_command_filtered(
-            &self.workspace_root,
+            &ws.canonical_root,
             args.command.as_deref(),
             args.test_filter.as_deref().unwrap_or(&[]),
         );
@@ -1358,7 +1281,7 @@ impl CodeBroMcpServer {
             crate::sandbox::SandboxPolicy::new().with_timeout(args.timeout.unwrap_or(120) as u64);
         let execution = self
             .sandbox_runtime
-            .execute(&self.workspace_root, cmd, &policy);
+            .execute(&ws.canonical_root, cmd, &policy);
         let verification =
             crate::sandbox::VerificationResult::from_execution_with_impacted_fact_ids(
                 execution,
@@ -1366,8 +1289,11 @@ impl CodeBroMcpServer {
                 args.expected_success,
                 args.affected_fact_ids,
             );
-        let verification_obj =
-            self.verification_object(&verification, args.test_filter.as_deref().unwrap_or(&[]));
+        let verification_obj = self.verification_object(
+            &ws,
+            &verification,
+            args.test_filter.as_deref().unwrap_or(&[]),
+        );
         let payload = json!({
             "execution": verification.execution,
             "verification": verification_obj,
@@ -1390,7 +1316,8 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<SandboxBuildArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let command = resolve_build_command(&self.workspace_root, args.command.as_deref());
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let command = resolve_build_command(&ws.canonical_root, args.command.as_deref());
         let cmd = crate::sandbox::SandboxCommand {
             command: command.clone(),
             working_directory: args.working_directory,
@@ -1401,7 +1328,7 @@ impl CodeBroMcpServer {
             crate::sandbox::SandboxPolicy::new().with_timeout(args.timeout.unwrap_or(120) as u64);
         let execution = self
             .sandbox_runtime
-            .execute(&self.workspace_root, cmd, &policy);
+            .execute(&ws.canonical_root, cmd, &policy);
         let verification =
             crate::sandbox::VerificationResult::from_execution_with_impacted_fact_ids(
                 execution,
@@ -1409,7 +1336,7 @@ impl CodeBroMcpServer {
                 args.expected_success,
                 args.affected_fact_ids,
             );
-        let verification_obj = self.verification_object(&verification, &[]);
+        let verification_obj = self.verification_object(&ws, &verification, &[]);
         let payload = json!({
             "execution": verification.execution,
             "verification": verification_obj,
@@ -1455,7 +1382,8 @@ impl CodeBroMcpServer {
         &self,
         Parameters(args): Parameters<ImpactArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.fact_store();
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let store = self.fact_store(&ws);
 
         let target = match args.target_type.as_deref() {
             None | Some("symbol") => {
@@ -1506,7 +1434,9 @@ impl CodeBroMcpServer {
             return Err(McpError::invalid_params(e.0, None));
         }
 
-        let result = crate::impact::analyze(&store, target, &opts, Some(&self.workspace_root));
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let store = self.fact_store(&ws);
+        let result = crate::impact::analyze(&store, target, &opts, Some(&ws.canonical_root));
         let payload = serde_json::to_string_pretty(&result)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
@@ -1523,8 +1453,12 @@ impl CodeBroMcpServer {
     #[tool(
         description = "Perform a full engineering fact reindex: regenerate .codebro/facts.json by re-scanning the entire workspace. Use after source changes when apply_change.needs_reindex=true. This is a full rebuild, not incremental."
     )]
-    async fn reindex(&self) -> Result<CallToolResult, McpError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+    async fn reindex(
+        &self,
+        Parameters(args): Parameters<ReindexArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let _mutation_guard = ws.mutation_lock.lock().await;
         let start = std::time::Instant::now();
 
         // The init pipeline is fully synchronous (filesystem walk +
@@ -1532,7 +1466,7 @@ impl CodeBroMcpServer {
         // Run it on the blocking thread pool so the async runtime — and
         // therefore every other in-flight MCP tool call on this stdio
         // connection — stays responsive.
-        let root = self.workspace_root.clone();
+        let root = ws.canonical_root.clone();
         let init_result = tokio::task::spawn_blocking(move || crate::init::run(&root))
             .await
             .map_err(|e| McpError::internal_error(format!("reindex worker panicked: {e}"), None))?;
@@ -1541,12 +1475,9 @@ impl CodeBroMcpServer {
             Ok(()) => {
                 // Invalidate the mtime-based fact store cache so the next
                 // call reloads the freshly written .codebro/facts.json.
-                {
-                    let mut guard = self.facts_cache.lock().expect("facts cache lock");
-                    *guard = None;
-                }
+                ws.invalidate_facts_cache();
 
-                let store = self.fact_store();
+                let store = self.fact_store(&ws);
                 let elapsed = start.elapsed();
                 let counts = store.collection().counts();
                 let validation = store.validate();
@@ -1612,8 +1543,12 @@ impl CodeBroMcpServer {
     #[tool(
         description = "Return a structured read-only health report for the CodeBro workspace: exit code, status (healthy/warn/error), per-check results and summary. Delegates to the existing doctor implementation."
     )]
-    async fn repository_health(&self) -> Result<CallToolResult, McpError> {
-        let (code, checks) = crate::doctor::report(&self.workspace_root)
+    async fn repository_health(
+        &self,
+        Parameters(args): Parameters<RepositoryHealthArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let (code, checks) = crate::doctor::report(&ws.canonical_root)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let status = match code {
@@ -1744,18 +1679,19 @@ impl CodeBroMcpServer {
         };
 
         // Inject CodeBro engineering context when requested.
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
         if args.include_project_context.unwrap_or(false) {
-            inject_project_context(&mut request, &self.workspace_root);
+            inject_project_context(&mut request, &ws.canonical_root);
         }
         if args.include_git_diff.unwrap_or(false) {
-            inject_git_diff(&mut request, &self.workspace_root);
+            inject_git_diff(&mut request, &ws.canonical_root);
         }
 
         // Debugging mode: inject the latest deterministic root-cause
         // hypotheses (if any) so the external LLM reasons OVER CodeBro's
         // structured evidence rather than re-deriving it.
         if matches!(mode, crate::consultant::types::ConsultantMode::Debugging) {
-            let guard = self.last_rca.lock().expect("last rca lock");
+            let guard = ws.last_rca.lock().expect("last rca lock");
             if let Some(rca) = guard.as_ref() {
                 let payload = serde_json::to_string(rca).unwrap_or_default();
                 request
@@ -1828,6 +1764,10 @@ pub struct FactsArgs {
     /// Maximum results returned; defaults to 10, capped at 50.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// Argument schema for `engineering_memory`.
@@ -1839,6 +1779,10 @@ pub struct MemoryArgs {
     /// Active-file tags to bias resolution toward current context.
     #[serde(default)]
     pub active_file_tags: Vec<String>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// Argument schema for `apply_change`.
@@ -1850,6 +1794,10 @@ pub struct ChangeArgs {
     pub old: String,
     /// Replacement text.
     pub new: String,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// One change inside an `apply_changes` transaction.
@@ -1869,6 +1817,10 @@ pub struct ApplyChangesArgs {
     /// The set of changes applied all-or-nothing: either every change lands
     /// or the workspace is rolled back to its prior state.
     pub changes: Vec<TransactionChangeArgs>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// Argument schema for `record_memory`.
@@ -1897,6 +1849,10 @@ pub struct RecordMemoryArgs {
     /// Optional session identifier recorded in structured provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// Argument schema for `delete_memory`.
@@ -1909,6 +1865,10 @@ pub struct DeleteMemoryArgs {
     /// deletion when an agent misidentifies a key.
     #[serde(default)]
     pub confirm: bool,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// A decision to record via `update_identity`.
@@ -1987,6 +1947,10 @@ pub struct UpdateIdentityArgs {
     /// Record a completed milestone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub add_milestone: Option<String>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// Trim and require a non-empty string field.
@@ -2052,6 +2016,10 @@ pub struct SandboxExecArgs {
     /// Arbitrary metadata to echo back in the result (optional).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: std::collections::HashMap<String, String>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// Argument schema for `sandbox_test`.
@@ -2086,6 +2054,10 @@ pub struct SandboxTestArgs {
     /// standard selection mechanism, and when an explicit command overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_filter: Option<Vec<String>>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// Argument schema for `sandbox_build`.
@@ -2114,6 +2086,10 @@ pub struct SandboxBuildArgs {
     /// independently verified by sandbox execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affected_fact_ids: Option<Vec<String>>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// Argument schema for `impact_analyze`.
@@ -2149,6 +2125,46 @@ pub struct ImpactArgs {
     /// (default 1000). When exceeded the result is marked partial.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_nodes: Option<usize>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+}
+
+/// Argument schema for `workspace_context`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct WorkspaceContextArgs {
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+}
+
+/// Argument schema for `memory_stats`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryStatsArgs {
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+}
+
+/// Argument schema for `reindex`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ReindexArgs {
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+}
+
+/// Argument schema for `repository_health`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RepositoryHealthArgs {
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// Argument schema for `consult`.
@@ -2179,6 +2195,10 @@ pub struct ConsultArgs {
     /// Maximum answer length in characters (0 = provider default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_answer_length: Option<usize>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// A single file to attach to a consultation request.
@@ -2540,6 +2560,7 @@ type SharedServer = Arc<CodeBroMcpServer>;
 mod tests {
     use super::*;
     use rmcp::ServerHandler;
+    use std::collections::HashSet;
 
     /// Regression test for the P0.1 tool-description defect: an agent
     /// (or a human) once wrote the full user task into a `#[tool(description)]
@@ -2755,6 +2776,7 @@ mod tests {
     #[test]
     fn m1a_zero_confidence_produces_zero_trust() {
         use crate::provenance::{compute_trust, FreshnessStatus, SourceKind};
+        use crate::workspace_registry::{WorkspaceRegistry, WorkspaceState};
         let t = compute_trust(&SourceKind::AgentDeclared, 0.0, FreshnessStatus::Unknown);
         // AgentDeclared base = 0.30, freshness Unknown = 0.8, confidence = 0.0
         // trust = 0.30 * 0.8 * 0.0 = 0.0
@@ -2771,6 +2793,7 @@ mod tests {
     #[tokio::test]
     async fn m1a_freshness_effect_on_trust() {
         use crate::provenance::{compute_trust, FreshnessStatus, SourceKind};
+        use crate::workspace_registry::{WorkspaceRegistry, WorkspaceState};
         let confidence = 0.8;
         let t_fresh = compute_trust(
             &SourceKind::AgentDeclared,
@@ -3669,7 +3692,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let server = local_sandbox_server(&dir);
 
-        let out = call_tool_text(&server, "workspace_context", json!({})).await;
+        let out = call_tool_text(
+            &server,
+            "workspace_context",
+            json!({
+                "workspace_root": serde_json::Value::Null,
+            }),
+        )
+        .await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert!(v["workspace_root"].is_string());
         assert!(v["fact_counts"].is_object());
@@ -3704,7 +3734,12 @@ mod tests {
     ) -> Result<String, String> {
         let result = match name {
             "memory_stats" => {
-                let r = server.memory_stats().await.map_err(|e| e.to_string())?;
+                let r = server
+                    .memory_stats(Parameters(MemoryStatsArgs {
+                        workspace_root: None,
+                    }))
+                    .await
+                    .map_err(|e| e.to_string())?;
                 text_of(r)
             }
             "record_memory" => {
@@ -3759,8 +3794,10 @@ mod tests {
                 text_of(r)
             }
             "workspace_context" => {
+                let p: WorkspaceContextArgs =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
                 let r = server
-                    .workspace_context()
+                    .workspace_context(Parameters(p))
                     .await
                     .map_err(|e| e.to_string())?;
                 text_of(r)
@@ -3803,12 +3840,19 @@ mod tests {
                 text_of(r)
             }
             "reindex" => {
-                let r = server.reindex().await.map_err(|e| e.to_string())?;
+                let r = server
+                    .reindex(Parameters(ReindexArgs {
+                        workspace_root: None,
+                    }))
+                    .await
+                    .map_err(|e| e.to_string())?;
                 text_of(r)
             }
             "repository_health" => {
                 let r = server
-                    .repository_health()
+                    .repository_health(Parameters(RepositoryHealthArgs {
+                        workspace_root: None,
+                    }))
                     .await
                     .map_err(|e| e.to_string())?;
                 text_of(r)
@@ -3857,7 +3901,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let server = std::sync::Arc::new(local_sandbox_server(&dir));
 
-        let guard = server.mutation_lock.lock().await;
+        let ws = server.resolve_workspace(None).unwrap();
+        let guard = ws.mutation_lock.lock().await;
         let s2 = server.clone();
         let mut task = tokio::spawn(async move {
             call_tool_text(
@@ -6141,7 +6186,11 @@ mod tests {
             )
         };
         let verification = crate::sandbox::VerificationResult::from_execution(execution);
-        let _ = server.verification_object(&verification, &[]);
+        let _ = server.verification_object(
+            &server.resolve_workspace(None).unwrap(),
+            &verification,
+            &[],
+        );
 
         let out = call_tool_text(&server, "repository_health", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -6285,6 +6334,656 @@ mod tests {
             }
         }
     }
+
+    // ── Multi-workspace isolation ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn facts_are_workspace_isolated() {
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let root_a = ws_a.path();
+        let root_b = ws_b.path();
+        std::fs::write(root_a.join("marker.txt"), "ALPHA").unwrap();
+        std::fs::write(root_a.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_a).unwrap();
+        std::fs::write(root_b.join("marker.txt"), "BRAVO").unwrap();
+        std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_b).unwrap();
+
+        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+
+        let out_a = call_tool_text(
+            &server,
+            "engineering_facts",
+            json!({
+                "query": "main",
+                "workspace_root": root_a.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let facts_a: serde_json::Value = serde_json::from_str(&out_a).unwrap();
+        assert!(facts_a["returned"].as_u64().unwrap() > 0);
+
+        let out_b = call_tool_text(
+            &server,
+            "engineering_facts",
+            json!({
+                "query": "main",
+                "workspace_root": root_b.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let facts_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
+        assert!(facts_b["returned"].as_u64().unwrap() > 0);
+
+        let ids_a: HashSet<String> = facts_a["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["id"].as_str())
+            .map(|s| s.to_string())
+            .collect();
+        let ids_b: HashSet<String> = facts_b["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["id"].as_str())
+            .map(|s| s.to_string())
+            .collect();
+        let overlap: HashSet<&String> = ids_a.iter().filter(|id| ids_b.contains(*id)).collect();
+        assert!(
+            overlap.is_empty(),
+            "facts from A must not appear in B (overlap: {})",
+            overlap.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_is_workspace_isolated() {
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let root_a = ws_a.path();
+        let root_b = ws_b.path();
+        std::fs::write(root_a.join("marker.txt"), "ALPHA").unwrap();
+        std::fs::write(root_a.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_a).unwrap();
+        std::fs::write(root_b.join("marker.txt"), "BRAVO").unwrap();
+        std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_b).unwrap();
+
+        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+
+        let _ = call_tool_text(
+            &server,
+            "record_memory",
+            json!({
+                "key": "wsA-key",
+                "value": "wsA-value",
+                "workspace_root": root_a.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let _ = call_tool_text(
+            &server,
+            "record_memory",
+            json!({
+                "key": "wsB-key",
+                "value": "wsB-value",
+                "workspace_root": root_b.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+
+        let out_a = call_tool_text(
+            &server,
+            "engineering_memory",
+            json!({
+                "task_keywords": ["wsA-key"],
+                "workspace_root": root_a.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let mem_a: serde_json::Value = serde_json::from_str(&out_a).unwrap();
+        let keys_a: Vec<String> = mem_a["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["key"].as_str())
+            .map(|s| s.to_string())
+            .collect();
+        assert!(keys_a.contains(&"wsA-key".to_string()));
+        assert!(!keys_a.contains(&"wsB-key".to_string()));
+
+        let out_b = call_tool_text(
+            &server,
+            "engineering_memory",
+            json!({
+                "task_keywords": ["wsB-key"],
+                "workspace_root": root_b.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let mem_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
+        let keys_b: Vec<String> = mem_b["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["key"].as_str())
+            .map(|s| s.to_string())
+            .collect();
+        assert!(keys_b.contains(&"wsB-key".to_string()));
+        assert!(!keys_b.contains(&"wsA-key".to_string()));
+    }
+
+    #[tokio::test]
+    async fn identity_is_workspace_isolated() {
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let root_a = ws_a.path();
+        let root_b = ws_b.path();
+        std::fs::write(root_a.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_a).unwrap();
+        std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_b).unwrap();
+
+        // Set distinct identities in each workspace so we can verify isolation.
+        {
+            let mut rt = crate::project_identity::ProjectIdentityRuntime::new(root_a);
+            rt.create_minimal("ALPHA", "rust").unwrap();
+        }
+        {
+            let mut rt = crate::project_identity::ProjectIdentityRuntime::new(root_b);
+            rt.create_minimal("BRAVO", "rust").unwrap();
+        }
+
+        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+
+        let out_a = call_tool_text(
+            &server,
+            "workspace_context",
+            json!({ "workspace_root": root_a.to_string_lossy().to_string() }),
+        )
+        .await;
+        let ctx_a: serde_json::Value = serde_json::from_str(&out_a).unwrap();
+
+        let out_b = call_tool_text(
+            &server,
+            "workspace_context",
+            json!({ "workspace_root": root_b.to_string_lossy().to_string() }),
+        )
+        .await;
+        let ctx_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
+
+        let name_a = ctx_a["project_identity"]["name"].as_str().unwrap_or("");
+        let name_b = ctx_b["project_identity"]["name"].as_str().unwrap_or("");
+        assert_eq!(name_a, "ALPHA");
+        assert_eq!(name_b, "BRAVO");
+    }
+
+    #[tokio::test]
+    async fn mutation_locks_are_workspace_isolated() {
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let root_a = ws_a.path();
+        let root_b = ws_b.path();
+        std::fs::write(root_a.join("marker.txt"), "ALPHA").unwrap();
+        std::fs::write(root_a.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_a).unwrap();
+        std::fs::write(root_b.join("marker.txt"), "BRAVO").unwrap();
+        std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_b).unwrap();
+
+        std::fs::write(root_a.join("a.txt"), "hello alpha\n").unwrap();
+        std::fs::write(root_b.join("b.txt"), "hello bravo\n").unwrap();
+
+        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+
+        let out_a = call_tool_text(
+            &server,
+            "apply_change",
+            json!({
+                "path": "a.txt",
+                "old": "hello alpha\n",
+                "new": "goodbye alpha\n",
+                "workspace_root": root_a.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let res_a: serde_json::Value = serde_json::from_str(&out_a).unwrap();
+        assert_eq!(res_a["applied"], true);
+
+        let out_b = call_tool_text(
+            &server,
+            "apply_change",
+            json!({
+                "path": "b.txt",
+                "old": "hello bravo\n",
+                "new": "goodbye bravo\n",
+                "workspace_root": root_b.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let res_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
+        assert_eq!(res_b["applied"], true);
+
+        assert_eq!(
+            std::fs::read_to_string(root_a.join("a.txt")).unwrap(),
+            "goodbye alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root_b.join("b.txt")).unwrap(),
+            "goodbye bravo\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_exec_follows_workspace() {
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let root_a = ws_a.path();
+        let root_b = ws_b.path();
+        std::fs::write(
+            root_a.join("marker.txt"),
+            "ALPHA_CODEBRO_WORKSPACE_MARKER\n",
+        )
+        .unwrap();
+        std::fs::write(root_a.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_a).unwrap();
+        std::fs::write(
+            root_b.join("marker.txt"),
+            "BRAVO_CODEBRO_WORKSPACE_MARKER\n",
+        )
+        .unwrap();
+        std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_b).unwrap();
+
+        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+
+        let out_a = call_tool_text(
+            &server,
+            "sandbox_exec",
+            json!({
+                "command": "cat marker.txt",
+                "workspace_root": root_a.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let res_a: serde_json::Value = serde_json::from_str(&out_a).unwrap();
+        assert!(res_a["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ALPHA_CODEBRO_WORKSPACE_MARKER"));
+
+        let out_b = call_tool_text(
+            &server,
+            "sandbox_exec",
+            json!({
+                "command": "cat marker.txt",
+                "workspace_root": root_b.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let res_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
+        assert!(res_b["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("BRAVO_CODEBRO_WORKSPACE_MARKER"));
+    }
+
+    #[tokio::test]
+    async fn reindex_is_workspace_isolated() {
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let root_a = ws_a.path();
+        let root_b = ws_b.path();
+        std::fs::write(root_a.join("marker.txt"), "ALPHA").unwrap();
+        std::fs::write(root_a.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_a).unwrap();
+        std::fs::write(root_b.join("marker.txt"), "BRAVO").unwrap();
+        std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_b).unwrap();
+
+        std::fs::write(root_a.join("extra.rs"), "pub fn alpha_unique_fn() {}\n").unwrap();
+
+        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+
+        let _ = call_tool_text(
+            &server,
+            "reindex",
+            json!({ "workspace_root": root_a.to_string_lossy().to_string() }),
+        )
+        .await;
+
+        let out_a = call_tool_text(
+            &server,
+            "engineering_facts",
+            json!({
+                "query": "alpha_unique_fn",
+                "workspace_root": root_a.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let facts_a: serde_json::Value = serde_json::from_str(&out_a).unwrap();
+        assert!(facts_a["returned"].as_u64().unwrap() > 0);
+
+        let out_b = call_tool_text(
+            &server,
+            "engineering_facts",
+            json!({
+                "query": "alpha_unique_fn",
+                "workspace_root": root_b.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let facts_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
+        assert_eq!(facts_b["returned"].as_u64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn impact_analyze_is_workspace_isolated() {
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let root_a = ws_a.path();
+        let root_b = ws_b.path();
+        std::fs::write(root_a.join("marker.txt"), "ALPHA").unwrap();
+        std::fs::write(root_a.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_a).unwrap();
+        std::fs::write(root_b.join("marker.txt"), "BRAVO").unwrap();
+        std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_b).unwrap();
+
+        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+
+        let out_a = call_tool_text(
+            &server,
+            "impact_analyze",
+            json!({
+                "target": "main",
+                "target_type": "symbol",
+                "workspace_root": root_a.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let impact_a: serde_json::Value = serde_json::from_str(&out_a).unwrap();
+        assert!(impact_a.get("target").is_some());
+
+        let out_b = call_tool_text(
+            &server,
+            "impact_analyze",
+            json!({
+                "target": "main",
+                "target_type": "symbol",
+                "workspace_root": root_b.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let impact_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
+        assert!(impact_b.get("target").is_some());
+    }
+
+    #[tokio::test]
+    async fn repository_health_is_workspace_isolated() {
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let root_a = ws_a.path();
+        let root_b = ws_b.path();
+        std::fs::write(root_a.join("marker.txt"), "ALPHA").unwrap();
+        std::fs::write(root_a.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_a).unwrap();
+        std::fs::write(root_b.join("marker.txt"), "BRAVO").unwrap();
+        std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_b).unwrap();
+
+        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+
+        let out_a = call_tool_text(
+            &server,
+            "repository_health",
+            json!({ "workspace_root": root_a.to_string_lossy().to_string() }),
+        )
+        .await;
+        let health_a: serde_json::Value = serde_json::from_str(&out_a).unwrap();
+        assert_eq!(health_a["status"], "healthy");
+
+        let out_b = call_tool_text(
+            &server,
+            "repository_health",
+            json!({ "workspace_root": root_b.to_string_lossy().to_string() }),
+        )
+        .await;
+        let health_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
+        assert_eq!(health_b["status"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn memory_stats_is_workspace_isolated() {
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let root_a = ws_a.path();
+        let root_b = ws_b.path();
+        std::fs::write(root_a.join("marker.txt"), "ALPHA").unwrap();
+        std::fs::write(root_a.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_a).unwrap();
+        std::fs::write(root_b.join("marker.txt"), "BRAVO").unwrap();
+        std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_b).unwrap();
+
+        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+
+        let _ = call_tool_text(
+            &server,
+            "record_memory",
+            json!({
+                "key": "wsA-stat-key",
+                "value": "wsA-stat-value",
+                "workspace_root": root_a.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let _ = call_tool_text(
+            &server,
+            "record_memory",
+            json!({
+                "key": "wsB-stat-key",
+                "value": "wsB-stat-value",
+                "workspace_root": root_b.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+
+        let out_a = call_tool_text(
+            &server,
+            "memory_stats",
+            json!({ "workspace_root": root_a.to_string_lossy().to_string() }),
+        )
+        .await;
+        let stats_a: serde_json::Value = serde_json::from_str(&out_a).unwrap();
+        assert!(stats_a["entry_count"].as_u64().unwrap() >= 1);
+
+        let out_b = call_tool_text(
+            &server,
+            "memory_stats",
+            json!({ "workspace_root": root_b.to_string_lossy().to_string() }),
+        )
+        .await;
+        let stats_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
+        assert!(stats_b["entry_count"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_access_does_not_leak() {
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let root_a = ws_a.path();
+        let root_b = ws_b.path();
+        std::fs::write(root_a.join("marker.txt"), "ALPHA").unwrap();
+        std::fs::write(root_a.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_a).unwrap();
+        std::fs::write(root_b.join("marker.txt"), "BRAVO").unwrap();
+        std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_b).unwrap();
+
+        let server = Arc::new(CodeBroMcpServer::new(root_a.to_path_buf()));
+        let path_a = root_a.to_string_lossy().to_string();
+        let path_b = root_b.to_string_lossy().to_string();
+
+        let server_a = server.clone();
+        let pa = path_a.clone();
+        let handle_a = tokio::spawn(async move {
+            for i in 0..20 {
+                let _ = call_tool_text(
+                    &server_a,
+                    "record_memory",
+                    json!({
+                        "key": format!("wsA-concurrent-{i}"),
+                        "value": format!("value-{i}"),
+                        "workspace_root": &pa,
+                    }),
+                )
+                .await;
+            }
+        });
+
+        let server_b = server.clone();
+        let pb = path_b.clone();
+        let handle_b = tokio::spawn(async move {
+            for i in 0..20 {
+                let _ = call_tool_text(
+                    &server_b,
+                    "record_memory",
+                    json!({
+                        "key": format!("wsB-concurrent-{i}"),
+                        "value": format!("value-{i}"),
+                        "workspace_root": &pb,
+                    }),
+                )
+                .await;
+            }
+        });
+
+        handle_a.await.unwrap();
+        handle_b.await.unwrap();
+
+        let out_a = call_tool_text(
+            &server,
+            "engineering_memory",
+            json!({
+                "task_keywords": ["wsA-concurrent-0"],
+                "workspace_root": &path_a,
+            }),
+        )
+        .await;
+        let mem_a: serde_json::Value = serde_json::from_str(&out_a).unwrap();
+        let keys_a: Vec<String> = mem_a["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["key"].as_str())
+            .map(|s| s.to_string())
+            .collect();
+        assert!(keys_a.contains(&"wsA-concurrent-0".to_string()));
+        assert!(!keys_a.contains(&"wsB-concurrent-0".to_string()));
+
+        let out_b = call_tool_text(
+            &server,
+            "engineering_memory",
+            json!({
+                "task_keywords": ["wsB-concurrent-0"],
+                "workspace_root": &path_b,
+            }),
+        )
+        .await;
+        let mem_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
+        let keys_b: Vec<String> = mem_b["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["key"].as_str())
+            .map(|s| s.to_string())
+            .collect();
+        assert!(keys_b.contains(&"wsB-concurrent-0".to_string()));
+        assert!(!keys_b.contains(&"wsA-concurrent-0".to_string()));
+    }
+
+    #[tokio::test]
+    async fn switching_workspace_a_to_b_to_a_preserves_isolation() {
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let root_a = ws_a.path();
+        let root_b = ws_b.path();
+        std::fs::write(root_a.join("marker.txt"), "ALPHA").unwrap();
+        std::fs::write(root_a.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_a).unwrap();
+        std::fs::write(root_b.join("marker.txt"), "BRAVO").unwrap();
+        std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
+        crate::init::run(root_b).unwrap();
+
+        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+
+        let out_a1 = call_tool_text(
+            &server,
+            "engineering_facts",
+            json!({
+                "query": "main",
+                "workspace_root": root_a.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let facts_a1: serde_json::Value = serde_json::from_str(&out_a1).unwrap();
+        let id_a1: HashSet<String> = facts_a1["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["id"].as_str())
+            .map(|s| s.to_string())
+            .collect();
+
+        let out_b = call_tool_text(
+            &server,
+            "engineering_facts",
+            json!({
+                "query": "main",
+                "workspace_root": root_b.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let facts_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
+        let id_b: HashSet<String> = facts_b["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["id"].as_str())
+            .map(|s| s.to_string())
+            .collect();
+
+        let out_a2 = call_tool_text(
+            &server,
+            "engineering_facts",
+            json!({
+                "query": "main",
+                "workspace_root": root_a.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let facts_a2: serde_json::Value = serde_json::from_str(&out_a2).unwrap();
+        let id_a2: HashSet<String> = facts_a2["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["id"].as_str())
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            id_a1, id_a2,
+            "workspace A facts must be stable across switches"
+        );
+        let overlap: HashSet<&String> = id_a1.iter().filter(|id| id_b.contains(*id)).collect();
+        assert!(
+            overlap.is_empty(),
+            "workspace A and B facts must never overlap"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6308,11 +7007,16 @@ mod debugging_consult_tests {
             include_project_context: false,
             max_answer_length: 0,
         };
-        server.inject_debugging_hypotheses(&mut req, &ConsultantMode::Debugging);
+        server.inject_debugging_hypotheses(
+            &server.resolve_workspace(None).unwrap(),
+            &mut req,
+            &ConsultantMode::Debugging,
+        );
         assert!(req.files.is_empty());
 
         // Store an analysis → injected exactly once in debugging mode.
-        *server.last_rca.lock().unwrap() = Some(crate::debugging::types::RootCauseAnalysis {
+        let ws = server.resolve_workspace(None).unwrap();
+        *ws.last_rca.lock().unwrap() = Some(crate::debugging::types::RootCauseAnalysis {
             status: crate::debugging::types::AnalysisStatus::Hypotheses,
             failure_classification: "test_failure".into(),
             hypotheses: vec![],
@@ -6320,7 +7024,11 @@ mod debugging_consult_tests {
             freshness: "stale".into(),
             limitations: vec![],
         });
-        server.inject_debugging_hypotheses(&mut req, &ConsultantMode::Debugging);
+        server.inject_debugging_hypotheses(
+            &server.resolve_workspace(None).unwrap(),
+            &mut req,
+            &ConsultantMode::Debugging,
+        );
         assert_eq!(req.files.len(), 1);
         assert_eq!(req.files[0].path, "codebro://root-cause-hypotheses");
         assert!(req.files[0].content.contains("test_failure"));
@@ -6328,7 +7036,11 @@ mod debugging_consult_tests {
         // Non-debugging modes never receive it.
         let mut req2 = req.clone();
         req2.files.clear();
-        server.inject_debugging_hypotheses(&mut req2, &ConsultantMode::Planning);
+        server.inject_debugging_hypotheses(
+            &server.resolve_workspace(None).unwrap(),
+            &mut req2,
+            &ConsultantMode::Planning,
+        );
         assert!(req2.files.is_empty());
     }
 }
@@ -6391,7 +7103,7 @@ mod evidence_journal_wiring_tests {
         let dir = tempfile::tempdir().unwrap();
         let server = server_at(dir.path());
         let v = verification_with(Some("treeX"), true, false);
-        let obj = server.verification_object(&v, &[]);
+        let obj = server.verification_object(&server.resolve_workspace(None).unwrap(), &v, &[]);
         assert!(obj.get("prior_evidence").is_none());
         assert!(!dir.path().join(".codebro/execution_evidence.json").exists());
     }
@@ -6404,7 +7116,7 @@ mod evidence_journal_wiring_tests {
         let server = server_at(dir.path());
         // from_local leaves repo_state None (non-git workspace analog).
         let v = verification_with(None, false, true);
-        let obj = server.verification_object(&v, &[]);
+        let obj = server.verification_object(&server.resolve_workspace(None).unwrap(), &v, &[]);
         assert!(obj.get("prior_evidence").is_none());
         assert!(!dir.path().join(".codebro/execution_evidence.json").exists());
     }
@@ -6418,7 +7130,7 @@ mod evidence_journal_wiring_tests {
         let server = server_at(dir.path());
 
         let v1 = verification_with(Some("treeQ"), false, true);
-        let obj1 = server.verification_object(&v1, &[]);
+        let obj1 = server.verification_object(&server.resolve_workspace(None).unwrap(), &v1, &[]);
         assert!(
             obj1.get("prior_evidence").is_none(),
             "first run has no history"
@@ -6426,8 +7138,10 @@ mod evidence_journal_wiring_tests {
         assert!(dir.path().join(".codebro/execution_evidence.json").exists());
 
         let v2 = verification_with(Some("treeQ"), false, true);
-        let obj2 = server.verification_object(&v2, &[]);
+        let obj2 = server.verification_object(&server.resolve_workspace(None).unwrap(), &v2, &[]);
         let prior = obj2.get("prior_evidence").expect("second run must surface");
         assert_eq!(prior["same_tree"]["outcome"], "success");
     }
 }
+
+// ── Multi-workspace isolation ────────────────────────────────────────────
