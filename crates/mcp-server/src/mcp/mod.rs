@@ -4681,7 +4681,16 @@ mod tests {
             .ok();
         std::process::Command::new("git")
             .current_dir(&dir)
-            .args(["commit", "-m", "init"])
+            // CI runners lack a global git identity; provide one inline.
+            .args([
+                "-c",
+                "user.email=codebro@test",
+                "-c",
+                "user.name=codebro",
+                "commit",
+                "-m",
+                "init",
+            ])
             .output()
             .ok();
         let server = local_sandbox_server(&dir);
@@ -5795,7 +5804,15 @@ mod tests {
             .expect("git add succeeded");
         std::process::Command::new("git")
             .current_dir(dir.path())
-            .args(["commit", "-m", "initial"])
+            .args([
+                "-c",
+                "user.email=codebro@test",
+                "-c",
+                "user.name=codebro",
+                "commit",
+                "-m",
+                "initial",
+            ])
             .output()
             .expect("git commit succeeded");
 

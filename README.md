@@ -1,6 +1,6 @@
 # CodeBro
 
-**CodeBro is an MCP-based engineering intelligence runtime that provides AI coding agents with repository understanding, verified facts, engineering memory, impact analysis, and safe execution.**
+**CodeBro is an MCP-based engineering intelligence runtime that provides AI coding agents with repository understanding, verified facts, engineering memory, impact analysis, guarded changes, and reproducible execution evidence.**
 
 AI coding agents are good at reasoning, but they repeatedly rediscover project
 structure and forget engineering decisions across sessions. CodeBro solves this
@@ -20,61 +20,65 @@ Architecture and module map: [ARCHITECTURE.md](ARCHITECTURE.md).
                  │ Facts     │
                  │ Memory    │
                  │ Identity  │
+                 │ Impact    │
                  │ Guarded   │
                  │ Changes   │
+                 │ Evidence  │
                  │ Consultant│
                  └─────┬─────┘
                        │
-              ConsultantProvider
+               ConsultantProvider
                        │
                        ▼
                  Conductor
               (HTTP + Bearer key)
                        │
-              routing / scoring / health
+               routing / scoring / health
                        │
                        ▼
                 Upstream providers
 ```
 
 **Host agent owns:** reasoning, planning, tool selection, execution strategy, UX.
-**CodeBro owns:** project identity, verified project facts, persistent engineering memory, optional guarded mutations, and consultant queries via Conductor.
+**CodeBro owns:** project identity, verified project facts, persistent engineering memory, impact analysis, guarded/transactional mutations, sandboxed execution evidence, and consultant queries via Conductor.
 
 CodeBro is **not**:
 - a replacement coding agent
+- a TUI or chat assistant
 - a model provider
 - a generic shell / filesystem / Git MCP
 - an autonomous agent loop
 
-For the full MCP contract, see [`docs/design/MCP_SERVER.md`](docs/design/MCP_SERVER.md).
+The frozen v1 tool contract is documented in
+[`docs/MCP_API_V1.md`](docs/MCP_API_V1.md); the historical design narrative
+lives in [`docs/design/MCP_SERVER.md`](docs/design/MCP_SERVER.md).
 
 ## Quick Start
 
 ```bash
 git clone https://github.com/EffNine/CodeBro.git
 cd CodeBro
-cargo install --path .
+cargo install --path crates/mcp-server   # binary name: codebro
 
 # From a target project:
-codebro init
-codebro doctor
+codebro init        # scan the workspace into .codebro/facts.json
+codebro doctor      # verify the runtime state
 opencode mcp add codebro -- "$(which codebro) serve"
 ```
 
 For a complete Conductor setup guide, see [`docs/CONDUCTOR_HOWTO.md`](docs/CONDUCTOR_HOWTO.md).
 
-## What CodeBro Provides
+## What CodeBro Provides (v1 contract: 17 tools)
 
-| Surface | Tool | Purpose |
-|---------|------|---------|
-| Read | `workspace_context` | Orient: project identity, root, fact counts |
-| Read | `engineering_facts` | Relevance-ranked fact retrieval (symbols, modules, tests, packages, build targets, dependencies) |
-| Read | `engineering_memory` | Resolve recorded decisions/constraints by task keywords |
-| Read | `memory_stats` | Memory state: entry count, confidence, recency, tags |
-| Write | `record_memory` | Upsert a persistent memory entry (secret-redacted) |
-| Write | `delete_memory` | Delete a memory entry by exact key |
-| Write | `apply_change` *(optional)* | Guarded single-file mutation via ChangeEngine |
-| Read/Write | `consult` | Ask Conductor for opinions (architecture, debugging, code review, planning, research, second opinion) |
+| Surface | Tools | Purpose |
+|---------|-------|---------|
+| Orientation | `workspace_context`, `repository_health` | Project identity, fact counts, workspace diagnostics |
+| Verified facts | `engineering_facts`, `reindex`, `impact_analyze` | Relevance-ranked retrieval over the validated fact graph; structural impact with per-edge confidence and evidence |
+| Engineering memory | `engineering_memory`, `memory_stats`, `record_memory`, `delete_memory` | Persistent, trust-aware agent-recorded memory (never promoted into facts) |
+| Identity | `update_identity` | Declared-intent store: constraints, decisions, roadmap |
+| Guarded changes | `apply_change`, `apply_changes` | Single-file guarded mutation; multi-file all-or-nothing transaction with rollback |
+| Execution evidence | `sandbox_status`, `sandbox_exec`, `sandbox_test`, `sandbox_build` | Policy-gated commands with full evidence envelopes (git revision, exit code, reproducibility, environment) |
+| Consultant | `consult` | Ask Conductor-backed providers for architecture/debug/review opinions |
 
 ## Trust Model
 
@@ -90,9 +94,11 @@ Agent-recorded memory is **never** promoted to the verified fact store.
 
 ## Installation
 
+Requires a Rust toolchain (see `rust-toolchain.toml`).
+
 ```bash
 cargo build --release
-cargo install --path .
+cargo install --path crates/mcp-server
 ```
 
 ## CLI
@@ -101,6 +107,7 @@ cargo install --path .
 codebro init       # Scan workspace → .codebro/facts.json
 codebro doctor     # Diagnostics (exit 0 ok / 1 warn / 2 error)
 codebro serve      # MCP server over stdio
+codebro facts diff # Diff current repo state vs last index + impact projection
 codebro list-models # List models from configured provider
 codebro consult    # Ask Conductor a question directly
 codebro auth status # Check consultant provider auth
@@ -108,7 +115,8 @@ codebro auth status # Check consultant provider auth
 
 ## Links
 
-- [MCP Server Design](docs/design/MCP_SERVER.md)
+- [Frozen v1 MCP Contract](docs/MCP_API_V1.md)
+- [v1.0.0 Release Notes](docs/RELEASE_v1.0.0.md)
 - [Conductor Setup HOWTO](docs/CONDUCTOR_HOWTO.md)
 - [Architecture Decision Records](docs/ADR/)
 - [Changelog](CHANGELOG.md)
@@ -116,7 +124,11 @@ codebro auth status # Check consultant provider auth
 
 ---
 
+<<<<<<< HEAD
 *Current public release: 1.0.0.*
+=======
+*Current public release: [v1.0.0](https://github.com/EffNine/CodeBro/releases/tag/v1.0.0).*
+>>>>>>> ab0734496666231d0871c21ff4b6ea870d526af7
 
-The former chat TUI is preserved on the `tui-legacy` branch; the current
-`main` branch is MCP-first.
+The former chat TUI is preserved on the `tui-legacy` branch; the development
+line is MCP-first only.

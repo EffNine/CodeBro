@@ -1964,7 +1964,15 @@ mod tests {
             .expect("git add succeeded");
         std::process::Command::new("git")
             .current_dir(dir.path())
-            .args(["commit", "-m", "initial"])
+            .args([
+                "-c",
+                "user.email=codebro@test",
+                "-c",
+                "user.name=codebro",
+                "commit",
+                "-m",
+                "initial",
+            ])
             .output()
             .expect("git commit succeeded");
 
