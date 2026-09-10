@@ -34,11 +34,16 @@ identical acceptance criteria.
 ## Condition isolation
 
 - A: `opencode run` invoked with env `OPENCODE_CONFIG` pointing at
-  `docs/benchmarks/codebro-ab-v2/artifacts/opencode-a.jsonc` — a full copy of
-  the user config with the `codebro` MCP entry removed. All other MCPs
-  unchanged (opensandbox, github, context7 …). This measures "OpenCode
-  without CodeBro" while keeping everything else identical.
+  `docs/benchmarks/codebro-ab-v2/artifacts/opencode-a.jsonc` — a minimal
+  overlay that sets the `codebro` MCP entry to `enabled: false` (OPENCODE_CONFIG
+  is merged on top of the user config; `enabled:false` disables just the
+  codebro server while every other MCP stays identical). Verified by probe:
+  the condition-A session reports `codebro_memory_stats` UNAVAILABLE and no
+  CodeBro tools in its toolset, while cloudflare/github/opensandbox/context7
+  remain.
 - B: normal user config (CodeBro MCP enabled, as this very session runs it).
+  Verified by probe: a fresh `opencode run` session successfully calls
+  `codebro_engineering_memory` via MCP.
 - Fresh session per run: `opencode run` (one-shot mode) — no `--continue`.
 - Repo baseline restore between every run:
   `git checkout 5d435bda0f -- .` + `git clean -fdx` scoped exclusions; worktree
