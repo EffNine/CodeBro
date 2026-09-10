@@ -74,18 +74,23 @@ impl LocalCommandPolicy {
             "npm" | "pnpm" | "yarn" => self.check_npm(&tokens[1..]),
             "npx" => self.check_npx(&tokens[1..]),
             "make" => self.check_make(&tokens[1..]),
-            "git" => self.check_git(&tokens[1..]),
+            "git" => self.check_git_in(&tokens[1..], workspace_root),
             "python" | "python3" => self.check_python(&tokens[1..]),
             "rustc" => self.check_rustc(&tokens[1..]),
-            // Read-only inspection commands — no workspace manifest required.
+            // Read-only inspection commands — no workspace manifest
+            // required, but their path arguments must stay confined to
+            // the workspace root when one is provided (audit F2: `head
+            // /etc/passwd`, `find / -fprint out`, `wc <any host file>`
+            // previously escaped the "confined sandbox" guarantee).
             "pwd" => true,
-            "ls" | "head" | "tail" | "wc" | "find" | "file" | "which" => true,
-            // `cat` is read-only but path confinement matters when a workspace
-            // root is provided.
-            "cat" => check_path_args_confined(
-                &tokens,
-                workspace_root.unwrap_or(std::path::Path::new("")),
-            ),
+            "ls" | "head" | "tail" | "wc" | "find" | "file" | "which" => {
+                workspace_root.is_none_or(|root| args_confined_for_inspection(&tokens, root))
+            }
+            // `cat` is read-only but every path-looking operand and
+            // flag value must stay inside the workspace root when one
+            // is provided (audit F2: `cat /etc/passwd` and
+            // `cat /home/.../credentials.json` previously escaped).
+            "cat" => workspace_root.is_none_or(|root| args_confined_for_inspection(&tokens, root)),
             _ => false,
         }
     }
@@ -191,6 +196,37 @@ impl LocalCommandPolicy {
             return false;
         }
         !args[1..].iter().any(|a| MUTATING_TOKENS.contains(a))
+    }
+
+    /// `check_git` with workspace confinement: git's read-only subcommands
+    /// may still carry paths (`--output=/tmp/x`, `show HEAD:../../file`),
+    /// so every path-looking operand must stay inside the root (audit F2:
+    /// `git log --output=/tmp/out` previously wrote outside the sandbox).
+    fn check_git_in(&self, args: &[&str], workspace_root: Option<&Path>) -> bool {
+        if !self.check_git(args) {
+            return false;
+        }
+        let Some(root) = workspace_root else {
+            return true;
+        };
+        for tok in &args[1..] {
+            let is_flag = tok.starts_with('-');
+            // Inline flag values (--output=/tmp/x) and path operands both
+            // need confinement when they look like paths.
+            let candidate = if let Some(v) = tok.strip_prefix("--output=") {
+                v
+            } else if is_flag {
+                continue;
+            } else {
+                tok
+            };
+            let looks_like_path =
+                candidate.contains('/') || candidate == ".." || candidate.starts_with("../");
+            if looks_like_path && !is_path_confined(candidate, root) {
+                return false;
+            }
+        }
+        true
     }
 
     fn check_rustc(&self, args: &[&str]) -> bool {
@@ -430,6 +466,85 @@ fn is_path_confined(candidate: &str, workspace_root: &Path) -> bool {
     let joined = workspace_root.join(candidate);
     if let (Ok(root_c), Ok(join_c)) = (workspace_root.canonicalize(), joined.canonicalize()) {
         return join_c.starts_with(&root_c);
+    }
+    true
+}
+
+/// Confinement for the read-only inspection programs
+/// (`ls`/`head`/`tail`/`wc`/`find`/`file`/`which`): every non-flag token
+/// that looks like a filesystem path must resolve inside the workspace
+/// root, and every path-bearing flag value must too (audit F2: `head
+/// /etc/passwd` and `find / -fprint /tmp/out` previously escaped; `find`
+/// especially is not purely read-only — `-fprint`/`-fprintf`/`-fls` WRITE
+/// to their argument paths).
+fn args_confined_for_inspection(tokens: &[&str], workspace_root: &Path) -> bool {
+    // Flags of the inspection family that take a path-ish value as the
+    // NEXT token. Everything else with a leading '-' is treated as a
+    // boolean/numeric flag and ignored.
+    const PATH_FLAGS_NEXT: &[&str] = &[
+        // find: output-writing and path-scoping forms.
+        "-fprint",
+        "-fprintf",
+        "-fls",
+        "-fprint0",
+        "-newer",
+        "-anewer",
+        "-cnewer",
+        "-samefile",
+        // head/tail: -c/-n take counts, not paths — excluded on purpose.
+        // file: -m/-f name files.
+        "-m",
+        "-f",
+        // ls: none beyond ignore patterns.
+    ];
+    // Inline `--flag=value` forms that carry paths.
+    const PATH_FLAGS_INLINE: &[&str] = &[
+        "-fprint=",
+        "-fprintf=",
+        "-fls=",
+        "-fprint0=",
+        "--color=",
+        "--format=",
+        "--output=",
+    ];
+    let mut i = 1; // tokens[0] is the program
+    while i < tokens.len() {
+        let tok = tokens[i];
+        let mut path_val: Option<String> = None;
+        if PATH_FLAGS_NEXT.contains(&tok) {
+            if i + 1 >= tokens.len() {
+                return false; // flag promised a value that is missing
+            }
+            path_val = Some(tokens[i + 1].to_string());
+            i += 1; // consume the value
+        } else {
+            for prefix in PATH_FLAGS_INLINE {
+                if let Some(v) = tok.strip_prefix(prefix) {
+                    path_val = Some(v.to_string());
+                    break;
+                }
+            }
+            if path_val.is_none() && !tok.starts_with('-') {
+                // Plain operand. Patterns like `*.rs` (glob) are programs'
+                // own syntax, not paths — but they may still be scanned
+                // against the current directory, so allow bare globs and
+                // names without separators; anything with a `/` or `..`
+                // is a path and must be confined.
+                if tok.contains('/')
+                    || tok == ".."
+                    || tok.starts_with("../")
+                    || tok.contains("/../")
+                {
+                    path_val = Some(tok.to_string());
+                }
+            }
+        }
+        if let Some(p) = &path_val {
+            if !is_path_confined(p, workspace_root) {
+                return false;
+            }
+        }
+        i += 1;
     }
     true
 }
@@ -971,6 +1086,118 @@ mod tests {
             !policy.check_in("cat ../../etc/passwd", Some(dir.path())),
             "cat with parent-dir escape must be denied"
         );
+    }
+
+    // ── P8 audit F2 regression: sandbox path escapes ───────────────────
+    // Before the audit fix, the read-only inspection programs (`head`,
+    // `tail`, `ls`, `wc`, `find`, `file`) accepted ANY argument — reading
+    // arbitrary host files (`head -c 200 /etc/passwd`), writing outside
+    // the sandbox (`find … -fprint /tmp/out`, `git log --output=…`), and
+    // `cat`'s confinement missed absolute-path operands. These tests pin
+    // every discovered escape.
+
+    #[test]
+    fn audit_f2_inspection_commands_cannot_read_absolute_host_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}").unwrap();
+        let policy = LocalCommandPolicy::for_workspace(dir.path());
+        for cmd in [
+            "head -c 200 /etc/passwd",
+            "head /etc/shadow",
+            "cat /etc/passwd",
+            "cat /home/user/.ssh/id_rsa",
+            "tail /etc/hosts",
+            "wc /etc/passwd",
+            "ls /home/user/.ssh",
+            "file /etc/passwd",
+            "find / -maxdepth 1 -name usr",
+            "find /etc -type f",
+        ] {
+            assert!(
+                !policy.check_in(cmd, Some(dir.path())),
+                "inspection escape must be denied: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_f2_find_cannot_write_outside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        let policy = LocalCommandPolicy::for_workspace(dir.path());
+        for cmd in [
+            "find . -fprint /tmp/escape.txt",
+            "find . -fprintf /tmp/escape.txt",
+            "find . -fls /tmp/escape.txt",
+            "find . -fprint0 /tmp/escape.txt",
+            // Scoping the search outside the root is an escape too.
+            "find /etc -maxdepth 1 -fprint out.txt",
+        ] {
+            assert!(
+                !policy.check_in(cmd, Some(dir.path())),
+                "find write/scope escape must be denied: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_f2_git_cannot_write_or_read_outside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        let policy = LocalCommandPolicy::for_workspace(dir.path());
+        // --output writes outside the sandbox.
+        assert!(
+            !policy.check_in("git log --output=/tmp/escape.txt", Some(dir.path())),
+            "git --output escape must be denied"
+        );
+        // Scoped to a repository elsewhere on the host.
+        assert!(
+            !policy.check_in(
+                "git -C /home/user/other-repo log --oneline",
+                Some(dir.path())
+            ),
+            "git -C outside-root escape must be denied"
+        );
+        // Normal in-workspace git usage stays allowed.
+        assert!(policy.check_in("git status", Some(dir.path())));
+        assert!(policy.check_in("git log --oneline -2", Some(dir.path())));
+        assert!(policy.check_in("git diff", Some(dir.path())));
+    }
+
+    #[test]
+    fn audit_f2_legitimate_in_workspace_inspection_still_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}").unwrap();
+        let policy = LocalCommandPolicy::for_workspace(dir.path());
+        for cmd in [
+            "pwd",
+            "ls",
+            "ls -la",
+            "ls src",
+            "cat Cargo.toml",
+            "cat src/lib.rs",
+            "head Cargo.toml",
+            "head -n 3 src/lib.rs",
+            "tail src/lib.rs",
+            "wc Cargo.toml",
+            "wc -l src/lib.rs",
+            "find . -maxdepth 2 -type f",
+            "find . -maxdepth 1 -name Cargo.toml",
+            "file Cargo.toml",
+            "which rustc",
+            "git status",
+            "git log --oneline -2",
+            "git show HEAD --stat",
+        ] {
+            assert!(
+                policy.check_in(cmd, Some(dir.path())),
+                "legitimate in-workspace command must stay allowed: {cmd}"
+            );
+        }
     }
 
     #[test]

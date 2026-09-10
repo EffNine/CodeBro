@@ -3,10 +3,13 @@
 //!
 //! This module extends the verified-facts model with graph-traversal
 //! queries over relationships, references, tests, and scope membership.
-//! Output is descriptive evidence only — no risk scores, no prescriptions.
+//! Output is descriptive evidence only — deterministic P6 risk signals
+//! (HIGH/MEDIUM/LOW) included — never prescriptions. OpenCode decides.
 
 #![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
+pub mod health;
 pub mod relationships;
+pub mod risk;
 
 use serde::{Deserialize, Serialize};
 
@@ -186,6 +189,11 @@ pub struct ImpactResult {
     /// it does not affect the relationship traversal or any other field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<FreshnessStatus>,
+    /// P6 deterministic risk signal (HIGH/MEDIUM/LOW + indicators +
+    /// blast-radius summary). Additive: absent in older serialised results.
+    /// Signals, not guarantees — OpenCode reasons over them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<risk::RiskSignal>,
 }
 
 /// Resolved target information.
@@ -286,6 +294,16 @@ pub fn analyze(
     let (target_fact_id, target_info) = match resolved {
         Some(r) => r,
         None => {
+            // Even for missing targets, report a LOW risk signal so the
+            // shape stays stable (bounded, deterministic, no dependents).
+            let missing_path = file_path_opt(&target);
+            let missing_risk = risk::assess_risk(&risk::RiskInput {
+                target_path: missing_path,
+                target_name: Some(target_label(&target)),
+                direct_dependents: 0,
+                transitive_dependents: 0,
+                is_public: false,
+            });
             return ImpactResult {
                 target: ImpactTargetInfo {
                     id: target_label(&target),
@@ -307,6 +325,7 @@ pub fn analyze(
                 provenance_summary: ProvenanceSummary::default(),
                 traversal_metadata: TraversalMetadata::default(),
                 freshness: compute_impact_freshness(store, workspace_root),
+                risk: Some(missing_risk),
             };
         }
     };
@@ -429,6 +448,20 @@ pub fn analyze(
         ));
     }
 
+    // P6 deterministic risk signal: derived from the resolved target path,
+    // public visibility (symbol metadata), and traversal dependent counts.
+    // Signals only — OpenCode reasons over them.
+    let risk_signal = {
+        let is_public = is_target_public(collection, &target_fact_id);
+        risk::assess_risk(&risk::RiskInput {
+            target_path: target_info.path.clone(),
+            target_name: target_info.name.clone(),
+            direct_dependents: relationships.len(),
+            transitive_dependents: transitive_rels.len(),
+            is_public,
+        })
+    };
+
     ImpactResult {
         target: target_info,
         status: ImpactStatus::Ok,
@@ -442,6 +475,7 @@ pub fn analyze(
         provenance_summary,
         traversal_metadata: traversal_meta,
         freshness: compute_impact_freshness(store, workspace_root),
+        risk: Some(risk_signal),
     }
 }
 
@@ -471,6 +505,22 @@ fn compute_impact_freshness(
             }
         }
         _ => Some(FreshnessStatus::Unknown),
+    }
+}
+
+/// Whether the resolved target is publicly visible. Deterministic:
+/// symbol visibility Public, or module visibility Public. Private/unknown
+/// items are not public. Used only for the P6 risk signal.
+fn is_target_public(collection: &crate::fact_store::FactCollection, target: &FactId) -> bool {
+    match target {
+        FactId::Symbol(id) => collection
+            .symbol(id)
+            .is_some_and(|s| matches!(s.visibility, crate::engineering_facts::Visibility::Public)),
+        FactId::Module(id) => collection
+            .module(id)
+            .is_some_and(|m| matches!(m.visibility, crate::engineering_facts::Visibility::Public)),
+        FactId::Package(_) => true,
+        _ => false,
     }
 }
 

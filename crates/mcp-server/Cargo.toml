@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 codebro-change-engine.workspace = true
+codebro-context-runtime.workspace = true
 codebro-core.workspace = true
 codebro-fact-store.workspace = true
 codebro-identity-runtime.workspace = true

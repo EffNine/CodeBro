@@ -18,6 +18,7 @@
 
 #![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 pub mod diagnostics;
+pub mod file_classify;
 pub mod parser;
 
 // =========================================================================

@@ -12,10 +12,12 @@
 #![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub mod change_invalidation;
 pub mod facts;
+pub mod response_bounds;
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -52,18 +54,81 @@ pub struct CodeBroMcpServer {
     registry: WorkspaceRegistry,
     tool_router: ToolRouter<Self>,
     sandbox_runtime: crate::sandbox::SandboxRuntime,
+    /// Durable user-context store (`~/.codebro/state.db`). Global across
+    /// workspaces; per-workspace data is scoped by workspace_root.
+    context_store: Arc<crate::context_runtime::ContextStore>,
+    /// P5 task-runtime worker identity: identifies THIS server process's
+    /// task ownership across lease/fencing checks. One per process.
+    task_worker_id: String,
+}
+
+/// Assemble a server: default state directory unless an explicit one is
+/// given (explicit dirs keep tests and embedded deployments hermetic).
+fn assemble_server(
+    workspace_root: PathBuf,
+    sandbox_runtime: crate::sandbox::SandboxRuntime,
+    state_dir: Option<PathBuf>,
+) -> CodeBroMcpServer {
+    let registry = WorkspaceRegistry::new(workspace_root);
+    assemble_server_with_registry(registry, sandbox_runtime, state_dir)
+}
+
+/// Assemble a server around an explicit (already-authorized) registry —
+/// the P8 root-authorization seam for multi-root deployments and tests.
+fn assemble_server_with_registry(
+    registry: WorkspaceRegistry,
+    sandbox_runtime: crate::sandbox::SandboxRuntime,
+    state_dir: Option<PathBuf>,
+) -> CodeBroMcpServer {
+    let context_store = Arc::new(crate::context_runtime::ContextStore::at_state_dir(
+        state_dir.unwrap_or_else(default_state_dir),
+    ));
+    CodeBroMcpServer {
+        registry,
+        tool_router: CodeBroMcpServer::tool_router(),
+        sandbox_runtime,
+        context_store,
+        task_worker_id: crate::context_runtime::mint_worker_id(),
+    }
+}
+
+/// State directory for the user-context database: `CODEBRO_STATE_DIR`
+/// overrides the default `~/.codebro`. Resolution happens at construction;
+/// the database itself is opened lazily on first use.
+fn default_state_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CODEBRO_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    crate::config::Config::config_dir()
 }
 
 #[tool_router]
 impl CodeBroMcpServer {
     /// Create a server bound to a workspace root.
     pub fn new(workspace_root: PathBuf) -> Self {
-        let registry = WorkspaceRegistry::new(workspace_root);
-        Self {
-            registry,
-            tool_router: Self::tool_router(),
-            sandbox_runtime: crate::sandbox::SandboxRuntime::from_env(),
-        }
+        assemble_server(
+            workspace_root,
+            crate::sandbox::SandboxRuntime::from_env(),
+            None,
+        )
+    }
+
+    /// Create a server bound to a workspace root with additional
+    /// operator-authorized roots (P8 root authorization). The default
+    /// root is always authorized; `extra_authorized_roots` widens the
+    /// set the per-call `workspace_root` argument may address.
+    pub fn with_authorized_roots(
+        workspace_root: PathBuf,
+        extra_authorized_roots: Vec<PathBuf>,
+    ) -> Self {
+        let registry = WorkspaceRegistry::with_authorized_roots(
+            workspace_root.clone(),
+            crate::workspace_registry::AuthorizedRoots::with_extras(
+                workspace_root,
+                extra_authorized_roots,
+            ),
+        );
+        assemble_server_with_registry(registry, crate::sandbox::SandboxRuntime::from_env(), None)
     }
 
     /// Create a server with an explicit sandbox runtime (for tests).
@@ -71,12 +136,22 @@ impl CodeBroMcpServer {
         workspace_root: PathBuf,
         runtime: crate::sandbox::SandboxRuntime,
     ) -> Self {
-        let registry = WorkspaceRegistry::new(workspace_root);
-        Self {
-            registry,
-            tool_router: Self::tool_router(),
-            sandbox_runtime: runtime,
-        }
+        assemble_server(workspace_root, runtime, None)
+    }
+
+    /// Create a server with an explicit user-context state directory and a
+    /// local sandbox runtime (for hermetic tests and embedded deployments).
+    pub fn with_state_dir(workspace_root: PathBuf, state_dir: PathBuf) -> Self {
+        assemble_server(
+            workspace_root,
+            crate::sandbox::SandboxRuntime::new(crate::sandbox::SandboxMode::Local),
+            Some(state_dir),
+        )
+    }
+
+    /// The user-context store handle.
+    fn context_store(&self) -> Arc<crate::context_runtime::ContextStore> {
+        Arc::clone(&self.context_store)
     }
 
     /// Resolve the workspace for a tool call.
@@ -335,6 +410,11 @@ impl CodeBroMcpServer {
     /// Return the workspace context: project identity, workspace root and
     /// the state of the engineering runtime for this project. Call this
     /// first to understand what project the agent is operating in.
+    ///
+    /// P6 adds deterministic engineering intelligence: repository identity
+    /// (canonical root + VCS), index freshness (READY/STALE/UNKNOWN with
+    /// counts), architecture observations, and supported-language surface
+    /// with parser limitations. All bounded and evidence-grounded.
     #[tool(
         description = "Return the workspace context: project identity, workspace root, and engineering runtime state. Call this first to orient the agent in the project."
     )]
@@ -347,10 +427,53 @@ impl CodeBroMcpServer {
         let store = self.fact_store(&ws);
         let counts = store.collection().counts();
 
+        // P6 repository identity: canonical root + VCS (never raw paths alone).
+        let repo_identity = codebro_core::RepoIdentity::from_workspace(&ws.canonical_root);
+        // P6 freshness: generation state vs live HEAD + file-digest diff.
+        let freshness = crate::mcp::facts::compute_freshness(&store, &ws.canonical_root);
+        let freshness_str = match freshness {
+            crate::mcp::facts::FreshnessStatus::Fresh => "fresh",
+            crate::mcp::facts::FreshnessStatus::Stale => "stale",
+            crate::mcp::facts::FreshnessStatus::Unknown => "unknown",
+        };
+        // P6 persisted index metadata (UNKNOWN when never indexed via P6 path).
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let persisted_index = self
+            .context_store()
+            .get_repo_index(&ws.canonical_root.to_string_lossy(), now_secs)
+            .ok()
+            .map(|r| {
+                json!({
+                    "index_status": r.index_status.as_str(),
+                    "indexed_at": r.indexed_at,
+                    "repository_revision": r.repository_revision,
+                    "file_count": r.file_count,
+                    "symbol_count": r.symbol_count,
+                    "edge_count": r.edge_count,
+                    "stale_count": r.stale_count,
+                })
+            })
+            .unwrap_or(json!({"index_status": "UNKNOWN"}));
+        // P6 architecture observations (bounded, filesystem-grounded).
+        let arch_summary = identity
+            .as_ref()
+            .and_then(|id| id.architecture_summary.clone())
+            .unwrap_or_default();
+
         let payload = json!({
             "workspace_root": ws.canonical_root.display().to_string(),
             "identity_loaded": identity_loaded,
             "project_identity": identity,
+            "repository_identity": {
+                "project_id": repo_identity.project_id,
+                "canonical_root": repo_identity.canonical_root,
+                "repository_type": repo_identity.repository_type,
+                "git_remote": repo_identity.git_remote,
+                "commit_sha": repo_identity.commit_sha,
+            },
             "fact_counts": {
                 "workspaces": counts.workspaces,
                 "modules": counts.modules,
@@ -367,6 +490,18 @@ impl CodeBroMcpServer {
                 "frameworks": counts.frameworks,
                 "entry_points": counts.entry_points,
                 "total": counts.total,
+            },
+            "index_freshness": {
+                "status": freshness_str,
+                "persisted": persisted_index,
+            },
+            "architecture": {
+                "summary": arch_summary,
+            },
+            "supported_languages": {
+                "parsed": ["rust", "python", "javascript", "typescript", "tsx", "jsx", "go"],
+                "file_level_only": ["c", "cpp", "shell", "toml", "yaml", "json", "markdown"],
+                "limitation": "file-level languages preserve path/size/hash/classification but never invent symbols",
             },
         });
 
@@ -639,6 +774,28 @@ impl CodeBroMcpServer {
 
         self.remember_edit(&ws, &args.path, advisory.recommended_tests.clone());
 
+        crate::history_capture::capture(
+            &self.context_store(),
+            &ws.canonical_root,
+            crate::history_capture::HistoryCapture {
+                kind: crate::context_runtime::HistoryKind::ChangeApplied,
+                summary: format!(
+                    "applied change to {}{}",
+                    args.path,
+                    if prepared.created { " (created)" } else { "" }
+                ),
+                tool: Some("apply_change".to_string()),
+                path: Some(args.path.clone()),
+                outcome: Some(if prepared.created {
+                    "created".to_string()
+                } else {
+                    "applied".to_string()
+                }),
+                payload: None,
+                task_id: None,
+            },
+        );
+
         let response = json!({
             "applied": true,
             "path": args.path,
@@ -694,6 +851,35 @@ impl CodeBroMcpServer {
             for change in &args.changes {
                 self.remember_edit(&ws, &change.path, Vec::new());
             }
+            let shown: Vec<&str> = args
+                .changes
+                .iter()
+                .map(|c| c.path.as_str())
+                .take(3)
+                .collect();
+            let more = args.changes.len().saturating_sub(shown.len());
+            crate::history_capture::capture(
+                &self.context_store(),
+                &ws.canonical_root,
+                crate::history_capture::HistoryCapture {
+                    kind: crate::context_runtime::HistoryKind::ChangeApplied,
+                    summary: format!(
+                        "applied transaction: {} files ({}{})",
+                        args.changes.len(),
+                        shown.join(", "),
+                        if more > 0 {
+                            format!(", +{more} more")
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    tool: Some("apply_changes".to_string()),
+                    path: None,
+                    outcome: Some("applied".to_string()),
+                    payload: None,
+                    task_id: None,
+                },
+            );
         }
 
         let response = json!({
@@ -992,23 +1178,40 @@ impl CodeBroMcpServer {
         let mut skipped: Vec<String> = Vec::new();
 
         if let Some(desc) = args.description.as_deref() {
-            changes.set_description = Some(require_non_empty(desc, "description")?);
+            changes.set_description = Some(require_non_empty(
+                &crate::tools::shell::redact_secrets_public(desc),
+                "description",
+            )?);
         }
         if let Some(url) = args.repository_url.as_deref() {
-            changes.set_repository_url = Some(require_non_empty(url, "repository_url")?);
+            changes.set_repository_url = Some(require_non_empty(
+                &crate::tools::shell::redact_secrets_public(url),
+                "repository_url",
+            )?);
         }
         if let Some(summary) = args.architecture_summary.as_deref() {
-            changes.update_architecture_summary =
-                Some(require_non_empty(summary, "architecture_summary")?);
+            changes.update_architecture_summary = Some(require_non_empty(
+                &crate::tools::shell::redact_secrets_public(summary),
+                "architecture_summary",
+            )?);
         }
         if let Some(sprint) = args.current_sprint.as_deref() {
-            changes.set_sprint = Some(require_non_empty(sprint, "current_sprint")?);
+            changes.set_sprint = Some(require_non_empty(
+                &crate::tools::shell::redact_secrets_public(sprint),
+                "current_sprint",
+            )?);
         }
         if let Some(item) = args.complete_roadmap_item.as_deref() {
-            changes.complete_roadmap_item = Some(require_non_empty(item, "complete_roadmap_item")?);
+            changes.complete_roadmap_item = Some(require_non_empty(
+                &crate::tools::shell::redact_secrets_public(item),
+                "complete_roadmap_item",
+            )?);
         }
         if let Some(milestone) = args.add_milestone.as_deref() {
-            changes.add_milestone = Some(require_non_empty(milestone, "add_milestone")?);
+            changes.add_milestone = Some(require_non_empty(
+                &crate::tools::shell::redact_secrets_public(milestone),
+                "add_milestone",
+            )?);
         }
 
         push_unique_strings(
@@ -1043,15 +1246,23 @@ impl CodeBroMcpServer {
             .map(|d| d.id.as_str())
             .collect();
         for input in &args.add_decisions {
-            let title = require_non_empty(&input.title, "decision title")?;
-            let description = require_non_empty(&input.description, "decision description")?;
+            // Redact at the write seam (identity JSON is persisted and
+            // surfaced by briefs/context packets).
+            let redact = |s: &str| crate::tools::shell::redact_secrets_public(s);
+            let title = require_non_empty(&redact(&input.title), "decision title")?;
+            let description =
+                require_non_empty(&redact(&input.description), "decision description")?;
             let id = slugify(&title);
             if existing_decision_ids.contains(id.as_str()) {
                 skipped.push(format!("decision '{id}' already recorded"));
                 continue;
             }
-            let mut decision =
-                EngineeringDecision::new(id.clone(), title, description, input.context.clone());
+            let mut decision = EngineeringDecision::new(
+                id.clone(),
+                title,
+                description,
+                input.context.as_deref().map(redact),
+            );
             if let Some(status) = parse_status(&input.status, "decision")? {
                 decision = decision.with_status(status);
             } else {
@@ -1065,16 +1276,18 @@ impl CodeBroMcpServer {
         let existing_roadmap_ids: std::collections::HashSet<&str> =
             current.roadmap.iter().map(|i| i.id.as_str()).collect();
         for input in &args.add_roadmap_items {
-            let title = require_non_empty(&input.title, "roadmap title")?;
+            let redact = |s: &str| crate::tools::shell::redact_secrets_public(s);
+            let title = require_non_empty(&redact(&input.title), "roadmap title")?;
             let id = slugify(&title);
             if existing_roadmap_ids.contains(id.as_str()) {
                 skipped.push(format!("roadmap item '{id}' already recorded"));
                 continue;
             }
-            let mut item = RoadmapItem::new(id.clone(), title, input.description.clone());
+            let mut item =
+                RoadmapItem::new(id.clone(), title, input.description.as_deref().map(redact));
             item.status = parse_roadmap(&input.status)?;
             if let Some(sprint) = input.sprint.as_deref() {
-                item.sprint = Some(sprint.to_string());
+                item.sprint = Some(redact(sprint));
             }
             changes.add_roadmap_items.push(item);
         }
@@ -1294,6 +1507,23 @@ impl CodeBroMcpServer {
             &verification,
             args.test_filter.as_deref().unwrap_or(&[]),
         );
+        crate::history_capture::capture(
+            &self.context_store(),
+            &ws.canonical_root,
+            crate::history_capture::HistoryCapture {
+                kind: crate::context_runtime::HistoryKind::Validation,
+                summary: format!(
+                    "{command} → {} (verified: {})",
+                    verification.classification.as_deref().unwrap_or("unknown"),
+                    verification.verified
+                ),
+                tool: Some("sandbox_test".to_string()),
+                path: None,
+                outcome: verification.classification.clone(),
+                payload: Some(crate::history_capture::detail(&verification.summary, 500)),
+                task_id: None,
+            },
+        );
         let payload = json!({
             "execution": verification.execution,
             "verification": verification_obj,
@@ -1337,6 +1567,23 @@ impl CodeBroMcpServer {
                 args.affected_fact_ids,
             );
         let verification_obj = self.verification_object(&ws, &verification, &[]);
+        crate::history_capture::capture(
+            &self.context_store(),
+            &ws.canonical_root,
+            crate::history_capture::HistoryCapture {
+                kind: crate::context_runtime::HistoryKind::Validation,
+                summary: format!(
+                    "{command} → {} (verified: {})",
+                    verification.classification.as_deref().unwrap_or("unknown"),
+                    verification.verified
+                ),
+                tool: Some("sandbox_build".to_string()),
+                path: None,
+                outcome: verification.classification.clone(),
+                payload: Some(crate::history_capture::detail(&verification.summary, 500)),
+                task_id: None,
+            },
+        );
         let payload = json!({
             "execution": verification.execution,
             "verification": verification_obj,
@@ -1376,7 +1623,7 @@ impl CodeBroMcpServer {
     /// related tests, owning module/package, and provenance metadata —
     /// descriptive evidence only, no risk scoring or prescriptions.
     #[tool(
-        description = "Analyze structural impact of changing a symbol, file, module, or package. Returns directed relationship edges (with bounded transitive traversal via depth), related tests, owning module/package, and provenance. Descriptive evidence only — no risk scores or prescriptions."
+        description = "Analyze structural impact of changing a symbol, file, module, or package. Returns directed relationship edges (bounded transitive traversal), related tests, owning module/package, provenance, and deterministic risk signals. Descriptive evidence only — OpenCode decides."
     )]
     async fn impact_analyze(
         &self,
@@ -1447,9 +1694,16 @@ impl CodeBroMcpServer {
     /// Perform a full engineering fact reindex. Regenerates
     /// `.codebro/facts.json` by re-scanning the entire workspace with the
     /// existing `codebro init` pipeline. Use this after source changes when
-    /// `apply_change.needs_reindex=true`. This is a full rebuild, not
-    /// incremental. The operation may take longer than normal read-only fact
-    /// queries.
+    /// `apply_change.needs_reindex=true`.
+    ///
+    /// P6: the rebuild reuses the content-addressed parse cache so only
+    /// changed files are reparsed (incremental at the parse layer);
+    /// unchanged files yield byte-identical symbol IDs (preserved, not
+    /// rewritten); deleted files disappear with no orphaned graph state.
+    /// The response reports the incremental diff (added/deleted/modified/
+    /// unchanged), updates the persisted index metadata (v7 `repo_indexes`),
+    /// and records a durable `index_completed`/`index_failed` history event.
+    /// The operation may take longer than normal read-only fact queries.
     #[tool(
         description = "Perform a full engineering fact reindex: regenerate .codebro/facts.json by re-scanning the entire workspace. Use after source changes when apply_change.needs_reindex=true. This is a full rebuild, not incremental."
     )]
@@ -1460,6 +1714,16 @@ impl CodeBroMcpServer {
         let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
         let _mutation_guard = ws.mutation_lock.lock().await;
         let start = std::time::Instant::now();
+
+        // P6 incremental diff: snapshot previous digests before the rebuild
+        // so the response can report added/deleted/modified/unchanged.
+        let prev_digests: std::collections::BTreeMap<String, String> = self
+            .fact_store(&ws)
+            .collection()
+            .model()
+            .file_digests()
+            .cloned()
+            .unwrap_or_default();
 
         // The init pipeline is fully synchronous (filesystem walk +
         // tree-sitter parsing) and can take minutes on large workspaces.
@@ -1482,6 +1746,63 @@ impl CodeBroMcpServer {
                 let counts = store.collection().counts();
                 let validation = store.validate();
                 let gen_state = store.collection().model().generation_repo_state();
+                let curr_digests: std::collections::BTreeMap<String, String> = store
+                    .collection()
+                    .model()
+                    .file_digests()
+                    .cloned()
+                    .unwrap_or_default();
+                // P6 diff + freshness (pure over digest maps + repo state).
+                let diff = diff_digests_for_mcp(&prev_digests, &curr_digests);
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let edge_count = counts.relationships + counts.references + counts.dependencies;
+                let repo_identity = codebro_core::RepoIdentity::from_workspace(&ws.canonical_root);
+                let identity_json =
+                    serde_json::to_string(&repo_identity).unwrap_or_else(|_| "{}".to_string());
+                let revision = gen_state
+                    .map(|s| s.working_tree_hash.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                // Persist derived index metadata (v7). Best-effort: a
+                // store failure never fails the reindex itself.
+                let _ = self.context_store().upsert_repo_index(
+                    &ws.canonical_root.to_string_lossy(),
+                    crate::context_runtime::RepoIndexUpsert {
+                        repository_identity: identity_json,
+                        index_status: crate::context_runtime::RepoIndexStatus::Ready,
+                        indexed_at: now_secs,
+                        repository_revision: revision.clone(),
+                        file_count: curr_digests.len(),
+                        symbol_count: counts.symbols,
+                        edge_count,
+                        stale_count: 0,
+                    },
+                    now_secs,
+                );
+                // Durable history: one meaningful event per completed index.
+                crate::history_capture::capture(
+                    &self.context_store(),
+                    &ws.canonical_root,
+                    crate::history_capture::HistoryCapture {
+                        kind: crate::context_runtime::HistoryKind::IndexCompleted,
+                        summary: format!(
+                            "index completed: {} files, {} symbols, {} edges ({} added, {} modified, {} deleted)",
+                            curr_digests.len(),
+                            counts.symbols,
+                            edge_count,
+                            diff.added.len(),
+                            diff.modified.len(),
+                            diff.deleted.len(),
+                        ),
+                        tool: Some("reindex".to_string()),
+                        path: None,
+                        outcome: Some("ok".to_string()),
+                        payload: None,
+                        task_id: None,
+                    },
+                );
 
                 let payload = json!({
                     "status": "ok",
@@ -1511,6 +1832,17 @@ impl CodeBroMcpServer {
                         "valid": validation.passed(),
                         "issue_count": validation.issue_count(),
                     },
+                    "incremental": {
+                        "added": diff.added,
+                        "deleted": diff.deleted,
+                        "modified": diff.modified,
+                        "unchanged_count": diff.unchanged.len(),
+                        "added_count": diff.added_count,
+                        "deleted_count": diff.deleted_count,
+                        "modified_count": diff.modified_count,
+                        "truncated": diff.truncated,
+                    },
+                    "index_status": "READY",
                     "duration_ms": elapsed.as_millis(),
                 });
 
@@ -1521,9 +1853,45 @@ impl CodeBroMcpServer {
             }
             Err(e) => {
                 let elapsed = start.elapsed();
+                // Durable history for failed runs (explicit, never silent).
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                // Preserve last-good metadata: a failure must never zero
+                // out known-good counts. Absent rows read as UNKNOWN (all
+                // zeros), which matches the old shape for fresh workspaces.
+                let prev_row = self
+                    .context_store()
+                    .get_repo_index(&ws.canonical_root.to_string_lossy(), now_secs)
+                    .unwrap_or_else(|_| {
+                        crate::context_runtime::RepoIndexRecord::unknown_for(
+                            &ws.canonical_root.to_string_lossy(),
+                            now_secs,
+                        )
+                    });
+                let _ = self.context_store().upsert_repo_index(
+                    &ws.canonical_root.to_string_lossy(),
+                    failed_index_upsert(&prev_row),
+                    now_secs,
+                );
+                crate::history_capture::capture(
+                    &self.context_store(),
+                    &ws.canonical_root,
+                    crate::history_capture::HistoryCapture {
+                        kind: crate::context_runtime::HistoryKind::IndexFailed,
+                        summary: format!("index failed: {}", short_error(&e.to_string())),
+                        tool: Some("reindex".to_string()),
+                        path: None,
+                        outcome: Some("error".to_string()),
+                        payload: None,
+                        task_id: None,
+                    },
+                );
                 let payload = json!({
                     "status": "error",
                     "error": e.to_string(),
+                    "index_status": "FAILED",
                     "duration_ms": elapsed.as_millis(),
                 });
                 Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1745,6 +2113,2751 @@ impl CodeBroMcpServer {
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?,
         )]))
     }
+
+    // ── Tool 25: engineering brief (P7 decision support) ───────────────
+
+    /// Compose a bounded engineering decision-support brief for a task:
+    /// repository identity and freshness, task-relevant files/symbols/
+    /// dependencies, bounded impact with risk signals, relevant tests and
+    /// health findings, history excerpts, engineering memory, accepted
+    /// learning, skill applicability, task state, constraints, decisions,
+    /// risks, and explicit unknowns. Read-only: never writes project or
+    /// user state, never transitions tasks, never executes skills.
+    /// CodeBro prepares evidence; OpenCode reasons and decides.
+    #[tool(
+        description = "Compose a bounded engineering decision-support brief for a task: repo intelligence, impact, health, history, memory, learning, skills, task state, constraints, and explicit unknowns. Read-only; OpenCode decides."
+    )]
+    async fn engineering_brief(
+        &self,
+        Parameters(args): Parameters<EngineeringBriefArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let task_id = args
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let request = crate::engineering_brief::BriefRequest {
+            task: args.task.clone().unwrap_or_default(),
+            task_id: task_id.map(str::to_string),
+            target_path: args.target_path.clone(),
+            target_symbol: args.target_symbol.clone(),
+            target_module: args.target_module.clone(),
+            keywords: args.keywords.clone().unwrap_or_default(),
+            depth: args
+                .depth
+                .unwrap_or(crate::engineering_brief::BRIEF_DEPTH_DEFAULT),
+        };
+        // Records use the request keywords plus a best-effort task hint
+        // (title/description/next-action tokens from the read-only task
+        // snapshot). The assembler derives a sibling enrichment for the
+        // brief's own scope (title/checkpoint-summary/next-action); the
+        // two sets intentionally overlap but are not identical — records
+        // resolve against the broader set. A missing snapshot simply
+        // yields no hint here (the brief records TASK_NOT_FOUND).
+        let mut record_keywords = request.keywords();
+        if let Some(tid) = task_id {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if let Ok(snap) = self.context_store().task_resume_snapshot(
+                &ws.canonical_root.to_string_lossy(),
+                tid,
+                now,
+            ) {
+                for extra in [
+                    snap.task.title.as_str(),
+                    snap.task.description.as_deref().unwrap_or(""),
+                    snap.latest_checkpoint
+                        .as_ref()
+                        .and_then(|c| c.next_action.as_deref())
+                        .unwrap_or(""),
+                ] {
+                    for tok in extra.split(|c: char| !c.is_alphanumeric()) {
+                        if tok.len() >= 3
+                            && !record_keywords.contains(&tok.to_string())
+                            && record_keywords.len() < crate::engineering_brief::MAX_BRIEF_KEYWORDS
+                        {
+                            record_keywords.push(tok.to_string());
+                        }
+                    }
+                }
+                record_keywords.sort();
+            }
+        }
+        let records = self.context_record_excerpts(&ws, task_id, &record_keywords);
+        let (identity_loaded, identity_opt) = self.identity_snapshot(&ws);
+        // Absent identity degrades to defaults (the brief records
+        // MISSING_IDENTITY); orientation never fails a read.
+        let identity = identity_opt.unwrap_or_else(|| {
+            crate::project_identity::ProjectIdentityRuntime::new(&ws.canonical_root).snapshot()
+        });
+        let store = self.fact_store(&ws);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let inputs = crate::engineering_brief::BriefInputs {
+            workspace_root: &ws.canonical_root,
+            workspace_key: crate::context_runtime::canonical_workspace_key(
+                &ws.canonical_root.to_string_lossy(),
+            ),
+            store: &store,
+            context_store: &self.context_store(),
+            identity_loaded,
+            identity: &identity,
+            records: &records,
+            now,
+        };
+        let brief = crate::engineering_brief::assemble(&inputs, &request)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let value = serde_json::to_value(&brief)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let payload = crate::mcp::response_bounds::bounded_response(value)
+            .map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
+    }
+
+    // ── Tool 18: context (always-available context packet) ─────────────
+
+    /// Compose the always-available context packet for the current task:
+    /// repository orientation and fact counts, task-relevant facts,
+    /// decisions, memory, execution evidence, and durable context records
+    /// (each tagged with its authority). With a task the packet is
+    /// task-relevant; without one it returns a clearly-labelled structural
+    /// digest. Read-only: never writes project or user state.
+    #[tool(
+        description = "Compose the always-available context packet: repository orientation, fact counts, task-relevant facts/decisions/memory/evidence, and durable context records tagged by authority (user_confirmed/ai_inferred/observed). Call at task start and when context runs thin."
+    )]
+    async fn context(
+        &self,
+        Parameters(args): Parameters<ContextArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let request = crate::engineering_context::EngineeringContextRequest {
+            task: args.task.clone().unwrap_or_default(),
+            task_keywords: args.keywords.clone().unwrap_or_default(),
+            active_file_tags: Vec::new(),
+        };
+        let has_task = !request.is_empty();
+        let task_id = args
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let records = self.context_record_excerpts(&ws, task_id, &request.keywords());
+        let packet = if has_task {
+            crate::engineering_context::compose(&ws.canonical_root, &request, &records)
+        } else {
+            crate::engineering_context::compose_structural(&ws.canonical_root, &records)
+        }
+        .map_err(|e| McpError::internal_error(e, None))?;
+        let value = serde_json::to_value(&packet)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let payload = crate::mcp::response_bounds::bounded_response(value)
+            .map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
+    }
+
+    /// Retrieve bounded durable-context excerpts for a workspace.
+    ///
+    /// Resolution (not concatenation): a generous fetch (keyword-less
+    /// importance order plus keyword matches when a task narrows relevance)
+    /// is reduced per (kind, namespace) to one winner by authority rank,
+    /// then scope specificity (task > project > global), decayed
+    /// confidence, recency, and id. Actionable intents surface alongside
+    /// fingerprint winners; losers stay in the store, queryable by id.
+    /// The user-context store is best-effort by design: if it cannot be
+    /// opened (e.g. an unwritable state dir), composition degrades to an
+    /// empty `records` section with a warning rather than failing the whole
+    /// packet — the engineering stores stay authoritative.
+    fn context_record_excerpts(
+        &self,
+        ws: &WorkspaceState,
+        task_id: Option<&str>,
+        keywords: &[String],
+    ) -> Vec<crate::engineering_context::ContextRecordExcerpt> {
+        use crate::context_runtime::{fingerprint, ContextRetriever};
+        let root = ws.canonical_root.display().to_string();
+        let store = self.context_store();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Fetch generously: resolution reduces, never expands. Keyword-less
+        // first (the always-available fingerprint), keyword matches merged
+        // in when a task narrows relevance.
+        let mut merged: std::collections::BTreeMap<String, crate::context_runtime::RankedRecord> =
+            std::collections::BTreeMap::new();
+        let mut fetch = |kw: Vec<String>| {
+            let query = crate::context_runtime::RecordQuery {
+                workspace_root: Some(root.as_str()),
+                task_id,
+                kind: None,
+                status: None,
+                keywords: kw,
+                limit: 100,
+            };
+            if let Ok(ranked) = ContextRetriever::search(&*store, &query, now) {
+                for r in ranked {
+                    merged.insert(r.record.id.clone(), r);
+                }
+            }
+        };
+        fetch(Vec::new());
+        if !keywords.is_empty() {
+            fetch(keywords.to_vec());
+        }
+        if merged.is_empty() {
+            // Distinguish "store unusable" from "store empty": a failed
+            // keyword-less fetch on an unusable store already degrades to
+            // empty here; warn once for observability.
+            tracing::debug!("context records: no rows visible for this viewpoint");
+        }
+        let scope = fingerprint::ResolutionScope {
+            workspace_key: Some(root.as_str()),
+            task_id,
+        };
+        let resolved = fingerprint::resolve_context(merged.into_values().collect(), &scope);
+        resolved
+            .intents
+            .iter()
+            .chain(resolved.fingerprint.iter())
+            .chain(resolved.other.iter())
+            .take(crate::engineering_context::MAX_CONTEXT_RECORDS)
+            .map(crate::engineering_context::excerpt_from)
+            .collect()
+    }
+
+    // ── Tool 19: remember (explicit user-context persistence) ──────────
+
+    /// Persist explicitly-confirmed user context: a collaboration
+    /// preference (user fingerprint) or the current intent. Semantic
+    /// writes, not database rows: the caller states what the user
+    /// confirmed and CodeBro assigns authority, provenance, scope, and
+    /// lifecycle. USER_CONFIRMED requires user_confirmed=true; inferred
+    /// or observed writes require evidence. Replacing knowledge uses
+    /// supersedes (history preserved); completing/cancelling an intent
+    /// retires it.
+    #[tool(
+        description = "Persist explicitly-confirmed user context (a preference or the current intent) with provenance, scope, and lifecycle. USER_CONFIRMED requires user_confirmed=true; observed/inferred writes require evidence. Only persist what the user stated."
+    )]
+    async fn remember(
+        &self,
+        Parameters(args): Parameters<RememberArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let _mutation_guard = ws.mutation_lock.lock().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let content = args.content.trim().to_string();
+        if content.is_empty() {
+            return Err(McpError::invalid_params("content must not be empty", None));
+        }
+        let namespace = args.namespace.trim().to_string();
+        if namespace.is_empty() {
+            return Err(McpError::invalid_params(
+                "namespace is required (e.g. fp.engineering.simplicity or intent.mission)",
+                None,
+            ));
+        }
+        let kind = parse_record_kind(args.kind.as_deref())?;
+        let scope = parse_record_scope(args.scope.as_deref(), true)?;
+
+        // ── Caller-principal rule for UserConfirmed ──
+        // USER_CONFIRMED means the system has a trusted basis for treating
+        // the information as explicitly confirmed by the user. The basis is
+        // OpenCode's explicit speech act: the agent sets user_confirmed=true
+        // only when the user stated or approved this content. Without the
+        // flag, authority=user_confirmed is refused — a caller cannot mint
+        // confirmation by merely naming the authority string.
+        let authority = match args.authority.as_deref().map(str::trim) {
+            None => {
+                if args.user_confirmed.unwrap_or(false) {
+                    crate::context_runtime::Authority::UserConfirmed
+                } else {
+                    crate::context_runtime::Authority::Observed
+                }
+            }
+            Some("user_confirmed") => {
+                if !args.user_confirmed.unwrap_or(false) {
+                    return Err(McpError::invalid_params(
+                        "authority=user_confirmed requires user_confirmed=true: \
+                         set the flag only when the user explicitly stated or approved this content",
+                        None,
+                    ));
+                }
+                crate::context_runtime::Authority::UserConfirmed
+            }
+            Some("observed") => crate::context_runtime::Authority::Observed,
+            Some("ai_inferred") => crate::context_runtime::Authority::AiInferred,
+            Some(other) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "unknown authority '{other}': use user_confirmed, observed, or ai_inferred"
+                    ),
+                    None,
+                ));
+            }
+        };
+
+        // ── Scope binding ──
+        let canonical_ws = ws.canonical_root.display().to_string();
+        let (workspace_root, task_id) = match scope {
+            crate::context_runtime::RecordScope::Global => (None, None),
+            crate::context_runtime::RecordScope::Project => (Some(canonical_ws.clone()), None),
+            crate::context_runtime::RecordScope::Task => {
+                let task = args.task_id.as_deref().map(str::trim).unwrap_or("");
+                if task.is_empty() {
+                    return Err(McpError::invalid_params(
+                        "task scope requires task_id (the OpenCode session/task this override belongs to)",
+                        None,
+                    ));
+                }
+                (Some(canonical_ws.clone()), Some(task.to_string()))
+            }
+        };
+
+        // ── Evidence (store re-verifies existence as a backstop) ──
+        let store = self.context_store();
+        let mut evidence: Vec<String> = Vec::new();
+        for id in &args.evidence_event_ids {
+            evidence.push(id.to_string());
+        }
+        if let Some(obs) = args.observation.as_deref() {
+            let obs = crate::tools::shell::redact_secrets_public(obs.trim());
+            if obs.trim().is_empty() {
+                return Err(McpError::invalid_params(
+                    "observation must not be empty when supplied",
+                    None,
+                ));
+            }
+            let event = crate::context_runtime::EventRecord {
+                id: None,
+                session_id: None,
+                workspace_root: canonical_ws.clone(),
+                task_id: None,
+                kind: "agent_observation".to_string(),
+                tool: Some("remember".to_string()),
+                path: None,
+                outcome: None,
+                summary: None,
+                payload: Some(obs.chars().take(2000).collect::<String>()),
+                dedup_key: None,
+                source: None,
+                digest: None,
+                created_at: 0,
+            };
+            let event_id = store
+                .append_event(&event, now)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            evidence.push(event_id.to_string());
+        }
+        if matches!(
+            authority,
+            crate::context_runtime::Authority::Observed
+                | crate::context_runtime::Authority::AiInferred
+        ) && evidence.is_empty()
+        {
+            return Err(McpError::invalid_params(
+                "observed/ai_inferred writes require evidence: pass evidence_event_ids \
+                 or describe what was observed in observation (P1 never auto-infers preferences)",
+                None,
+            ));
+        }
+
+        // ── Record assembly ──
+        let redacted_content = crate::tools::shell::redact_secrets_public(&content);
+        let mut record = crate::context_runtime::ContextRecord::new(
+            String::new(), // minted below
+            kind,
+            namespace.clone(),
+            redacted_content,
+            authority,
+        );
+        record.scope = scope;
+        record.workspace_root = workspace_root;
+        record.task_id = task_id;
+        record.lifecycle = crate::context_runtime::lifecycle_for_authority(authority);
+        record.confidence = args.confidence.map(|c| c.clamp(0.0, 1.0)).unwrap_or(
+            if authority == crate::context_runtime::Authority::UserConfirmed {
+                0.9
+            } else {
+                0.6
+            },
+        );
+        record.importance = args.importance.map(|c| c.clamp(0.0, 1.0)).unwrap_or(0.6);
+        if let Some(orig) = args.original_text.as_deref() {
+            let orig = crate::tools::shell::redact_secrets_public(orig.trim());
+            if orig.chars().count() > 2048 {
+                return Err(McpError::invalid_params(
+                    "original_text exceeds 2048 characters",
+                    None,
+                ));
+            }
+            if !orig.is_empty() {
+                record.original_text = Some(orig);
+            }
+        }
+        if let Some(lang) = args.language.as_deref() {
+            let lang = lang.trim().to_string();
+            if !lang.is_empty() {
+                record.language = Some(lang);
+            }
+        }
+        if let Some(src) = args.source.as_deref() {
+            let src = src.trim().to_string();
+            if !src.is_empty() {
+                record.source = Some(src);
+            }
+        }
+        record.related_ids = args.related_ids.clone();
+        record.evidence = evidence;
+
+        // Intent metadata lives in extra_json (one schemaless column, not
+        // rigid per-intent columns); non-intent kinds must not carry it.
+        let intent_status = if kind == crate::context_runtime::RecordKind::Intent {
+            let meta = crate::context_runtime::IntentMetadata {
+                rationale: args
+                    .rationale
+                    .as_deref()
+                    .map(|r| crate::tools::shell::redact_secrets_public(r.trim())),
+                priority: args
+                    .priority
+                    .as_deref()
+                    .map(|p| {
+                        p.parse::<crate::context_runtime::IntentPriority>()
+                            .map_err(|e| McpError::invalid_params(e, None))
+                    })
+                    .transpose()?,
+                intent_status: args
+                    .intent_status
+                    .as_deref()
+                    .map(|s| {
+                        s.parse::<crate::context_runtime::IntentStatus>()
+                            .map_err(|e| McpError::invalid_params(e, None))
+                    })
+                    .transpose()?
+                    .unwrap_or(crate::context_runtime::IntentStatus::Active),
+            };
+            let status = meta.intent_status;
+            meta.apply_to(&mut record)
+                .map_err(|e| McpError::invalid_params(e, None))?;
+            Some(status)
+        } else {
+            if args.rationale.is_some() || args.priority.is_some() || args.intent_status.is_some() {
+                return Err(McpError::invalid_params(
+                    "rationale/priority/intent_status apply only to kind=intent",
+                    None,
+                ));
+            }
+            None
+        };
+
+        // Terminal intent replacements retire (expired/rejected), everything
+        // else supersedes active. Map the intent status onto the storage
+        // lifecycle now so the store's shape rule sees a coherent record.
+        if let Some(status) = intent_status {
+            record.status = match status {
+                crate::context_runtime::IntentStatus::Active
+                | crate::context_runtime::IntentStatus::Paused => {
+                    crate::context_runtime::RecordStatus::Active
+                }
+                crate::context_runtime::IntentStatus::Completed => {
+                    crate::context_runtime::RecordStatus::Expired
+                }
+                crate::context_runtime::IntentStatus::Cancelled => {
+                    crate::context_runtime::RecordStatus::Rejected
+                }
+                crate::context_runtime::IntentStatus::Superseded => {
+                    crate::context_runtime::RecordStatus::Superseded
+                }
+            };
+            if status == crate::context_runtime::IntentStatus::Superseded
+                && args
+                    .supersedes
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+            {
+                return Err(McpError::invalid_params(
+                    "intent_status=superseded requires supersedes (the record this replaces)",
+                    None,
+                ));
+            }
+        }
+
+        // ── Fresh write vs replacement ──
+        if let Some(prev_id) = args
+            .supersedes
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let prev = store
+                .get_record(prev_id)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("supersedes target '{prev_id}' does not exist"),
+                        None,
+                    )
+                })?;
+            if prev.status != crate::context_runtime::RecordStatus::Active {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "only an active record can be superseded ('{prev_id}' is {})",
+                        prev.status
+                    ),
+                    None,
+                ));
+            }
+            // Intent transition guard: terminal intents are history —
+            // start a fresh intent instead of rewriting them.
+            if prev.kind == crate::context_runtime::RecordKind::Intent {
+                let from = crate::context_runtime::IntentMetadata::read_from(&prev)
+                    .map(|m| m.intent_status)
+                    .map_err(|e| {
+                        McpError::invalid_params(
+                            format!("supersedes target has malformed intent metadata: {e}"),
+                            None,
+                        )
+                    })?;
+                let to = intent_status.unwrap_or(crate::context_runtime::IntentStatus::Active);
+                crate::context_runtime::intent::validate_transition(Some(from), to)
+                    .map_err(|e| McpError::invalid_params(e, None))?;
+            }
+            record.id = mint_record_id(&store, kind, &namespace, now);
+            record.supersedes = Some(prev_id.to_string());
+            if record.status == crate::context_runtime::RecordStatus::Active {
+                store
+                    .supersede_record(prev_id, &record, now)
+                    .map_err(remember_error)?;
+            } else {
+                store
+                    .retire_record(prev_id, &record, now)
+                    .map_err(remember_error)?;
+            }
+            crate::history_capture::capture(
+                &store,
+                &ws.canonical_root,
+                crate::history_capture::HistoryCapture {
+                    kind: crate::context_runtime::HistoryKind::Decision,
+                    summary: format!(
+                        "recorded {} {}: {}",
+                        kind,
+                        namespace,
+                        crate::history_capture::detail(&record.content, 160)
+                    ),
+                    tool: Some("remember".to_string()),
+                    path: None,
+                    outcome: Some("superseded".to_string()),
+                    payload: None,
+                    task_id: record.task_id.clone(),
+                },
+            );
+            let payload = serde_json::json!({
+                "remembered": true,
+                "id": record.id,
+                "kind": kind.to_string(),
+                "namespace": namespace,
+                "authority": authority.to_string(),
+                "scope": scope.to_string(),
+                "status": record.status.to_string(),
+                "superseded": prev_id,
+                "evidence": record.evidence,
+            });
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                serde_json::to_string_pretty(&payload)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            )]));
+        }
+
+        // Fresh write: refuse when an active record already owns this
+        // (kind, namespace, scope) — replacing knowledge must name its
+        // predecessor via supersedes so history is never silently forked.
+        // (Terminal intent completion without supersedes auto-retires the
+        // single active intent in the namespace; ambiguity errors out.)
+        let clash = find_active_in_namespace(
+            &store,
+            kind,
+            &namespace,
+            scope,
+            record.workspace_root.as_deref(),
+            record.task_id.as_deref(),
+            now,
+        )
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if !clash.is_empty() {
+            let retiring = matches!(
+                intent_status,
+                Some(
+                    crate::context_runtime::IntentStatus::Completed
+                        | crate::context_runtime::IntentStatus::Cancelled
+                )
+            );
+            if retiring && clash.len() == 1 {
+                let prev_id = clash[0].clone();
+                let prev = store
+                    .get_record(&prev_id)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    .ok_or_else(|| McpError::internal_error("clashing record vanished", None))?;
+                let from = crate::context_runtime::IntentMetadata::read_from(&prev)
+                    .map(|m| m.intent_status)
+                    .unwrap_or(crate::context_runtime::IntentStatus::Active);
+                crate::context_runtime::intent::validate_transition(
+                    from.into(),
+                    intent_status.unwrap(),
+                )
+                .map_err(|e| McpError::invalid_params(e, None))?;
+                record.id = mint_record_id(&store, kind, &namespace, now);
+                record.supersedes = Some(prev_id.clone());
+                store
+                    .retire_record(&prev_id, &record, now)
+                    .map_err(remember_error)?;
+                crate::history_capture::capture(
+                    &store,
+                    &ws.canonical_root,
+                    crate::history_capture::HistoryCapture {
+                        kind: crate::context_runtime::HistoryKind::Decision,
+                        summary: format!(
+                            "recorded {} {}: {}",
+                            kind,
+                            namespace,
+                            crate::history_capture::detail(&record.content, 160)
+                        ),
+                        tool: Some("remember".to_string()),
+                        path: None,
+                        outcome: Some("retired".to_string()),
+                        payload: None,
+                        task_id: record.task_id.clone(),
+                    },
+                );
+                let payload = serde_json::json!({
+                    "remembered": true,
+                    "id": record.id,
+                    "kind": kind.to_string(),
+                    "namespace": namespace,
+                    "authority": authority.to_string(),
+                    "scope": scope.to_string(),
+                    "status": record.status.to_string(),
+                    "superseded": prev_id,
+                    "evidence": record.evidence,
+                });
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+                )]));
+            }
+            return Err(McpError::invalid_params(
+                format!(
+                    "an active {} record already exists in namespace '{namespace}' for this scope ({}); \
+                     pass supersedes with its id to replace it (history is preserved, never overwritten)",
+                    kind,
+                    clash.join(", ")
+                ),
+                None,
+            ));
+        }
+
+        record.id = mint_record_id(&store, kind, &namespace, now);
+        store.put_record(&record, now).map_err(remember_error)?;
+        crate::history_capture::capture(
+            &store,
+            &ws.canonical_root,
+            crate::history_capture::HistoryCapture {
+                kind: crate::context_runtime::HistoryKind::Decision,
+                summary: format!(
+                    "recorded {} {}: {}",
+                    kind,
+                    namespace,
+                    crate::history_capture::detail(&record.content, 160)
+                ),
+                tool: Some("remember".to_string()),
+                path: None,
+                outcome: Some("recorded".to_string()),
+                payload: None,
+                task_id: record.task_id.clone(),
+            },
+        );
+        let payload = serde_json::json!({
+            "remembered": true,
+            "id": record.id,
+            "kind": kind.to_string(),
+            "namespace": namespace,
+            "authority": authority.to_string(),
+            "scope": scope.to_string(),
+            "status": record.status.to_string(),
+            "evidence": record.evidence,
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&payload)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        )]))
+    }
+
+    // ── Tool 20: forget (reversible retirement of user context) ────────
+
+    /// Retire a persisted context record. Default is a reversible reject
+    /// (the row stays for the audit trail, like negative knowledge);
+    /// permanent=true hard-removes it (cleanup of junk only). Requires
+    /// confirm=true. Project/task records only from their own workspace.
+    #[tool(
+        description = "Retire a persisted context record by id (reversible reject; the row stays for audit) or permanently remove it with permanent=true. Requires confirm=true. Project/task records only from their own workspace."
+    )]
+    async fn forget(
+        &self,
+        Parameters(args): Parameters<ForgetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let _mutation_guard = ws.mutation_lock.lock().await;
+        if !args.confirm.unwrap_or(false) {
+            return Err(McpError::invalid_params(
+                "forget rejected: set confirm=true to retire this record",
+                None,
+            ));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let store = self.context_store();
+
+        // Locate: exact id first; otherwise resolve the namespace winner
+        // for this viewpoint (the record `context` would have shown).
+        let target_id: String = if let Some(id) =
+            args.id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
+            id.to_string()
+        } else if let Some(ns) = args
+            .namespace
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let root = ws.canonical_root.display().to_string();
+            let query = crate::context_runtime::RecordQuery {
+                workspace_root: Some(root.as_str()),
+                task_id: args.task_id.as_deref(),
+                kind: None,
+                status: None,
+                keywords: Vec::new(),
+                limit: 100,
+            };
+            let ranked = crate::context_runtime::ContextRetriever::search(&*store, &query, now)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let scope = crate::context_runtime::fingerprint::ResolutionScope {
+                workspace_key: Some(root.as_str()),
+                task_id: args.task_id.as_deref(),
+            };
+            let resolved = crate::context_runtime::fingerprint::resolve_context(ranked, &scope);
+            resolved
+                .fingerprint
+                .iter()
+                .chain(resolved.intents.iter())
+                .chain(resolved.other.iter())
+                .find(|r| r.record.namespace == ns)
+                .map(|r| r.record.id.clone())
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("no visible record in namespace '{ns}' for this workspace/task"),
+                        None,
+                    )
+                })?
+        } else {
+            return Err(McpError::invalid_params(
+                "forget requires id (or namespace + workspace/task to resolve the winner)",
+                None,
+            ));
+        };
+
+        let target = store
+            .get_record(&target_id)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("no record with id '{target_id}'"), None)
+            })?;
+
+        // Workspace confinement: one project cannot forget another's rows.
+        let canonical_ws = ws.canonical_root.display().to_string();
+        match target.scope {
+            crate::context_runtime::RecordScope::Global => {}
+            crate::context_runtime::RecordScope::Project => {
+                if target.workspace_root.as_deref() != Some(canonical_ws.as_str()) {
+                    return Err(McpError::invalid_params(
+                        "that record belongs to another workspace and cannot be retired from here",
+                        None,
+                    ));
+                }
+            }
+            crate::context_runtime::RecordScope::Task => {
+                if target.workspace_root.as_deref() != Some(canonical_ws.as_str())
+                    || target.task_id.as_deref()
+                        != args
+                            .task_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                {
+                    return Err(McpError::invalid_params(
+                        "that task record is not visible from this workspace/task",
+                        None,
+                    ));
+                }
+            }
+        }
+
+        if args.permanent.unwrap_or(false) {
+            let removed = store
+                .remove_record(&target_id)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            crate::history_capture::capture(
+                &store,
+                &ws.canonical_root,
+                crate::history_capture::HistoryCapture {
+                    kind: crate::context_runtime::HistoryKind::Observation,
+                    summary: format!("retired context record {target_id} (removed)"),
+                    tool: Some("forget".to_string()),
+                    path: None,
+                    outcome: Some("removed".to_string()),
+                    payload: None,
+                    task_id: args.task_id.clone(),
+                },
+            );
+            let payload = serde_json::json!({
+                "forgotten": removed,
+                "id": target_id,
+                "action": "removed",
+            });
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                serde_json::to_string_pretty(&payload)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            )]));
+        }
+
+        let prior = target.status.to_string();
+        let rejected = store
+            .reject_record(&target_id, now)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        crate::history_capture::capture(
+            &store,
+            &ws.canonical_root,
+            crate::history_capture::HistoryCapture {
+                kind: crate::context_runtime::HistoryKind::Observation,
+                summary: format!(
+                    "retired context record {target_id} ({})",
+                    if rejected {
+                        "rejected"
+                    } else {
+                        "already_terminal"
+                    }
+                ),
+                tool: Some("forget".to_string()),
+                path: None,
+                outcome: Some("rejected".to_string()),
+                payload: None,
+                task_id: args.task_id.clone(),
+            },
+        );
+        let payload = serde_json::json!({
+            "forgotten": rejected,
+            "id": target_id,
+            "action": if rejected { "rejected" } else { "already_terminal" },
+            "prior_status": prior,
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&payload)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        )]))
+    }
+
+    // ── Tool 21: recall (historical evidence on demand) ─────────────────
+
+    /// Recall relevant previous engineering work: decisions, failures,
+    /// validations, and changes from past sessions in this project (or
+    /// task). Returns compact provenance-tagged excerpts — the evidence,
+    /// not transcripts. Call when asking "have we tried this before?",
+    /// "why did we choose this?", or "did this fail previously?".
+    /// Read-only: never writes history (recalling must not record), and
+    /// never dumps history into the always-available context packet.
+    #[tool(
+        description = "Recall relevant previous engineering work from past sessions: decisions, failures, validations, changes. Returns compact provenance-tagged excerpts (session, timestamp, scope, event type, source). Call when asking 'have we tried this before' or 'why did we choose this'. Read-only."
+    )]
+    async fn recall(
+        &self,
+        Parameters(args): Parameters<RecallArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        // Read-only: no mutation lock. And deliberately no history capture
+        // — recalling history must not write history (no recursion).
+        let scope = match args.scope.as_deref().map(str::trim) {
+            None | Some("") | Some("project") => crate::context_runtime::RecallScope::Project,
+            Some("task") => crate::context_runtime::RecallScope::Task,
+            Some("global") => crate::context_runtime::RecallScope::Global,
+            Some(other) => {
+                return Err(McpError::invalid_params(
+                    format!("unknown recall scope '{other}': use project, task, or global"),
+                    None,
+                ))
+            }
+        };
+        let mut kinds = Vec::new();
+        for raw in args.kinds.as_deref().unwrap_or(&[]) {
+            kinds.push(
+                raw.parse::<crate::context_runtime::HistoryKind>()
+                    .map_err(|e| McpError::invalid_params(e, None))?,
+            );
+        }
+        let task_id = args
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let root = ws.canonical_root.display().to_string();
+        let store = self.context_store();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let outcome = store
+            .recall(
+                &crate::context_runtime::RecallQuery {
+                    query: args.query.as_str(),
+                    workspace_root: Some(root.as_str()),
+                    task_id,
+                    scope,
+                    kinds,
+                    session_id: args.session_id.as_deref(),
+                    limit: args.limit.unwrap_or(0),
+                },
+                now,
+            )
+            .map_err(|e| match e {
+                crate::context_runtime::store::ContextError::Validation(msg) => {
+                    McpError::invalid_params(msg, None)
+                }
+                other => McpError::internal_error(other.to_string(), None),
+            })?;
+        // Compact structured evidence: session grouping with per-hit
+        // provenance (never transcripts). Hit scope is derived from the
+        // row: task-bound → task, own workspace → project, else global.
+        let groups: Vec<serde_json::Value> = outcome
+            .groups
+            .iter()
+            .map(|g| {
+                let events: Vec<serde_json::Value> = g
+                    .hits
+                    .iter()
+                    .map(|h| {
+                        let scope = if h.event.task_id.is_some() {
+                            "task"
+                        } else if h.event.workspace_root == root {
+                            "project"
+                        } else {
+                            "global"
+                        };
+                        json!({
+                            "event_id": h.event.id,
+                            "event": h.event.kind,
+                            "timestamp": h.event.created_at,
+                            "scope": scope,
+                            "task_id": h.event.task_id,
+                            "tool": h.event.tool,
+                            "path": h.event.path,
+                            "outcome": h.event.outcome,
+                            "source": h.event.source,
+                            "session_stale": h.session_stale,
+                            "excerpt": h.excerpt,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "session": g.session_id,
+                    "session_title": g.session_title,
+                    "session_status": g.session_status,
+                    "session_stale": g.session_stale,
+                    "workspace_root": g.workspace_root,
+                    "task_id": g.task_id,
+                    "total_in_session": g.total_in_session,
+                    "events": events,
+                })
+            })
+            .collect();
+        let returned: usize = groups
+            .iter()
+            .map(|g| g["events"].as_array().map(|e| e.len()).unwrap_or(0))
+            .sum();
+        let payload = json!({
+            "query": args.query,
+            "scope": scope.to_string(),
+            "returned": returned,
+            "total_matches": outcome.total_matches,
+            "truncated": outcome.truncated,
+            "provenance": "historical-evidence",
+            "history": groups,
+            "note": "Historical evidence from past sessions: what happened, when, where, and what produced it — not what to do. Task history stays invisible without its task_id; pass scope=global to explicitly search every workspace.",
+        });
+        let text = crate::mcp::response_bounds::bounded_response(payload)
+            .map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    // ── Tool 22: learn (cautious hypotheses from history) ─────────────────
+
+    /// Learn from accumulated engineering history: detect recurring patterns
+    /// in past decisions, validations, and changes; evaluate them against
+    /// supporting and contradicting evidence with bounded confidence; and
+    /// persist sufficiently-supported conclusions as AI_INFERRED knowledge
+    /// (never USER_CONFIRMED). Inspect pending candidates, confirm what the
+    /// user explicitly approves, or reject what does not hold. Read-only
+    /// actions (list, get) write nothing; learning never writes history.
+    #[tool(
+        description = "Learn from engineering history: detect recurring patterns, evaluate them against supporting and contradicting evidence, and persist strong hypotheses as AI_INFERRED knowledge. Confirm only what the user approved; reject what does not hold."
+    )]
+    async fn learn(
+        &self,
+        Parameters(args): Parameters<LearnArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = args.action.as_deref().map(str::trim).unwrap_or("");
+        // Read-only actions take no lock and capture no history.
+        // Mutating actions serialize on the workspace lock like every
+        // other writer; learning never writes history (no recursion, no
+        // self-evidence).
+        match action {
+            "list" | "get" => self.learn_read(args).await,
+            "run" | "propose" | "evaluate" | "confirm" | "reject" => {
+                let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+                let _mutation_guard = ws.mutation_lock.lock().await;
+                self.learn_write(args).await
+            }
+            other => Err(McpError::invalid_params(
+                format!(
+                    "unknown learn action '{other}': use run, propose, list, get, \
+                     evaluate, confirm, or reject"
+                ),
+                None,
+            )),
+        }
+    }
+
+    /// Read-only `learn` actions: inspect candidates and explanations.
+    async fn learn_read(&self, args: LearnArgs) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let store = self.context_store();
+        let root = ws.canonical_root.display().to_string();
+        let action = args.action.as_deref().unwrap_or("");
+        match action {
+            "list" => {
+                let status = match args.status.as_deref().map(str::trim) {
+                    None | Some("") => None,
+                    Some(raw) => Some(
+                        raw.parse::<crate::context_runtime::CandidateStatus>()
+                            .map_err(|e| McpError::invalid_params(e, None))?,
+                    ),
+                };
+                let limit = args.limit.unwrap_or(20).clamp(1, 50);
+                let candidates = store
+                    .list_candidates(Some(root.as_str()), status, args.task_id.as_deref(), limit)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let items: Vec<serde_json::Value> = candidates
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "candidate_id": c.candidate_id,
+                            "kind": c.kind,
+                            "scope": c.scope,
+                            "status": c.status,
+                            "confidence": c.confidence,
+                            "proposition": c.proposition,
+                            "namespace": c.namespace,
+                            "supporting": c.supporting_evidence.len(),
+                            "contradicting": c.contradicting_evidence.len(),
+                            "eval_reason": c.eval_reason,
+                            "inference_record_id": c.inference_record_id,
+                            "updated_at": c.updated_at,
+                        })
+                    })
+                    .collect();
+                let payload = json!({
+                    "candidates": items,
+                    "returned": items.len(),
+                    "provenance": "learning-candidates",
+                    "note": "Pending hypotheses with their evidence counts and confidence. Deferred/rejected rows are preserved for audit, never surfaced as trusted context.",
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "get" => {
+                let id = args.candidate_id.as_deref().map(str::trim).unwrap_or("");
+                if id.is_empty() {
+                    return Err(McpError::invalid_params(
+                        "learn get requires candidate_id",
+                        None,
+                    ));
+                }
+                let candidate = store
+                    .get_candidate(id)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    .ok_or_else(|| {
+                        McpError::invalid_params(format!("no learning candidate '{id}'"), None)
+                    })?;
+                // Workspace confinement: one project inspects its own
+                // candidates plus globals, never another project's.
+                let visible = match candidate.scope.as_str() {
+                    "global" => true,
+                    _ => candidate.workspace_root.as_deref() == Some(root.as_str()),
+                };
+                if !visible {
+                    return Err(McpError::invalid_params(
+                        "that candidate belongs to another workspace",
+                        None,
+                    ));
+                }
+                let payload = json!({
+                    "candidate": candidate,
+                    "explanation": candidate.explain(),
+                    "provenance": "learning-candidates",
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            _ => Err(McpError::internal_error("unreachable learn action", None)),
+        }
+    }
+
+    /// Mutating `learn` actions. The workspace lock is already held by the
+    /// caller (`learn`). History is never written here.
+    async fn learn_write(&self, args: LearnArgs) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let store = self.context_store();
+        let root = ws.canonical_root.display().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let scope = match args.scope.as_deref().map(str::trim) {
+            None | Some("") | Some("project") => crate::context_runtime::LearnScope::Project,
+            Some("task") => crate::context_runtime::LearnScope::Task,
+            Some("global") => crate::context_runtime::LearnScope::Global,
+            Some(other) => {
+                return Err(McpError::invalid_params(
+                    format!("unknown learn scope '{other}': use project, task, or global"),
+                    None,
+                ))
+            }
+        };
+        let task_id = args
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let learn_error = |e: crate::context_runtime::store::ContextError| match e {
+            crate::context_runtime::store::ContextError::Validation(msg) => {
+                McpError::invalid_params(msg, None)
+            }
+            other => McpError::internal_error(other.to_string(), None),
+        };
+        let action = args.action.as_deref().unwrap_or("");
+        match action {
+            "run" => {
+                let outcome = store
+                    .run_learning(Some(root.as_str()), task_id, scope, now)
+                    .map_err(learn_error)?;
+                let payload = json!({
+                    "learned": true,
+                    "scope": scope.to_string(),
+                    "proposed": outcome.proposed,
+                    "accepted": outcome.accepted,
+                    "deferred": outcome.deferred,
+                    "rejected": outcome.rejected,
+                    "refreshed": outcome.refreshed,
+                    "skipped_terminal": outcome.skipped_terminal,
+                    "failures": outcome.failures,
+                    "provenance": "learning-candidates",
+                    "note": "Accepted hypotheses persist as AI_INFERRED records with evidence and bounded confidence — never as USER_CONFIRMED truth.",
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "propose" => {
+                let candidates = store
+                    .propose_candidates(Some(root.as_str()), task_id, scope, now)
+                    .map_err(learn_error)?;
+                let items: Vec<serde_json::Value> = candidates
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "candidate_id": c.candidate_id,
+                            "kind": c.kind,
+                            "status": c.status,
+                            "confidence": c.confidence,
+                            "proposition": c.proposition,
+                            "supporting": c.supporting_evidence.len(),
+                            "contradicting": c.contradicting_evidence.len(),
+                        })
+                    })
+                    .collect();
+                let payload = json!({
+                    "proposed": items.len(),
+                    "scope": scope.to_string(),
+                    "candidates": items,
+                    "provenance": "learning-candidates",
+                    "note": "Observations only: nothing evaluated, nothing persisted as knowledge. Call learn evaluate (or run) to weigh the evidence.",
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "evaluate" => {
+                let id = args.candidate_id.as_deref().map(str::trim).unwrap_or("");
+                if id.is_empty() {
+                    return Err(McpError::invalid_params(
+                        "learn evaluate requires candidate_id",
+                        None,
+                    ));
+                }
+                let candidate = store.evaluate_candidate(id, now).map_err(learn_error)?;
+                let payload = json!({
+                    "candidate": candidate,
+                    "explanation": candidate.explain(),
+                    "provenance": "learning-candidates",
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "confirm" => {
+                // Caller-principal rule: only an explicit user speech act
+                // (user_confirmed=true) creates USER_CONFIRMED truth. The
+                // model can never self-confirm an inference.
+                if !args.user_confirmed.unwrap_or(false) {
+                    return Err(McpError::invalid_params(
+                        "learn confirm requires user_confirmed=true: set the flag only \
+                         when the user explicitly stated or approved this conclusion",
+                        None,
+                    ));
+                }
+                let id = args.candidate_id.as_deref().map(str::trim).unwrap_or("");
+                if id.is_empty() {
+                    return Err(McpError::invalid_params(
+                        "learn confirm requires candidate_id",
+                        None,
+                    ));
+                }
+                let candidate = store
+                    .confirm_candidate(id, true, now)
+                    .map_err(learn_error)?;
+                let payload = json!({
+                    "confirmed": true,
+                    "candidate": candidate,
+                    "provenance": "learning-candidates",
+                    "note": "The user confirmed this conclusion: a USER_CONFIRMED record now supersedes the AI_INFERRED hypothesis (audit trail preserved).",
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "reject" => {
+                let id = args.candidate_id.as_deref().map(str::trim).unwrap_or("");
+                if id.is_empty() {
+                    return Err(McpError::invalid_params(
+                        "learn reject requires candidate_id",
+                        None,
+                    ));
+                }
+                if !args.confirm.unwrap_or(false) {
+                    return Err(McpError::invalid_params(
+                        "learn reject requires confirm=true",
+                        None,
+                    ));
+                }
+                let candidate = store
+                    .reject_candidate(id, args.reason.as_deref(), now)
+                    .map_err(learn_error)?;
+                let payload = json!({
+                    "rejected": true,
+                    "candidate": candidate,
+                    "provenance": "learning-candidates",
+                    "note": "Rejection is preserved as negative knowledge (rows stay for audit, never deleted). A project-scoped preference can still be recorded via remember.",
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            _ => Err(McpError::internal_error("unreachable learn action", None)),
+        }
+    }
+
+    // ── P4: skill lifecycle tool ────────────────────────────────────────
+
+    /// Skill publication root: `$CODEBRO_SKILLS_DIR` when set (tests and
+    /// embedded deployments stay hermetic), otherwise OpenCode's global
+    /// skill directory `~/.config/opencode/skills`.
+    fn skills_root() -> Result<std::path::PathBuf, McpError> {
+        if let Ok(dir) = std::env::var("CODEBRO_SKILLS_DIR") {
+            if !dir.trim().is_empty() {
+                return Ok(std::path::PathBuf::from(dir));
+            }
+        }
+        dirs::home_dir()
+            .map(|h| h.join(".config").join("opencode").join("skills"))
+            .ok_or_else(|| McpError::internal_error("cannot determine HOME", None))
+    }
+
+    /// Whether a skill candidate is visible from the requesting
+    /// workspace: global rows are visible everywhere, project/task rows
+    /// only from their own workspace (and task rows need the task id).
+    fn skill_candidate_visible_from(
+        candidate: &crate::context_runtime::SkillCandidate,
+        ws_root: &str,
+        task_id: Option<&str>,
+    ) -> bool {
+        match candidate.scope.as_str() {
+            "global" => true,
+            "project" => candidate
+                .workspace_root
+                .as_deref()
+                .map(|w| {
+                    crate::context_runtime::canonical_workspace_key(w)
+                        == crate::context_runtime::canonical_workspace_key(ws_root)
+                })
+                .unwrap_or(false),
+            "task" => {
+                let ws_ok = candidate
+                    .workspace_root
+                    .as_deref()
+                    .map(|w| {
+                        crate::context_runtime::canonical_workspace_key(w)
+                            == crate::context_runtime::canonical_workspace_key(ws_root)
+                    })
+                    .unwrap_or(false);
+                let task_ok = candidate
+                    .task_id
+                    .as_deref()
+                    .zip(task_id)
+                    .map(|(a, b)| a.trim() == b.trim())
+                    .unwrap_or(false);
+                ws_ok && task_ok
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a skill is visible from the requesting workspace (same
+    /// rule as candidates, minus task scoping: published skills are
+    /// project-or-global).
+    fn skill_visible_from(skill: &crate::context_runtime::Skill, ws_root: &str) -> bool {
+        match skill.scope.as_str() {
+            "global" => true,
+            "project" => skill
+                .workspace_root
+                .as_deref()
+                .map(|w| {
+                    crate::context_runtime::canonical_workspace_key(w)
+                        == crate::context_runtime::canonical_workspace_key(ws_root)
+                })
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    #[tool(
+        description = "Skill lifecycle: discover, propose, inspect, validate, approve, reject, deprecate, rollback, health. Manages evidence-backed skill candidates and versioned publication. OpenCode executes skills natively."
+    )]
+    async fn skill(
+        &self,
+        Parameters(args): Parameters<SkillArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let action = args.action.as_deref().unwrap_or("discover");
+        let store = self.context_store();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ws_root = ws.canonical_root.to_string_lossy().to_string();
+        let task_id = args.task_id.as_deref();
+
+        match action {
+            "discover" => {
+                let status_filter = args
+                    .status
+                    .as_deref()
+                    .and_then(|s| crate::context_runtime::SkillCandidateStatus::from_str(s).ok());
+                let candidates = store
+                    .list_skill_candidates(
+                        Some(&ws_root),
+                        task_id,
+                        status_filter,
+                        args.limit.unwrap_or(20),
+                    )
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let skills = store
+                    .list_skills(
+                        Some(&ws_root),
+                        Some(crate::context_runtime::SkillStatus::Active),
+                        args.limit.unwrap_or(20),
+                    )
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let payload = serde_json::json!({
+                    "action": "discover",
+                    "skill_candidates": candidates.iter().map(|c| c.explain()).collect::<Vec<_>>(),
+                    "active_skills": skills,
+                    "count": candidates.len() + skills.len(),
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "propose" => {
+                let _guard = ws.mutation_lock.lock().await;
+                let name = args.name.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("propose requires 'name'", None)
+                })?;
+                // Secret redaction at the write seam (same policy as
+                // remember/task/record_memory): the free-text description
+                // and purpose are persisted verbatim into skill rows that
+                // every reader (inspect, discover, health, engineering
+                // brief) surfaces — a secret pasted here must never
+                // reach storage or any brief.
+                let description = &crate::tools::shell::redact_secrets_public(
+                    args.description.as_deref().unwrap_or(""),
+                );
+                let purpose = &crate::tools::shell::redact_secrets_public(
+                    args.purpose.as_deref().unwrap_or(""),
+                );
+                let content = args.content.as_deref().unwrap_or("");
+
+                // Structurally impossible names (traversal-shaped,
+                // uppercase, separators) are refused outright: such a
+                // candidate could never publish, so storing it would only
+                // pollute the registry.
+                if !crate::context_runtime::is_valid_skill_name(name) {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "invalid skill name '{name}': must be 1-64 lowercase \
+                             alphanumeric segments with single hyphens (e.g. git-release)"
+                        ),
+                        None,
+                    ));
+                }
+
+                // Scope rules mirror P3 learning: project needs a
+                // workspace (always present here), task needs a task id.
+                let scope_str = args.scope.as_deref().unwrap_or("project");
+                let scope = crate::context_runtime::SkillScope::from_str(scope_str)
+                    .map_err(|e| McpError::invalid_params(e, None))?;
+                if scope == crate::context_runtime::SkillScope::Task
+                    && task_id.map(str::trim).unwrap_or("").is_empty()
+                {
+                    return Err(McpError::invalid_params(
+                        "task-scoped skill candidates require task_id",
+                        None,
+                    ));
+                }
+
+                // If a learning candidate id is provided, derive from it.
+                // The store enforces the P3 trust boundary (accepted-only)
+                // and the P4 lineage conflict rules.
+                if let Some(lc_id) = args.learning_candidate_id.as_deref() {
+                    let lc = store
+                        .get_candidate(lc_id)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                        .ok_or_else(|| McpError::invalid_params("learning candidate not found", None))?;
+
+                    // Cross-workspace learning evidence must not seed
+                    // candidates visible here.
+                    if !Self::learning_candidate_in_scope(&lc, &ws_root, task_id) {
+                        return Err(McpError::invalid_params(
+                            "learning candidate is not visible from this workspace/task",
+                            None,
+                        ));
+                    }
+
+                    let applicability = crate::context_runtime::SkillApplicability {
+                        languages: args.languages.clone().unwrap_or_default(),
+                        subsystems: args.subsystems.clone().unwrap_or_default(),
+                        ..Default::default()
+                    };
+
+                    let candidate = store
+                        .create_skill_candidate_from_learning(
+                            &lc,
+                            name,
+                            description,
+                            purpose,
+                            applicability,
+                            content,
+                            now,
+                        )
+                        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                    let payload = serde_json::json!({
+                        "action": "propose",
+                        "candidate": candidate.explain(),
+                        "note": "Candidate created from accepted learning evidence. Use 'validate' (after promoting to draft) then explicit user approval to publish.",
+                    });
+                    let text = crate::mcp::response_bounds::bounded_response(payload)
+                        .map_err(|e| McpError::internal_error(e, None))?;
+                    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+                } else {
+                    // Standalone proposal (not from learning): carries no
+                    // evidence citations, so confidence is caller-declared
+                    // and capped below the approval floor — a standalone
+                    // candidate can never pass the store's confidence gate
+                    // without evidence-backed learning behind it.
+                    let declared = args.confidence.unwrap_or(0.5);
+                    let confidence = declared.min(crate::context_runtime::SKILL_APPROVAL_MIN_CONFIDENCE - 0.01);
+                    let candidate_id = crate::context_runtime::mint_skill_candidate_id(
+                        &scope,
+                        Some(&ws_root),
+                        task_id,
+                        name,
+                        content,
+                    );
+                    let validation = crate::context_runtime::validate_skill_content(
+                        content,
+                        name,
+                        Some(&ws_root),
+                    );
+                    let candidate = crate::context_runtime::SkillCandidate {
+                        candidate_id,
+                        workspace_root: Some(ws_root.clone()),
+                        task_id: args.task_id.clone(),
+                        scope: scope_str.to_string(),
+                        name: name.to_string(),
+                        description: description.to_string(),
+                        purpose: purpose.to_string(),
+                        applicability: crate::context_runtime::SkillApplicability {
+                            languages: args.languages.clone().unwrap_or_default(),
+                            subsystems: args.subsystems.clone().unwrap_or_default(),
+                            ..Default::default()
+                        },
+                        source_learning_candidates: Vec::new(),
+                        supporting_evidence: Vec::new(),
+                        contradicting_evidence: Vec::new(),
+                        proposed_content: content.to_string(),
+                        status: "candidate".to_string(),
+                        confidence,
+                        validation: Some(validation),
+                        eval_reason: Some("standalone proposal (no evidence citations; confidence capped below approval floor)".to_string()),
+                        rejection_reason: None,
+                        supersedes_skill: None,
+                        based_on_version: {
+                            // Anchor standalone updates to the current
+                            // active version of the same-name lineage.
+                            let sid = crate::context_runtime::mint_skill_id(
+                                &scope, Some(&ws_root), name,
+                            );
+                            store
+                                .get_skill(&sid)
+                                .unwrap_or(None)
+                                .filter(|s| s.status == "active")
+                                .map(|s| s.current_version)
+                        },
+                        created_at: now,
+                        updated_at: now,
+                        expires_at: Some(now + crate::context_runtime::SKILL_CANDIDATE_TTL_SECS),
+                    };
+                    store
+                        .insert_skill_candidate(&candidate)
+                        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                    let payload = serde_json::json!({
+                        "action": "propose",
+                        "candidate": candidate.explain(),
+                        "note": "Standalone candidate created (confidence capped below the approval floor: publication requires evidence-backed learning). Use 'validate' then explicit user approval to publish.",
+                    });
+                    let text = crate::mcp::response_bounds::bounded_response(payload)
+                        .map_err(|e| McpError::internal_error(e, None))?;
+                    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+                }
+            }
+            "inspect" => {
+                let candidate_id = args.candidate_id.as_deref();
+                let skill_id = args.skill_id.as_deref();
+                let skill_name = args.name.as_deref();
+
+                if let Some(cid) = candidate_id {
+                    let candidate = store
+                        .get_skill_candidate(cid)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                        .ok_or_else(|| McpError::invalid_params("candidate not found", None))?;
+                    if !Self::skill_candidate_visible_from(&candidate, &ws_root, task_id) {
+                        return Err(McpError::invalid_params(
+                            "candidate not visible from this workspace",
+                            None,
+                        ));
+                    }
+                    let payload = serde_json::json!({
+                        "action": "inspect",
+                        "type": "candidate",
+                        "candidate": candidate.explain(),
+                    });
+                    let text = crate::mcp::response_bounds::bounded_response(payload)
+                        .map_err(|e| McpError::internal_error(e, None))?;
+                    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+                } else if let Some(sid) = skill_id {
+                    let skill = store
+                        .get_skill(sid)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                        .ok_or_else(|| McpError::invalid_params("skill not found", None))?;
+                    if !Self::skill_visible_from(&skill, &ws_root) {
+                        return Err(McpError::invalid_params(
+                            "skill not visible from this workspace",
+                            None,
+                        ));
+                    }
+                    let versions = store
+                        .list_skill_versions(sid, 10)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    let active_version = store
+                        .get_active_skill_version(sid)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    let payload = serde_json::json!({
+                        "action": "inspect",
+                        "type": "skill",
+                        "skill": skill,
+                        "versions": versions,
+                        "active_version": active_version,
+                    });
+                    let text = crate::mcp::response_bounds::bounded_response(payload)
+                        .map_err(|e| McpError::internal_error(e, None))?;
+                    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+                } else if let Some(n) = skill_name {
+                    let skill = store
+                        .get_skill_by_name(n)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                        .ok_or_else(|| McpError::invalid_params("skill not found by name", None))?;
+                    if !Self::skill_visible_from(&skill, &ws_root) {
+                        return Err(McpError::invalid_params(
+                            "skill not visible from this workspace",
+                            None,
+                        ));
+                    }
+                    let payload = serde_json::json!({
+                        "action": "inspect",
+                        "type": "skill",
+                        "skill": skill,
+                    });
+                    let text = crate::mcp::response_bounds::bounded_response(payload)
+                        .map_err(|e| McpError::internal_error(e, None))?;
+                    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+                } else {
+                    Err(McpError::invalid_params(
+                        "inspect requires candidate_id, skill_id, or name",
+                        None,
+                    ))
+                }
+            }
+            "validate" => {
+                let _guard = ws.mutation_lock.lock().await;
+                let candidate_id = args.candidate_id.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("validate requires candidate_id", None)
+                })?;
+                let candidate = store
+                    .get_skill_candidate(candidate_id)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    .ok_or_else(|| McpError::invalid_params("candidate not found", None))?;
+                if !Self::skill_candidate_visible_from(&candidate, &ws_root, task_id) {
+                    return Err(McpError::invalid_params(
+                        "candidate not visible from this workspace",
+                        None,
+                    ));
+                }
+
+                // The automated evaluation pass: re-validate the proposed
+                // content and, on success, advance candidate → evaluating →
+                // draft → validated. The human gates (approve/reject) stay
+                // separate; a validated candidate still requires
+                // user-confirmed approval to publish.
+                let updated = store
+                    .evaluate_candidate_content(candidate_id, now)
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                let validation = updated
+                    .validation
+                    .clone()
+                    .unwrap_or_default();
+
+                let payload = serde_json::json!({
+                    "action": "validate",
+                    "candidate_id": candidate_id,
+                    "status": updated.status,
+                    "validation": validation,
+                    "note": if validation.valid && updated.status == "validated" {
+                        "Validation passed and the candidate is validated. Publishing requires explicit user approval: approve with user_confirmed=true."
+                    } else if validation.valid {
+                        "Validation passed. Re-run validate to advance the pipeline (content committed as draft)."
+                    } else {
+                        "Validation failed. Fix errors (propose a corrected candidate) before approving."
+                    },
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "approve" => {
+                // Caller-principal rule (defense in depth on top of the
+                // store's status/confidence/workspace gates): approval is
+                // a user decision. The model may not self-approve — the
+                // flag must be set only when the user explicitly approved
+                // publication of this candidate.
+                if !args.user_confirmed.unwrap_or(false) {
+                    return Err(McpError::invalid_params(
+                        "skill approve requires user_confirmed=true: set the flag only \
+                         when the user explicitly approved publishing this skill",
+                        None,
+                    ));
+                }
+                let _guard = ws.mutation_lock.lock().await;
+                let candidate_id = args.candidate_id.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("approve requires candidate_id", None)
+                })?;
+
+                let skill_root = Self::skills_root()?;
+
+                let (skill, version) = store
+                    .approve_skill_candidate(candidate_id, Some(&ws_root), &skill_root, now)
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let payload = serde_json::json!({
+                    "action": "approve",
+                    "skill": skill,
+                    "version": version,
+                    "note": "Skill published (user-approved). OpenCode will discover it via its native skill system.",
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "reject" => {
+                let _guard = ws.mutation_lock.lock().await;
+                let candidate_id = args.candidate_id.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("reject requires candidate_id", None)
+                })?;
+                let reason = args.reason.as_deref().unwrap_or("rejected");
+
+                let candidate = store
+                    .get_skill_candidate(candidate_id)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    .ok_or_else(|| McpError::invalid_params("candidate not found", None))?;
+                if !Self::skill_candidate_visible_from(&candidate, &ws_root, task_id) {
+                    return Err(McpError::invalid_params(
+                        "candidate not visible from this workspace",
+                        None,
+                    ));
+                }
+
+                let updated = store
+                    .transition_skill_candidate(
+                        candidate_id,
+                        crate::context_runtime::SkillCandidateStatus::Rejected,
+                        Some(reason),
+                        now,
+                    )
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let payload = serde_json::json!({
+                    "action": "reject",
+                    "candidate": updated.explain(),
+                    "note": "Rejection preserved for audit trail. Future learning will not re-propose without new evidence.",
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "deprecate" => {
+                let _guard = ws.mutation_lock.lock().await;
+                let skill_id = args.skill_id.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("deprecate requires skill_id", None)
+                })?;
+                let reason = args.reason.as_deref();
+
+                let skill_root = Self::skills_root()?;
+
+                let skill = store
+                    .deprecate_skill(skill_id, Some(&ws_root), &skill_root, reason, now)
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let payload = serde_json::json!({
+                    "action": "deprecate",
+                    "skill": skill,
+                    "note": "Skill deprecated and its published file removed. It will no longer be discovered; version history is preserved.",
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "rollback" => {
+                let _guard = ws.mutation_lock.lock().await;
+                let skill_id = args.skill_id.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("rollback requires skill_id", None)
+                })?;
+                let target_version = args.version.ok_or_else(|| {
+                    McpError::invalid_params("rollback requires version", None)
+                })?;
+
+                let skill_root = Self::skills_root()?;
+
+                let (skill, version) = store
+                    .rollback_skill(skill_id, Some(&ws_root), target_version, &skill_root, now)
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let payload = serde_json::json!({
+                    "action": "rollback",
+                    "skill": skill,
+                    "rolled_back_to": version,
+                    "note": format!("Rolled back to version {}. Previous version preserved in history.", target_version),
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "health" => {
+                let _guard = ws.mutation_lock.lock().await;
+                let skill_id = args.skill_id.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("health requires skill_id", None)
+                })?;
+                let success = args.success.unwrap_or(true);
+
+                let skill = store
+                    .get_skill(skill_id)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    .ok_or_else(|| McpError::invalid_params("skill not found", None))?;
+                if !Self::skill_visible_from(&skill, &ws_root) {
+                    return Err(McpError::invalid_params(
+                        "skill not visible from this workspace",
+                        None,
+                    ));
+                }
+
+                store
+                    .record_skill_use(skill_id, success, now)
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let skill = store
+                    .get_skill(skill_id)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    .ok_or_else(|| McpError::invalid_params("skill not found", None))?;
+
+                let payload = serde_json::json!({
+                    "action": "health",
+                    "skill": skill,
+                    "recorded": if success { "success" } else { "failure" },
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            _ => Err(McpError::invalid_params(
+                "unknown skill action: use discover, propose, inspect, validate, approve, reject, deprecate, rollback, or health",
+                None,
+            )),
+        }
+    }
+
+    // ── P5: durable engineering task runtime ───────────────────────────
+
+    /// Map a store-level ContextError to an MCP error: validation
+    /// failures (state machine, isolation, lease, stale writers) are
+    /// caller mistakes (invalid params); the rest are internal.
+    fn task_error(e: crate::context_runtime::store::ContextError) -> McpError {
+        match e {
+            crate::context_runtime::store::ContextError::Validation(msg) => {
+                McpError::invalid_params(msg, None)
+            }
+            other => McpError::internal_error(other.to_string(), None),
+        }
+    }
+
+    /// The per-task JSON payload (bounded via response_bounds).
+    fn task_payload(task: &crate::context_runtime::TaskRecord) -> serde_json::Value {
+        serde_json::to_value(task).unwrap_or(serde_json::json!({}))
+    }
+
+    /// Build the mutation context for a per-task action (handler helper).
+    fn task_ctx<'a>(
+        ws_root: &'a str,
+        task_id: &'a str,
+        worker: &'a str,
+        lease_version: u64,
+        based_on_version: Option<u64>,
+        now: u64,
+    ) -> crate::context_runtime::tasks::TaskMutationCtx<'a> {
+        crate::context_runtime::tasks::TaskMutationCtx {
+            workspace_root: ws_root,
+            task_id,
+            worker,
+            lease_version,
+            based_on_version,
+            now,
+        }
+    }
+
+    #[tool(
+        description = "Durable engineering task runtime: create, start, pause, resume, checkpoint, validate, complete, fail, cancel, list, inspect, stale, outcome. Tasks persist across sessions with immutable checkpoints, worker leases with fencing, and a validated lifecycle; OpenCode remains the executor."
+    )]
+    async fn task(
+        &self,
+        Parameters(args): Parameters<TaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let store = self.context_store();
+        let ws_root = ws.canonical_root.to_string_lossy().to_string();
+        let worker = self.task_worker_id.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let action = args.action.as_deref().map(str::trim).unwrap_or("list");
+
+        // Read-only actions never take the mutation lock. Mutating
+        // actions hold it for the whole handler: the guard must stay
+        // alive until the mutation completes (a guard scoped to this
+        // match arm alone would drop immediately and serialize nothing).
+        let _mutation_guard = match action {
+            "list" | "inspect" | "stale" => None,
+            _ => Some(ws.mutation_lock.lock().await),
+        };
+
+        let require_task_id = || -> Result<String, McpError> {
+            args.task_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("task action '{action}' requires task_id"),
+                        None,
+                    )
+                })
+        };
+
+        let payload = match action {
+            "list" => {
+                let status = match args.status.as_deref().map(str::trim) {
+                    None | Some("") => None,
+                    Some(raw) => Some(
+                        raw.parse::<crate::context_runtime::TaskStatus>()
+                            .map_err(|e| McpError::invalid_params(e, None))?,
+                    ),
+                };
+                let tasks = store
+                    .list_tasks(
+                        &ws_root,
+                        status,
+                        args.parent_task_id.as_deref(),
+                        args.limit.unwrap_or(20),
+                        now,
+                    )
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "list",
+                    "tasks": tasks,
+                    "count": tasks.len(),
+                })
+            }
+            "stale" => {
+                // Recoverable work: interrupted tasks with expired leases.
+                let tasks = store.stale_tasks(&ws_root, now).map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "stale",
+                    "interrupted_tasks": tasks,
+                    "note": "interrupted work is never auto-completed; resume explicitly to continue it",
+                    "count": tasks.len(),
+                })
+            }
+            "create" => {
+                let title = args
+                    .title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| McpError::invalid_params("create requires 'title'", None))?;
+                let priority = match args.priority.as_deref().map(str::trim) {
+                    None | Some("") => None,
+                    Some(raw) => Some(
+                        raw.parse::<crate::context_runtime::TaskPriority>()
+                            .map_err(|e| McpError::invalid_params(e, None))?,
+                    ),
+                };
+                let input = crate::context_runtime::tasks::NewTask {
+                    title: title.to_string(),
+                    description: args.description.as_deref().map(str::to_string),
+                    priority,
+                    intent_record_id: args.intent_record_id.as_deref().map(str::to_string),
+                    parent_task_id: args.parent_task_id.as_deref().map(str::to_string),
+                    idempotency_key: args.idempotency_key.as_deref().map(str::to_string),
+                    skill_refs: args.skill_refs.clone().unwrap_or_default(),
+                };
+                let task = store
+                    .create_task(&ws_root, &input, now)
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "create",
+                    "task": Self::task_payload(&task),
+                })
+            }
+            "inspect" => {
+                let task_id = require_task_id()?;
+                let snapshot = store
+                    .task_resume_snapshot(&ws_root, &task_id, now)
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "inspect",
+                    "snapshot": snapshot,
+                })
+            }
+            "start" => {
+                let task_id = require_task_id()?;
+                let task = store
+                    .start_task(&ws_root, &task_id, &worker, args.based_on_version, now)
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "start",
+                    "task": Self::task_payload(&task),
+                })
+            }
+            "pause" => {
+                let task_id = require_task_id()?;
+                let task = store
+                    .get_task(&ws_root, &task_id)
+                    .map_err(Self::task_error)?
+                    .ok_or_else(|| {
+                        McpError::invalid_params(format!("task {task_id} does not exist"), None)
+                    })?;
+                let task = store
+                    .pause_task(
+                        &ws_root,
+                        &task_id,
+                        &worker,
+                        task.lease_version,
+                        args.based_on_version,
+                        now,
+                    )
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "pause",
+                    "task": Self::task_payload(&task),
+                })
+            }
+            "resume" => {
+                let task_id = require_task_id()?;
+                let task = store
+                    .resume_task(&ws_root, &task_id, &worker, args.based_on_version, now)
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "resume",
+                    "task": Self::task_payload(&task),
+                })
+            }
+            "checkpoint" => {
+                let task_id = require_task_id()?;
+                let summary = args
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        McpError::invalid_params("checkpoint requires 'summary'", None)
+                    })?;
+                let task = store
+                    .get_task(&ws_root, &task_id)
+                    .map_err(Self::task_error)?
+                    .ok_or_else(|| {
+                        McpError::invalid_params(format!("task {task_id} does not exist"), None)
+                    })?;
+                let checkpoint = store
+                    .create_task_checkpoint(
+                        &Self::task_ctx(
+                            &ws_root,
+                            &task_id,
+                            &worker,
+                            task.lease_version,
+                            args.based_on_version,
+                            now,
+                        ),
+                        &crate::context_runtime::tasks::CheckpointInput {
+                            summary,
+                            progress: args.progress.as_deref(),
+                            next_action: args.next_action.as_deref(),
+                            validation_status: None,
+                            metadata_json: args.metadata.as_deref(),
+                        },
+                    )
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "checkpoint",
+                    "checkpoint": checkpoint,
+                })
+            }
+            "validate" => {
+                let task_id = require_task_id()?;
+                let what = args
+                    .what
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("repository validation");
+                let task = store
+                    .get_task(&ws_root, &task_id)
+                    .map_err(Self::task_error)?
+                    .ok_or_else(|| {
+                        McpError::invalid_params(format!("task {task_id} does not exist"), None)
+                    })?;
+                let task = store
+                    .start_task_validation(
+                        &Self::task_ctx(
+                            &ws_root,
+                            &task_id,
+                            &worker,
+                            task.lease_version,
+                            args.based_on_version,
+                            now,
+                        ),
+                        what,
+                    )
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "validate",
+                    "task": Self::task_payload(&task),
+                })
+            }
+            "validation_result" => {
+                let task_id = require_task_id()?;
+                let result = match args.result.as_deref().map(str::trim) {
+                    Some("passed") => crate::context_runtime::TaskValidationResult::Passed,
+                    Some("failed") => crate::context_runtime::TaskValidationResult::Failed,
+                    other => {
+                        return Err(McpError::invalid_params(
+                            format!(
+                            "validation_result requires result='passed'|'failed' (got {other:?})"
+                        ),
+                            None,
+                        ))
+                    }
+                };
+                let what = args
+                    .what
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("repository validation");
+                let task = store
+                    .get_task(&ws_root, &task_id)
+                    .map_err(Self::task_error)?
+                    .ok_or_else(|| {
+                        McpError::invalid_params(format!("task {task_id} does not exist"), None)
+                    })?;
+                let task = store
+                    .record_task_validation(
+                        &Self::task_ctx(
+                            &ws_root,
+                            &task_id,
+                            &worker,
+                            task.lease_version,
+                            args.based_on_version,
+                            now,
+                        ),
+                        what,
+                        result,
+                        args.reason.as_deref(),
+                    )
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "validation_result",
+                    "task": Self::task_payload(&task),
+                })
+            }
+            "complete" => {
+                let task_id = require_task_id()?;
+                let task = store
+                    .get_task(&ws_root, &task_id)
+                    .map_err(Self::task_error)?
+                    .ok_or_else(|| {
+                        McpError::invalid_params(format!("task {task_id} does not exist"), None)
+                    })?;
+                let task = store
+                    .complete_task(
+                        &Self::task_ctx(
+                            &ws_root,
+                            &task_id,
+                            &worker,
+                            task.lease_version,
+                            args.based_on_version,
+                            now,
+                        ),
+                        args.reason.as_deref().unwrap_or("completed"),
+                        args.changed_areas.clone().unwrap_or_default(),
+                    )
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "complete",
+                    "task": Self::task_payload(&task),
+                })
+            }
+            "fail" => {
+                let task_id = require_task_id()?;
+                let task = store
+                    .get_task(&ws_root, &task_id)
+                    .map_err(Self::task_error)?
+                    .ok_or_else(|| {
+                        McpError::invalid_params(format!("task {task_id} does not exist"), None)
+                    })?;
+                let task = store
+                    .fail_task(
+                        &Self::task_ctx(
+                            &ws_root,
+                            &task_id,
+                            &worker,
+                            task.lease_version,
+                            args.based_on_version,
+                            now,
+                        ),
+                        args.reason.as_deref().unwrap_or("failed"),
+                    )
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "fail",
+                    "task": Self::task_payload(&task),
+                })
+            }
+            "cancel" => {
+                let task_id = require_task_id()?;
+                let task = store
+                    .cancel_task(
+                        &ws_root,
+                        &task_id,
+                        args.reason.as_deref(),
+                        args.based_on_version,
+                        now,
+                    )
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "cancel",
+                    "task": Self::task_payload(&task),
+                })
+            }
+            "skill_refs" => {
+                let task_id = require_task_id()?;
+                let refs = args.skill_refs.clone().unwrap_or_default();
+                let task = store
+                    .set_task_skill_refs(&ws_root, &task_id, refs, args.based_on_version, now)
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "skill_refs",
+                    "task": Self::task_payload(&task),
+                })
+            }
+            "outcome" => {
+                // P9 engineering-outcome ingestion: OpenCode reports what its
+                // work taught us; CodeBro persists the report as task-bound
+                // history evidence. No transition, no execution, no
+                // inference — validation/completion stay on their own
+                // actions, and generalization stays with `learn`.
+                let task_id = require_task_id()?;
+                let classification = args
+                    .classification
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        McpError::invalid_params(
+                            "outcome requires 'classification': \
+                             success|partial|failure|rejected|superseded",
+                            None,
+                        )
+                    })?;
+                let classification = classification
+                    .parse::<crate::context_runtime::OutcomeClassification>()
+                    .map_err(|e| McpError::invalid_params(e, None))?;
+                let summary = args
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| McpError::invalid_params("outcome requires 'summary'", None))?;
+                let input = crate::context_runtime::tasks::TaskOutcomeInput {
+                    classification,
+                    summary,
+                    evidence: args.reason.as_deref(),
+                    command: args.what.as_deref(),
+                    exit_code: args.exit_code,
+                    changed_areas: args.changed_areas.clone().unwrap_or_default(),
+                    user_confirmed: args.user_confirmed.unwrap_or(false),
+                    dedup_key: args.dedup_key.as_deref(),
+                };
+                let record = store
+                    .record_task_outcome(&ws_root, &task_id, &input, now)
+                    .map_err(Self::task_error)?;
+                serde_json::json!({
+                    "action": "outcome",
+                    "task_id": task_id,
+                    "event_id": record.event_id,
+                    "duplicate": record.duplicate,
+                    "classification": record.classification.as_str(),
+                    "authority": record.authority,
+                })
+            }
+            other => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "unknown task action: {other:?} — use list, stale, create, inspect, \
+                         start, pause, resume, checkpoint, validate, validation_result, \
+                         complete, fail, cancel, outcome, or skill_refs"
+                    ),
+                    None,
+                ))
+            }
+        };
+        let text = crate::mcp::response_bounds::bounded_response(payload)
+            .map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    /// P3 learning-candidate visibility from a workspace (mirrors the
+    /// candidate scope rule used by the `learn` tool).
+    fn learning_candidate_in_scope(
+        lc: &crate::context_runtime::LearningCandidate,
+        ws_root: &str,
+        task_id: Option<&str>,
+    ) -> bool {
+        let canon = crate::context_runtime::canonical_workspace_key;
+        match lc.scope.as_str() {
+            "global" => true,
+            "project" => lc
+                .workspace_root
+                .as_deref()
+                .map(|w| canon(w) == canon(ws_root))
+                .unwrap_or(false),
+            "task" => {
+                let ws_ok = lc
+                    .workspace_root
+                    .as_deref()
+                    .map(|w| canon(w) == canon(ws_root))
+                    .unwrap_or(false);
+                let task_ok = lc
+                    .task_id
+                    .as_deref()
+                    .zip(task_id)
+                    .map(|(a, b)| a.trim() == b.trim())
+                    .unwrap_or(false);
+                ws_ok && task_ok
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Argument schema for `engineering_brief` (P7 decision support).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct EngineeringBriefArgs {
+    /// The engineering task in the agent's own words. Ad-hoc text is never
+    /// persisted. At least one of task, task_id, a target, or keywords is
+    /// required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Existing P5 task id (canonical `task::<hex>`). Read-only snapshot;
+    /// never transitions the task. Cross-workspace ids read as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Explicit workspace-relative file path target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    /// Explicit symbol target (id or name; ambiguous names are reported,
+    /// never guessed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_symbol: Option<String>,
+    /// Explicit module target (id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_module: Option<String>,
+    /// Extra keyword hints for evidence retrieval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<Vec<String>>,
+    /// Impact traversal depth (default 1, max 2; deeper graphs belong to
+    /// `impact_analyze`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+}
+
+/// Argument schema for `context`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ContextArgs {
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    /// The task in the agent's own words. Omit for a structural digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Extra keyword hints for fact/memory/record retrieval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<Vec<String>>,
+    /// Task identity for task-scoped context resolution. When supplied,
+    /// task-scoped fingerprint/intent overrides for this task resolve
+    /// alongside project and global records (task > project > global).
+    /// Omit to resolve project + global only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+}
+
+/// Argument schema for `remember` (explicit user-context persistence).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RememberArgs {
+    /// Canonical semantic statement (what the user confirmed). Secrets are
+    /// redacted before storage.
+    pub content: String,
+    /// Machine-facing namespace (e.g. fp.engineering.simplicity,
+    /// intent.mission). One winner per (kind, namespace, scope).
+    pub namespace: String,
+    /// Record kind: preference, intent, constraint, principle, style,
+    /// taste, pattern, or other. Default: preference. fact/decision/skill
+    /// are reference-only and require related_ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Scope: global, project (default), or task (requires task_id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Task identity for task scope (the OpenCode session/task this
+    /// override belongs to).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Authority: user_confirmed (requires user_confirmed=true),
+    /// observed, or ai_inferred (both require evidence). Default:
+    /// user_confirmed when the flag is set, else observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
+    /// Explicit user-confirmation speech act: set true only when the user
+    /// stated or approved this content. Required for USER_CONFIRMED.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_confirmed: Option<bool>,
+    /// Verbatim user wording the canonical statement was interpreted
+    /// from (evidence of the interpretation, ≤2048 chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_text: Option<String>,
+    /// Language/dialect tag of the original exchange (e.g. en, ms, manglish).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Existing evidence event ids to cite (must exist in the store).
+    #[serde(default)]
+    pub evidence_event_ids: Vec<i64>,
+    /// What was observed, in the agent's words: mints an evidence event
+    /// and cites it (so observed writes never cite fiction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<String>,
+    /// Confidence in [0,1] (default 0.9 confirmed, 0.6 otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// Importance in [0,1] for excerpt ordering (default 0.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub importance: Option<f64>,
+    /// Provenance source label (e.g. a session id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Canonical entity ids this record references (required for
+    /// fact/decision/skill kinds, which never duplicate canonical content).
+    #[serde(default)]
+    pub related_ids: Vec<String>,
+    /// Intent only: why this goal matters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    /// Intent only: high, medium, or low.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    /// Intent only: active (default), paused, completed, cancelled, or
+    /// superseded (requires supersedes). Completed/cancelled retire the
+    /// predecessor into a terminal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_status: Option<String>,
+    /// Id of the active record this replaces (history preserved via the
+    /// supersede chain, never overwritten).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+}
+
+/// Argument schema for `forget` (reversible retirement of user context).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ForgetArgs {
+    /// Exact id of the record to retire (from a `context` excerpt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Otherwise the namespace whose resolution winner to retire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Task identity, required to retire task-scoped records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Explicit confirmation gate: forget refuses unless true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<bool>,
+    /// Hard-remove the row instead of the default reversible reject.
+    /// Cleanup of junk only; prefer the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permanent: Option<bool>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+}
+
+/// Argument schema for `recall` (historical evidence on demand).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RecallArgs {
+    /// The question in the caller's words (e.g. "why are we using SQLite?").
+    /// Must contain at least one searchable token (3+ alphanumeric chars).
+    pub query: String,
+    /// Scope: project (default, this workspace only), task (this workspace
+    /// plus task_id), or global (explicit opt-in across all workspaces).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Task identity: required for task scope; boosts ranking otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Narrow to event kinds (e.g. ["decision", "validation", "error"]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<String>>,
+    /// Narrow to one session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Maximum excerpts returned (default 10, max 50).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+}
+
+/// Argument schema for `learn` (cautious hypotheses from history).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct LearnArgs {
+    /// Action: run (detect + evaluate + persist justified inferences),
+    /// propose (detect only), list (inspect candidates), get (one candidate
+    /// with its explanation), evaluate (weigh one candidate's evidence),
+    /// confirm (explicit user confirmation → USER_CONFIRMED, requires
+    /// user_confirmed=true), reject (user rejection → rejected, requires
+    /// confirm=true).
+    pub action: Option<String>,
+    /// Scope: project (default, this workspace only), task (this workspace
+    /// plus task_id), or global (explicit opt-in across all workspaces;
+    /// global inference needs broader evidence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Task identity: required for task scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Candidate id for get, evaluate, confirm, reject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<String>,
+    /// Confirm list/get filter by status (candidate, deferred, accepted,
+    /// rejected, expired, superseded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Maximum candidates returned by list (default 20, max 50).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Explicit user-confirmation speech act for confirm: set true only
+    /// when the user stated or approved this conclusion. Required for
+    /// USER_CONFIRMED; the model can never self-confirm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_confirmed: Option<bool>,
+    /// Explicit confirmation gate for reject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<bool>,
+    /// Optional reason recorded with a rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+}
+
+/// Argument schema for `skill`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SkillArgs {
+    /// Action: discover (list candidates + skills), propose (create candidate),
+    /// inspect (view candidate or skill details), validate (check content),
+    /// approve (publish skill), reject (reject candidate), deprecate
+    /// (retire skill), rollback (revert to prior version), health
+    /// (record usage outcome).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Skill candidate id for inspect, validate, approve, reject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<String>,
+    /// Skill id for inspect, deprecate, rollback, health.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_id: Option<String>,
+    /// Skill name for propose, inspect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Skill description for propose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Skill purpose for propose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// Proposed SKILL.md content for propose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Learning candidate id to derive from (optional for propose).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learning_candidate_id: Option<String>,
+    /// Scope: project (default), task, or global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Task identity for task-scoped skills and candidate visibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Confidence score for standalone proposals (capped below the
+    /// approval floor: standalone proposals carry no evidence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// Languages for applicability metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub languages: Option<Vec<String>>,
+    /// Subsystems for applicability metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsystems: Option<Vec<String>>,
+    /// Filter by status for discover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Maximum results for discover (default 20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Rejection/deprecation reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Target version for rollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// Whether the health recording is a success (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    /// Explicit user-approval speech act: required for `approve`. Set
+    /// true only when the user explicitly approved publishing this
+    /// skill candidate; the model may never self-approve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_confirmed: Option<bool>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+}
+
+/// Argument schema for `task` (P5 durable engineering task runtime).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TaskArgs {
+    /// Semantic action: list (default), create, inspect, start, pause,
+    /// resume, checkpoint, validate, validation_result, complete, fail,
+    /// cancel, stale, outcome, skill_refs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Task id (required for every per-task action except create/list/stale).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// New-task title (create).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// New-task description (create).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Task priority: high | medium (default) | low.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    /// Optional P1 intent record id this task implements (reference only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_record_id: Option<String>,
+    /// Optional parent task id (create: organizational nesting only;
+    /// list: filter children of this task).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    /// Explicit idempotency key: creating with the same (workspace, key)
+    /// returns the existing task instead of duplicating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Optimistic-concurrency anchor: the task version this mutation is
+    /// based on. Stale writers are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub based_on_version: Option<u64>,
+    /// Status filter (list): pending | running | paused | validating |
+    /// completed | failed | cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Maximum tasks returned by list (default 20, max 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Checkpoint fields (checkpoint): what has been completed.
+    pub summary: Option<String>,
+    /// Checkpoint field: what remains (progress).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
+    /// Checkpoint field: what should happen next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+    /// Checkpoint field: bounded JSON object of task-private metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+    /// Validation description (validate / validation_result): what is being
+    /// validated (command/test summary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub what: Option<String>,
+    /// Validation outcome (validation_result): passed | failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// Validation evidence summary (validation_result), and outcome
+    /// summary (complete/fail/cancel reason).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Changed areas for the completion outcome (complete).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_areas: Option<Vec<String>>,
+    /// Outcome classification (outcome): success | partial | failure |
+    /// rejected | superseded. What the reported work taught us; whether
+    /// it generalizes is P3 learning's job, never this call's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
+    /// Explicit user-confirmation speech act (outcome): set true only
+    /// when the user stated or approved this outcome. Otherwise the
+    /// report is recorded as observed (OpenCode-reported), never as
+    /// user-confirmed truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_confirmed: Option<bool>,
+    /// Explicit idempotency key (outcome): redelivering the same
+    /// (task, key) returns the original event instead of duplicating
+    /// history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_key: Option<String>,
+    /// Command exit status (outcome): the exit code of the reported
+    /// test/build command, when the outcome reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Skill references (skill_refs): skill ids this task used.
+    /// Reference-only association; CodeBro never executes skills.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_refs: Option<Vec<String>>,
+    /// Optional workspace root to operate against. When omitted, the
+    /// server's configured default workspace is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// Argument schema for `engineering_facts`.
@@ -1953,6 +5066,123 @@ pub struct UpdateIdentityArgs {
     pub workspace_root: Option<String>,
 }
 
+/// Parse a `remember` kind string into a [`RecordKind`]. Fingerprint and
+/// intent kinds are first-class; `experience` passes through for the later
+/// learning phase; `fact`/`decision`/`skill` are reference-only (the store
+/// refuses them without `related_ids`).
+fn parse_record_kind(raw: Option<&str>) -> Result<crate::context_runtime::RecordKind, McpError> {
+    use crate::context_runtime::RecordKind;
+    match raw.map(str::trim).unwrap_or("preference") {
+        "" | "preference" => Ok(RecordKind::Preference),
+        "intent" => Ok(RecordKind::Intent),
+        "constraint" => Ok(RecordKind::Constraint),
+        "principle" => Ok(RecordKind::Principle),
+        "style" => Ok(RecordKind::Style),
+        "taste" => Ok(RecordKind::Taste),
+        "pattern" => Ok(RecordKind::Pattern),
+        "experience" => Ok(RecordKind::Experience),
+        "fact" => Ok(RecordKind::Fact),
+        "decision" => Ok(RecordKind::Decision),
+        "skill" => Ok(RecordKind::Skill),
+        "other" => Ok(RecordKind::Other),
+        other => Err(McpError::invalid_params(
+            format!(
+                "unknown record kind '{other}': use preference, intent, constraint, \
+                 principle, style, taste, pattern, experience, or other"
+            ),
+            None,
+        )),
+    }
+}
+
+/// Parse a scope string. `allow_task` is always true today (both callers
+/// accept task scope); the parameter documents that global/project callers
+/// never silently coerce.
+fn parse_record_scope(
+    raw: Option<&str>,
+    _allow_task: bool,
+) -> Result<crate::context_runtime::RecordScope, McpError> {
+    use crate::context_runtime::RecordScope;
+    match raw.map(str::trim).unwrap_or("project") {
+        "" | "project" => Ok(RecordScope::Project),
+        "global" => Ok(RecordScope::Global),
+        "task" => Ok(RecordScope::Task),
+        other => Err(McpError::invalid_params(
+            format!("unknown scope '{other}': use global, project, or task"),
+            None,
+        )),
+    }
+}
+
+/// Mint a collision-free record id: `ctx::<kind>::<namespace-slug>::<now>`
+/// with a numeric suffix while the id exists (a plain upsert would
+/// silently overwrite an unrelated record).
+fn mint_record_id(
+    store: &crate::context_runtime::ContextStore,
+    kind: crate::context_runtime::RecordKind,
+    namespace: &str,
+    now: u64,
+) -> String {
+    let base = format!("ctx::{}::{}::{now}", kind.as_str(), slugify(namespace));
+    let mut candidate = base.clone();
+    let mut n = 2u32;
+    loop {
+        match store.get_record(&candidate) {
+            Ok(None) => return candidate,
+            _ => {
+                candidate = format!("{base}-{n}");
+                n += 1;
+            }
+        }
+    }
+}
+
+/// Active record ids sharing one (kind, namespace, scope) binding — the
+/// clash set a fresh `remember` must refuse (callers replace via
+/// `supersedes`) or, for terminal intents, auto-retire when unambiguous.
+fn find_active_in_namespace(
+    store: &crate::context_runtime::ContextStore,
+    kind: crate::context_runtime::RecordKind,
+    namespace: &str,
+    scope: crate::context_runtime::RecordScope,
+    workspace_root: Option<&str>,
+    task_id: Option<&str>,
+    now: u64,
+) -> Result<Vec<String>, crate::context_runtime::store::ContextError> {
+    use crate::context_runtime::ContextRetriever;
+    let query = crate::context_runtime::RecordQuery {
+        workspace_root,
+        task_id,
+        kind: Some(kind),
+        status: None, // active-only default
+        keywords: Vec::new(),
+        limit: 100,
+    };
+    let ranked = store.search(&query, now)?;
+    Ok(ranked
+        .into_iter()
+        .filter(|r| {
+            r.record.namespace == namespace
+                && r.record.scope == scope
+                && r.record.workspace_root.as_deref() == workspace_root
+                && r.record.task_id.as_deref() == task_id
+        })
+        .map(|r| r.record.id)
+        .collect())
+}
+
+/// Map store errors from the `remember` write path: validation failures
+/// (bad scope, fictitious evidence, reference-only kinds without backlinks)
+/// are caller errors (`invalid_params`); anything else is internal.
+fn remember_error(e: crate::context_runtime::store::ContextError) -> McpError {
+    match e {
+        crate::context_runtime::store::ContextError::Validation(msg) => {
+            McpError::invalid_params(msg, None)
+        }
+        other => McpError::internal_error(other.to_string(), None),
+    }
+}
+
 /// Trim and require a non-empty string field.
 fn require_non_empty(value: &str, field: &str) -> Result<String, McpError> {
     let trimmed = value.trim();
@@ -1991,12 +5221,16 @@ fn slugify(title: &str) -> String {
 /// Append values not already present in `existing` (case-sensitive).
 fn push_unique_strings(target: &mut Vec<String>, values: &[String], existing: &[String]) {
     for value in values {
-        let trimmed = value.trim();
-        if trimmed.is_empty() || existing.iter().any(|e| e == trimmed) {
+        // Redact at the write seam: identity free-text (constraints,
+        // patterns, conventions, modules, files) is persisted to
+        // .codebro/project_identity.json and surfaced by context packets
+        // and engineering briefs — a pasted secret must never persist.
+        let trimmed = crate::tools::shell::redact_secrets_public(value.trim());
+        if trimmed.is_empty() || existing.iter().any(|e| e == &trimmed) {
             continue;
         }
-        if !target.iter().any(|t| t == trimmed) {
-            target.push(trimmed.to_string());
+        if !target.iter().any(|t| t == &trimmed) {
+            target.push(trimmed);
         }
     }
 }
@@ -2212,6 +5446,88 @@ pub struct ConsultFileArg {
 
 /// Inject project identity, facts summary, and memory into the request context
 /// so the consultant answers with project-awareness.
+///
+/// P6 helpers: incremental digest diff + bounded error shortening for
+/// history summaries. Pure, deterministic, no I/O.
+struct McpFileDiff {
+    added: Vec<String>,
+    deleted: Vec<String>,
+    modified: Vec<String>,
+    unchanged: Vec<String>,
+    /// Full pre-truncation totals (lists below are capped at
+    /// [`MCP_DIFF_LIST_CAP`] entries each for response bounds).
+    added_count: usize,
+    deleted_count: usize,
+    modified_count: usize,
+    unchanged_count: usize,
+    /// True when any list was truncated (totals exceed the cap).
+    truncated: bool,
+}
+
+/// Maximum entries per diff list in MCP responses (deterministic
+/// head-truncation; totals + `truncated` keep the response honest).
+const MCP_DIFF_LIST_CAP: usize = 100;
+
+fn diff_digests_for_mcp(
+    prev: &std::collections::BTreeMap<String, String>,
+    curr: &std::collections::BTreeMap<String, String>,
+) -> McpFileDiff {
+    // Single kernel: the indexer's pure deterministic diff. The MCP layer
+    // only applies bounded presentation truncation on top — never its own
+    // traversal logic.
+    let full = crate::init::engineering::diff_digests(prev, curr);
+    let truncated = full.added.len() > MCP_DIFF_LIST_CAP
+        || full.deleted.len() > MCP_DIFF_LIST_CAP
+        || full.modified.len() > MCP_DIFF_LIST_CAP;
+    let mut added = full.added;
+    let mut deleted = full.deleted;
+    let mut modified = full.modified;
+    let (added_count, deleted_count, modified_count) = (added.len(), deleted.len(), modified.len());
+    added.truncate(MCP_DIFF_LIST_CAP);
+    deleted.truncate(MCP_DIFF_LIST_CAP);
+    modified.truncate(MCP_DIFF_LIST_CAP);
+    let unchanged_count = full.unchanged.len();
+    McpFileDiff {
+        added,
+        deleted,
+        modified,
+        unchanged: full.unchanged,
+        added_count,
+        deleted_count,
+        modified_count,
+        unchanged_count,
+        truncated,
+    }
+}
+
+/// [`RepoIndexUpsert`] for a failed index run: preserves the last-good
+/// counts/revision/timestamps from the existing row so a failure never
+/// zeroes out known-good metadata. Only the status (FAILED) and the
+/// bookkeeping timestamp move. Pure constructor for testability.
+fn failed_index_upsert(
+    prev: &crate::context_runtime::RepoIndexRecord,
+) -> crate::context_runtime::RepoIndexUpsert {
+    crate::context_runtime::RepoIndexUpsert {
+        repository_identity: prev.repository_identity.clone(),
+        index_status: crate::context_runtime::RepoIndexStatus::Failed,
+        indexed_at: prev.indexed_at,
+        repository_revision: prev.repository_revision.clone(),
+        file_count: prev.file_count,
+        symbol_count: prev.symbol_count,
+        edge_count: prev.edge_count,
+        stale_count: prev.stale_count,
+    }
+}
+
+fn short_error(raw: &str) -> String {
+    let one_line: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.len() > 240 {
+        format!("{}…[truncated]", &one_line[..240])
+    } else {
+        one_line
+    }
+}
+
 fn inject_project_context(
     request: &mut crate::consultant::types::ConsultantRequest,
     workspace: &std::path::Path,
@@ -2481,7 +5797,15 @@ mod phase8_tests {
 #[tool_handler]
 impl rmcp::ServerHandler for CodeBroMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+        // P8 integration contract: the server identifies itself as the
+        // product (`codebro` + crate version), never the SDK default
+        // (`"rmcp"`). Clients display and route on `serverInfo`.
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(rmcp::model::Implementation::new(
+                crate::integration::SERVER_NAME,
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
             "You are connected to CodeBro, the engineering context & memory layer for THIS \
              workspace. It maintains a verified fact store (symbols, modules, packages, tests, \
              build targets, dependencies), project identity, and persistent engineering memory \
@@ -2513,36 +5837,107 @@ impl rmcp::ServerHandler for CodeBroMcpServer {
                 timeout, denied). Check availability first with codebro_sandbox_status.\n\
                - To understand what is structurally affected by changing a symbol, file, module, \
                  or package, call codebro_impact_analyze (returns directed relationship edges, \
-                 related tests, owning module/package, and provenance — descriptive evidence \
-                 only, no risk scores).\n\
+                 related tests, owning module/package, provenance, and deterministic risk \
+                 signals — descriptive evidence only; OpenCode decides).\n\
               - To check the health of the CodeBro workspace (project identity, fact store, \
                   engineering memory, git status), call codebro_repository_health (returns \
                   structured exit code, status, per-check results, and summary).\n\
-                - To ask an AI consultant (Conductor) for opinions on \
-                  architecture, debugging, code review, planning, research, or second \
-                  opinions, call codebro_consult (supports provider selection, mode shaping, \
-                  and automatic injection of CodeBro engineering context like facts, memory, \
-                  and git diff).\n\
-               \n\
-             WRITE PATH (OPTIONAL):\n\
-             - codebro_apply_change is an optional guarded mutation API for controlled/autonomous \
-               workflows. Use your native editing tools for normal coding edits. If you do use \
-               apply_change, it enforces the workspace boundary and refuses stale/ambiguous \
-               edits; create files with old=\"\".\n\
-             \n\
-             HARD RULES:\n\
-             - Never invent symbol names, ids, counts or file locations. If codebro returns \
-               empty results, state that facts/memory are empty rather than guessing.\n\
-             - Treat engineering_memory content as agent-recorded context (with confidence \
-               scores), not as verified engineering truth; engineering_facts are the verified \
-               store.",
+              - To ask an AI consultant (Conductor) for opinions on \
+                architecture, debugging, code review, planning, research, or second \
+                opinions, call codebro_consult (supports provider selection, mode shaping, \
+                and automatic injection of CodeBro engineering context like facts, memory, \
+                and git diff).\n\
+               - For durable user context (preferences, intents) -> call codebro_context \
+                 with task_id at task start; it resolves task > project > global winners \
+                 tagged by authority. Persist ONLY what the user explicitly confirmed via \
+                 codebro_remember (user_confirmed=true); retire via codebro_forget.\n\
+               - For previous engineering work (past decisions, failures, validations, \
+                 changes) -> call codebro_recall with a question ('why are we using \
+                 SQLite again?'). History is query-driven and never dumped into context; \
+                 task history stays invisible without its task_id.\n\
+               - For recurring patterns in past work -> call codebro_learn (run to \
+                 detect and evaluate hypotheses, list/get to inspect them with \
+                 explanations). Accepted hypotheses persist as AI_INFERRED knowledge \
+                 with evidence and confidence — never as USER_CONFIRMED truth. Confirm \
+                 only what the user explicitly approved (user_confirmed=true).\n\
+               - For a bounded decision-support brief before planning a task -> call \
+                 codebro_engineering_brief with task/task_id plus an optional target. \
+                 It assembles repo intelligence, impact, health, history, memory, \
+                 learning, skills, task state, constraints, and explicit unknowns in \
+                 one read-only call. CodeBro prepares evidence; you decide.\n\
+                \n\
+              WRITE PATH (OPTIONAL):\n\
+              - codebro_apply_change is an optional guarded mutation API for controlled/autonomous \
+              workflows. Use your native editing tools for normal coding edits. If you do use \
+              apply_change, it enforces the workspace boundary and refuses stale/ambiguous \
+              edits; create files with old=\"\".\n\
+              \n\
+              HARD RULES:\n\
+              - Never invent symbol names, ids, counts or file locations. If codebro returns \
+              empty results, state that facts/memory are empty rather than guessing.\n\
+              - Treat engineering_memory content as agent-recorded context (with confidence \
+              scores), not as verified engineering truth; engineering_facts are the verified \
+              store.",
         )
+    }
+
+    /// P8 per-call observability: one bounded tracing line per tool call
+    /// (client, tool, duration, status, response size). Never arguments,
+    /// task text, brief content, or secrets — this seam must not become a
+    /// data-leak path. The router behavior itself is unchanged: this is
+    /// a wrapper, not a second dispatch. Client identity comes from the
+    /// peer info rmcp's default `initialize` registered (single-client
+    /// stdio server: exactly one peer); it is process-local and never
+    /// persisted, so no client-specific state exists.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        let started = std::time::Instant::now();
+        let tool = request.name.clone();
+        let client = context.peer.peer_info().map(|info| {
+            (
+                info.client_info.name.clone(),
+                info.client_info.version.clone(),
+            )
+        });
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = self.tool_router.call(tcc).await;
+        // Compose the observation from the outcome. Size uses the
+        // serialized content length (bounded evidence, never content).
+        let (errored, error_summary, response_bytes) = match &result {
+            Ok(rmcp::model::CallToolResponse::Complete(r)) => (
+                r.is_error.unwrap_or(false),
+                None,
+                serde_json::to_vec(&r.content).map(|v| v.len()).unwrap_or(0),
+            ),
+            Ok(_) => (false, None, 0),
+            Err(e) => (
+                true,
+                Some(crate::integration::bounded_error_summary(&e.message)),
+                0,
+            ),
+        };
+        let obs = crate::integration::observe_call(
+            client,
+            &tool,
+            started,
+            errored,
+            error_summary,
+            response_bytes,
+        );
+        tracing::info!(observation = %obs.render_line(), "tool call");
+        result
     }
 }
 
 /// Run the MCP server over stdio until the client disconnects.
-pub async fn serve(workspace_root: PathBuf) -> anyhow::Result<()> {
-    let server = CodeBroMcpServer::new(workspace_root);
+pub async fn serve(
+    workspace_root: PathBuf,
+    extra_authorized_roots: Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    let server = CodeBroMcpServer::with_authorized_roots(workspace_root, extra_authorized_roots);
     let service = server
         .serve(stdio())
         .await
@@ -2588,6 +5983,14 @@ mod tests {
             "repository_health",
             "update_identity",
             "consult",
+            "context",
+            "remember",
+            "forget",
+            "recall",
+            "learn",
+            "skill",
+            "task",
+            "engineering_brief",
         ];
 
         for name in expected {
@@ -2655,12 +6058,118 @@ mod tests {
             "repository_health",
             "update_identity",
             "consult",
+            "context",
+            "remember",
+            "forget",
+            "recall",
+            "learn",
+            "skill",
+            "task",
+            "engineering_brief",
         ] {
             assert!(
                 server.get_tool(expected).is_some(),
                 "tool {expected} missing from tool handler"
             );
         }
+    }
+
+    /// Hardening (doc-drift regression): the `impact_analyze` description
+    /// must reflect the P6 deterministic risk signals and must NOT repeat
+    /// the pre-P6 "no risk scores" claim. Descriptions are client-visible
+    /// contract surface; drift here misleads the agent's tool selection.
+    #[test]
+    fn impact_description_mentions_risk_signals() {
+        let server = CodeBroMcpServer::new(PathBuf::from("/tmp/unused-root"));
+        let tool = server
+            .get_tool("impact_analyze")
+            .expect("impact_analyze missing from tool handler");
+        let desc = tool
+            .description
+            .as_deref()
+            .expect("impact_analyze has no description");
+        assert!(
+            desc.contains("risk signal"),
+            "impact_analyze description must mention deterministic risk signals: {desc}"
+        );
+        assert!(
+            !desc.to_lowercase().contains("no risk scores"),
+            "impact_analyze description must not claim 'no risk scores' (P6 added signals): {desc}"
+        );
+    }
+
+    /// P8: the MCP handshake must identify the server as the product
+    /// (`codebro` + crate version), never the rmcp SDK default — clients
+    /// display and route on `serverInfo`.
+    #[test]
+    fn p8_server_info_identifies_the_product() {
+        let server = CodeBroMcpServer::new(PathBuf::from("/tmp/unused-root"));
+        let info = rmcp::ServerHandler::get_info(&server);
+        assert_eq!(info.server_info.name, crate::integration::SERVER_NAME);
+        assert_eq!(info.server_info.name, "codebro");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert!(!info.server_info.name.is_empty());
+        // Instructions survive (the client-facing usage contract).
+        assert!(info.instructions.unwrap_or_default().contains("CodeBro"));
+    }
+
+    /// P8: the integration contract (integration::contract::intents) must
+    /// map every agent-client intent to an existing routed tool — the
+    /// contract is enforced by regression, not prose. P8 adds no tools.
+    #[test]
+    fn p8_integration_contract_intents_are_routed_tools() {
+        let server = CodeBroMcpServer::new(PathBuf::from("/tmp/unused-root"));
+        for (intent, tool) in crate::integration::contract::intents() {
+            assert!(
+                server.get_tool(tool).is_some(),
+                "P8 contract intent '{intent}' maps to unrouted tool '{tool}'"
+            );
+        }
+        // The primary surface is the brief (P8 §6: the Engineering Brief
+        // is the primary high-level context acquisition surface).
+        assert_eq!(
+            crate::integration::contract::PRIMARY_CONTEXT_TOOL,
+            "engineering_brief"
+        );
+    }
+
+    /// P8: the per-call observability observation must never embed tool
+    /// arguments, task text, or brief content — only client identity,
+    /// tool name, duration, status, and size. Defense in depth against
+    /// the observability seam becoming a data-leak path.
+    #[test]
+    fn p8_observation_never_carries_payloads() {
+        let obs = crate::integration::ToolCallObservation {
+            client_name: Some("opencode".to_string()),
+            client_version: Some("1.18".to_string()),
+            tool: "engineering_brief".to_string(),
+            duration_ms: 12,
+            errored: false,
+            error_summary: None,
+            response_bytes: 4096,
+        };
+        let line = obs.render_line();
+        for banned in ["task=", "keywords=", "arguments", "content="] {
+            assert!(
+                !line.contains(banned),
+                "observation leaked {banned}: {line}"
+            );
+        }
+        // Round-trip through observe_call keeps the invariant.
+        let built = crate::integration::observe_call(
+            Some(("opencode".to_string(), "1.18".to_string())),
+            "remember",
+            std::time::Instant::now(),
+            true,
+            Some("invalid_params: password=hunter2".to_string()),
+            10,
+        );
+        let rendered = built.render_line();
+        assert!(
+            !rendered.contains("hunter2"),
+            "secret-shaped error leaked: {rendered}"
+        );
+        assert!(rendered.contains("status=error"));
     }
 
     /// P0.3: `memory_stats` must report meaningful state — entry count,
@@ -3706,6 +7215,2341 @@ mod tests {
         assert_eq!(v["fact_counts"]["total"], 0);
     }
 
+    // ── context tool (tool 18) ─────────────────────────────────────────
+
+    /// A server whose user-context store lives in an explicit directory
+    /// (hermetic: never touches the real `~/.codebro/state.db`).
+    fn stateful_server(dir: &tempfile::TempDir, state_dir: &tempfile::TempDir) -> CodeBroMcpServer {
+        CodeBroMcpServer::with_state_dir(dir.path().to_path_buf(), state_dir.path().to_path_buf())
+    }
+
+    /// Multi-workspace stateful server for cross-workspace isolation tests
+    /// (P8 root authorization): the default root plus every listed sibling
+    /// is authorized exactly as an operator would configure at launch —
+    /// isolation is then asserted between AUTHORIZED roots, which is the
+    /// real product guarantee (the registry refuses unauthorized roots
+    /// before any store access, pinned by dedicated tests).
+    fn stateful_multiws_server(
+        dir: &tempfile::TempDir,
+        others: &[&tempfile::TempDir],
+        state_dir: &tempfile::TempDir,
+    ) -> CodeBroMcpServer {
+        let registry = WorkspaceRegistry::with_authorized_roots(
+            dir.path().to_path_buf(),
+            crate::workspace_registry::AuthorizedRoots::with_extras(
+                dir.path().to_path_buf(),
+                others.iter().map(|o| o.path().to_path_buf()),
+            ),
+        );
+        assemble_server_with_registry(
+            registry,
+            crate::sandbox::SandboxRuntime::new(crate::sandbox::SandboxMode::Local),
+            Some(state_dir.path().to_path_buf()),
+        )
+    }
+
+    fn parse(out: &str) -> serde_json::Value {
+        serde_json::from_str(out).expect("valid json")
+    }
+
+    /// context with no task returns a labelled structural digest with
+    /// repository orientation, without creating any `.codebro` state.
+    #[tokio::test]
+    async fn context_without_task_returns_structural_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+
+        let out = call_tool_text(
+            &server,
+            "context",
+            json!({"workspace_root": dir.path().to_string_lossy()}),
+        )
+        .await;
+        let v = parse(&out);
+        assert_eq!(
+            v["repository"]["workspace_root"],
+            dir.path().to_string_lossy().as_ref()
+        );
+        assert_eq!(v["repository"]["identity_loaded"], false);
+        assert!(v["repository"]["fact_counts"].is_object());
+        assert!(v["facts"].is_array() && v["facts"].as_array().unwrap().is_empty());
+        assert!(v["records"].is_array());
+        assert_eq!(v["records_provenance"], "recorded");
+        assert_eq!(v["repository"]["provenance"], "recorded");
+        // Clearly labelled as structural, never mistaken for task context.
+        let notes: Vec<&str> = v["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert!(notes.iter().any(|n| n.contains("structural digest")));
+        // Read-only: no .codebro directory may be created by the call.
+        assert!(!dir.path().join(".codebro").exists());
+    }
+
+    /// context with a task returns the task-relevant packet shape.
+    #[tokio::test]
+    async fn context_with_task_returns_task_relevant_packet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+
+        let out = call_tool_text(
+            &server,
+            "context",
+            json!({
+                "workspace_root": dir.path().to_string_lossy(),
+                "task": "Fix failing authentication tests",
+            }),
+        )
+        .await;
+        let v = parse(&out);
+        assert!(v["repository"].is_object());
+        // Empty workspace: sections empty but structurally present.
+        assert!(v["facts"].as_array().unwrap().is_empty());
+        assert!(v["memory"].as_array().unwrap().is_empty());
+        assert!(v["impact"]["suggested_targets"].is_array());
+        let notes: Vec<&str> = v["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert!(!notes.iter().any(|n| n.contains("structural digest")));
+        assert!(!dir.path().join(".codebro").exists());
+    }
+
+    /// Durable context records surface in the packet, scoped to the
+    /// workspace, tagged with their authority and effective confidence.
+    #[tokio::test]
+    async fn context_surfaces_records_scoped_and_authority_tagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let ws_root = dir.path().to_string_lossy().to_string();
+        let server = stateful_server(&dir, &state);
+
+        // Seed the user-context store directly through the canonical store.
+        let store = crate::context_runtime::ContextStore::at_state_dir(state.path().to_path_buf());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut global = crate::context_runtime::ContextRecord::new(
+            "ctx::g1",
+            crate::context_runtime::RecordKind::Style,
+            "fp.communication.verbosity",
+            "User prefers direct concise replies over lengthy prose",
+            crate::context_runtime::Authority::UserConfirmed,
+        );
+        global.confidence = 0.95;
+        global.language = Some("manglish".to_string());
+        store.put_record(&global, now).unwrap();
+
+        let mut local = crate::context_runtime::ContextRecord::new(
+            "ctx::p1",
+            crate::context_runtime::RecordKind::Constraint,
+            "fp.engineering.simplicity",
+            "This project must stay minimal; avoid unnecessary abstraction",
+            crate::context_runtime::Authority::UserConfirmed,
+        );
+        local.scope = crate::context_runtime::RecordScope::Project;
+        local.workspace_root = Some(ws_root.clone());
+        store.put_record(&local, now).unwrap();
+
+        // A record for a DIFFERENT workspace must never leak into this one.
+        let mut other_ws = crate::context_runtime::ContextRecord::new(
+            "ctx::x1",
+            crate::context_runtime::RecordKind::Preference,
+            "fp.other.project",
+            "Unrelated project secret preference",
+            crate::context_runtime::Authority::UserConfirmed,
+        );
+        other_ws.scope = crate::context_runtime::RecordScope::Project;
+        other_ws.workspace_root = Some("/somewhere/else".to_string());
+        store.put_record(&other_ws, now).unwrap();
+
+        let out = call_tool_text(
+            &server,
+            "context",
+            json!({"workspace_root": ws_root, "task": "keep the change minimal"}),
+        )
+        .await;
+        let v = parse(&out);
+        let records = v["records"].as_array().unwrap();
+        let namespaces: Vec<&str> = records
+            .iter()
+            .map(|r| r["namespace"].as_str().unwrap())
+            .collect();
+        assert!(
+            namespaces.contains(&"fp.communication.verbosity"),
+            "global record missing: {namespaces:?}"
+        );
+        assert!(
+            namespaces.contains(&"fp.engineering.simplicity"),
+            "workspace record missing: {namespaces:?}"
+        );
+        assert!(
+            !namespaces.contains(&"fp.other.project"),
+            "another workspace's record leaked in: {namespaces:?}"
+        );
+        for r in records {
+            assert_eq!(r["authority"], "user_confirmed");
+            assert!(r["effective_confidence"].as_f64().unwrap() > 0.0);
+        }
+        let verbosity = records
+            .iter()
+            .find(|r| r["namespace"] == "fp.communication.verbosity")
+            .unwrap();
+        assert_eq!(verbosity["language"], "manglish");
+        assert!(!dir.path().join(".codebro").exists());
+    }
+
+    /// A broken user-context store degrades to an empty records section —
+    /// composition must never fail the packet because state.db is broken.
+    #[tokio::test]
+    async fn context_degrades_gracefully_when_store_is_unusable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        // state.db as a non-empty DIRECTORY: the store cannot open it AND
+        // quarantine cannot move it — a deterministic unusable case.
+        let bogus = state.path().join("state.db");
+        std::fs::create_dir(&bogus).unwrap();
+        std::fs::write(bogus.join("blocker"), b"x").unwrap();
+        let server = stateful_server(&dir, &state);
+
+        let out = call_tool_text(
+            &server,
+            "context",
+            json!({"workspace_root": dir.path().to_string_lossy()}),
+        )
+        .await;
+        let v = parse(&out);
+        assert!(v["records"].as_array().unwrap().is_empty());
+        assert!(v["repository"]["workspace_root"].is_string());
+    }
+
+    /// context never writes engineering-memory/facts files (trust
+    /// separation holds for the read path as well).
+    #[tokio::test]
+    async fn context_composition_never_touches_project_state_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let _ = call_tool_text(
+            &server,
+            "context",
+            json!({"workspace_root": dir.path().to_string_lossy(), "task": "probe"}),
+        )
+        .await;
+        for name in [
+            ".codebro/facts.json",
+            ".codebro/engineering_memory.json",
+            ".codebro/project_identity.json",
+        ] {
+            assert!(
+                !dir.path().join(name).exists(),
+                "context tool must not create {name}"
+            );
+        }
+    }
+
+    // ── P1: fingerprint + intent (remember / forget / resolution) ──────
+
+    fn ws_arg(dir: &tempfile::TempDir) -> serde_json::Value {
+        serde_json::Value::String(dir.path().to_string_lossy().to_string())
+    }
+
+    fn records_of(packet: &serde_json::Value) -> &Vec<serde_json::Value> {
+        packet["records"].as_array().expect("records is array")
+    }
+
+    /// First-session flow (§27): the user confirms a collaboration
+    /// preference, OpenCode persists it, and a later session retrieves it
+    /// as USER_CONFIRMED context.
+    #[tokio::test]
+    async fn p1_confirmed_preference_roundtrips_as_user_confirmed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+
+        let out = call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Prefer the simplest reasonable implementation and avoid unnecessary abstraction",
+                "namespace": "fp.engineering.simplicity",
+                "kind": "preference",
+                "scope": "global",
+                "user_confirmed": true,
+                "original_text": "jangan overengineer benda ni",
+                "language": "manglish",
+            }),
+        )
+        .await;
+        let v = parse(&out);
+        assert_eq!(v["remembered"], true);
+        assert_eq!(v["authority"], "user_confirmed");
+        assert_eq!(v["scope"], "global");
+        assert!(v["id"].as_str().unwrap().starts_with("ctx::"));
+
+        // Later session: context carries the preference with provenance.
+        let out = call_tool_text(
+            &server,
+            "context",
+            json!({"workspace_root": ws_arg(&dir), "task": "Build a small API for this"}),
+        )
+        .await;
+        let packet = parse(&out);
+        let recs = records_of(&packet);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["namespace"], "fp.engineering.simplicity");
+        assert_eq!(recs[0]["authority"], "user_confirmed");
+        assert_eq!(recs[0]["kind"], "preference");
+        assert_eq!(recs[0]["scope"], "global");
+        assert_eq!(
+            recs[0]["content"],
+            "Prefer the simplest reasonable implementation and avoid unnecessary abstraction"
+        );
+    }
+
+    /// Caller-principal rule: naming user_confirmed without the explicit
+    /// confirmation flag is refused.
+    #[tokio::test]
+    async fn p1_user_confirmed_requires_the_confirmation_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+
+        let err = call_tool_err(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Forged preference",
+                "namespace": "fp.forge",
+                "authority": "user_confirmed",
+            }),
+        )
+        .await;
+        assert!(err.contains("user_confirmed=true"), "got: {err}");
+
+        // Default (no authority, no flag) is observed-gated, not confirmed.
+        let err = call_tool_err(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Silent preference",
+                "namespace": "fp.silent",
+            }),
+        )
+        .await;
+        assert!(err.contains("evidence"), "got: {err}");
+    }
+
+    /// Observed writes mint their evidence event; fictitious evidence ids
+    /// are refused by the store backstop.
+    #[tokio::test]
+    async fn p1_observed_evidence_minted_or_verified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+
+        // Observation mints an event: evidence ids are real.
+        let out = call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "User repeatedly runs cargo test before committing",
+                "namespace": "fp.workflow.verify",
+                "authority": "observed",
+                "observation": "three consecutive sessions ended with cargo test runs",
+            }),
+        )
+        .await;
+        let v = parse(&out);
+        assert_eq!(v["authority"], "observed");
+        assert!(!v["evidence"].as_array().unwrap().is_empty());
+
+        // Fiction is refused.
+        let err = call_tool_err(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Fictitious observation",
+                "namespace": "fp.fiction",
+                "authority": "observed",
+                "evidence_event_ids": [999999],
+            }),
+        )
+        .await;
+        assert!(err.contains("does not exist"), "got: {err}");
+
+        // ai_inferred with minted evidence stays inferred, never confirmed.
+        let out = call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "User may prefer terse output",
+                "namespace": "fp.communication.verbosity",
+                "authority": "ai_inferred",
+                "observation": "last three replies were one-liners",
+            }),
+        )
+        .await;
+        assert_eq!(parse(&out)["authority"], "ai_inferred");
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "reply style probe"}),
+            )
+            .await,
+        );
+        let rec = records_of(&packet)
+            .iter()
+            .find(|r| r["namespace"] == "fp.communication.verbosity")
+            .expect("inferred record visible");
+        assert_eq!(rec["authority"], "ai_inferred");
+    }
+
+    /// Project override wins over global at equal authority; task wins
+    /// over project when the task is named.
+    #[tokio::test]
+    async fn p1_resolution_task_beats_project_beats_global() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let ns = "fp.communication.verbosity";
+
+        for (scope, content, extra) in [
+            ("global", "Prefer concise responses", json!({})),
+            (
+                "project",
+                "For this architecture document, provide detailed reasoning",
+                json!({}),
+            ),
+        ] {
+            let mut args = json!({
+                "workspace_root": ws_arg(&dir),
+                "content": content,
+                "namespace": ns,
+                "scope": scope,
+                "user_confirmed": true,
+            });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            call_tool_text(&server, "remember", args).await;
+        }
+        // Project wins inside the project.
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "write the doc"}),
+            )
+            .await,
+        );
+        let recs = records_of(&packet);
+        assert_eq!(recs.len(), 1, "one winner per namespace: {recs:?}");
+        assert_eq!(recs[0]["scope"], "project");
+
+        // Task override wins when the task is named...
+        call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Give only the final implementation plan",
+                "namespace": ns,
+                "scope": "task",
+                "task_id": "task-7",
+                "user_confirmed": true,
+            }),
+        )
+        .await;
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "write the doc", "task_id": "task-7"}),
+            )
+            .await,
+        );
+        let recs = records_of(&packet);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["scope"], "task");
+
+        // ... and stays invisible without the task.
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "write the doc"}),
+            )
+            .await,
+        );
+        assert_eq!(records_of(&packet)[0]["scope"], "project");
+    }
+
+    /// Confirmation outranks inference across scopes: an inferred project
+    /// guess must not silently override a confirmed global.
+    #[tokio::test]
+    async fn p1_confirmed_global_beats_inferred_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let ns = "fp.engineering.simplicity";
+        call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Prefer simple implementations",
+                "namespace": ns,
+                "scope": "global",
+                "user_confirmed": true,
+            }),
+        )
+        .await;
+        call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Maybe prefers abstraction here",
+                "namespace": ns,
+                "scope": "project",
+                "authority": "ai_inferred",
+                "observation": "imported a framework crate",
+            }),
+        )
+        .await;
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "pick a design"}),
+            )
+            .await,
+        );
+        let recs = records_of(&packet);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["authority"], "user_confirmed");
+        assert_eq!(recs[0]["scope"], "global");
+    }
+
+    /// Updating a preference goes through supersede: history preserved,
+    /// blind overwrite refused.
+    #[tokio::test]
+    async fn p1_update_requires_supersedes_and_preserves_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let ns = "fp.communication.verbosity";
+
+        let first = parse(
+            &call_tool_text(
+                &server,
+                "remember",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "Prefer concise responses",
+                    "namespace": ns,
+                    "scope": "global",
+                    "user_confirmed": true,
+                }),
+            )
+            .await,
+        );
+        let first_id = first["id"].as_str().unwrap().to_string();
+
+        // Blind second write to the same namespace is refused, naming the owner.
+        let err = call_tool_err(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Prefer detailed explanations",
+                "namespace": ns,
+                "scope": "global",
+                "user_confirmed": true,
+            }),
+        )
+        .await;
+        assert!(err.contains(&first_id), "must name the incumbent: {err}");
+        assert!(
+            err.contains("supersedes"),
+            "must direct to supersede: {err}"
+        );
+
+        // Explicit supersede: new winner, old row superseded (still stored).
+        let second = parse(
+            &call_tool_text(
+                &server,
+                "remember",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "Prefer detailed explanations for architecture discussions",
+                    "namespace": ns,
+                    "scope": "global",
+                    "user_confirmed": true,
+                    "supersedes": first_id,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(second["superseded"], first_id);
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "discuss architecture"}),
+            )
+            .await,
+        );
+        let recs = records_of(&packet);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0]["content"],
+            "Prefer detailed explanations for architecture discussions"
+        );
+    }
+
+    /// Intent lifecycle: create active with rationale/priority, pause via
+    /// supersede, complete via auto-retire, then terminal refusal.
+    #[tokio::test]
+    async fn p1_intent_lifecycle_active_pause_complete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let ns = "intent.codebro-mission";
+
+        let created = parse(
+            &call_tool_text(
+                &server,
+                "remember",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "Build CodeBro as persistent engineering infrastructure for OpenCode",
+                    "namespace": ns,
+                    "kind": "intent",
+                    "scope": "project",
+                    "user_confirmed": true,
+                    "rationale": "Provide context and memory without another coding agent",
+                    "priority": "high",
+                }),
+            )
+            .await,
+        );
+        assert_eq!(created["kind"], "intent");
+        assert_eq!(created["status"], "active");
+        let active_id = created["id"].as_str().unwrap().to_string();
+
+        // Active intent surfaces with decoded metadata.
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "plan next milestone"}),
+            )
+            .await,
+        );
+        let intent = records_of(&packet)
+            .iter()
+            .find(|r| r["namespace"] == ns)
+            .expect("intent visible");
+        assert_eq!(intent["kind"], "intent");
+        assert_eq!(intent["intent"]["intent_status"], "active");
+        assert_eq!(intent["intent"]["priority"], "high");
+        assert!(intent["intent"]["rationale"]
+            .as_str()
+            .unwrap()
+            .contains("without another"));
+
+        // Pause via supersede: still actionable, still visible.
+        let paused = parse(
+            &call_tool_text(
+                &server,
+                "remember",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "Build CodeBro as persistent engineering infrastructure for OpenCode",
+                    "namespace": ns,
+                    "kind": "intent",
+                    "scope": "project",
+                    "user_confirmed": true,
+                    "rationale": "Provide context and memory without another coding agent",
+                    "priority": "high",
+                    "intent_status": "paused",
+                    "supersedes": active_id,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(paused["status"], "active");
+        let paused_id = paused["id"].as_str().unwrap().to_string();
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "plan next milestone"}),
+            )
+            .await,
+        );
+        assert_eq!(
+            records_of(&packet)
+                .iter()
+                .find(|r| r["namespace"] == ns)
+                .unwrap()["intent"]["intent_status"],
+            "paused"
+        );
+
+        // Complete retires the predecessor (auto-found, no supersedes needed).
+        let done = parse(
+            &call_tool_text(
+                &server,
+                "remember",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "Build CodeBro as persistent engineering infrastructure for OpenCode",
+                    "namespace": ns,
+                    "kind": "intent",
+                    "scope": "project",
+                    "user_confirmed": true,
+                    "intent_status": "completed",
+                }),
+            )
+            .await,
+        );
+        assert_eq!(done["status"], "expired");
+        assert_eq!(done["superseded"], paused_id);
+
+        // Completed intent leaves the actionable packet...
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "plan next milestone"}),
+            )
+            .await,
+        );
+        assert!(
+            records_of(&packet).iter().all(|r| r["namespace"] != ns),
+            "completed intent must leave the packet"
+        );
+
+        // ... and refuses further supersession (history is append-only).
+        let err = call_tool_err(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Resurrect the mission",
+                "namespace": ns,
+                "kind": "intent",
+                "scope": "project",
+                "user_confirmed": true,
+                "supersedes": done["id"],
+            }),
+        )
+        .await;
+        assert!(
+            err.contains("terminal") || err.contains("active"),
+            "got: {err}"
+        );
+    }
+
+    /// Intent fields on non-intent kinds, bad vocabularies, and malformed
+    /// scope ask are caller errors, not stored rows.
+    #[tokio::test]
+    async fn p1_intent_shape_violations_are_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+
+        for (label, args) in [
+            (
+                "rationale on preference",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "x", "namespace": "fp.x",
+                    "user_confirmed": true, "rationale": "nope",
+                }),
+            ),
+            (
+                "bad priority",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "x", "namespace": "intent.x", "kind": "intent",
+                    "user_confirmed": true, "priority": "urgent",
+                }),
+            ),
+            (
+                "bad intent status",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "x", "namespace": "intent.x", "kind": "intent",
+                    "user_confirmed": true, "intent_status": "thriving",
+                }),
+            ),
+            (
+                "bad scope",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "x", "namespace": "fp.x",
+                    "user_confirmed": true, "scope": "universe",
+                }),
+            ),
+            (
+                "bad kind",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "x", "namespace": "fp.x",
+                    "user_confirmed": true, "kind": "vibe",
+                }),
+            ),
+            (
+                "task scope without task_id",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "x", "namespace": "fp.x",
+                    "user_confirmed": true, "scope": "task",
+                }),
+            ),
+            (
+                "reference-only fact without backlink",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "mirrored fact",
+                    "namespace": "fact.x", "kind": "fact",
+                    "user_confirmed": true,
+                }),
+            ),
+        ] {
+            let err = call_tool_err(&server, "remember", args).await;
+            assert!(!err.is_empty(), "{label} must fail");
+        }
+
+        // Nothing from the rejection battery persisted.
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "probe"}),
+            )
+            .await,
+        );
+        assert!(records_of(&packet).is_empty());
+    }
+
+    /// forget: confirm gate, reversible reject, namespace resolution,
+    /// permanent removal, and cross-workspace refusal.
+    #[tokio::test]
+    async fn p1_forget_confirm_reject_remove_and_isolation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let other = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_multiws_server(&dir, &[&other], &state);
+
+        let created = parse(
+            &call_tool_text(
+                &server,
+                "remember",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": "Temporary preference",
+                    "namespace": "fp.temp",
+                    "scope": "project",
+                    "user_confirmed": true,
+                }),
+            )
+            .await,
+        );
+        let id = created["id"].as_str().unwrap().to_string();
+
+        // No confirm: refused.
+        let err = call_tool_err(&server, "forget", json!({"id": id})).await;
+        assert!(err.contains("confirm=true"), "got: {err}");
+
+        // Namespace resolution retires the winner (reversible reject).
+        let out = parse(
+            &call_tool_text(
+                &server,
+                "forget",
+                json!({"workspace_root": ws_arg(&dir), "namespace": "fp.temp", "confirm": true}),
+            )
+            .await,
+        );
+        assert_eq!(out["id"], id);
+        assert_eq!(out["action"], "rejected");
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "probe"}),
+            )
+            .await,
+        );
+        assert!(
+            records_of(&packet).is_empty(),
+            "rejected rows leave the packet"
+        );
+
+        // Cross-workspace forget is refused even with confirm...
+        let err = call_tool_err(
+            &server,
+            "forget",
+            json!({
+                "workspace_root": other.path().to_string_lossy(),
+                "id": id, "confirm": true,
+            }),
+        )
+        .await;
+        assert!(err.contains("another workspace"), "got: {err}");
+
+        // ... and permanent removal deletes the row.
+        let out = parse(
+            &call_tool_text(
+                &server,
+                "forget",
+                json!({"workspace_root": ws_arg(&dir), "id": id, "confirm": true, "permanent": true}),
+            )
+            .await,
+        );
+        assert_eq!(out["action"], "removed");
+        let err = call_tool_err(
+            &server,
+            "forget",
+            json!({"workspace_root": ws_arg(&dir), "id": id, "confirm": true}),
+        )
+        .await;
+        assert!(err.contains("no record"), "got: {err}");
+    }
+
+    /// Workspace isolation: project rows never leak across projects sharing
+    /// one state.db; equivalent path spellings resolve to one namespace.
+    #[tokio::test]
+    async fn p1_workspace_isolation_and_canonical_equivalence() {
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_multiws_server(&dir_a, &[&dir_b], &state);
+
+        call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir_a),
+                "content": "Project A secret preference",
+                "namespace": "fp.secret",
+                "scope": "project",
+                "user_confirmed": true,
+            }),
+        )
+        .await;
+        // Sibling project sees nothing of A (same store file, other root).
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": dir_b.path().to_string_lossy(), "task": "probe"}),
+            )
+            .await,
+        );
+        assert!(records_of(&packet).is_empty());
+
+        // Trailing-slash spelling of A resolves to the same namespace.
+        let with_slash = format!("{}/", dir_a.path().display());
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": with_slash, "task": "probe"}),
+            )
+            .await,
+        );
+        assert_eq!(records_of(&packet).len(), 1);
+        assert_eq!(records_of(&packet)[0]["namespace"], "fp.secret");
+    }
+
+    /// The packet stays bounded no matter how many rows compete.
+    #[tokio::test]
+    async fn p1_context_stays_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        for i in 0..20 {
+            call_tool_text(
+                &server,
+                "remember",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "content": format!("Preference number {i} with enough words to be searchable"),
+                    "namespace": format!("fp.bulk.{i}"),
+                    "scope": "global",
+                    "user_confirmed": true,
+                }),
+            )
+            .await;
+        }
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "bulk probe"}),
+            )
+            .await,
+        );
+        assert!(records_of(&packet).len() <= crate::engineering_context::MAX_CONTEXT_RECORDS);
+    }
+
+    /// remember/forget serialize on the workspace mutation lock like every
+    /// other mutating tool.
+    #[tokio::test]
+    async fn p1_remember_blocks_while_mutation_lock_held() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = Arc::new(stateful_server(&dir, &state));
+        let ws = server.resolve_workspace(None).unwrap();
+        let guard = ws.mutation_lock.lock().await;
+        let s2 = server.clone();
+        let root = dir.path().to_string_lossy().to_string();
+        let mut task = tokio::spawn(async move {
+            call_tool_text(
+                &s2,
+                "remember",
+                json!({
+                    "workspace_root": root,
+                    "content": "Blocked preference",
+                    "namespace": "fp.blocked",
+                    "scope": "global",
+                    "user_confirmed": true,
+                }),
+            )
+            .await
+        });
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(100), &mut task)
+            .await
+            .is_err();
+        assert!(blocked, "remember must wait while the lock is held");
+        drop(guard);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("finishes after release")
+            .expect("join ok");
+        assert!(out.contains("remembered"), "got: {out}");
+    }
+
+    // ── P2: sessions + history + recall ─────────────────────────────────
+
+    fn history_of(out: &serde_json::Value) -> &Vec<serde_json::Value> {
+        out["history"].as_array().expect("history is array")
+    }
+
+    fn all_recall_events(out: &serde_json::Value) -> Vec<&serde_json::Value> {
+        history_of(out)
+            .iter()
+            .flat_map(|g| g["events"].as_array().unwrap().iter())
+            .collect()
+    }
+
+    /// End-to-end P2 flow, session 1 → session 2: a decision recorded via
+    /// remember (passively captured) is recalled by a later question —
+    /// the user never names the session.
+    #[tokio::test]
+    async fn p2_remembered_decision_is_recallable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+
+        // Session 1: the user confirms SQLite; OpenCode persists it.
+        call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Use SQLite because this is a local persistent runtime without unnecessary infrastructure",
+                "namespace": "intent.storage.local",
+                "kind": "intent",
+                "scope": "project",
+                "user_confirmed": true,
+                "rationale": "local persistent runtime, no extra infrastructure",
+            }),
+        )
+        .await;
+
+        // Session 2: "Why are we using SQLite again?" → recall.
+        let out = parse(
+            &call_tool_text(
+                &server,
+                "recall",
+                json!({"workspace_root": ws_arg(&dir), "query": "why are we using SQLite again"}),
+            )
+            .await,
+        );
+        assert_eq!(out["provenance"], "historical-evidence");
+        let events = all_recall_events(&out);
+        assert!(!events.is_empty(), "the decision must be recalled");
+        let decision = events
+            .iter()
+            .find(|e| e["event"] == "decision")
+            .expect("a decision event");
+        assert!(decision["excerpt"].as_str().unwrap().contains("SQLite"));
+        assert_eq!(decision["scope"], "project");
+        // Session grouping carries the provenance.
+        let group = &history_of(&out)[0];
+        assert!(group["session"].is_string());
+        assert!(group["workspace_root"].is_string());
+    }
+
+    /// Applied changes are passively captured and recallable as history.
+    #[tokio::test]
+    async fn p2_applied_change_is_recallable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "sqlite weighs nothing").unwrap();
+        let server = stateful_server(&dir, &state);
+
+        call_tool_text(
+            &server,
+            "apply_change",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "path": "notes.txt",
+                "old": "weighs nothing",
+                "new": "weighs nothing and needs no server",
+            }),
+        )
+        .await;
+
+        let out = parse(
+            &call_tool_text(
+                &server,
+                "recall",
+                json!({"workspace_root": ws_arg(&dir), "query": "changes to notes file"}),
+            )
+            .await,
+        );
+        let events = all_recall_events(&out);
+        assert!(
+            events.iter().any(|e| e["event"] == "change_applied"),
+            "change must be recalled: {events:?}"
+        );
+    }
+
+    /// Project isolation through the MCP boundary: B never sees A's
+    /// history, even though FTS physically contains A's text.
+    #[tokio::test]
+    async fn p2_recall_enforces_project_isolation() {
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        // One server, one shared state.db, two AUTHORIZED workspaces
+        // (operator-equivalent launch config).
+        let server = stateful_multiws_server(&dir_a, &[&dir_b], &state);
+        let a = dir_a.path().to_string_lossy().to_string();
+        let b = dir_b.path().to_string_lossy().to_string();
+
+        call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": a,
+                "content": "Project A rejected architecture xylophone for complexity reasons",
+                "namespace": "intent.architecture.private",
+                "kind": "intent",
+                "scope": "project",
+                "user_confirmed": true,
+            }),
+        )
+        .await;
+
+        let out_b = parse(
+            &call_tool_text(
+                &server,
+                "recall",
+                json!({"workspace_root": b, "query": "architecture xylophone"}),
+            )
+            .await,
+        );
+        assert_eq!(out_b["total_matches"], 0);
+        assert!(history_of(&out_b).is_empty());
+
+        // ... while A itself recalls it.
+        let out_a = parse(
+            &call_tool_text(
+                &server,
+                "recall",
+                json!({"workspace_root": a, "query": "architecture xylophone"}),
+            )
+            .await,
+        );
+        assert!(out_a["total_matches"].as_u64().unwrap() >= 1);
+    }
+
+    /// Task isolation through the MCP boundary: task B recall excludes
+    /// task A history; task A recall includes it.
+    #[tokio::test]
+    async fn p2_recall_enforces_task_isolation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let root = ws_arg(&dir);
+
+        call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": root,
+                "content": "Task alpha decided to use SQLite for the queue",
+                "namespace": "intent.queue.backend",
+                "kind": "intent",
+                "scope": "task",
+                "task_id": "alpha",
+                "user_confirmed": true,
+            }),
+        )
+        .await;
+
+        // Task beta must not see alpha's history…
+        let out_beta = parse(
+            &call_tool_text(
+                &server,
+                "recall",
+                json!({"workspace_root": root, "query": "queue backend sqlite", "scope": "task", "task_id": "beta"}),
+            )
+            .await,
+        );
+        assert_eq!(out_beta["total_matches"], 0);
+
+        // …while alpha does.
+        let out_alpha = parse(
+            &call_tool_text(
+                &server,
+                "recall",
+                json!({"workspace_root": root, "query": "queue backend sqlite", "scope": "task", "task_id": "alpha"}),
+            )
+            .await,
+        );
+        assert_eq!(out_alpha["total_matches"], 1);
+        assert_eq!(all_recall_events(&out_alpha)[0]["scope"], "task");
+    }
+
+    /// recall is read-only over history: calling it creates no sessions
+    /// and no events (no recursion), and it rejects empty queries.
+    #[tokio::test]
+    async fn p2_recall_writes_no_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let probe = crate::context_runtime::ContextStore::at_state_dir(state.path().to_path_buf());
+        let ws = dir.path().display().to_string();
+
+        call_tool_text(
+            &server,
+            "recall",
+            json!({"workspace_root": ws_arg(&dir), "query": "anything sqlite"}),
+        )
+        .await;
+        assert_eq!(probe.list_events(&ws, 200).unwrap().len(), 0);
+        assert!(probe
+            .list_sessions(&ws, &crate::context_runtime::SessionFilter::default(), 0)
+            .unwrap()
+            .is_empty());
+
+        let err = call_tool_err(
+            &server,
+            "recall",
+            json!({"workspace_root": ws_arg(&dir), "query": "a?"}),
+        )
+        .await;
+        assert!(err.contains("searchable token"), "got: {err}");
+
+        let err = call_tool_err(
+            &server,
+            "recall",
+            json!({"workspace_root": ws_arg(&dir), "query": "sqlite", "scope": "nebula"}),
+        )
+        .await;
+        assert!(err.contains("unknown recall scope"), "got: {err}");
+    }
+
+    /// context never dumps history: the packet has no history section and
+    /// recall works independently of it.
+    #[tokio::test]
+    async fn p2_context_does_not_dump_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+
+        call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Use SQLite for local persistence",
+                "namespace": "intent.storage.local",
+                "kind": "intent",
+                "scope": "project",
+                "user_confirmed": true,
+            }),
+        )
+        .await;
+
+        let packet = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({"workspace_root": ws_arg(&dir), "task": "choose storage sqlite"}),
+            )
+            .await,
+        );
+        assert!(
+            packet.get("history").is_none(),
+            "history must stay out of context"
+        );
+        assert!(packet.get("recall").is_none());
+        // …while recall independently surfaces the decision.
+        let out = parse(
+            &call_tool_text(
+                &server,
+                "recall",
+                json!({"workspace_root": ws_arg(&dir), "query": "sqlite storage"}),
+            )
+            .await,
+        );
+        assert!(out["total_matches"].as_u64().unwrap() >= 1);
+    }
+
+    /// Recall output is bounded excerpts with provenance, never transcripts.
+    #[tokio::test]
+    async fn p2_recall_output_is_bounded_and_provenance_tagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+
+        call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Use SQLite because this is a local persistent runtime",
+                "namespace": "intent.storage.local",
+                "kind": "intent",
+                "scope": "project",
+                "user_confirmed": true,
+            }),
+        )
+        .await;
+
+        let out = parse(
+            &call_tool_text(
+                &server,
+                "recall",
+                json!({"workspace_root": ws_arg(&dir), "query": "sqlite", "limit": 2}),
+            )
+            .await,
+        );
+        for e in all_recall_events(&out) {
+            assert!(e["event_id"].is_number());
+            assert!(e["event"].is_string());
+            assert!(e["timestamp"].is_number());
+            assert!(e["scope"].is_string());
+            assert!(e["excerpt"].is_string());
+            assert!(e["excerpt"].as_str().unwrap().chars().count() <= 240 + 64);
+        }
+        assert!(out["note"]
+            .as_str()
+            .unwrap()
+            .contains("Historical evidence"));
+    }
+
+    // ── learn tool (tool 22, P3) ───────────────────────────────────────
+
+    /// Seed three confirmed dependency-avoidance decisions (distinct
+    /// namespaces so the clash rule holds, shared vocabulary so the
+    /// deterministic pair clustering fires).
+    async fn seed_avoidance_decisions(server: &CodeBroMcpServer, ws: serde_json::Value) {
+        for (ns, area) in [
+            ("fp.deps.alpha", "alpha"),
+            ("fp.deps.beta", "beta"),
+            ("fp.deps.gamma", "gamma"),
+        ] {
+            call_tool_text(
+                server,
+                "remember",
+                json!({
+                    "workspace_root": ws,
+                    "content": format!("Avoid unnecessary dependencies for tiny utilities in module {area}"),
+                    "namespace": ns,
+                    "kind": "preference",
+                    "scope": "project",
+                    "user_confirmed": true,
+                }),
+            )
+            .await;
+        }
+    }
+
+    fn learn_candidates(out: &serde_json::Value) -> &Vec<serde_json::Value> {
+        out["candidates"].as_array().expect("candidates array")
+    }
+
+    /// Repeated decisions become an evaluated AI_INFERRED hypothesis —
+    /// never user-confirmed truth.
+    #[tokio::test]
+    async fn p3_learn_run_accepts_repeated_decisions_as_ai_inferred() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        seed_avoidance_decisions(&server, ws_arg(&dir)).await;
+
+        let out = parse(
+            &call_tool_text(
+                &server,
+                "learn",
+                json!({"workspace_root": ws_arg(&dir), "action": "run"}),
+            )
+            .await,
+        );
+        assert_eq!(out["accepted"], 1, "one hypothesis must accept: {out:?}");
+        assert_eq!(out["provenance"], "learning-candidates");
+
+        let list = parse(
+            &call_tool_text(
+                &server,
+                "learn",
+                json!({"workspace_root": ws_arg(&dir), "action": "list"}),
+            )
+            .await,
+        );
+        let items = learn_candidates(&list);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "user_preference");
+        assert_eq!(items[0]["status"], "accepted");
+        assert!(items[0]["confidence"].as_f64().unwrap() >= 0.55);
+        assert_eq!(items[0]["supporting"], 3);
+        assert!(items[0]["proposition"].as_str().unwrap().contains("prefer"));
+
+        // The persisted inference is AI_INFERRED with cited evidence.
+        let got = parse(
+            &call_tool_text(
+                &server,
+                "learn",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "action": "get",
+                    "candidate_id": items[0]["candidate_id"],
+                }),
+            )
+            .await,
+        );
+        assert_eq!(got["explanation"]["authority"], "ai_inferred");
+        assert_eq!(
+            got["candidate"]["inference_record_id"].as_str().unwrap(),
+            got["explanation"]["inference_record_id"].as_str().unwrap()
+        );
+        assert!(!got["explanation"]["note"].as_str().unwrap().is_empty());
+    }
+
+    /// The model can never self-confirm: confirm without the explicit user
+    /// speech act is refused and the authority stays inferred.
+    #[tokio::test]
+    async fn p3_learn_confirm_requires_user_confirmed_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        seed_avoidance_decisions(&server, ws_arg(&dir)).await;
+        call_tool_text(
+            &server,
+            "learn",
+            json!({"workspace_root": ws_arg(&dir), "action": "run"}),
+        )
+        .await;
+        let list = parse(
+            &call_tool_text(
+                &server,
+                "learn",
+                json!({"workspace_root": ws_arg(&dir), "action": "list"}),
+            )
+            .await,
+        );
+        let id = list["candidates"][0]["candidate_id"].clone();
+
+        let err = call_tool_err(
+            &server,
+            "learn",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "action": "confirm",
+                "candidate_id": id,
+            }),
+        )
+        .await;
+        assert!(
+            err.contains("user_confirmed=true"),
+            "forgery refused: {err}"
+        );
+    }
+
+    /// Explicit user confirmation promotes AI_INFERRED → USER_CONFIRMED via
+    /// supersede, and the inference becomes context-visible as confirmed.
+    #[tokio::test]
+    async fn p3_learn_confirm_promotes_to_user_confirmed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        seed_avoidance_decisions(&server, ws_arg(&dir)).await;
+        call_tool_text(
+            &server,
+            "learn",
+            json!({"workspace_root": ws_arg(&dir), "action": "run"}),
+        )
+        .await;
+        let list = parse(
+            &call_tool_text(
+                &server,
+                "learn",
+                json!({"workspace_root": ws_arg(&dir), "action": "list"}),
+            )
+            .await,
+        );
+        let id = list["candidates"][0]["candidate_id"].clone();
+
+        let out = parse(
+            &call_tool_text(
+                &server,
+                "learn",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "action": "confirm",
+                    "candidate_id": id,
+                    "user_confirmed": true,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(out["confirmed"], true);
+        assert_eq!(out["candidate"]["status"], "superseded");
+
+        // The confirmed record resolves in context with its authority.
+        let ctx = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "task": "should I add a dependency for this tiny utility",
+                    "keywords": ["dependencies", "utility"],
+                }),
+            )
+            .await,
+        );
+        let records = ctx["records"].as_array().expect("records array");
+        let confirmed = records
+            .iter()
+            .find(|r| r["namespace"].as_str().unwrap().starts_with("learn."));
+        assert!(
+            confirmed.is_some(),
+            "confirmed learning must be context-eligible: {records:?}"
+        );
+        assert_eq!(confirmed.unwrap()["authority"], "user_confirmed");
+    }
+
+    /// User rejection preserves negative knowledge and survives re-runs.
+    #[tokio::test]
+    async fn p3_learn_reject_preserves_negative_knowledge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        seed_avoidance_decisions(&server, ws_arg(&dir)).await;
+        call_tool_text(
+            &server,
+            "learn",
+            json!({"workspace_root": ws_arg(&dir), "action": "run"}),
+        )
+        .await;
+        let list = parse(
+            &call_tool_text(
+                &server,
+                "learn",
+                json!({"workspace_root": ws_arg(&dir), "action": "list"}),
+            )
+            .await,
+        );
+        let id = list["candidates"][0]["candidate_id"].clone();
+
+        // The confirm gate holds for rejection too.
+        let err = call_tool_err(
+            &server,
+            "learn",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "action": "reject",
+                "candidate_id": id,
+            }),
+        )
+        .await;
+        assert!(err.contains("confirm=true"), "{err}");
+
+        let out = parse(
+            &call_tool_text(
+                &server,
+                "learn",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "action": "reject",
+                    "candidate_id": id,
+                    "confirm": true,
+                    "reason": "only true for small utilities",
+                }),
+            )
+            .await,
+        );
+        assert_eq!(out["rejected"], true);
+        assert_eq!(out["candidate"]["status"], "rejected");
+
+        // A re-run refuses to rewrite the user's verdict.
+        let rerun = parse(
+            &call_tool_text(
+                &server,
+                "learn",
+                json!({"workspace_root": ws_arg(&dir), "action": "run"}),
+            )
+            .await,
+        );
+        assert_eq!(rerun["skipped_terminal"], 1);
+    }
+
+    /// Learning is workspace-confined: B learns nothing from A's history.
+    #[tokio::test]
+    async fn p3_learn_enforces_project_isolation() {
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_multiws_server(&dir_a, &[&dir_b], &state);
+        let a = dir_a.path().to_string_lossy().to_string();
+        let b = dir_b.path().to_string_lossy().to_string();
+        seed_avoidance_decisions(&server, json!(a)).await;
+
+        let out_b = parse(
+            &call_tool_text(
+                &server,
+                "learn",
+                json!({"workspace_root": b, "action": "run"}),
+            )
+            .await,
+        );
+        assert_eq!(out_b["proposed"], 0);
+        let list_b = parse(
+            &call_tool_text(
+                &server,
+                "learn",
+                json!({"workspace_root": b, "action": "list"}),
+            )
+            .await,
+        );
+        assert!(learn_candidates(&list_b).is_empty());
+    }
+
+    /// Learning writes no history: recall evidence counts are identical
+    /// before and after a learn pass (no recursion, no self-evidence).
+    #[tokio::test]
+    async fn p3_learn_writes_no_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        seed_avoidance_decisions(&server, ws_arg(&dir)).await;
+
+        let before = parse(
+            &call_tool_text(
+                &server,
+                "recall",
+                json!({"workspace_root": ws_arg(&dir), "query": "unnecessary dependencies tiny utilities"}),
+            )
+            .await,
+        );
+        call_tool_text(
+            &server,
+            "learn",
+            json!({"workspace_root": ws_arg(&dir), "action": "run"}),
+        )
+        .await;
+        // Recall itself writes nothing either; list/get are read-only too.
+        call_tool_text(
+            &server,
+            "learn",
+            json!({"workspace_root": ws_arg(&dir), "action": "list"}),
+        )
+        .await;
+        let after = parse(
+            &call_tool_text(
+                &server,
+                "recall",
+                json!({"workspace_root": ws_arg(&dir), "query": "unnecessary dependencies tiny utilities"}),
+            )
+            .await,
+        );
+        assert_eq!(before["total_matches"], after["total_matches"]);
+    }
+
+    /// A weak hypothesis (single observation) defers and never enters the
+    /// always-available context packet.
+    #[tokio::test]
+    async fn p3_weak_hypothesis_stays_out_of_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        call_tool_text(
+            &server,
+            "remember",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "content": "Avoid unnecessary dependencies for tiny utilities in module solo",
+                "namespace": "fp.deps.solo",
+                "kind": "preference",
+                "scope": "project",
+                "user_confirmed": true,
+            }),
+        )
+        .await;
+
+        let out = parse(
+            &call_tool_text(
+                &server,
+                "learn",
+                json!({"workspace_root": ws_arg(&dir), "action": "run"}),
+            )
+            .await,
+        );
+        assert_eq!(out["accepted"], 0, "one event is not a pattern: {out:?}");
+
+        let ctx = parse(
+            &call_tool_text(
+                &server,
+                "context",
+                json!({
+                    "workspace_root": ws_arg(&dir),
+                    "task": "tiny utility dependency choice",
+                    "keywords": ["dependencies", "utility"],
+                }),
+            )
+            .await,
+        );
+        let records = ctx["records"].as_array().expect("records array");
+        assert!(
+            records
+                .iter()
+                .all(|r| !r["namespace"].as_str().unwrap().starts_with("learn.")),
+            "no inferred namespace may surface: {records:?}"
+        );
+    }
+
+    /// Unknown actions and missing arguments are clean invalid_params.
+    #[tokio::test]
+    async fn p3_learn_rejects_bad_actions_and_args() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+
+        let err = call_tool_err(
+            &server,
+            "learn",
+            json!({"workspace_root": ws_arg(&dir), "action": "hallucinate"}),
+        )
+        .await;
+        assert!(err.contains("unknown learn action"), "{err}");
+
+        let err = call_tool_err(
+            &server,
+            "learn",
+            json!({"workspace_root": ws_arg(&dir), "action": "evaluate"}),
+        )
+        .await;
+        assert!(err.contains("candidate_id"), "{err}");
+
+        let err = call_tool_err(
+            &server,
+            "learn",
+            json!({
+                "workspace_root": ws_arg(&dir),
+                "action": "get",
+                "candidate_id": "lc::missing0000000000",
+            }),
+        )
+        .await;
+        assert!(err.contains("no learning candidate"), "{err}");
+    }
+
+    // ── P7 engineering brief (tool 25) ─────────────────────────────────
+
+    fn brief_json(out: &str) -> serde_json::Value {
+        serde_json::from_str(out).expect("brief is valid json")
+    }
+
+    fn unknown_kinds(v: &serde_json::Value) -> Vec<String> {
+        v["unknowns"]
+            .as_array()
+            .expect("unknowns array")
+            .iter()
+            .filter_map(|u| u["kind"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Empty scope is rejected, never answered with a dump.
+    #[tokio::test]
+    async fn brief_rejects_empty_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let err = call_tool_err(
+            &server,
+            "engineering_brief",
+            json!({"workspace_root": ws_arg(&dir)}),
+        )
+        .await;
+        assert!(err.contains("task scope is required"), "{err}");
+    }
+
+    /// Traversal-shaped and blank targets are caller errors.
+    #[tokio::test]
+    async fn brief_rejects_bad_targets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        for bad in [
+            json!({"workspace_root": ws_arg(&dir), "task": "x", "target_path": "../escape"}),
+            json!({"workspace_root": ws_arg(&dir), "task": "x", "target_symbol": " "}),
+        ] {
+            let err = call_tool_err(&server, "engineering_brief", bad).await;
+            assert!(
+                err.contains("target_path")
+                    || err.contains("target_symbol")
+                    || err.contains("must not"),
+                "{err}"
+            );
+        }
+    }
+
+    /// Empty workspace: unknowns reported, shape stable, no impact invented.
+    #[tokio::test]
+    async fn brief_on_empty_workspace_reports_unknowns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let out = call_tool_text(
+            &server,
+            "engineering_brief",
+            json!({"workspace_root": ws_arg(&dir), "task": "fix authentication login"}),
+        )
+        .await;
+        let v = brief_json(&out);
+        assert_eq!(v["task"], "fix authentication login");
+        assert!(v["impact"].is_null());
+        assert_eq!(v["targets"]["discovery"], "none");
+        let kinds = unknown_kinds(&v);
+        for required in [
+            "EMPTY_REPOSITORY",
+            "NO_RELEVANT_TESTS",
+            "NO_HISTORY",
+            "NO_MEMORY",
+            "NO_LEARNING",
+            "NO_SKILLS",
+            "MISSING_IDENTITY",
+        ] {
+            assert!(
+                kinds.contains(&required.to_string()),
+                "missing {required}: {kinds:?}"
+            );
+        }
+        // Category vocabulary present on sections.
+        assert_eq!(v["repository"]["category"], "FACT");
+        assert_eq!(v["freshness"]["provenance"], "derived");
+        assert!(v["bounds"].is_object());
+        assert!(v["scope"]["keywords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == "authentication"));
+    }
+
+    /// Task-scoped brief surfaces read-only task state without transitioning.
+    #[tokio::test]
+    async fn brief_with_task_id_reads_task_state_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let created = call_tool_text(
+            &server,
+            "task",
+            json!({"workspace_root": ws_arg(&dir), "action": "create", "title": "Repair login flow", "description": "session tokens expire early"}),
+        )
+        .await;
+        let task_id = brief_json(&created)["task"]["task_id"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+
+        let out = call_tool_text(
+            &server,
+            "engineering_brief",
+            json!({"workspace_root": ws_arg(&dir), "task_id": task_id}),
+        )
+        .await;
+        let v = brief_json(&out);
+        let ts = &v["task_state"];
+        assert_eq!(ts["task_id"], task_id.as_str());
+        assert_eq!(ts["status"], "pending");
+        assert_eq!(ts["category"], "TASK_STATE");
+        // Task-derived keywords enrich scope even though no task text given.
+        let keywords: Vec<String> = v["scope"]["keywords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|k| k.as_str().map(str::to_string))
+            .collect();
+        assert!(
+            keywords.iter().any(|k| k == "Repair" || k == "login"),
+            "{keywords:?}"
+        );
+
+        // Read-only: the task is still pending at the same version.
+        let inspected = call_tool_text(
+            &server,
+            "task",
+            json!({"workspace_root": ws_arg(&dir), "action": "inspect", "task_id": task_id}),
+        )
+        .await;
+        let snap = &brief_json(&inspected)["snapshot"];
+        assert_eq!(snap["task"]["status"], "pending");
+        assert_eq!(snap["task"]["current_version"], ts["version"]);
+    }
+
+    /// Cross-workspace task ids read as unknown — never leaked.
+    #[tokio::test]
+    async fn brief_cross_workspace_task_is_unknown() {
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_multiws_server(&a, &[&b], &state);
+        let created = call_tool_text(
+            &server,
+            "task",
+            json!({"workspace_root": ws_arg(&b), "action": "create", "title": "Secret plan"}),
+        )
+        .await;
+        let task_id = brief_json(&created)["task"]["task_id"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+        assert!(task_id.starts_with("task::"));
+
+        let out = call_tool_text(
+            &server,
+            "engineering_brief",
+            json!({"workspace_root": ws_arg(&a), "task_id": task_id, "task": "continue work"}),
+        )
+        .await;
+        let v = brief_json(&out);
+        assert!(v["task_state"].is_null());
+        assert!(unknown_kinds(&v).contains(&"TASK_NOT_FOUND".to_string()));
+        assert!(
+            !out.contains("Secret plan"),
+            "task content must not leak across workspaces"
+        );
+    }
+
+    /// USER_CONFIRMED constraints flow as hard constraints; preferences do not.
+    #[tokio::test]
+    async fn brief_surfaces_confirmed_constraints_not_preferences() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        call_tool_text(
+            &server,
+            "remember",
+            json!({"workspace_root": ws_arg(&dir), "content": "No new dependencies without review", "namespace": "eng.constraints.deps", "kind": "constraint", "user_confirmed": true}),
+        )
+        .await;
+        call_tool_text(
+            &server,
+            "remember",
+            json!({"workspace_root": ws_arg(&dir), "content": "Prefers short functions", "namespace": "eng.style.brevity", "kind": "preference", "user_confirmed": true}),
+        )
+        .await;
+        let out = call_tool_text(
+            &server,
+            "engineering_brief",
+            json!({"workspace_root": ws_arg(&dir), "task": "add dependency review"}),
+        )
+        .await;
+        let v = brief_json(&out);
+        let constraints = v["constraints"].as_array().expect("constraints");
+        assert!(
+            constraints.iter().any(|c| c["content"]
+                .as_str()
+                .unwrap()
+                .contains("No new dependencies")
+                && c["hardness"] == "hard"
+                && c["authority"] == "user_confirmed"),
+            "{constraints:?}"
+        );
+        assert!(
+            constraints
+                .iter()
+                .all(|c| !c["content"].as_str().unwrap().contains("short functions")),
+            "preferences must never become constraints: {constraints:?}"
+        );
+    }
+
+    /// Identity decisions flow with currency; superseded ones are not current.
+    #[tokio::test]
+    async fn brief_decisions_mark_superseded_not_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"brief-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "pub fn main() {}\n").unwrap();
+        crate::init::run(dir.path()).expect("init");
+        let server = local_sandbox_server(&dir);
+        call_tool_text(
+            &server,
+            "update_identity",
+            json!({
+                "add_decisions": [
+                    {"title": "Use SQLite for state", "description": "Durable local state via SQLite."},
+                    {"title": "Retire SQLite backend", "description": "Superseded experiment.", "status": "superseded"}
+                ]
+            }),
+        )
+        .await;
+        let out = call_tool_text(
+            &server,
+            "engineering_brief",
+            json!({"task": "SQLite state backend"}),
+        )
+        .await;
+        let v = brief_json(&out);
+        let decisions = v["decisions"].as_array().expect("decisions");
+        let sqlite: Vec<&serde_json::Value> = decisions
+            .iter()
+            .filter(|d| d["title"].as_str().unwrap().contains("SQLite"))
+            .collect();
+        assert_eq!(sqlite.len(), 2, "{decisions:?}");
+        let current: Vec<&&serde_json::Value> =
+            sqlite.iter().filter(|d| d["current"] == true).collect();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0]["status"], "accepted");
+    }
+
+    /// History is relevant excerpts, never a transcript dump.
+    #[tokio::test]
+    async fn brief_history_is_bounded_excerpts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        call_tool_text(
+            &server,
+            "remember",
+            json!({"workspace_root": ws_arg(&dir), "content": "Chose SQLite for durable login sessions", "namespace": "eng.history.logindecision", "kind": "decision", "related_ids": ["task::x"], "user_confirmed": true}),
+        )
+        .await;
+        let out = call_tool_text(
+            &server,
+            "engineering_brief",
+            json!({"workspace_root": ws_arg(&dir), "task": "login sessions SQLite"}),
+        )
+        .await;
+        let v = brief_json(&out);
+        let history = v["history"].as_array().expect("history");
+        assert!(
+            !history.is_empty(),
+            "remembered decision must surface as history"
+        );
+        assert!(history.len() <= crate::engineering_brief::MAX_BRIEF_HISTORY);
+        for h in history {
+            assert_eq!(h["category"], "HISTORY");
+            assert_eq!(h["provenance"], "observed");
+            assert!(
+                h["excerpt"].as_str().unwrap().len() <= 240 + 64,
+                "excerpt bounded"
+            );
+            assert!(h.get("payload").is_none(), "raw payloads never exposed");
+        }
+    }
+
+    /// Explicit missing symbols are unknowns; determinism holds.
+    #[tokio::test]
+    async fn brief_missing_symbol_and_determinism() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let args = json!({"workspace_root": ws_arg(&dir), "task": "fix things", "target_symbol": "no_such_symbol_xyz"});
+        let a = call_tool_text(&server, "engineering_brief", args.clone()).await;
+        let b = call_tool_text(&server, "engineering_brief", args).await;
+        assert_eq!(
+            a, b,
+            "same state + same request must produce the same brief"
+        );
+        let v = brief_json(&a);
+        assert!(v["impact"].is_null());
+        assert!(unknown_kinds(&v).contains(&"TARGET_NOT_FOUND".to_string()));
+    }
+
+    /// Concurrent briefs agree; generation writes no `.codebro` state.
+    #[tokio::test]
+    async fn brief_concurrent_requests_agree_and_write_nothing() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = Arc::new(stateful_server(&dir, &state));
+        let before: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let s = server.clone();
+            let root = dir.path().to_string_lossy().to_string();
+            tasks.push(tokio::spawn(async move {
+                call_tool_text(
+                    &s,
+                    "engineering_brief",
+                    json!({"workspace_root": root, "task": "concurrent probe xyz"}),
+                )
+                .await
+            }));
+        }
+        let mut results = Vec::new();
+        for t in tasks {
+            results.push(t.await.expect("join ok"));
+        }
+        for r in &results[1..] {
+            assert_eq!(&results[0], r, "concurrent briefs must agree");
+        }
+        let after: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            before, after,
+            "brief generation must not create workspace state"
+        );
+    }
+
+    /// Conflicting decisions surface as conflicts; nothing is resolved by guessing.
+    #[tokio::test]
+    async fn brief_conflicting_decisions_surface() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"conflict-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "pub fn main() {}\n").unwrap();
+        crate::init::run(dir.path()).expect("init");
+        let server = local_sandbox_server(&dir);
+        call_tool_text(
+            &server,
+            "update_identity",
+            json!({
+                "add_decisions": [
+                    {"title": "Adopt SQLite durable storage", "description": "SQLite backs all durable state."},
+                    {"title": "Retire SQLite durable storage", "description": "Superseded by the file backend.", "status": "superseded"}
+                ]
+            }),
+        )
+        .await;
+        let out = call_tool_text(
+            &server,
+            "engineering_brief",
+            json!({"task": "SQLite durable storage"}),
+        )
+        .await;
+        let v = brief_json(&out);
+        let conflicts = v["decision_conflicts"].as_array().expect("conflicts");
+        assert!(
+            !conflicts.is_empty(),
+            "shared-area decisions with differing currency must conflict: {v:?}"
+        );
+        assert!(conflicts[0]["decision_ids"].as_array().unwrap().len() == 2);
+    }
+
+    /// Failed tasks feed negative knowledge so approaches are not repeated.
+    #[tokio::test]
+    async fn brief_failed_task_feeds_negative_knowledge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let created = call_tool_text(
+            &server,
+            "task",
+            json!({"workspace_root": ws_arg(&dir), "action": "create", "title": "Migrate to new cache"}),
+        )
+        .await;
+        let task_id = brief_json(&created)["task"]["task_id"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+        call_tool_text(
+            &server,
+            "task",
+            json!({"workspace_root": ws_arg(&dir), "action": "start", "task_id": task_id}),
+        )
+        .await;
+        call_tool_text(&server, "task", json!({"workspace_root": ws_arg(&dir), "action": "fail", "task_id": task_id, "reason": "cache migration corrupted state"})).await;
+        let out = call_tool_text(
+            &server,
+            "engineering_brief",
+            json!({"workspace_root": ws_arg(&dir), "task_id": task_id, "task": "cache migration"}),
+        )
+        .await;
+        let v = brief_json(&out);
+        assert_eq!(v["task_state"]["status"], "failed");
+        let neg = v["negative_knowledge"]
+            .as_array()
+            .expect("negative knowledge");
+        assert!(neg.iter().any(|n| n["kind"] == "failed_task"), "{neg:?}");
+    }
+
+    /// Task skill refs are reference-only and bounded; no execution implied.
+    #[tokio::test]
+    async fn brief_task_skill_refs_bounded_and_reference_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = stateful_server(&dir, &state);
+        let refs: Vec<String> = (0..10).map(|i| format!("skill-ref-{i}")).collect();
+        let created = call_tool_text(
+            &server,
+            "task",
+            json!({"workspace_root": ws_arg(&dir), "action": "create", "title": "Skill-bound work", "skill_refs": refs}),
+        )
+        .await;
+        let task_id = brief_json(&created)["task"]["task_id"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+        let out = call_tool_text(
+            &server,
+            "engineering_brief",
+            json!({"workspace_root": ws_arg(&dir), "task_id": task_id, "task": "skill work"}),
+        )
+        .await;
+        let v = brief_json(&out);
+        let skills = v["skills"].as_array().expect("skills");
+        assert!(
+            skills.len() <= crate::engineering_brief::MAX_BRIEF_SKILLS,
+            "{}",
+            skills.len()
+        );
+        assert!(!skills.is_empty());
+        assert!(skills
+            .iter()
+            .all(|s| s["origin"] == "task_ref" && s["category"] == "SKILL"));
+        assert!(
+            !out.to_lowercase().contains("execute"),
+            "brief must never order skill execution"
+        );
+    }
+
+    /// Briefs stay available during mutating operations (no lock coupling).
+    #[tokio::test]
+    async fn brief_concurrent_with_reindex_task_and_skill_mutation() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"conc-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "pub fn main() {}\n").unwrap();
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = Arc::new(stateful_server(&dir, &state));
+        let root = ws_arg(&dir);
+
+        let created = call_tool_text(
+            &server,
+            "task",
+            json!({"workspace_root": root, "action": "create", "title": "Concurrent probe"}),
+        )
+        .await;
+        let task_id = brief_json(&created)["task"]["task_id"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+        call_tool_text(
+            &server,
+            "task",
+            json!({"workspace_root": root, "action": "start", "task_id": task_id}),
+        )
+        .await;
+
+        // reindex (mutation lock) || checkpoint (mutation lock) ||
+        // skill propose (mutation lock) || brief (lock-free) run together.
+        let s1 = server.clone();
+        let r1 = root.clone();
+        let reindex = tokio::spawn(async move {
+            call_tool_text(&s1, "reindex", json!({"workspace_root": r1})).await
+        });
+        let s2 = server.clone();
+        let r2 = root.clone();
+        let t2 = task_id.clone();
+        let checkpoint = tokio::spawn(async move {
+            call_tool_text(&s2, "task", json!({"workspace_root": r2, "action": "checkpoint", "task_id": t2, "summary": "half done"})).await
+        });
+        let s3 = server.clone();
+        let r3 = root.clone();
+        let propose = tokio::spawn(async move {
+            call_tool_text(&s3, "skill", json!({"workspace_root": r3, "action": "propose", "name": "conc-skill", "description": "Concurrency probe skill", "purpose": "Testing", "content": "---\nname: conc-skill\ndescription: Concurrency probe skill\n---\n\n# Purpose\n\nBody."})).await
+        });
+        let mut briefs = Vec::new();
+        for _ in 0..4 {
+            let s = server.clone();
+            let r = root.clone();
+            briefs.push(tokio::spawn(async move {
+                call_tool_text(
+                    &s,
+                    "engineering_brief",
+                    json!({"workspace_root": r, "task": "concurrent probe"}),
+                )
+                .await
+            }));
+        }
+        let re_out = reindex.await.expect("join ok");
+        assert!(re_out.contains("\"status\": \"ok\""), "{re_out}");
+        let cp_out = checkpoint.await.expect("join ok");
+        assert!(cp_out.contains("checkpoint"), "{cp_out}");
+        let prop_out = propose.await.expect("join ok");
+        assert!(prop_out.contains("conc-skill"), "{prop_out}");
+        let mut first: Option<String> = None;
+        for b in briefs {
+            let out = b.await.expect("join ok");
+            let v = brief_json(&out);
+            assert!(v["bounds"].is_object());
+            if let Some(f) = first.as_ref() {
+                // Briefs racing a reindex may legitimately differ in freshness;
+                // each one must still be well-formed and bounded.
+                assert!(brief_json(f)["bounds"].is_object());
+            } else {
+                first = Some(out);
+            }
+        }
+    }
+
     /// Helper: call a tool method directly (the tool methods are private
     /// but visible to the module's own tests) and return its text content.
     async fn call_tool_text(
@@ -3802,6 +9646,62 @@ mod tests {
                     .map_err(|e| e.to_string())?;
                 text_of(r)
             }
+            "context" => {
+                let p: ContextArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .context(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "remember" => {
+                let p: RememberArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .remember(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "forget" => {
+                let p: ForgetArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .forget(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "recall" => {
+                let p: RecallArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .recall(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "learn" => {
+                let p: LearnArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .learn(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "skill" => {
+                let p: SkillArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .skill(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "task" => {
+                let p: TaskArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .task(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
             "sandbox_exec" => {
                 let p: SandboxExecArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
                 let r = server
@@ -3870,6 +9770,15 @@ mod tests {
                     serde_json::from_value(args).map_err(|e| e.to_string())?;
                 let r = server
                     .update_identity(Parameters(p))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                text_of(r)
+            }
+            "engineering_brief" => {
+                let p: EngineeringBriefArgs =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                let r = server
+                    .engineering_brief(Parameters(p))
                     .await
                     .map_err(|e| e.to_string())?;
                 text_of(r)
@@ -4160,15 +10069,25 @@ mod tests {
     // ── Sandbox tool tests ─────────────────────────────────────────────
 
     /// Helper: create a CodeBroMcpServer forced into local sandbox mode,
-    /// regardless of OPEN_SANDBOX_URL in the environment.
+    /// regardless of OPEN_SANDBOX_URL in the environment. User-context
+    /// state is hermetic: passive history capture writes on sandbox/apply
+    /// paths, so the state dir lives inside the test workspace (owned by
+    /// its TempDir — auto-cleaned, unique per test, never ~/.codebro).
     fn local_sandbox_server(dir: &tempfile::TempDir) -> CodeBroMcpServer {
-        let rt = crate::sandbox::SandboxRuntime::new(crate::sandbox::SandboxMode::Local);
-        CodeBroMcpServer::with_sandbox_runtime(dir.path().to_path_buf(), rt)
+        CodeBroMcpServer::with_state_dir(
+            dir.path().to_path_buf(),
+            dir.path().join(".codebro-test-state"),
+        )
     }
 
-    fn local_sandbox_server_for_path(path: &std::path::Path) -> CodeBroMcpServer {
-        let rt = crate::sandbox::SandboxRuntime::new(crate::sandbox::SandboxMode::Local);
-        CodeBroMcpServer::with_sandbox_runtime(path.to_path_buf(), rt)
+    fn local_sandbox_server_for_path(
+        path: &std::path::Path,
+        state: &tempfile::TempDir,
+    ) -> CodeBroMcpServer {
+        // The state dir stays in the caller's TempDir (auto-cleaned):
+        // fixture workspaces inside the repo checkout must never gain
+        // state files.
+        CodeBroMcpServer::with_state_dir(path.to_path_buf(), state.path().to_path_buf())
     }
 
     /// sandbox_exec must return a parseable structured result with success=true
@@ -4490,7 +10409,8 @@ mod tests {
     async fn sandbox_build_fixture_passes() {
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/cargo-project");
-        let server = local_sandbox_server_for_path(&fixture);
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server_for_path(&fixture, &state);
         let out = call_tool_text(&server, "sandbox_build", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["execution"]["command"], "cargo check");
@@ -4503,7 +10423,8 @@ mod tests {
     async fn sandbox_test_fixture_passes() {
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/cargo-project");
-        let server = local_sandbox_server_for_path(&fixture);
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server_for_path(&fixture, &state);
         let out = call_tool_text(&server, "sandbox_test", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["execution"]["command"], "cargo test");
@@ -4520,7 +10441,8 @@ mod tests {
     async fn sandbox_test_fixture_failing_reports_verification_failure() {
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/cargo-project-failing");
-        let server = local_sandbox_server_for_path(&fixture);
+        let state = tempfile::tempdir().expect("tempdir");
+        let server = local_sandbox_server_for_path(&fixture, &state);
         let out = call_tool_text(&server, "sandbox_test", json!({})).await;
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         // The fixture has a should_panic test which panics in normal test runs,
@@ -5878,6 +11800,82 @@ mod tests {
             v.get("validation").is_none(),
             "error response must not contain validation"
         );
+        assert_eq!(v["index_status"], "FAILED");
+    }
+
+    /// P6-AUDIT: the MCP diff shares the indexer kernel (no second
+    /// implementation) and signals truncation honestly with totals.
+    #[test]
+    fn mcp_diff_delegates_to_single_kernel_and_signals_truncation() {
+        use std::collections::BTreeMap;
+        // Small diff: identical to the kernel, no truncation.
+        let prev: BTreeMap<String, String> = [("a.rs".to_string(), "h1".to_string())]
+            .into_iter()
+            .collect();
+        let curr: BTreeMap<String, String> = [
+            ("a.rs".to_string(), "h1".to_string()),
+            ("b.rs".to_string(), "h2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let kernel = crate::init::engineering::diff_digests(&prev, &curr);
+        let mcp = diff_digests_for_mcp(&prev, &curr);
+        assert_eq!(mcp.added, kernel.added);
+        assert_eq!(mcp.deleted, kernel.deleted);
+        assert_eq!(mcp.modified, kernel.modified);
+        assert_eq!(mcp.unchanged, kernel.unchanged);
+        assert!(!mcp.truncated);
+        assert_eq!(
+            (mcp.added_count, mcp.deleted_count, mcp.modified_count),
+            (1, 0, 0)
+        );
+        assert_eq!(mcp.unchanged_count, 1);
+        // Large diff: lists cap at MCP_DIFF_LIST_CAP but totals stay exact
+        // and `truncated` is visible (no silent drop).
+        let big_prev: BTreeMap<String, String> = BTreeMap::new();
+        let big_curr: BTreeMap<String, String> = (0..250)
+            .map(|i| (format!("f{i:03}.rs"), "h".to_string()))
+            .collect();
+        let big = diff_digests_for_mcp(&big_prev, &big_curr);
+        assert_eq!(big.added.len(), MCP_DIFF_LIST_CAP);
+        assert_eq!(big.added_count, 250);
+        assert!(big.truncated);
+        // Truncated lists are the deterministic head of the sorted full list.
+        let mut sorted: Vec<String> = (0..250).map(|i| format!("f{i:03}.rs")).collect();
+        sorted.sort();
+        sorted.truncate(MCP_DIFF_LIST_CAP);
+        assert_eq!(big.added, sorted);
+    }
+
+    /// P6-AUDIT: a failed index run preserves last-good metadata instead
+    /// of zeroing counts/revision (the old branch wrote symbol_count 0,
+    /// edge_count 0, revision "unknown").
+    #[test]
+    fn failed_index_upsert_preserves_last_good_metadata() {
+        let prev = crate::context_runtime::RepoIndexRecord {
+            workspace_root: "/w".to_string(),
+            repository_identity: "{\"project_id\":\"abc\"}".to_string(),
+            index_status: crate::context_runtime::RepoIndexStatus::Ready,
+            indexed_at: 111,
+            repository_revision: "rev-good".to_string(),
+            file_count: 10,
+            symbol_count: 50,
+            edge_count: 20,
+            stale_count: 2,
+            updated_at: 111,
+        };
+        let up = failed_index_upsert(&prev);
+        assert_eq!(
+            up.index_status,
+            crate::context_runtime::RepoIndexStatus::Failed
+        );
+        assert_eq!(up.file_count, 10);
+        assert_eq!(up.symbol_count, 50);
+        assert_eq!(up.edge_count, 20);
+        assert_eq!(up.stale_count, 2);
+        assert_eq!(up.repository_revision, "rev-good");
+        assert_eq!(up.indexed_at, 111);
+        assert_eq!(up.repository_identity, "{\"project_id\":\"abc\"}");
     }
 
     // ── M5: repository_health MCP tool tests ──────────────────────────
@@ -6354,6 +12352,32 @@ mod tests {
 
     // ── Multi-workspace isolation ──────────────────────────────────────
 
+    /// Hermetic multi-workspace server: default workspace root_a, with
+    /// user-context state isolated inside root_a (never ~/.codebro).
+    /// Passive history capture on apply/test paths needs the isolation;
+    /// root_a is always a test TempDir, so cleanup is automatic.
+    /// P8 root authorization: every workspace these tests address
+    /// (root_a as the default + each extra root) is authorized exactly
+    /// as an operator would authorize at launch — the isolation the tests
+    /// assert is then between two AUTHORIZED roots, which is the real
+    /// product guarantee. Unauthorized roots are refused (asserted by the
+    /// dedicated registry tests and the real-binary boundary probes).
+    fn hermetic_multiws_server(
+        root_a: &std::path::Path,
+        extra_roots: &[&std::path::Path],
+    ) -> CodeBroMcpServer {
+        let registry = WorkspaceRegistry::with_authorized_roots(
+            root_a.to_path_buf(),
+            crate::workspace_registry::AuthorizedRoots::with_extras(
+                root_a.to_path_buf(),
+                extra_roots.iter().map(|p| p.to_path_buf()),
+            ),
+        );
+        let state_dir = root_a.join(".codebro-test-state");
+        let sandbox = crate::sandbox::SandboxRuntime::new(crate::sandbox::SandboxMode::Local);
+        assemble_server_with_registry(registry, sandbox, Some(state_dir))
+    }
+
     #[tokio::test]
     async fn facts_are_workspace_isolated() {
         let ws_a = tempfile::tempdir().unwrap();
@@ -6367,7 +12391,7 @@ mod tests {
         std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
         crate::init::run(root_b).unwrap();
 
-        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+        let server = hermetic_multiws_server(root_a, &[root_b]);
 
         let out_a = call_tool_text(
             &server,
@@ -6428,7 +12452,7 @@ mod tests {
         std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
         crate::init::run(root_b).unwrap();
 
-        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+        let server = hermetic_multiws_server(root_a, &[root_b]);
 
         let _ = call_tool_text(
             &server,
@@ -6513,7 +12537,7 @@ mod tests {
             rt.create_minimal("BRAVO", "rust").unwrap();
         }
 
-        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+        let server = hermetic_multiws_server(root_a, &[root_b]);
 
         let out_a = call_tool_text(
             &server,
@@ -6553,7 +12577,7 @@ mod tests {
         std::fs::write(root_a.join("a.txt"), "hello alpha\n").unwrap();
         std::fs::write(root_b.join("b.txt"), "hello bravo\n").unwrap();
 
-        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+        let server = hermetic_multiws_server(root_a, &[root_b]);
 
         let out_a = call_tool_text(
             &server,
@@ -6614,7 +12638,7 @@ mod tests {
         std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
         crate::init::run(root_b).unwrap();
 
-        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+        let server = hermetic_multiws_server(root_a, &[root_b]);
 
         let out_a = call_tool_text(
             &server,
@@ -6662,7 +12686,7 @@ mod tests {
 
         std::fs::write(root_a.join("extra.rs"), "pub fn alpha_unique_fn() {}\n").unwrap();
 
-        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+        let server = hermetic_multiws_server(root_a, &[root_b]);
 
         let _ = call_tool_text(
             &server,
@@ -6709,7 +12733,7 @@ mod tests {
         std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
         crate::init::run(root_b).unwrap();
 
-        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+        let server = hermetic_multiws_server(root_a, &[root_b]);
 
         let out_a = call_tool_text(
             &server,
@@ -6751,7 +12775,7 @@ mod tests {
         std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
         crate::init::run(root_b).unwrap();
 
-        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+        let server = hermetic_multiws_server(root_a, &[root_b]);
 
         let out_a = call_tool_text(
             &server,
@@ -6785,7 +12809,7 @@ mod tests {
         std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
         crate::init::run(root_b).unwrap();
 
-        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+        let server = hermetic_multiws_server(root_a, &[root_b]);
 
         let _ = call_tool_text(
             &server,
@@ -6840,7 +12864,7 @@ mod tests {
         std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
         crate::init::run(root_b).unwrap();
 
-        let server = Arc::new(CodeBroMcpServer::new(root_a.to_path_buf()));
+        let server = Arc::new(hermetic_multiws_server(root_a, &[root_b]));
         let path_a = root_a.to_string_lossy().to_string();
         let path_b = root_b.to_string_lossy().to_string();
 
@@ -6935,7 +12959,7 @@ mod tests {
         std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
         crate::init::run(root_b).unwrap();
 
-        let server = CodeBroMcpServer::new(root_a.to_path_buf());
+        let server = hermetic_multiws_server(root_a, &[root_b]);
 
         let out_a1 = call_tool_text(
             &server,
@@ -7162,3 +13186,1128 @@ mod evidence_journal_wiring_tests {
 }
 
 // ── Multi-workspace isolation ────────────────────────────────────────────
+
+// ── P4 skill lifecycle adversarial tests ────────────────────────────────
+//
+// The skill tests share one global env var (CODEBRO_SKILLS_DIR), so the
+// module serializes on a static lock: no cross-test env clobbering, and
+// publication always lands in a per-test tempdir — never the real
+// ~/.config/opencode/skills.
+
+#[cfg(test)]
+mod skill_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Serialize env-var mutation across every skill test (tests run on
+    /// parallel threads). Async-aware: the guard is held across await
+    /// points by design — each test owns the env var for its lifetime.
+    static SKILL_ENV_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    async fn skill_env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        SKILL_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    struct Guard(std::path::PathBuf);
+
+    fn hermetic_server(dir: &tempfile::TempDir) -> (CodeBroMcpServer, Guard) {
+        let server =
+            CodeBroMcpServer::with_state_dir(dir.path().to_path_buf(), dir.path().join("state"));
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::env::set_var("CODEBRO_SKILLS_DIR", &skills);
+        (server, Guard(skills))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            std::env::remove_var("CODEBRO_SKILLS_DIR");
+        }
+    }
+
+    async fn call_text(server: &CodeBroMcpServer, args: serde_json::Value) -> String {
+        let p: SkillArgs = serde_json::from_value(args).unwrap();
+        let r = server
+            .skill(Parameters(p))
+            .await
+            .expect("skill call succeeds");
+        text_of(r)
+    }
+
+    async fn call_err(server: &CodeBroMcpServer, args: serde_json::Value) -> String {
+        let p: SkillArgs = serde_json::from_value(args).unwrap();
+        server
+            .skill(Parameters(p))
+            .await
+            .expect_err("skill call must fail")
+            .to_string()
+    }
+
+    fn text_of(result: CallToolResult) -> String {
+        result
+            .content
+            .into_iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn content_for(name: &str) -> String {
+        format!("---\nname: {name}\ndescription: A hermetic test skill\n---\n\n# Purpose\n\nBody.")
+    }
+
+    /// Seed an accepted P3 learning candidate the honest way: record
+    /// repeated validation events through the public history pipeline,
+    /// let the deterministic detector cluster them into a candidate, and
+    /// evaluate it to `accepted`. Returns the learning candidate id.
+    fn seed_accepted_learning(server: &CodeBroMcpServer, ws: &str) -> String {
+        let store = server.context_store();
+        let now = 1_700_000_000u64;
+        for i in 0..4 {
+            let mut input = crate::context_runtime::HistoryInput::new(
+                ws.to_string(),
+                crate::context_runtime::HistoryKind::Validation,
+                format!("cargo test phase-{i} passed with fmt clippy suite"),
+            );
+            input.tool = Some("sandbox_test".to_string());
+            input.outcome = Some("success".to_string());
+            input.created_at = Some(now + i);
+            let (id, _fresh) = store.record_history(&input, now + i).unwrap();
+            assert!(id > 0);
+        }
+        let candidates = store
+            .propose_candidates(
+                Some(ws),
+                None,
+                crate::context_runtime::LearnScope::Project,
+                now + 10,
+            )
+            .unwrap();
+        assert!(
+            !candidates.is_empty(),
+            "deterministic detector must cluster the repeated validations"
+        );
+        let id = candidates[0].candidate_id.clone();
+        let evaluated = store.evaluate_candidate(&id, now + 20).unwrap();
+        assert_eq!(evaluated.status, "accepted", "got {:?}", evaluated.status);
+        id
+    }
+
+    /// Propose (evidence-backed via learning) and drive to validated
+    /// through the canonical store pipeline. Returns the candidate id.
+    async fn evidence_backed_validated(server: &CodeBroMcpServer, name: &str, ws: &str) -> String {
+        let lc_id = seed_accepted_learning(server, ws);
+        let out = call_text(
+            server,
+            json!({
+                "action": "propose",
+                "name": name,
+                "description": "Evidence-backed test skill",
+                "purpose": "Testing",
+                "content": content_for(name),
+                "learning_candidate_id": lc_id,
+            }),
+        )
+        .await;
+        assert!(out.contains(name), "propose failed: {out}");
+
+        let store = server.context_store();
+        let candidates = store
+            .list_skill_candidates(Some(ws), None, None, 10)
+            .unwrap();
+        let cid = candidates
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.candidate_id.clone())
+            .unwrap();
+        use crate::context_runtime::SkillCandidateStatus as S;
+        store
+            .transition_skill_candidate(&cid, S::Evaluating, None, 1)
+            .unwrap();
+        store
+            .promote_candidate_to_draft(&cid, &content_for(name), 2)
+            .unwrap();
+        store
+            .transition_skill_candidate(&cid, S::Validated, None, 3)
+            .unwrap();
+        cid
+    }
+
+    #[tokio::test]
+    async fn approve_requires_user_confirmed_flag() {
+        let _env = skill_env_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _guard) = hermetic_server(&dir);
+        let ws = dir.path().to_str().unwrap().to_string();
+
+        let cid = evidence_backed_validated(&server, "gate-skill", &ws).await;
+
+        // Without the flag: refused — the model cannot self-approve.
+        let err = call_err(&server, json!({ "action": "approve", "candidate_id": cid })).await;
+        assert!(
+            err.contains("user_confirmed"),
+            "self-approval must be refused: {err}"
+        );
+
+        // Nothing was published.
+        assert!(!_guard.0.join("gate-skill").exists());
+
+        // With the flag (user speech act): publishes.
+        let out = call_text(
+            &server,
+            json!({ "action": "approve", "candidate_id": cid, "user_confirmed": true }),
+        )
+        .await;
+        assert!(out.contains("active"), "approve output: {out}");
+        assert!(_guard.0.join("gate-skill").join("SKILL.md").exists());
+    }
+
+    #[tokio::test]
+    async fn forged_approval_from_wrong_status_refused() {
+        let _env = skill_env_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _guard) = hermetic_server(&dir);
+        let ws = dir.path().to_str().unwrap().to_string();
+
+        let lc_id = seed_accepted_learning(&server, &ws);
+        let out = call_text(
+            &server,
+            json!({
+                "action": "propose",
+                "name": "forge-skill",
+                "description": "d", "purpose": "p",
+                "content": content_for("forge-skill"),
+                "learning_candidate_id": lc_id,
+            }),
+        )
+        .await;
+        assert!(out.contains("forge-skill"));
+
+        // The candidate is still in 'candidate' status. Supplying
+        // user_confirmed=true (a forged speech act) still cannot publish:
+        // the store demands the full validated pipeline.
+        let store = server.context_store();
+        let candidates = store
+            .list_skill_candidates(Some(&ws), None, None, 10)
+            .unwrap();
+        let cid = candidates
+            .iter()
+            .find(|c| c.name == "forge-skill")
+            .map(|c| c.candidate_id.clone())
+            .unwrap();
+        let err = call_err(
+            &server,
+            json!({ "action": "approve", "candidate_id": cid, "user_confirmed": true }),
+        )
+        .await;
+        assert!(
+            err.contains("validated"),
+            "store gate must refuse unvalidated content even with a claimed speech act: {err}"
+        );
+        assert!(!_guard.0.join("forge-skill").exists());
+    }
+
+    #[tokio::test]
+    async fn standalone_confidence_capped_below_approval_floor() {
+        let _env = skill_env_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _guard) = hermetic_server(&dir);
+        let ws = dir.path().to_str().unwrap().to_string();
+
+        // Claimed confidence 0.99 → capped below 0.60: a standalone
+        // proposal can never approve without evidence-backed learning.
+        let out = call_text(
+            &server,
+            json!({
+                "action": "propose",
+                "name": "capped-skill",
+                "description": "d", "purpose": "p",
+                "content": content_for("capped-skill"),
+                "confidence": 0.99,
+            }),
+        )
+        .await;
+        let obj: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let confidence = obj["candidate"]["confidence"].as_f64().unwrap();
+        assert!(
+            confidence < crate::context_runtime::SKILL_APPROVAL_MIN_CONFIDENCE,
+            "standalone confidence must be capped below the floor: {confidence}"
+        );
+
+        // Drive it through the pipeline: approval still fails on the
+        // confidence gate.
+        let store = server.context_store();
+        let candidates = store
+            .list_skill_candidates(Some(&ws), None, None, 10)
+            .unwrap();
+        let cid = candidates
+            .iter()
+            .find(|c| c.name == "capped-skill")
+            .map(|c| c.candidate_id.clone())
+            .unwrap();
+        use crate::context_runtime::SkillCandidateStatus as S;
+        store
+            .transition_skill_candidate(&cid, S::Evaluating, None, 1)
+            .unwrap();
+        store
+            .promote_candidate_to_draft(&cid, &content_for("capped-skill"), 2)
+            .unwrap();
+        store
+            .transition_skill_candidate(&cid, S::Validated, None, 3)
+            .unwrap();
+        let err = call_err(
+            &server,
+            json!({ "action": "approve", "candidate_id": cid, "user_confirmed": true }),
+        )
+        .await;
+        assert!(
+            err.contains("below approval floor"),
+            "capped standalone candidate must not publish: {err}"
+        );
+        assert!(!_guard.0.join("capped-skill").exists());
+    }
+
+    #[tokio::test]
+    async fn secrets_never_publish() {
+        let _env = skill_env_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _guard) = hermetic_server(&dir);
+        let ws = dir.path().to_str().unwrap().to_string();
+
+        let lc_id = seed_accepted_learning(&server, &ws);
+        let out = call_text(
+            &server,
+            json!({
+                "action": "propose",
+                "name": "leaky-skill",
+                "description": "d", "purpose": "p",
+                "content": "---\nname: leaky-skill\ndescription: d\n---\n\n# Purpose\n\nUse api_key sk-abc123.",
+                "learning_candidate_id": lc_id,
+            }),
+        )
+        .await;
+        let obj: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            obj["candidate"]["validation"]["secret_safe"],
+            json!(false),
+            "secret content must be flagged at propose"
+        );
+
+        // The pipeline refuses to draft secret content, so it can never
+        // reach approval.
+        let store = server.context_store();
+        let candidates = store
+            .list_skill_candidates(Some(&ws), None, None, 10)
+            .unwrap();
+        let cid = candidates
+            .iter()
+            .find(|c| c.name == "leaky-skill")
+            .map(|c| c.candidate_id.clone())
+            .unwrap();
+        use crate::context_runtime::SkillCandidateStatus as S;
+        store
+            .transition_skill_candidate(&cid, S::Evaluating, None, 1)
+            .unwrap();
+        let secret_content =
+            "---\nname: leaky-skill\ndescription: d\n---\n\n# Purpose\n\nUse api_key sk-abc123.";
+        let draft = store.promote_candidate_to_draft(&cid, secret_content, 2);
+        assert!(draft.is_err(), "secret content must not draft: {draft:?}");
+        assert!(!_guard.0.join("leaky-skill").exists());
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_mutations_refused() {
+        let _env = skill_env_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        // Authorize a foreign sibling workspace up front (operator-
+        // equivalent launch config); the isolation below must hold even
+        // between two AUTHORIZED roots.
+        let foreign = tempfile::tempdir().unwrap();
+        let registry = WorkspaceRegistry::with_authorized_roots(
+            dir.path().to_path_buf(),
+            crate::workspace_registry::AuthorizedRoots::with_extras(
+                dir.path().to_path_buf(),
+                [foreign.path().to_path_buf()],
+            ),
+        );
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::env::set_var("CODEBRO_SKILLS_DIR", &skills);
+        let server = assemble_server_with_registry(
+            registry,
+            crate::sandbox::SandboxRuntime::new(crate::sandbox::SandboxMode::Local),
+            Some(dir.path().join("state")),
+        );
+        let _guard = Guard(skills);
+        let ws = dir.path().to_str().unwrap().to_string();
+
+        let cid = evidence_backed_validated(&server, "iso-mcp-skill", &ws).await;
+        call_text(
+            &server,
+            json!({ "action": "approve", "candidate_id": cid, "user_confirmed": true }),
+        )
+        .await;
+
+        let store = server.context_store();
+        let skill = store.get_skill_by_name("iso-mcp-skill").unwrap().unwrap();
+        let sid = skill.skill_id.clone();
+
+        // A foreign (AUTHORIZED, sibling) workspace cannot inspect by id,
+        // record health, deprecate, or roll back the skill — store-level
+        // workspace gates, independent of root authorization.
+        let fws = foreign.path().to_str().unwrap().to_string();
+
+        let err = call_err(
+            &server,
+            json!({ "action": "inspect", "skill_id": sid, "workspace_root": fws }),
+        )
+        .await;
+        assert!(
+            err.contains("not visible"),
+            "cross-workspace inspect leaked: {err}"
+        );
+
+        let err = call_err(
+            &server,
+            json!({ "action": "health", "skill_id": sid, "workspace_root": fws }),
+        )
+        .await;
+        assert!(
+            err.contains("not visible"),
+            "cross-workspace health leaked: {err}"
+        );
+
+        let err = call_err(
+            &server,
+            json!({ "action": "deprecate", "skill_id": sid, "workspace_root": fws }),
+        )
+        .await;
+        assert!(
+            err.contains("workspace mismatch"),
+            "cross-workspace deprecate leaked: {err}"
+        );
+
+        let err = call_err(
+            &server,
+            json!({ "action": "rollback", "skill_id": sid, "version": 1, "workspace_root": fws }),
+        )
+        .await;
+        assert!(
+            err.contains("workspace mismatch"),
+            "cross-workspace rollback leaked: {err}"
+        );
+
+        // Candidate inspect from foreign workspace: refused.
+        let err = call_err(
+            &server,
+            json!({ "action": "inspect", "candidate_id": cid, "workspace_root": fws }),
+        )
+        .await;
+        assert!(
+            err.contains("not visible"),
+            "cross-workspace candidate inspect leaked: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_scoped_candidates_need_task_context() {
+        let _env = skill_env_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _guard) = hermetic_server(&dir);
+
+        // Task-scoped propose without task_id: refused.
+        let err = call_err(
+            &server,
+            json!({ "action": "propose", "name": "task-skill", "scope": "task",
+                    "description": "d", "purpose": "p", "content": "x" }),
+        )
+        .await;
+        assert!(err.contains("task_id"), "task scope without task id: {err}");
+
+        // With task_id: works.
+        let out = call_text(
+            &server,
+            json!({ "action": "propose", "name": "task-skill", "scope": "task", "task_id": "t-42",
+                    "description": "d", "purpose": "p",
+                    "content": content_for("task-skill") }),
+        )
+        .await;
+        assert!(out.contains("task-skill"));
+
+        // Discover without the task: invisible.
+        let discover = call_text(&server, json!({ "action": "discover" })).await;
+        assert!(
+            !discover.contains("\"task-skill\""),
+            "task-scoped candidate must not be visible without its task"
+        );
+
+        // Discover with the task: visible.
+        let discover = call_text(&server, json!({ "action": "discover", "task_id": "t-42" })).await;
+        assert!(discover.contains("task-skill"));
+    }
+
+    #[tokio::test]
+    async fn discover_lists_only_active_skills() {
+        let _env = skill_env_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _guard) = hermetic_server(&dir);
+        let ws = dir.path().to_str().unwrap().to_string();
+
+        // Publish, then deprecate.
+        let cid = evidence_backed_validated(&server, "deprecated-view-skill", &ws).await;
+        call_text(
+            &server,
+            json!({ "action": "approve", "candidate_id": cid, "user_confirmed": true }),
+        )
+        .await;
+        let store = server.context_store();
+        let skill = store
+            .get_skill_by_name("deprecated-view-skill")
+            .unwrap()
+            .unwrap();
+        call_text(
+            &server,
+            json!({ "action": "deprecate", "skill_id": skill.skill_id }),
+        )
+        .await;
+
+        // Discover: the deprecated skill must not appear in the
+        // active_skills section (its candidate lineage stays listed for
+        // audit, which is correct).
+        let discover = call_text(&server, json!({ "action": "discover" })).await;
+        let obj: serde_json::Value = serde_json::from_str(&discover).unwrap();
+        let active = obj["active_skills"].as_array().unwrap().clone();
+        assert!(
+            !active
+                .iter()
+                .any(|s| s["name"] == json!("deprecated-view-skill")),
+            "deprecated skill must not be listed as active: {active:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_records_only_for_active_skills() {
+        let _env = skill_env_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _guard) = hermetic_server(&dir);
+        let ws = dir.path().to_str().unwrap().to_string();
+
+        let cid = evidence_backed_validated(&server, "health-gate-skill", &ws).await;
+        call_text(
+            &server,
+            json!({ "action": "approve", "candidate_id": cid, "user_confirmed": true }),
+        )
+        .await;
+        let store = server.context_store();
+        let skill = store
+            .get_skill_by_name("health-gate-skill")
+            .unwrap()
+            .unwrap();
+
+        // Record a failure: works while active.
+        call_text(
+            &server,
+            json!({ "action": "health", "skill_id": skill.skill_id, "success": false }),
+        )
+        .await;
+
+        // Deprecate, then health: refused.
+        call_text(
+            &server,
+            json!({ "action": "deprecate", "skill_id": skill.skill_id }),
+        )
+        .await;
+        let err = call_err(
+            &server,
+            json!({ "action": "health", "skill_id": skill.skill_id, "success": true }),
+        )
+        .await;
+        assert!(
+            err.contains("active"),
+            "deprecated skills must not accumulate health: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_tests_are_hermetic() {
+        let _env = skill_env_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _guard) = hermetic_server(&dir);
+        let ws = dir.path().to_str().unwrap().to_string();
+
+        // Full pipeline: everything lands inside this tempdir.
+        let cid = evidence_backed_validated(&server, "hermetic-check", &ws).await;
+        call_text(
+            &server,
+            json!({ "action": "approve", "candidate_id": cid, "user_confirmed": true }),
+        )
+        .await;
+
+        let skills_root = std::env::var("CODEBRO_SKILLS_DIR").unwrap();
+        assert!(skills_root.starts_with(dir.path().to_str().unwrap()));
+        assert!(std::path::PathBuf::from(&skills_root)
+            .join("hermetic-check")
+            .join("SKILL.md")
+            .exists());
+        assert!(dir.path().join("state").join("state.db").exists());
+    }
+
+    #[tokio::test]
+    async fn unknown_action_rejected() {
+        let _env = skill_env_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _guard) = hermetic_server(&dir);
+        let err = call_err(&server, json!({ "action": "execute" })).await;
+        assert!(err.contains("unknown skill action"));
+        assert!(err.contains("discover"));
+    }
+}
+
+// ── P5 durable task runtime adversarial tests ──────────────────────────
+
+#[cfg(test)]
+mod task_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn text_of(result: CallToolResult) -> String {
+        result
+            .content
+            .into_iter()
+            .find_map(|b| match b {
+                rmcp::model::ContentBlock::Text(t) => Some(t.text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn server(dir: &tempfile::TempDir) -> CodeBroMcpServer {
+        CodeBroMcpServer::with_state_dir(dir.path().to_path_buf(), dir.path().join("state"))
+    }
+
+    /// Multi-root task-test server: the default root plus listed extra
+    /// subdirectory workspaces are authorized (operator-equivalent
+    /// launch config) so cross-workspace isolation is asserted between
+    /// AUTHORIZED roots (the real product guarantee).
+    fn server_multiroot(
+        dir: &tempfile::TempDir,
+        extras: &[std::path::PathBuf],
+    ) -> CodeBroMcpServer {
+        let registry = WorkspaceRegistry::with_authorized_roots(
+            dir.path().to_path_buf(),
+            crate::workspace_registry::AuthorizedRoots::with_extras(
+                dir.path().to_path_buf(),
+                extras.iter().cloned(),
+            ),
+        );
+        assemble_server_with_registry(
+            registry,
+            crate::sandbox::SandboxRuntime::new(crate::sandbox::SandboxMode::Local),
+            Some(dir.path().join("state")),
+        )
+    }
+
+    async fn call(server: &CodeBroMcpServer, args: serde_json::Value) -> serde_json::Value {
+        let p: TaskArgs = serde_json::from_value(args).unwrap();
+        let r = server
+            .task(Parameters(p))
+            .await
+            .expect("task call succeeds");
+        serde_json::from_str(&text_of(r)).unwrap_or(json!({}))
+    }
+
+    async fn call_err(server: &CodeBroMcpServer, args: serde_json::Value) -> String {
+        let p: TaskArgs = serde_json::from_value(args).unwrap();
+        server
+            .task(Parameters(p))
+            .await
+            .expect_err("must fail")
+            .to_string()
+    }
+
+    async fn create(server: &CodeBroMcpServer, title: &str) -> String {
+        let out = call(server, json!({ "action": "create", "title": title })).await;
+        out["task"]["task_id"].as_str().unwrap().to_string()
+    }
+
+    async fn drive_to_validating(server: &CodeBroMcpServer, task_id: &str) {
+        call(server, json!({ "action": "start", "task_id": task_id })).await;
+        call(
+            server,
+            json!({ "action": "validate", "task_id": task_id, "what": "cargo test" }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn full_lifecycle_over_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let id = create(&s, "implement task runtime").await;
+
+        // start
+        let out = call(&s, json!({ "action": "start", "task_id": id })).await;
+        assert_eq!(out["task"]["status"], "running");
+        // checkpoint
+        let out = call(
+            &s,
+            json!({
+                "action": "checkpoint", "task_id": id,
+                "summary": "runtime core done", "progress": "mcp wiring", "next_action": "wire tool"
+            }),
+        )
+        .await;
+        assert_eq!(out["checkpoint"]["version"], 1);
+        // validate + record passed
+        call(
+            &s,
+            json!({ "action": "validate", "task_id": id, "what": "cargo test" }),
+        )
+        .await;
+        let out = call(
+            &s,
+            json!({ "action": "validation_result", "task_id": id, "result": "passed", "what": "cargo test" }),
+        )
+        .await;
+        assert_eq!(out["task"]["status"], "validating");
+        // complete
+        let out = call(
+            &s,
+            json!({
+                "action": "complete", "task_id": id, "reason": "shipped",
+                "changed_areas": ["crates/context-runtime"]
+            }),
+        )
+        .await;
+        assert_eq!(out["task"]["status"], "completed");
+        assert_eq!(out["task"]["outcome"]["result"], "completed");
+        // inspect shows the bounded snapshot
+        let out = call(&s, json!({ "action": "inspect", "task_id": id })).await;
+        assert_eq!(out["snapshot"]["task"]["status"], "completed");
+        assert!(out["snapshot"]["latest_checkpoint"].is_object());
+    }
+
+    #[tokio::test]
+    async fn completion_gate_is_enforced_over_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let id = create(&s, "gate test").await;
+        call(&s, json!({ "action": "start", "task_id": id })).await;
+        // complete without validation: refused.
+        let err = call_err(
+            &s,
+            json!({ "action": "complete", "task_id": id, "reason": "trust me" }),
+        )
+        .await;
+        assert!(err.to_lowercase().contains("validating"), "{err}");
+        // Even validate → failed blocks completion.
+        call(
+            &s,
+            json!({ "action": "validate", "task_id": id, "what": "t" }),
+        )
+        .await;
+        call(
+            &s,
+            json!({ "action": "validation_result", "task_id": id, "result": "failed" }),
+        )
+        .await;
+        // Failed validation returned the task to running; completion is
+        // structurally refused from there.
+        let err = call_err(
+            &s,
+            json!({ "action": "complete", "task_id": id, "reason": "trust me" }),
+        )
+        .await;
+        assert!(err.to_lowercase().contains("validating"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn invalid_transitions_are_refused_over_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let id = create(&s, "transitions").await;
+        // pause before start: pending → paused is invalid.
+        let err = call_err(&s, json!({ "action": "pause", "task_id": id })).await;
+        assert!(err.contains("transition"), "{err}");
+        // complete a pending task: refused.
+        let err = call_err(&s, json!({ "action": "complete", "task_id": id })).await;
+        assert!(err.contains("validating"), "{err}");
+        // Drive to completed, then mutate: terminal refusal.
+        drive_to_validating(&s, &id).await;
+        call(
+            &s,
+            json!({ "action": "validation_result", "task_id": id, "result": "passed" }),
+        )
+        .await;
+        call(
+            &s,
+            json!({ "action": "complete", "task_id": id, "reason": "ok" }),
+        )
+        .await;
+        for action in ["start", "pause", "resume", "checkpoint", "validate"] {
+            let err = call_err(&s, json!({ "action": action, "task_id": id })).await;
+            assert!(!err.is_empty(), "terminal task must refuse {action}");
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_isolation_over_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_a = dir.path().join("a");
+        let ws_b = dir.path().join("b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+        let s = server_multiroot(&dir, &[ws_a.clone(), ws_b.clone()]);
+        // Create in A.
+        let out = call(
+            &s,
+            json!({ "action": "create", "title": "a-task", "workspace_root": ws_a.display().to_string() }),
+        )
+        .await;
+        let id = out["task"]["task_id"].as_str().unwrap().to_string();
+        // Inspect from B: not found (invisible, not leaked).
+        let err = call_err(
+            &s,
+            json!({ "action": "inspect", "task_id": id, "workspace_root": ws_b.display().to_string() }),
+        )
+        .await;
+        assert!(err.contains("workspace"), "{err}");
+        // List from B is empty.
+        let out = call(
+            &s,
+            json!({ "action": "list", "workspace_root": ws_b.display().to_string() }),
+        )
+        .await;
+        assert_eq!(out["count"], 0);
+        // Mutations from B are refused.
+        let err = call_err(
+            &s,
+            json!({ "action": "start", "task_id": id, "workspace_root": ws_b.display().to_string() }),
+        )
+        .await;
+        assert!(err.contains("workspace"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stale_writer_and_lease_are_enforced_over_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let id = create(&s, "concurrency").await;
+        // Read v0, start (→v1), then mutate with the stale anchor: refused.
+        let out = call(&s, json!({ "action": "inspect", "task_id": id })).await;
+        let stale_version = out["snapshot"]["task"]["current_version"].as_u64().unwrap();
+        call(&s, json!({ "action": "start", "task_id": id })).await;
+        let err = call_err(
+            &s,
+            json!({ "action": "checkpoint", "task_id": id, "summary": "stale", "based_on_version": stale_version }),
+        )
+        .await;
+        assert!(err.contains("stale"), "{err}");
+        // A second server process (different worker) cannot pause while
+        // the first worker's lease is live.
+        let s2 = server(&dir);
+        let err = call_err(&s2, json!({ "action": "pause", "task_id": id })).await;
+        assert!(err.contains("lease") || err.contains("worker"), "{err}");
+        // The stale-lease path: after TTL expiry the second worker resumes.
+        // (Simulated at the store layer in unit tests; here the first
+        // worker legitimately pauses.)
+        let out = call(&s, json!({ "action": "pause", "task_id": id })).await;
+        assert_eq!(out["task"]["status"], "paused");
+        let out = call(&s2, json!({ "action": "resume", "task_id": id })).await;
+        assert_eq!(out["task"]["status"], "running");
+        assert_ne!(
+            out["task"]["lease_worker"],
+            serde_json::Value::Null,
+            "the resuming worker holds the lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn secrets_are_redacted_over_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let secret = "sk-ABCDEFGHIJKLMNOP123456";
+        let out = call(
+            &s,
+            json!({ "action": "create", "title": "deploy", "description": format!("key {secret}") }),
+        )
+        .await;
+        let desc = out["task"]["description"].as_str().unwrap();
+        assert!(
+            !desc.contains(secret),
+            "description must be redacted: {desc}"
+        );
+        let id = out["task"]["task_id"].as_str().unwrap().to_string();
+        call(&s, json!({ "action": "start", "task_id": id })).await;
+        let out = call(
+            &s,
+            json!({ "action": "checkpoint", "task_id": id, "summary": format!("used {secret}") }),
+        )
+        .await;
+        let summary = out["checkpoint"]["summary"].as_str().unwrap();
+        assert!(
+            !summary.contains(secret),
+            "checkpoint must be redacted: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_create_and_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let a = call(
+            &s,
+            json!({ "action": "create", "title": "fix gpu init", "idempotency_key": "gpu-fix" }),
+        )
+        .await;
+        let b = call(
+            &s,
+            json!({ "action": "create", "title": "fix gpu init", "idempotency_key": "gpu-fix" }),
+        )
+        .await;
+        assert_eq!(
+            a["task"]["task_id"], b["task"]["task_id"],
+            "idempotency key returns the same task"
+        );
+        let list = call(&s, json!({ "action": "list" })).await;
+        assert_eq!(list["count"], 1);
+        // Similar titles without keys: distinct tasks.
+        call(&s, json!({ "action": "create", "title": "fix gpu init" })).await;
+        let list = call(&s, json!({ "action": "list" })).await;
+        assert_eq!(list["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn paused_tasks_are_not_listed_as_stale_over_mcp() {
+        // Audit pin: an intentionally paused task is not interrupted
+        // work, so the recoverable-work listing must stay empty.
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let id = create(&s, "pausable work").await;
+        call(&s, json!({ "action": "start", "task_id": id })).await;
+        let out = call(&s, json!({ "action": "pause", "task_id": id })).await;
+        assert_eq!(out["task"]["status"], "paused");
+        let out = call(&s, json!({ "action": "stale" })).await;
+        assert_eq!(out["count"], 0, "paused work is not recoverable work");
+        let out = call(&s, json!({ "action": "inspect", "task_id": id })).await;
+        assert_eq!(out["snapshot"]["task"]["stale"], false);
+    }
+
+    #[tokio::test]
+    async fn secrets_redacted_in_validation_and_outcome_over_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let secret = "ghp_abcdefghij1234567890XY";
+        let id = create(&s, "redaction probe").await;
+        call(&s, json!({ "action": "start", "task_id": id })).await;
+        call(
+            &s,
+            json!({ "action": "validate", "task_id": id, "what": format!("run with {secret}") }),
+        )
+        .await;
+        let out = call(
+            &s,
+            json!({ "action": "validation_result", "task_id": id, "result": "passed", "reason": format!("evidence {secret}") }),
+        )
+        .await;
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(
+            !text.contains(secret),
+            "validation surfaces must be redacted"
+        );
+        let out = call(
+            &s,
+            json!({ "action": "complete", "task_id": id, "reason": format!("shipped {secret}") }),
+        )
+        .await;
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains(secret), "outcome must be redacted");
+        let out = call(&s, json!({ "action": "inspect", "task_id": id })).await;
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains(secret), "resume snapshot must be redacted");
+    }
+
+    // ── P9 engineering outcomes ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn outcome_reports_evidence_without_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let id = create(&s, "outcome probe").await;
+        call(&s, json!({ "action": "start", "task_id": id })).await;
+        let before = call(&s, json!({ "action": "inspect", "task_id": id })).await;
+        let version = before["snapshot"]["task"]["current_version"]
+            .as_u64()
+            .unwrap();
+        let out = call(
+            &s,
+            json!({
+                "action": "outcome", "task_id": id,
+                "classification": "failure",
+                "summary": "integration test failed because API contract differs",
+                "what": "cargo test", "exit_code": 101,
+                "changed_areas": ["src/api.rs"],
+            }),
+        )
+        .await;
+        assert_eq!(out["action"], "outcome");
+        assert_eq!(out["classification"], "failure");
+        assert_eq!(out["authority"], "observed");
+        assert_eq!(out["duplicate"], false);
+        assert!(out["event_id"].as_i64().unwrap() > 0);
+        // No transition: status and version are untouched.
+        let after = call(&s, json!({ "action": "inspect", "task_id": id })).await;
+        assert_eq!(after["snapshot"]["task"]["status"], "running");
+        assert_eq!(after["snapshot"]["task"]["current_version"], version);
+        let events = after["snapshot"]["recent_events"].as_array().unwrap();
+        assert!(
+            events.iter().any(|e| e["event_id"] == out["event_id"]
+                && e["summary"].as_str().unwrap().contains("API contract")),
+            "outcome evidence must surface in the resume snapshot: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_after_completion_distinguishes_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let id = create(&s, "confirmable work").await;
+        call(&s, json!({ "action": "start", "task_id": id })).await;
+        call(
+            &s,
+            json!({ "action": "validate", "task_id": id, "what": "cargo test" }),
+        )
+        .await;
+        call(
+            &s,
+            json!({ "action": "validation_result", "task_id": id, "result": "passed" }),
+        )
+        .await;
+        call(
+            &s,
+            json!({ "action": "complete", "task_id": id, "reason": "shipped" }),
+        )
+        .await;
+        // OpenCode-reported evidence stays observed…
+        let out = call(
+            &s,
+            json!({ "action": "outcome", "task_id": id, "classification": "success", "summary": "tests passed" }),
+        )
+        .await;
+        assert_eq!(out["authority"], "observed");
+        // …while an explicit user speech act records user confirmation.
+        let out = call(
+            &s,
+            json!({
+                "action": "outcome", "task_id": id, "classification": "success",
+                "summary": "user confirmed the fix resolves the issue", "user_confirmed": true,
+            }),
+        )
+        .await;
+        assert_eq!(out["authority"], "user_confirmed");
+        assert_eq!(out["duplicate"], false);
+    }
+
+    #[tokio::test]
+    async fn outcome_rejects_malformed_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let id = create(&s, "malformed outcomes").await;
+        for args in [
+            json!({ "action": "outcome", "task_id": id }),
+            json!({ "action": "outcome", "task_id": id, "summary": "no classification" }),
+            json!({ "action": "outcome", "task_id": id, "classification": "triumph", "summary": "x" }),
+            json!({ "action": "outcome", "task_id": id, "classification": "success", "summary": "   " }),
+            json!({ "action": "outcome", "classification": "success", "summary": "no task" }),
+            json!({ "action": "outcome", "task_id": "task::0000000000000000", "classification": "success", "summary": "ghost" }),
+        ] {
+            assert!(!call_err(&s, args).await.is_empty());
+        }
+        let err = call_err(&s, json!({ "action": "frobnicate", "task_id": id })).await;
+        assert!(
+            err.contains("outcome"),
+            "unknown-action help must name outcome: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_dedup_is_idempotent_over_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let a = create(&s, "task A").await;
+        let b = create(&s, "task B").await;
+        let args = |task: &str| {
+            json!({
+                "action": "outcome", "task_id": task, "classification": "partial",
+                "summary": "half the migration is done", "dedup_key": "m1",
+            })
+        };
+        let first = call(&s, args(&a)).await;
+        assert_eq!(first["duplicate"], false);
+        let replay = call(&s, args(&a)).await;
+        assert_eq!(replay["duplicate"], true);
+        assert_eq!(replay["event_id"], first["event_id"]);
+        // Same caller key on another task: distinct outcome (per-task
+        // namespacing, no cross-task collision).
+        let other = call(&s, args(&b)).await;
+        assert_eq!(other["duplicate"], false);
+        assert_ne!(other["event_id"], first["event_id"]);
+    }
+
+    #[tokio::test]
+    async fn outcome_respects_workspace_isolation_over_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_a = dir.path().join("a");
+        let ws_b = dir.path().join("b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+        let s = server_multiroot(&dir, &[ws_a.clone(), ws_b.clone()]);
+        let out = call(
+            &s,
+            json!({ "action": "create", "title": "a-task", "workspace_root": ws_a.display().to_string() }),
+        )
+        .await;
+        let id = out["task"]["task_id"].as_str().unwrap().to_string();
+        let err = call_err(
+            &s,
+            json!({
+                "action": "outcome", "task_id": id, "classification": "success",
+                "summary": "cross-workspace injection", "workspace_root": ws_b.display().to_string(),
+            }),
+        )
+        .await;
+        assert!(err.contains("workspace"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn outcome_secrets_are_redacted_over_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let secret = "sk-OUTCOME1234567890abcdef";
+        let id = create(&s, "outcome redaction").await;
+        let out = call(
+            &s,
+            json!({
+                "action": "outcome", "task_id": id, "classification": "failure",
+                "summary": format!("deploy failed with api_key=\"{secret}\""),
+                "reason": format!("token {secret}"),
+                "changed_areas": [format!("src/{secret}.rs")],
+            }),
+        )
+        .await;
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains(secret), "outcome response must be redacted");
+        let out = call(&s, json!({ "action": "inspect", "task_id": id })).await;
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(
+            !text.contains(secret),
+            "snapshot must not leak outcome secrets"
+        );
+    }
+}

@@ -261,8 +261,101 @@ pub fn report(workspace_root: &Path) -> Result<(i32, Vec<Check>)> {
         }
     }
 
+    // ── 8. P6 engineering intelligence (additive, evidence-based) ───────
+    // These checks never mutate the workspace and never invent scores.
+    // They project the persisted fact store through deterministic
+    // structural queries (stale index, cycles, fanout, orphans, parser
+    // failures, missing tests). Absent facts.json means "unknown", not
+    // failure: the existing `facts` check already covers absence.
+    {
+        let facts_path = codebro_dir.join("facts.json");
+        if let Ok(bytes) = std::fs::read(&facts_path) {
+            if let Ok(model) =
+                serde_json::from_slice::<crate::engineering_facts::FactsModel>(&bytes)
+            {
+                let store = crate::fact_store::FactStore::from_model(&model);
+                // Stale index: generation state vs current HEAD.
+                let gen = model.generation_repo_state();
+                let current = codebro_core::RepoState::capture(&root);
+                let stale = matches!((gen, current.as_ref()), (Some(p), Some(c)) if p.working_tree_hash != c.working_tree_hash);
+                // Health findings (bounded, deterministic). Severity drives
+                // the check outcome: Error → fail, Warning → warn,
+                // Info-only → pass (observations, not bugs). This keeps
+                // tiny healthy workspaces green while still surfacing
+                // structural signals for OpenCode to reason over.
+                let findings = crate::impact::health::analyze_health(&store, stale, 50);
+                if findings.is_empty() {
+                    checks.push(Check::pass(
+                        "engineering_health",
+                        "no structural findings (cycles/fanout/orphans/stale)",
+                    ));
+                } else {
+                    use crate::impact::health::FindingSeverity;
+                    let has_error = findings.iter().any(|f| {
+                        matches!(f.severity, FindingSeverity::Error)
+                            || matches!(
+                                f.finding_type,
+                                crate::impact::health::FindingType::UnresolvedReference
+                            )
+                    });
+                    let has_warning = findings
+                        .iter()
+                        .any(|f| matches!(f.severity, FindingSeverity::Warning));
+                    let summary = summarize_findings(&findings);
+                    if has_error {
+                        checks.push(Check::fail("engineering_health", summary));
+                        errors += 1;
+                    } else if has_warning {
+                        checks.push(Check::warn("engineering_health", summary));
+                        warnings += 1;
+                    } else {
+                        checks.push(Check::pass(
+                            "engineering_health",
+                            format!("{summary} (info only)"),
+                        ));
+                    }
+                }
+                // Parser limitation disclosure: file-level-only languages
+                // present in the tree are reported, never hidden.
+                {
+                    let langs: Vec<String> =
+                        model.languages().iter().map(|l| l.name.clone()).collect();
+                    let detail = if langs.is_empty() {
+                        "no language facts recorded".to_string()
+                    } else {
+                        format!("languages: {}", langs.join(", "))
+                    };
+                    checks.push(Check::pass("engineering_languages", detail));
+                }
+            }
+        } else {
+            checks.push(Check::pass(
+                "engineering_health",
+                "skipped (no facts.json; see `facts` check)",
+            ));
+        }
+    }
+
     let _ = (errors, warnings);
     Ok((compute_exit_code(&checks), checks))
+}
+
+/// Deterministic one-line summary of health findings: counts by type.
+fn summarize_findings(findings: &[crate::impact::health::HealthFinding]) -> String {
+    use std::collections::BTreeMap;
+    let mut by_type: BTreeMap<&str, usize> = BTreeMap::new();
+    for f in findings {
+        *by_type.entry(f.finding_type.as_str()).or_default() += 1;
+    }
+    let parts: Vec<String> = by_type
+        .into_iter()
+        .map(|(t, n)| format!("{t}={n}"))
+        .collect();
+    format!(
+        "{} finding(s) [{}] — evidence-based observations, not bugs",
+        findings.len(),
+        parts.join(", ")
+    )
 }
 
 /// Compute the overall exit code from the collected checks.

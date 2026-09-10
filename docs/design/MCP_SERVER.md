@@ -383,7 +383,8 @@ Structural impact analysis over the verified fact store. Answers the
 question: *"What is likely affected by changing X?"* — returning directed
 relationship edges, related tests, owning module/package, and provenance
 metadata. Supports **bounded transitive graph traversal** up to a configurable
-depth. **Descriptive evidence only; no risk scores, no prescriptions.**
+depth. **Descriptive evidence only, plus deterministic P6 risk signals
+(HIGH/MEDIUM/LOW); no prescriptions. OpenCode decides.**
 
 Arguments:
 

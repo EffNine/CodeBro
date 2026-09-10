@@ -1,10 +1,11 @@
 //! Workspace-root resolution for the CodeBro MCP runtime.
 //!
-//! A single CodeBro server process serves exactly one workspace root. Every
-//! state file (`.codebro/facts.json`, `engineering_memory.json`,
-//! `project_identity.json`, `execution_evidence.json`) and every guarded
-//! mutation ([`ChangeEngine`](crate::coding::change_engine::ChangeEngine))
-//! is bound to that root.
+//! A single CodeBro server process serves exactly one workspace root by
+//! default. Every state file (`.codebro/facts.json`,
+//! `engineering_memory.json`, `project_identity.json`,
+//! `execution_evidence.json`) and every guarded mutation
+//! ([`ChangeEngine`](crate::coding::change_engine::ChangeEngine)) is
+//! bound to that root.
 //!
 //! # Precedence
 //!
@@ -19,18 +20,35 @@
 //! boundary: serving `/tmp/link-to-repo` and `/tmp/real-repo` must resolve
 //! to the same root so identity, facts, memory, and mutation guards agree.
 //!
+//! # Additional authorized roots (P8 security boundary closure)
+//!
+//! The operator may authorize additional workspace roots at launch:
+//!
+//! - repeatable `--allow-root <path>` CLI flags on `codebro serve`, and/or
+//! - the `CODEBRO_ALLOW_ROOTS` environment variable (path-list separated
+//!   by `:` on unix, `;` on Windows).
+//!
+//! These extend the authorized set the
+//! [`WorkspaceRegistry`](crate::workspace_registry::WorkspaceRegistry)
+//! enforces: a per-call `workspace_root` tool argument must canonicalize
+//! to exactly one authorized root. Default single-root deployments change
+//! nothing — the server root alone is authorized, exactly as before.
+//!
 //! # What this module deliberately does NOT do
 //!
 //! - **No automatic git-root walk-up.** If OpenCode opens `<repo>/subdir`,
 //!   auto-climbing to `<repo>` would silently widen the ChangeEngine write
 //!   boundary beyond what the operator configured. Explicit configuration
 //!   (arg or env) is required to serve a different root.
-//! - **No per-tool workspace override.** Letting individual tool calls name
-//!   an arbitrary root would turn the single-root ChangeEngine boundary into
-//!   a per-call variable and allow writes anywhere the server process can
-//!   reach. Multi-root service requires a separate server process per root.
+//! - **No per-call authorization widening.** A `workspace_root` tool
+//!   argument selects among operator-authorized roots (discovery); it can
+//!   never add one. Multi-root service requires operator authorization
+//!   at launch (`--allow-root` / `CODEBRO_ALLOW_ROOTS`), and letting a
+//!   per-call argument name arbitrary roots would turn the single-root
+//!   ChangeEngine boundary into a per-call variable (P8 audit F3 — now
+//!   closed by the registry's authorization gate).
 //! - **No weakening of the ChangeEngine boundary.** This module only decides
-//!   *which* directory is the root; [`resolve_path`](crate::coding::change_engine)
+//!   *which* directories are roots; [`resolve_path`](crate::coding::change_engine)
 //!   still denies `..` traversal, outside-root absolutes, and symlink escape
 //!   at prepare time and again at apply time.
 
@@ -54,11 +72,24 @@ use std::path::PathBuf;
 /// ```
 pub const WORKSPACE_ROOT_ENV_VAR: &str = "CODEBRO_WORKSPACE_ROOT";
 
+/// Environment variable authorizing additional workspace roots at launch
+/// (P8 security boundary closure). Path-list separated by `:` on unix,
+/// `;` on Windows. Each entry must canonicalize to an existing directory;
+/// entries that do not are skipped with a stderr warning (the server keeps
+/// running with the roots that do resolve).
+pub const ALLOW_ROOTS_ENV_VAR: &str = "CODEBRO_ALLOW_ROOTS";
+
+/// Path-list separator for `CODEBRO_ALLOW_ROOTS` entries.
+#[cfg(windows)]
+const ALLOW_ROOTS_SEP: char = ';';
+#[cfg(not(windows))]
+const ALLOW_ROOTS_SEP: char = ':';
+
 /// Resolve the workspace root for this server process.
 ///
 /// Precedence: explicit argument > `CODEBRO_WORKSPACE_ROOT` env var >
-/// process current directory. The result is canonicalized and verified to
-/// be an existing directory; otherwise an error is returned and the caller
+/// process current directory. The result is canonicalized and verified
+/// to be an existing directory; otherwise an error is returned and the caller
 /// (CLI `serve`/`init`/`doctor`/…) fails closed instead of silently serving
 /// an empty workspace.
 pub fn resolve_workspace_root(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -79,6 +110,51 @@ pub fn resolve_workspace_root(explicit: Option<PathBuf>) -> anyhow::Result<PathB
         );
     }
     Ok(canonical)
+}
+
+/// Resolve the additional operator-authorized workspace roots for this
+/// server process (P8 security boundary closure).
+///
+/// Sources (merged, de-duplicated against the default root):
+/// - `allow_root_args`: every `--allow-root <path>` CLI flag, in order.
+/// - `CODEBRO_ALLOW_ROOTS` env var: path-list entries.
+///
+/// Each entry must canonicalize to an existing directory. Invalid entries
+/// are skipped with a warning on stderr (never stdout — protocol purity)
+/// so one bad path does not take the server down; the operator sees it
+/// immediately in the launch log. A path that canonicalizes to the default
+/// root is a harmless duplicate.
+pub fn resolve_additional_roots(allow_root_args: &[PathBuf]) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = allow_root_args.to_vec();
+    if let Ok(list) = std::env::var(ALLOW_ROOTS_ENV_VAR) {
+        for entry in list.split(ALLOW_ROOTS_SEP) {
+            let trimmed = entry.trim();
+            if !trimmed.is_empty() {
+                candidates.push(PathBuf::from(trimmed));
+            }
+        }
+    }
+
+    let mut resolved: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        match candidate.canonicalize() {
+            Ok(canon) if canon.is_dir() => {
+                if !resolved.contains(&canon) {
+                    resolved.push(canon);
+                }
+            }
+            Ok(canon) => {
+                eprintln!(
+                    "skipping --allow-root '{}': canonicalized path is not a directory",
+                    canon.display()
+                );
+            }
+            Err(e) => {
+                eprintln!("skipping --allow-root '{}': {e}", candidate.display());
+            }
+        }
+    }
+    resolved
 }
 
 /// Where the resolved root came from (for diagnostics and startup logs).
@@ -213,5 +289,67 @@ mod tests {
         let (root, source) = resolve_with_source(Some(dir.path().to_path_buf())).unwrap();
         assert_eq!(source, WorkspaceRootSource::ExplicitArg);
         assert_eq!(root, dir.path().canonicalize().unwrap());
+    }
+
+    // ── P8 root authorization: additional-roots resolution ─────────────
+
+    #[test]
+    fn additional_roots_resolve_flags_and_env() {
+        let home = tempfile::tempdir().unwrap();
+        let a = home.path().join("a");
+        let b = home.path().join("b");
+        let c = home.path().join("c");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::create_dir_all(&c).unwrap();
+        let a_canon = a.canonicalize().unwrap();
+        let b_canon = b.canonicalize().unwrap();
+        let c_canon = c.canonicalize().unwrap();
+
+        // Flag-only.
+        let via_flags = resolve_additional_roots(&[a]);
+        assert_eq!(via_flags, vec![a_canon.clone()]);
+
+        // Env-only (path list).
+        std::env::set_var(
+            ALLOW_ROOTS_ENV_VAR,
+            format!("{}:{}", b.display(), c.display()),
+        );
+        let via_env = resolve_additional_roots(&[]);
+        assert_eq!(via_env, vec![b_canon.clone(), c_canon.clone()]);
+
+        // Flags + env merge, de-duplicated, canonicalized (symlinks
+        // collapse to their targets).
+        std::env::set_var(ALLOW_ROOTS_ENV_VAR, b.display().to_string());
+        let merged = resolve_additional_roots(&[home.path().join("a"), home.path().join("b")]);
+        assert_eq!(merged, vec![a_canon.clone(), b_canon.clone()]);
+
+        std::env::remove_var(ALLOW_ROOTS_ENV_VAR);
+    }
+
+    #[test]
+    fn additional_roots_skip_invalid_entries_without_failing() {
+        let home = tempfile::tempdir().unwrap();
+        let good = home.path().join("good");
+        std::fs::create_dir_all(&good).unwrap();
+        let file_entry = home.path().join("file.txt");
+        std::fs::write(&file_entry, "x").unwrap();
+
+        std::env::set_var(
+            ALLOW_ROOTS_ENV_VAR,
+            format!(
+                "{}:{}:{}",
+                good.display(),
+                file_entry.display(),
+                home.path().join("missing").display()
+            ),
+        );
+        let resolved = resolve_additional_roots(&[]);
+        assert_eq!(
+            resolved,
+            vec![good.canonicalize().unwrap()],
+            "invalid entries are skipped; valid ones survive"
+        );
+        std::env::remove_var(ALLOW_ROOTS_ENV_VAR);
     }
 }

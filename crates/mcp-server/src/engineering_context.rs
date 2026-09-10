@@ -1,9 +1,10 @@
-//! Bounded engineering-context composition (foundation, not yet an MCP tool).
+//! Bounded engineering-context composition (foundation for the `context`
+//! MCP capability).
 //!
 //! This module composes the existing read-side runtimes — project identity,
-//! verified facts, engineering memory, and the execution-evidence journal —
-//! into a single task-relevant packet for OpenCode. It is the minimal
-//! internal foundation for a future unified context capability:
+//! verified facts, engineering memory, the execution-evidence journal, and
+//! durable context records (user-context store) — into a single
+//! task-relevant packet for OpenCode.
 //!
 //! ```text
 //! task ──► compose() ──► EngineeringContextPacket ──► OpenCode plans
@@ -11,16 +12,22 @@
 //!
 //! # Invariants
 //!
-//! - **Read-only.** `compose` never writes files, never executes commands,
-//!   never mutates `.codebro/` state. Verified by test (`composing_creates_no_files`).
-//! - **Bounded.** Every section has a hard cap; oversized memory values are
-//!   returned as explicit excerpts with a `…[truncated for context budget]`
-//!   marker, mirroring the memory resolver convention.
-//! - **No whole-store dumps.** An empty task with no filters is rejected,
-//!   exactly like `engineering_facts`: context must be task-relevant.
+//! - **Read-only.** Composition never writes files, never executes
+//!   commands, never mutates `.codebro/` state. Verified by test
+//!   (`composing_creates_no_files`). The user-context store is opened only
+//!   for reads by the caller and degrades to an empty section on error.
+//! - **Bounded.** Every section has a hard cap; oversized memory values and
+//!   context records are returned as explicit excerpts with a
+//!   `…[truncated for context budget]` marker.
+//! - **No whole-store dumps.** `compose` rejects an empty task exactly
+//!   like `engineering_facts`: context must be task-relevant.
+//!   `compose_structural` is the deliberate exception — a bounded,
+//!   task-free orientation digest for session start, clearly labelled as
+//!   structural in `notes`.
 //! - **Provenance-tagged.** Every section carries a [`ContextProvenance`]
 //!   tag so OpenCode can tell verified structure apart from agent-recorded
-//!   prose, observed execution history, and derived summaries.
+//!   prose, observed execution history, durable user context, and derived
+//!   summaries.
 //! - **No decisions made.** The packet contains evidence and pointers
 //!   (including which `impact_analyze` call to make next); OpenCode remains
 //!   the planner and decision-maker.
@@ -33,7 +40,7 @@
 //! | Tag | Meaning | Sections |
 //! |-----|---------|----------|
 //! | `verified` | Deterministic static analysis (`codebro init`) | facts |
-//! | `recorded` | Human/agent-declared intent | identity, decisions, memory |
+//! | `recorded` | Human/agent-declared intent | identity, decisions, memory, records |
 //! | `observed` | Machine-recorded execution history | evidence journal |
 //! | `derived` | Deterministic summaries computed at compose time | freshness, impact guidance |
 //!
@@ -42,6 +49,7 @@
 
 #![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
 
+use codebro_context_runtime::RankedRecord;
 use serde::{Deserialize, Serialize};
 
 // ── Bounds ────────────────────────────────────────────────────────────────
@@ -58,6 +66,10 @@ pub const MAX_DECISIONS: usize = 5;
 pub const MAX_EVIDENCE_ITEMS: usize = 5;
 /// Maximum suggested impact targets in one packet.
 pub const MAX_IMPACT_SUGGESTIONS: usize = 5;
+/// Maximum context records in one packet.
+pub const MAX_CONTEXT_RECORDS: usize = 8;
+/// Maximum characters kept per context-record content before excerpting.
+pub const MAX_RECORD_CONTENT_CHARS: usize = 240;
 /// Marker appended when a value is excerpted (matches memory convention).
 pub const TRUNCATION_MARKER: &str = "…[truncated for context budget]";
 
@@ -111,7 +123,7 @@ pub struct EngineeringContextRequest {
 
 impl EngineeringContextRequest {
     /// All keywords: task text tokens (len ≥ 3) plus explicit hints.
-    fn keywords(&self) -> Vec<String> {
+    pub fn keywords(&self) -> Vec<String> {
         let mut out: Vec<String> = self.task_keywords.clone();
         for tok in self.task.split(|c: char| !c.is_alphanumeric()) {
             if tok.len() >= 3 {
@@ -125,7 +137,7 @@ impl EngineeringContextRequest {
 
     /// A request with neither task text nor keywords cannot be made
     /// task-relevant; reject it rather than dumping the store.
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.task.trim().is_empty() && self.task_keywords.iter().all(|k| k.trim().is_empty())
     }
 }
@@ -143,6 +155,9 @@ pub struct RepositorySection {
     #[serde(default)]
     pub languages: Vec<String>,
     pub freshness: String,
+    /// Per-kind fact counts (`derived`), present when facts.json parses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fact_counts: Option<serde_json::Value>,
 }
 
 /// One decision excerpt (`recorded`).
@@ -166,6 +181,113 @@ pub struct MemoryExcerpt {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceItem {
     pub summary: String,
+}
+
+/// One durable context-record excerpt (`recorded`).
+///
+/// Records carry their kind, scope, and authority (user_confirmed /
+/// ai_inferred / observed / project_derived / imported / system_derived)
+/// so the agent can weigh them without opening the full store. Intent
+/// records additionally carry their decoded `intent_status` / `priority` /
+/// `rationale` (excerpted); a record whose intent metadata cannot be
+/// decoded never reaches the packet (see the resolution layer), so
+/// `intent` here is always well-formed when present.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextRecordExcerpt {
+    pub id: String,
+    pub kind: String,
+    pub namespace: String,
+    pub content: String,
+    pub authority: String,
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<IntentExcerpt>,
+    pub status: String,
+    pub importance: f64,
+    /// Confidence after evidence decay at retrieval time.
+    pub effective_confidence: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+/// Decoded intent metadata excerpt (bounded rationale).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntentExcerpt {
+    pub intent_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+}
+
+/// Maximum characters kept per intent rationale before excerpting.
+pub const MAX_RATIONALE_EXCERPT_CHARS: usize = 160;
+
+/// Bound an excerpt from a ranked record (content excerpted with the
+/// standard marker when longer than the budget).
+pub fn excerpt_from(ranked: &RankedRecord) -> ContextRecordExcerpt {
+    let mut content: String = ranked
+        .record
+        .content
+        .chars()
+        .take(MAX_RECORD_CONTENT_CHARS + 1)
+        .collect();
+    if content.chars().count() > MAX_RECORD_CONTENT_CHARS {
+        content = format!(
+            "{}{}",
+            content
+                .chars()
+                .take(MAX_RECORD_CONTENT_CHARS)
+                .collect::<String>(),
+            TRUNCATION_MARKER
+        );
+    }
+    ContextRecordExcerpt {
+        id: ranked.record.id.clone(),
+        kind: ranked.record.kind.to_string(),
+        namespace: ranked.record.namespace.clone(),
+        content,
+        authority: ranked.record.authority.to_string(),
+        scope: ranked.record.scope.to_string(),
+        task_id: ranked.record.task_id.clone(),
+        intent: intent_excerpt_of(ranked),
+        status: ranked.record.status.to_string(),
+        importance: ranked.record.importance,
+        effective_confidence: ranked.effective_confidence,
+        language: ranked.record.language.clone(),
+    }
+}
+
+/// Decode an intent excerpt for intent records; `None` for every other
+/// kind, and `None` (not a placeholder) when the metadata is malformed —
+/// malformed intents are excluded upstream by the resolution layer, so a
+/// `None` here on an intent record only occurs when excerpting ad-hoc.
+fn intent_excerpt_of(ranked: &RankedRecord) -> Option<IntentExcerpt> {
+    if ranked.record.kind != codebro_context_runtime::RecordKind::Intent {
+        return None;
+    }
+    let meta = codebro_context_runtime::IntentMetadata::read_from(&ranked.record).ok()?;
+    let rationale = meta.rationale.as_deref().map(|r| {
+        let mut short: String = r.chars().take(MAX_RATIONALE_EXCERPT_CHARS + 1).collect();
+        if short.chars().count() > MAX_RATIONALE_EXCERPT_CHARS {
+            short = format!(
+                "{}{}",
+                short
+                    .chars()
+                    .take(MAX_RATIONALE_EXCERPT_CHARS)
+                    .collect::<String>(),
+                TRUNCATION_MARKER
+            );
+        }
+        short
+    });
+    Some(IntentExcerpt {
+        intent_status: meta.intent_status.to_string(),
+        priority: meta.priority.map(|p| p.to_string()),
+        rationale,
+    })
 }
 
 /// Impact next-step guidance (`derived` — pointers, not analysis).
@@ -193,6 +315,9 @@ pub struct EngineeringContextPacket {
     #[serde(default)]
     pub evidence: Vec<EvidenceItem>,
     pub evidence_provenance: ContextProvenance,
+    #[serde(default)]
+    pub records: Vec<ContextRecordExcerpt>,
+    pub records_provenance: ContextProvenance,
     pub impact: ImpactGuidance,
     #[serde(default)]
     pub validation: Vec<String>,
@@ -210,10 +335,12 @@ impl EngineeringContextPacket {
 }
 
 /// Compose a bounded context packet. Read-only: loads identity, facts,
-/// memory, and the evidence journal but writes nothing and executes nothing.
+/// memory, the evidence journal, and (via the caller) durable context
+/// records but writes nothing and executes nothing.
 pub fn compose(
     workspace_root: &std::path::Path,
     request: &EngineeringContextRequest,
+    records: &[ContextRecordExcerpt],
 ) -> Result<EngineeringContextPacket, String> {
     if request.is_empty() {
         return Err(
@@ -224,14 +351,7 @@ pub fn compose(
     let keywords = request.keywords();
 
     // ── Identity (recorded) ──
-    let mut identity_rt = crate::project_identity::ProjectIdentityRuntime::new(workspace_root);
-    let identity_loaded = identity_rt.load().is_ok();
-    let snapshot = identity_rt.snapshot();
-    let project_name = if snapshot.name.is_empty() {
-        None
-    } else {
-        Some(snapshot.name.clone())
-    };
+    let (identity_loaded, snapshot) = load_identity(workspace_root);
 
     // ── Facts (verified) ──
     let store = load_fact_store(workspace_root);
@@ -280,14 +400,7 @@ pub fn compose(
     }
 
     Ok(EngineeringContextPacket {
-        repository: RepositorySection {
-            provenance: ContextProvenance::Recorded,
-            workspace_root: workspace_root.display().to_string(),
-            identity_loaded,
-            project_name,
-            languages: snapshot.languages.clone(),
-            freshness: freshness_str,
-        },
+        repository: repository_section(workspace_root, &snapshot, identity_loaded, &store, freshness_str),
         facts,
         facts_provenance: ContextProvenance::Verified,
         decisions,
@@ -296,6 +409,8 @@ pub fn compose(
         memory_provenance: ContextProvenance::Recorded,
         evidence,
         evidence_provenance: ContextProvenance::Observed,
+        records: records.to_vec(),
+        records_provenance: ContextProvenance::Recorded,
         impact: ImpactGuidance {
             provenance: ContextProvenance::Derived,
             note: "call impact_analyze with one specific symbol, file, module, or package — this packet only suggests starting points, it performs no traversal itself".to_string(),
@@ -309,7 +424,96 @@ pub fn compose(
     })
 }
 
+/// Compose a bounded, task-free orientation digest for session start.
+///
+/// Unlike [`compose`], this does not rank facts/memory (there is no task to
+/// be relevant to). It returns identity, fact counts, evidence status, and
+/// durable context records, and always labels itself structural in `notes`
+/// so it is never mistaken for task-relevant context.
+pub fn compose_structural(
+    workspace_root: &std::path::Path,
+    records: &[ContextRecordExcerpt],
+) -> Result<EngineeringContextPacket, String> {
+    let (identity_loaded, snapshot) = load_identity(workspace_root);
+    let store = load_fact_store(workspace_root);
+    let freshness = crate::mcp::facts::compute_freshness(&store, workspace_root);
+    let (evidence, mut notes) = read_evidence(workspace_root);
+    notes.push(
+        "structural digest — no task supplied, so facts/memory were not ranked; describe the task to get task-relevant context"
+            .to_string(),
+    );
+    Ok(EngineeringContextPacket {
+        repository: repository_section(
+            workspace_root,
+            &snapshot,
+            identity_loaded,
+            &store,
+            freshness.to_string(),
+        ),
+        facts: Vec::new(),
+        facts_provenance: ContextProvenance::Verified,
+        decisions: Vec::new(),
+        decisions_provenance: ContextProvenance::Recorded,
+        memory: Vec::new(),
+        memory_provenance: ContextProvenance::Recorded,
+        evidence,
+        evidence_provenance: ContextProvenance::Observed,
+        records: records.to_vec(),
+        records_provenance: ContextProvenance::Recorded,
+        impact: ImpactGuidance {
+            provenance: ContextProvenance::Derived,
+            note: "no task given — impact guidance resumes once a task is supplied".to_string(),
+            suggested_targets: Vec::new(),
+        },
+        validation: vec![],
+        notes,
+    })
+}
+
 // ── Internal composition helpers (each delegates, none duplicates) ────────
+
+fn load_identity(
+    workspace_root: &std::path::Path,
+) -> (bool, crate::project_identity::ProjectIdentity) {
+    let mut identity_rt = crate::project_identity::ProjectIdentityRuntime::new(workspace_root);
+    let identity_loaded = identity_rt.load().is_ok();
+    (identity_loaded, identity_rt.snapshot())
+}
+
+/// Build the repository orientation section (`recorded` + `derived`):
+/// identity digest plus per-kind fact counts.
+fn repository_section(
+    workspace_root: &std::path::Path,
+    snapshot: &crate::project_identity::ProjectIdentity,
+    identity_loaded: bool,
+    store: &crate::fact_store::FactStore,
+    freshness: String,
+) -> RepositorySection {
+    let counts = store.collection().counts();
+    RepositorySection {
+        provenance: ContextProvenance::Recorded,
+        workspace_root: workspace_root.display().to_string(),
+        identity_loaded,
+        project_name: if snapshot.name.is_empty() {
+            None
+        } else {
+            Some(snapshot.name.clone())
+        },
+        languages: snapshot.languages.clone(),
+        freshness,
+        fact_counts: Some(serde_json::json!({
+            "modules": counts.modules,
+            "packages": counts.packages,
+            "symbols": counts.symbols,
+            "tests": counts.tests,
+            "build_targets": counts.build_targets,
+            "dependencies": counts.dependencies,
+            "relationships": counts.relationships,
+            "references": counts.references,
+            "total": counts.total,
+        })),
+    }
+}
 
 fn load_fact_store(workspace_root: &std::path::Path) -> crate::fact_store::FactStore {
     let path = workspace_root.join(".codebro/facts.json");
@@ -503,13 +707,13 @@ mod tests {
     fn empty_task_is_rejected_not_dumped() {
         let dir = temp_root();
         let req = EngineeringContextRequest::default();
-        assert!(compose(dir.path(), &req).is_err());
+        assert!(compose(dir.path(), &req, &[]).is_err());
     }
 
     #[test]
     fn fresh_workspace_yields_empty_categories_with_notes() {
         let dir = temp_root();
-        let packet = compose(dir.path(), &request("Fix failing authentication test")).unwrap();
+        let packet = compose(dir.path(), &request("Fix failing authentication test"), &[]).unwrap();
         assert!(!packet.repository.workspace_root.is_empty());
         assert!(!packet.repository.identity_loaded);
         assert!(packet.facts.is_empty());
@@ -525,7 +729,7 @@ mod tests {
     fn composing_creates_no_files() {
         let dir = temp_root();
         let before = codebro_files(dir.path());
-        let _ = compose(dir.path(), &request("investigate parser failure")).unwrap();
+        let _ = compose(dir.path(), &request("investigate parser failure"), &[]).unwrap();
         // Composition may READ .codebro state but must never create it.
         assert_eq!(codebro_files(dir.path()), before);
     }
@@ -540,7 +744,7 @@ mod tests {
         let _ = memory.load();
         // Seed via file so the test does not depend on record() internals:
         // memory resolution reads the same store compose() reads.
-        let packet = compose(dir.path(), &request("memory separation probe")).unwrap();
+        let packet = compose(dir.path(), &request("memory separation probe"), &[]).unwrap();
         // With no facts file and no memory entries, both sections are empty
         // but carry DISTINCT provenance tags — never merged.
         assert!(packet.facts.is_empty() || packet.memory.is_empty());
@@ -553,7 +757,7 @@ mod tests {
     #[test]
     fn provenance_tags_cover_all_sections() {
         let dir = temp_root();
-        let packet = compose(dir.path(), &request("audit provenance tags")).unwrap();
+        let packet = compose(dir.path(), &request("audit provenance tags"), &[]).unwrap();
         let json = serde_json::to_value(&packet).unwrap();
         for section in [
             "facts_provenance",
@@ -571,7 +775,7 @@ mod tests {
     fn packet_is_bounded_on_seeded_workspace() {
         let dir = temp_root();
         crate::init::run(dir.path()).unwrap();
-        let packet = compose(dir.path(), &request("investigate change engine")).unwrap();
+        let packet = compose(dir.path(), &request("investigate change engine"), &[]).unwrap();
         assert!(packet.facts.len() <= MAX_FACTS);
         assert!(packet.memory.len() <= MAX_MEMORY_ENTRIES);
         assert!(packet.decisions.len() <= MAX_DECISIONS);
@@ -583,6 +787,63 @@ mod tests {
                     <= MAX_MEMORY_VALUE_CHARS + TRUNCATION_MARKER.chars().count()
             );
         }
+        assert!(packet.serialized_len() < 16384);
+    }
+
+    #[test]
+    fn structural_digest_needs_no_task() {
+        let dir = temp_root();
+        let packet = compose_structural(dir.path(), &[]).unwrap();
+        // Orientation fields present; ranked sections deliberately empty.
+        assert!(!packet.repository.workspace_root.is_empty());
+        assert!(!packet.repository.identity_loaded);
+        assert!(packet.facts.is_empty());
+        assert!(packet.memory.is_empty());
+        assert!(packet.records.is_empty());
+        // The digest labels itself structural so it is never mistaken for
+        // task-relevant context.
+        assert!(packet.notes.iter().any(|n| n.contains("structural digest")));
+    }
+
+    #[test]
+    fn records_section_is_provenance_tagged_and_bounded() {
+        let dir = temp_root();
+        let ranked = RankedRecord {
+            record: codebro_context_runtime::ContextRecord::new(
+                "ctx::a",
+                codebro_context_runtime::RecordKind::Preference,
+                "fp.communication.verbosity",
+                "Prefers direct concise replies",
+                codebro_context_runtime::Authority::UserConfirmed,
+            ),
+            bm25: None,
+            effective_confidence: 0.9,
+        };
+        let excerpts = vec![excerpt_from(&ranked)];
+        let packet = compose(dir.path(), &request("how should I reply?"), &excerpts).unwrap();
+        assert_eq!(packet.records.len(), 1);
+        assert_eq!(packet.records[0].authority, "user_confirmed");
+        assert_eq!(packet.records_provenance, ContextProvenance::Recorded);
+
+        // Excerpts are bounded even for oversized content.
+        let mut big = ranked.clone();
+        big.record.content = "x".repeat(10_000);
+        let ex = excerpt_from(&big);
+        assert!(
+            ex.content.chars().count()
+                <= MAX_RECORD_CONTENT_CHARS + TRUNCATION_MARKER.chars().count()
+        );
+        assert!(ex.content.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn structural_digest_reports_fact_counts_when_store_exists() {
+        let dir = temp_root();
+        crate::init::run(dir.path()).unwrap();
+        let packet = compose_structural(dir.path(), &[]).unwrap();
+        let counts = packet.repository.fact_counts.as_ref().expect("fact counts");
+        assert!(counts["modules"].is_number());
+        assert!(counts["total"].as_u64().unwrap() > 0);
         assert!(packet.serialized_len() < 16384);
     }
 }

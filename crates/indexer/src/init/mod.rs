@@ -28,6 +28,7 @@ use crate::engineering_facts::{
 
 /// Run the population pipeline for a workspace root and persist the model.
 pub mod cache;
+pub mod engineering;
 pub mod graph_edges;
 pub mod repo_intel;
 
@@ -365,7 +366,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         &impl_scopes,
     );
     if rel_count > 0 {
-        println!("  relationships: {rel_count}");
+        eprintln!("  relationships: {rel_count}");
     }
 
     // ── Link tests to the symbols they exercise ───────────────────────
@@ -535,36 +536,36 @@ pub fn run(workspace_root: &Path) -> Result<()> {
     // clobbers curated identity data (goals, constraints, decisions).
     let patterns = repo_intel::detect_patterns(&root, &pkg_deps, &lang_stats);
     match refresh_identity(&root, &ws_name, &arch_summary, &top_modules, &patterns) {
-        Ok(true) => println!("  identity:    refreshed"),
+        Ok(true) => eprintln!("  identity:    refreshed"),
         Ok(false) => {}
         Err(e) => {
             tracing::warn!("identity refresh skipped: {e}");
-            println!("  identity:    refresh failed ({e})");
+            eprintln!("  identity:    refresh failed ({e})");
         }
     }
 
     let counts = model.counts();
-    println!("codebro init complete");
-    println!("  workspace:   {ws_name}");
-    println!("  packages:    {}", counts.packages);
-    println!("  modules:     {}", counts.modules);
-    println!("  symbols:     {}", counts.symbols);
-    println!("  tests:       {}", counts.tests);
-    println!("  build targets: {}", counts.build_targets);
-    println!("  dependencies: {}", counts.dependencies);
-    println!("  relationships: {}", counts.relationships);
-    println!("  references:    {}", counts.references);
-    println!("  languages:     {}", counts.languages);
-    println!("  frameworks:    {}", counts.frameworks);
-    println!("  entry points:  {}", counts.entry_points);
-    println!("  parse cache:   {cache_hits} reused, {cache_misses} parsed");
+    eprintln!("codebro init complete");
+    eprintln!("  workspace:   {ws_name}");
+    eprintln!("  packages:    {}", counts.packages);
+    eprintln!("  modules:     {}", counts.modules);
+    eprintln!("  symbols:     {}", counts.symbols);
+    eprintln!("  tests:       {}", counts.tests);
+    eprintln!("  build targets: {}", counts.build_targets);
+    eprintln!("  dependencies: {}", counts.dependencies);
+    eprintln!("  relationships: {}", counts.relationships);
+    eprintln!("  references:    {}", counts.references);
+    eprintln!("  languages:     {}", counts.languages);
+    eprintln!("  frameworks:    {}", counts.frameworks);
+    eprintln!("  entry points:  {}", counts.entry_points);
+    eprintln!("  parse cache:   {cache_hits} reused, {cache_misses} parsed");
     if skipped_oversized > 0 {
-        println!(
+        eprintln!(
             "  skipped:     {skipped_oversized} oversized source files (>{} KiB)",
             MAX_SOURCE_FILE_BYTES / 1024
         );
     }
-    println!("  facts file:  {}", out.display());
+    eprintln!("  facts file:  {}", out.display());
 
     Ok(())
 }
@@ -1689,9 +1690,9 @@ pub fn compute_facts_diff(root: &Path) -> Result<FactsDiffReport> {
 pub fn facts_diff(root: &Path) -> Result<()> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let report = compute_facts_diff(&root)?;
-    println!("facts diff — {}", root.display());
+    eprintln!("facts diff — {}", root.display());
     if report.digests_missing {
-        println!(
+        eprintln!(
             "  note: stored facts carry no per-file digests; run `codebro init` to enable precise diffs"
         );
     }

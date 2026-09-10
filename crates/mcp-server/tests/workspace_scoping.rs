@@ -140,6 +140,7 @@ fn facts_loading_empty_then_populated() {
             task: "facts loading probe".to_string(),
             ..Default::default()
         },
+        &[],
     )
     .unwrap();
     assert!(packet.facts.is_empty());
@@ -172,6 +173,7 @@ fn fresh_workspace_context_is_honest_and_bounded() {
             task: "fresh workspace probe".to_string(),
             ..Default::default()
         },
+        &[],
     )
     .unwrap();
     assert!(!packet.repository.identity_loaded);

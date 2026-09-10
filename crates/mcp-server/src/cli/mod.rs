@@ -25,6 +25,11 @@ enum Commands {
         /// Workspace root to serve; defaults to CODEBRO_WORKSPACE_ROOT or the current directory.
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Additional workspace root the server may operate on (P8 root
+        /// authorization). Repeatable; per-call workspace_root arguments
+        /// must resolve to the server root or one of these.
+        #[arg(long = "allow-root")]
+        allow_root: Vec<PathBuf>,
     },
 
     /// Scan the workspace and populate .codebro/facts.json.
@@ -128,15 +133,19 @@ pub async fn run() -> Result<()> {
                 println!("  {}", m);
             }
         }
-        Some(Commands::Serve { root }) => {
+        Some(Commands::Serve { root, allow_root }) => {
             let (workspace_root, source) = crate::workspace::resolve_with_source(root)?;
+            // P8 root authorization: additional roots come only from the
+            // operator (--allow-root flags and/or CODEBRO_ALLOW_ROOTS).
+            let extra_roots = crate::workspace::resolve_additional_roots(&allow_root);
             tracing::info!(
-                "CodeBro serving workspace {} (via {})",
+                "CodeBro serving workspace {} (via {}); {} authorized root(s)",
                 workspace_root.display(),
-                source
+                source,
+                extra_roots.len() + 1
             );
 
-            let mcp_result = crate::mcp::serve(workspace_root).await;
+            let mcp_result = crate::mcp::serve(workspace_root, extra_roots).await;
             if let Err(e) = &mcp_result {
                 tracing::warn!("MCP server exited: {e}");
             }

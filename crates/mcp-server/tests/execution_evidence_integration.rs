@@ -82,6 +82,10 @@ struct Server {
     child: Child,
     stdin: BufWriter<ChildStdin>,
     reader: std::io::BufReader<ChildStdout>,
+    // Hermetic user-context state for the child server process (auto-
+    // cleaned): spawned servers run sandbox paths whose passive history
+    // capture must never touch the real ~/.codebro/state.db.
+    _state: tempfile::TempDir,
 }
 
 type ChildStdin = std::process::ChildStdin;
@@ -90,9 +94,14 @@ type ChildStdout = std::process::ChildStdout;
 impl Server {
     fn start(root: &Path) -> Self {
         let bin = env!("CARGO_BIN_EXE_codebro");
+        let state = tempfile::Builder::new()
+            .prefix("evj-state")
+            .tempdir()
+            .expect("state tempdir");
         let mut child = Proc::new(bin)
             .args(["serve", "--root"])
             .arg(root)
+            .env("CODEBRO_STATE_DIR", state.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -104,6 +113,7 @@ impl Server {
             child,
             stdin,
             reader,
+            _state: state,
         };
         s.rpc(
             "initialize",

@@ -19,6 +19,7 @@ codebro-sandbox-runtime = { path = "crates/sandbox-runtime" }
 codebro-impact-engine = { path = "crates/impact-engine" }
 codebro-indexer = { path = "crates/indexer" }
 codebro-change-engine = { path = "crates/change-engine" }
+codebro-context-runtime = { path = "crates/context-runtime" }
 
 anyhow = "1"
 async-trait = "0.1"

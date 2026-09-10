@@ -608,6 +608,9 @@ mod tests {
                 project_id: "abc123".to_string(),
                 root: "/workspace".to_string(),
                 repository_type: "cargo".to_string(),
+                canonical_root: Some("/workspace".to_string()),
+                git_remote: None,
+                commit_sha: None,
             }),
             repo_state: Some(crate::repo_state::RepoState {
                 commit_sha: "deadbeef".to_string(),
@@ -864,6 +867,9 @@ mod tests {
                 project_id: "p".to_string(),
                 root: "/workspace".to_string(),
                 repository_type: "cargo".to_string(),
+                canonical_root: Some("/workspace".to_string()),
+                git_remote: None,
+                commit_sha: None,
             }),
             repo_state: Some(crate::repo_state::RepoState {
                 commit_sha: "abc".to_string(),
@@ -1102,6 +1108,9 @@ mod tests {
                 project_id: "proj".to_string(),
                 root: "/workspace".to_string(),
                 repository_type: "cargo".to_string(),
+                canonical_root: Some("/workspace".to_string()),
+                git_remote: None,
+                commit_sha: None,
             }),
             repo_state: Some(crate::repo_state::RepoState {
                 commit_sha: "abc123".to_string(),
