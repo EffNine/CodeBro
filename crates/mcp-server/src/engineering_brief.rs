@@ -2027,75 +2027,49 @@ fn skills_section(
     use crate::context_runtime::SkillStatus;
     let mut out: Vec<BriefSkill> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let repo_langs: BTreeSet<String> = inputs
-        .identity
-        .languages
-        .iter()
-        .map(|l| l.to_lowercase())
-        .collect();
+    // Registry skills go through the single deterministic selection
+    // implementation (context-runtime::skill_selection) — the brief never
+    // reimplements applicability. Task text for selection is the brief's
+    // task plus keyword hints; the selector tokenizes deterministically.
     let listed = inputs
         .context_store
         .list_skills(Some(&inputs.workspace_key), Some(SkillStatus::Active), 100)
         .unwrap_or_default();
-    for s in listed {
-        let langs: BTreeSet<String> = s
-            .applicability
-            .languages
-            .iter()
-            .map(|l| l.to_lowercase())
-            .collect();
-        let subs: Vec<String> = s
-            .applicability
-            .subsystems
-            .iter()
-            .map(|x| x.to_lowercase())
-            .collect();
-        let lang_hit = !langs.is_empty() && !langs.is_disjoint(&repo_langs);
-        let sub_hit = subs.iter().any(|sub| {
-            keywords.iter().any(|k| {
-                k.len() >= 3
-                    && (sub.contains(k.to_lowercase().as_str())
-                        || k.to_lowercase().contains(sub.as_str()))
-            })
-        });
-        let unscoped = langs.is_empty() && subs.is_empty();
-        let (applicable, reason) = if lang_hit {
-            (
-                true,
-                format!(
-                    "repository language matches skill applicability ({})",
-                    s.applicability.languages.join(", ")
-                ),
-            )
-        } else if sub_hit {
-            (
-                true,
-                "task keywords overlap skill subsystem applicability".to_string(),
-            )
-        } else if unscoped {
-            (
-                false,
-                "skill declares no language/subsystem applicability — relevance is uncertain"
-                    .to_string(),
-            )
-        } else {
-            continue;
-        };
-        if seen.insert(s.name.clone()) {
+    let sel_request = crate::context_runtime::skill_selection::SkillSelectionRequest {
+        task_text: request.task.clone(),
+        keywords: keywords.to_vec(),
+        workspace_root: inputs.workspace_key.clone(),
+        task_id: request
+            .task_id
+            .clone()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        repo_languages: inputs.identity.languages.clone(),
+        limit: Some(MAX_BRIEF_SKILLS),
+    };
+    // Active-only listing above, but the selector enforces executability
+    // again (defense in depth: degraded/excluded rows never surface as
+    // applicable here).
+    let selection =
+        crate::context_runtime::skill_selection::select_applicable_skills(&listed, &sel_request);
+    for ranked in &selection.applicable {
+        let (applicable, reason) =
+            crate::context_runtime::skill_selection::brief_reason_summary(ranked);
+        if seen.insert(ranked.name.clone()) {
             out.push(BriefSkill {
-                name: s.name.clone(),
+                name: ranked.name.clone(),
                 // Defense in depth: skill rows persist write-time redaction,
                 // but the brief projection redacts again so a legacy or
                 // externally-seeded row can never leak a secret through
                 // a brief.
                 description: excerpt(
-                    &crate::tools::shell::redact_secrets_public(&s.description),
+                    &crate::tools::shell::redact_secrets_public(&ranked.description),
                     MAX_BRIEF_EXCERPT_CHARS,
                 ),
                 applicable,
                 applicability_reason: reason,
-                status: s.status.clone(),
-                version: s.current_version,
+                status: ranked.status.clone(),
+                version: ranked.version,
                 origin: "registry".to_string(),
                 category: category::SKILL.to_string(),
                 provenance: provenance::RECORDED.to_string(),

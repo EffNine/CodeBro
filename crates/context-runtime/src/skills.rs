@@ -193,6 +193,10 @@ impl SkillCandidateStatus {
     /// Deferred — drafted/validated/approved content never silently
     /// expires), deprecation and supersession from post-activation.
     /// Deferred may be re-evaluated or explicitly rejected.
+    /// P10 adds Validated → Deferred: a human approver may defer a
+    /// validated candidate through the approval protocol (resumable via
+    /// Deferred → Evaluating re-evaluation); the automated pass never
+    /// defers on its own.
     pub fn can_transition_to(&self, target: &SkillCandidateStatus) -> bool {
         use SkillCandidateStatus::*;
         matches!(
@@ -209,6 +213,7 @@ impl SkillCandidateStatus {
                 | (Draft, Rejected)
                 | (Validated, Approved)
                 | (Validated, Rejected)
+                | (Validated, Deferred)
                 | (Approved, Active)
                 | (Approved, Rejected)
                 | (Approved, Superseded)

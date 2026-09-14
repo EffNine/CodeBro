@@ -42,6 +42,7 @@ uuid.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 walkdir.workspace = true
 tempfile.workspace = true
 toml.workspace = true
