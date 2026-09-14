@@ -78,10 +78,12 @@ fn mid_transaction_failure_rolls_back_applied_changes() {
     // path via rollback_changes.)
     let report = engine.apply_transaction(&tx).unwrap();
     assert!(report.success());
-    // Note: the patch seam normalizes a trailing newline on write.
+    // The patch seam writes the declared content exactly: a file without a
+    // trailing newline is rewritten without one (the old normalization
+    // silently produced bytes the caller did not request).
     assert_eq!(
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-        "KEEP me\n"
+        "KEEP me"
     );
     assert!(dir.path().join("new.txt").exists());
 

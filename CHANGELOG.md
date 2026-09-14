@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Execution-state reliability gate (edit → verification → completion)** — closes the failure class where an agent claims an implementation succeeded although the edit failed, applied partially, produced invalid code, or left the build/tests broken. No new MCP tool (stays 25), no schema change (stays v7).
+  (1) **Post-apply edit verification** — `ChangeEngine::verify_applied` re-reads every written file after `apply`/`apply_transaction` and confirms the on-disk bytes equal the prepared intent (`target_exists`, `readable`, `content_matches_intent`); a mismatch rolls the change (or the whole transaction) back from the preparation-time snapshot and returns a tool error — a failed edit is never reported as applied. `apply_change`/`apply_changes` responses carry `status: "applied_unverified"`, the `edit_verification` evidence, and `verification_status: "unverified"` until a build/test passes.
+  (2) **Current-tree execution state** — `evidence_journal::assess` reduces the durable execution-evidence journal for the CURRENT working-tree hash into a deterministic `execution_state` (`failed | verified | unverified | unknown`) with bounded unresolved-failure evidence (command, classification, exit code, failed tests, diagnostic digests, age). Any edit changes the tree hash, so stale evidence never applies; a failure is resolved only by a later recorded success of the same invocation (identical command; identical filter or a full run) — prose never clears evidence. `compile_error`/`test_failure` are authoritative and block; `timeout`/`unknown_failure` are inconclusive, surfaced as `unverified` without blocking.
+  (3) **Completion gate** — `task complete` and `task outcome classification=success` are refused while authoritative unresolved failures apply to the current tree, with the failure evidence in the bounded error; `failure`/`partial` reports remain available.
+  (4) **Surfacing** — `execution_state` appears in `workspace_context`, `context` (packet + `notes`), `task inspect`, `task complete/outcome` responses, and every `sandbox_test`/`sandbox_build` verification result.
+  (5) **Exact write semantics** — `PatchEngine` now writes the declared target content exactly with an exactness gate that refuses a reconstruction diverging from the declared target.
+
+### Fixed
+- **Patch seam trailing-newline drift** — applying an edit to a file without a trailing newline silently appended one; the reconstructed bytes differed from the requested `new` content. `PatchEngine::apply` now verifies reconstruction against the declared target and refuses on divergence. Regression: `test_apply_preserves_absent_final_newline` (`crates/core/src/tools/change.rs`); the transaction fixture's documented normalization expectation was corrected.
+
+### Tests
+- 10 evidence-journal assessment unit tests (unresolved vs superseded vs inconclusive, tree scoping, shown-bound vs honest totals, non-git workspace); 4 ChangeEngine post-apply/rollback tests; 3 MCP execution-state gate tests (refusal until resolved, session-start/inspect surfacing, inconclusive non-blocking); 2 apply-response semantics tests. New real-binary E2E suite `crates/mcp-server/tests/execution_state_e2e.rs` (3 probes: edit → fail → blocked completion/outcome → fix → verified → complete; failure state visible at session start; stale-tree failure invalidated by a new edit). Existing suite green, clippy `-D warnings` clean, fmt clean, dependency-direction check OK.
+
+---
+
 ## [1.0.0] - 2026-09-10
 
 ### Added

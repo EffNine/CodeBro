@@ -145,11 +145,11 @@ errors — they return structured payloads with recovery hints.
 | `record_memory` | `key` ≤256ch, `value` ≤64KB (secret-redacted), `tags[]` ≤32×64ch, `confidence`, `importance`, `source?`, `expires_in_secs?`, `session?` | upsert by key replaces full logical entry preserving id/created_at; key conflicts supersede prior entry with lineage; near-duplicates flagged; writes never touch the fact store |
 | `delete_memory` | `key`, `confirm=true` (else no-op) | deleting missing keys errors |
 | `update_identity` | description/constraints/decisions/roadmap/sprint/conventions/patterns/architecture_summary | list fields append unique entries; duplicates reported skipped; requires existing identity; every free-text field is secret-redacted at write (same redaction authority as remember/task/record_memory) |
-| `apply_change` | `path`, `old` (empty = create), `new` | single-file guarded mutation: boundary, traversal denial, symlink escape prevention, stale-content protection, ambiguity rejection; response includes `recommended_tests` (edited-symbol linkage, cap 32) and invalidation advisory |
-| `apply_changes` | `changes[]{path,old,new}` | multi-file transaction: validate all against current content → conflict pass re-checks staleness across the set → sequential apply with rollback on first failure; all-or-nothing |
-| `sandbox_exec` | `command` (read-only build/test/lint policy), `working_directory?`, `timeout?`, `metadata?` | fail-closed execution; full evidence envelope below |
-| `sandbox_build` | same contract as sandbox_test (auto: cargo check/go build/npm-pnpm-yarn run build) | build/check verification |
-| `sandbox_test` | `command?`, `test_filter?` (targeted names; cargo/go/pytest runners), `expected_exit_code?`, `expected_success?`, `affected_fact_ids?` | auto-detected runner + pass/fail verification with violations, parsed `diagnostics`, coarse `classification`, `affected_modules`, `related_recent_changes` (in-session edit correlation), and deterministic `root_cause` hypotheses on failures |
+| `apply_change` | `path`, `old` (empty = create), `new` | single-file guarded mutation: boundary, traversal denial, symlink escape prevention, stale-content protection, ambiguity rejection; post-apply read-back (`edit_verification`) — a mismatch rolls back and errors; response `status=applied_unverified`, `verification_status=unverified` until a build/test passes, plus `recommended_tests` (edited-symbol linkage, cap 32) and invalidation advisory |
+| `apply_changes` | `changes[]{path,old,new}` | multi-file transaction: validate all against current content → conflict pass re-checks staleness across the set → sequential apply with rollback on first failure; every file read back after apply, any mismatch rolls the whole set back and errors; all-or-nothing; same `applied_unverified` semantics |
+| `sandbox_exec` | `command` (read-only build/test/lint policy), `working_directory?`, `timeout?`, `metadata?` | fail-closed execution; full evidence envelope below; raw execution — does NOT produce durable validation evidence |
+| `sandbox_build` | same contract as sandbox_test (auto: cargo check/go build/npm-pnpm-yarn run build) | build/check verification; recorded durably per tree hash and returned as `execution_state` |
+| `sandbox_test` | `command?`, `test_filter?` (targeted names; cargo/go/pytest runners), `expected_exit_code?`, `expected_success?`, `affected_fact_ids?` | auto-detected runner + pass/fail verification with violations, parsed `diagnostics`, coarse `classification`, `affected_modules`, `related_recent_changes` (in-session edit correlation), deterministic `root_cause` hypotheses on failures, and current-tree `execution_state` (`failed | verified | unverified | unknown`) |
 | `consult` | `question`, `provider` {auto,conductor}, `mode` {architecture,debugging,code_review,planning,research,second_opinion}, file contexts, context flags | opinion injection of engineering context; never mutates state |
 
 ### Execution evidence envelope (v1)
@@ -172,7 +172,17 @@ Every `sandbox_*` execution returns:
     "reproducibility": "deterministic|likely_deterministic|non_deterministic|unknown",
     "environment": {"os","arch","family"}
   },
-  "verification": {"verified", "summary", "violations", ["impacted_fact_ids"]}
+  "verification": {
+    "verified", "summary", "violations", ["impacted_fact_ids"],
+    ["diagnostics"], ["classification"], ["affected_modules"],
+    ["prior_evidence"], ["related_recent_changes"], ["root_cause"],
+    "execution_state": {
+      "state": "failed | verified | unverified | unknown",
+      "tree_hash?", ["unresolved_failures"], "unresolved_failures_total",
+      ["inconclusive_failures"], "inconclusive_failures_total",
+      "last_success?", "evidence_records", "note"
+    }
+  }
 }
 ```
 

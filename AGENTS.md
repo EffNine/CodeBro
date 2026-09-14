@@ -51,18 +51,18 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 
 | Tool | R/W | Description |
 |---|---|---|
-| `workspace_context` | read | Project orientation: identity, root, fact counts |
+| `workspace_context` | read | Project orientation: identity, root, fact counts, `execution_state` (current-tree failure/verification evidence) |
 | `engineering_facts` | read | Relevance-ranked fact retrieval (lexical matching, not embeddings). Filters: `query`, `kind`, `path`, `limit` |
 | `engineering_memory` | read | Resolve persistent memory by task keywords. Entries carry confidence, source, tags |
 | `memory_stats` | read | Store stats: entry count, token budget, tag distribution, confidence, recency |
 | `record_memory` | write | Upsert a memory entry (secret-redacted). Updating a key replaces the full logical entry |
 | `delete_memory` | write | Delete by exact key. **Requires `confirm=true`** — omitting is a no-op |
 | `update_identity` | write | Update project identity (`.codebro/project_identity.json`). Requires existing identity. All free-text fields (decisions, constraints, summaries, roadmap, milestones) secret-redacted at write |
-| `apply_change` | write | Guarded single-file mutation via ChangeEngine. For new files pass `old=""` |
-| `apply_changes` | write | Transactional multi-file mutation: validate → conflict check → apply with rollback |
-| `sandbox_exec` | write | Execute command in isolated sandbox. Read-only build/test/lint only |
-| `sandbox_test` | write | Run tests with structured verification. Auto-detects project type |
-| `sandbox_build` | write | Build/check with structured verification |
+| `apply_change` | write | Guarded single-file mutation via ChangeEngine. For new files pass `old=""`. Post-apply read-back verification (`edit_verification`); response is `status=applied_unverified`, `verification_status=unverified` until a build/test passes |
+| `apply_changes` | write | Transactional multi-file mutation: validate → conflict check → apply with rollback; every file read back after apply, any mismatch rolls the whole set back and fails the call. Same `applied_unverified` response semantics |
+| `sandbox_exec` | write | Execute command in isolated sandbox. Read-only build/test/lint only. Raw execution — does NOT produce durable validation evidence |
+| `sandbox_test` | write | Run tests with structured verification. Auto-detects project type. Passing/failing runs are recorded durably per tree hash and returned as `execution_state` |
+| `sandbox_build` | write | Build/check with structured verification. Passing/failing runs are recorded durably per tree hash and returned as `execution_state` |
 | `sandbox_status` | read | Sandbox runtime status and capabilities |
 | `impact_analyze` | read | Structural impact: directed edges, related tests, provenance |
 | `reindex` | write | Full fact reindex via `codebro init` pipeline |
@@ -74,7 +74,7 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 | `recall` | read | Query-driven historical evidence: session-grouped bounded excerpts (decisions, failures, validations, changes) with session/timestamp/scope/task provenance. Task history invisible without its task; `scope=global` opts into cross-workspace search. Read-only — recalls write nothing |
 | `learn` | write | Cautious hypotheses from history: run/propose detect recurring patterns (deterministic, ≥3 support); list/get inspect with explanations; evaluate weighs supporting vs contradicting evidence (bounded confidence); accepted hypotheses persist as AI_INFERRED (never USER_CONFIRMED); confirm requires user_confirmed=true; reject preserves negative knowledge. No learn action writes history. Serializes mutating actions on the workspace mutation lock |
 | `skill` | write | Skill lifecycle: discover, propose, inspect, validate, approve, reject, deprecate, rollback, health. Evidence-backed candidates (accepted P3 learning only), immutable versioned publication, secret-redacted descriptions/purposes at propose (all identity free-text likewise redacted at update_identity), `user_confirmed`-gated approval, optimistic-concurrency stale-writer refusal, workspace/scope enforcement on every action, atomic + symlink-safe SKILL.md publication, deprecation removes the artifact. CodeBro owns lifecycle; OpenCode executes skills natively |
-| `task` | write | Durable engineering task runtime: list, stale, create, inspect, start, pause, resume, checkpoint, validate, validation_result, complete, fail, cancel, outcome (P9: structured outcome evidence — classification + bounded evidence + authority, no transition), skill_refs. Strict lifecycle (pending → running → paused/validating → completed/failed/cancelled) with a completion gate (passed validation required), immutable versioned checkpoints (atomic row+pointer+event in one tx), worker leases with fencing (`wkr::` ids, `lease_version`; stale workers refused), `based_on_version` optimistic concurrency, idempotency-key dedup, interrupted tasks recoverable only via explicit resume (never auto-completed), bounded resume snapshots, workspace isolation at every seam, every free-text field (incl. skill refs) redacted. Request-driven — no scheduler/daemon; OpenCode remains the executor |
+| `task` | write | Durable engineering task runtime: list, stale, create, inspect, start, pause, resume, checkpoint, validate, validation_result, complete, fail, cancel, outcome (P9: structured outcome evidence — classification + bounded evidence + authority, no transition), skill_refs. Strict lifecycle (pending → running → paused/validating → completed/failed/cancelled) with a completion gate (passed validation required) and the execution-state gate (`complete` and `outcome=success` refused while unresolved compile/test failures apply to the current tree), immutable versioned checkpoints (atomic row+pointer+event in one tx), worker leases with fencing (`wkr::` ids, `lease_version`; stale workers refused), `based_on_version` optimistic concurrency, idempotency-key dedup, interrupted tasks recoverable only via explicit resume (never auto-completed), bounded resume snapshots, workspace isolation at every seam, every free-text field (incl. skill refs) redacted. Request-driven — no scheduler/daemon; OpenCode remains the executor |
 | `engineering_brief` | read | P7 decision support: bounded deterministic brief (task + repo intelligence + impact + health + history + memory + learning + skills + task state + constraints/decisions/risks/unknowns). Read-only; OpenCode decides |
 
 ## P8 integration contract (agent clients)
@@ -252,6 +252,53 @@ it through CodeBro sandbox tools.
 `crates/mcp-server/src/debugging/` turns failure evidence (parsed diagnostics, failing-test linkage, recent-edit correlation, bounded impact context) into deterministic ranked hypotheses embedded additively in `sandbox_test`/`sandbox_build` responses as `root_cause`. Invariants: hypotheses are derived runtime evidence — never persisted, never written to the fact store or engineering memory; ranking is transparent heuristic weights with dedup by (kind, source); correlated representations of one event cannot stack (weaker location channels are subsumed by stronger ones, and a diagnostic without line precision never earns exact-location weight); serialized evidence is exactly what was scored; freshness/ambiguity reduce confidence; "changed recently" is never claimed as "caused". Consult `mode=debugging` injects the latest analysis as `codebro://root-cause-hypotheses` file context.
 
 For normal coding edits use your native editing tools. `apply_change` is for controlled/autonomous workflows.
+
+## Execution-state & verification gate (reliability contract)
+
+Three distinct claims — never conflated:
+
+| Claim | Meaning | Where it lives |
+|---|---|---|
+| **operation succeeded** | the tool call itself completed (write returned, command ran) | tool result (`applied: true`, `execution.success`) |
+| **change completed** | the on-disk state matches the requested change | `edit_verification` on `apply_change`/`apply_changes` (read-back: `target_exists`, `readable`, `content_matches_intent`) |
+| **change verified** | the current working tree has passing build/test evidence | `execution_state` (`failed | verified | unverified | unknown`) |
+
+- **Post-apply read-back is enforced.** `apply_change` / `apply_changes`
+  re-read every written file after apply. A mismatch rolls the change (or the
+  whole transaction) back from the preparation-time snapshot and returns a
+  tool error — a failed edit is never reported as applied. Successful
+  responses are `status: "applied_unverified"` with
+  `verification_status: "unverified"` until a build/test passes.
+- **Evidence is bound to the tree hash.** `sandbox_test` / `sandbox_build`
+  record every run durably in `.codebro/execution_evidence.json`
+  (`.codebro/` is excluded from the hash). Any edit — CodeBro or native —
+  changes the working-tree hash, so old evidence never applies to the new
+  state; it becomes `unverified` until re-run. `sandbox_exec` is raw
+  execution and produces NO durable validation evidence.
+- **Failures are resolved only by evidence.** A recorded failure is resolved
+  by a later recorded success of the same invocation (identical command;
+  identical filter or a full run) on the same tree. Prose — including a
+  `task validate` / `validation_result passed` record — never clears it.
+- **Authoritative vs inconclusive failures.** `compile_error` and
+  `test_failure` are authoritative (the toolchain ran and reported a defect)
+  and set `execution_state: failed`. `timeout` / `unknown_failure` are
+  inconclusive: surfaced as `unverified`, never silently upgraded and never
+  blocking on their own.
+- **Completion gate.** `task complete` and `task outcome
+  classification=success` are refused while authoritative unresolved
+  failures apply to the current working tree; the bounded error carries the
+  evidence. `failure` / `partial` reports remain available. A passing re-run
+  of the same invocation clears the gate.
+- **Surfacing.** `workspace_context`, `context` (packet + notes), `task
+  inspect`, `task complete/outcome` responses, and every `sandbox_test`/
+  `sandbox_build` verification result include `execution_state` with bounded
+  failure evidence (command, classification, exit code, failed tests,
+  diagnostics, age).
+
+Limits (honest): CodeBro-native edits through `sandbox_exec` are untracked
+by design; non-git workspaces have no tree identity (`unknown`); a direct
+host `cargo test` run by the agent is invisible to CodeBro. The gate can only
+speak about evidence CodeBro actually observed.
 
 ## Development workflow
 

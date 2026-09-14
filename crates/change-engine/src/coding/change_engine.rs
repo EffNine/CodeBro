@@ -51,6 +51,28 @@ pub struct PreparedChange {
     pub full_new: String,
 }
 
+/// Post-apply verification: the filesystem state actually observed after
+/// [`ChangeEngine::apply`] returned. A successful apply is a successful
+/// write call; only these read-back checks establish that the requested
+/// change (and not something else) is what now exists on disk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApplyVerification {
+    /// The target path exists after apply.
+    pub target_exists: bool,
+    /// The target content was readable for verification.
+    pub readable: bool,
+    /// The read-back content equals the prepared full new content — the
+    /// declared change is exactly what is on disk now.
+    pub content_matches_intent: bool,
+}
+
+impl ApplyVerification {
+    /// All checks passed: the edit is verified as applied.
+    pub fn verified(&self) -> bool {
+        self.target_exists && self.readable && self.content_matches_intent
+    }
+}
+
 /// The workspace-bound mutation engine behind MCP `apply_change`.
 ///
 /// Existing-file writes route through a
@@ -224,6 +246,63 @@ impl ChangeEngine {
             &prepared.full_new,
         )?;
         plan.apply()
+    }
+
+    /// Restore one applied change from its preparation-time snapshot:
+    /// modified files are rewritten with their original bytes; created
+    /// files are removed. Used when post-apply verification finds the
+    /// on-disk result does not match the prepared intent — a failed edit
+    /// must never be left in place as if it succeeded.
+    pub fn rollback_change(&self, prepared: &PreparedChange) -> crate::error::Result<()> {
+        ensure_symlink_safe(&self.workspace_root, &prepared.path)?;
+        if prepared.created {
+            match std::fs::remove_file(&prepared.path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(crate::error::CodeBroError::Patch(format!(
+                    "rollback failed for created file {}: {e}",
+                    prepared.path.display()
+                ))),
+            }
+        } else {
+            codebro_core::persistence::write_atomic(&prepared.path, prepared.backup.as_bytes())
+                .map_err(|e| {
+                    crate::error::CodeBroError::Patch(format!(
+                        "rollback failed for {}: {e}",
+                        prepared.path.display()
+                    ))
+                })
+        }
+    }
+
+    /// Re-read the target and verify the filesystem now holds exactly the
+    /// prepared result.
+    ///
+    /// [`ChangeEngine::apply`] returning `Ok` means the write call returned
+    /// successfully; it does not prove the on-disk state matches the
+    /// requested change (partial writes, concurrent rewrite between write
+    /// and read-back, filesystem-level surprises). This read-back closes
+    /// that gap with structured evidence. Never writes.
+    pub fn verify_applied(&self, prepared: &PreparedChange) -> ApplyVerification {
+        if !prepared.path.exists() {
+            return ApplyVerification {
+                target_exists: false,
+                readable: false,
+                content_matches_intent: false,
+            };
+        }
+        match std::fs::read_to_string(&prepared.path) {
+            Ok(content) => ApplyVerification {
+                target_exists: true,
+                readable: true,
+                content_matches_intent: content == prepared.full_new,
+            },
+            Err(_) => ApplyVerification {
+                target_exists: true,
+                readable: false,
+                content_matches_intent: false,
+            },
+        }
     }
 
     /// The CONTROLLED creation path of the engine — the sole filesystem write
@@ -624,6 +703,77 @@ mod tests {
             std::fs::read_to_string(dir.path().join("extra.rs")).unwrap(),
             "extra!\n"
         );
+    }
+
+    #[test]
+    fn test_engine_verify_applied_confirms_modification_and_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("main.rs"), "old line\n");
+        let engine = ChangeEngine::new(dir.path(), &[], false);
+
+        let modified = engine.prepare("main.rs", "old line", "new line").unwrap();
+        engine.apply(&modified).unwrap();
+        let v = engine.verify_applied(&modified);
+        assert!(v.verified(), "{v:?}");
+
+        let created = engine
+            .prepare("src/new.rs", "", "pub fn fresh() {}\n")
+            .unwrap();
+        engine.apply(&created).unwrap();
+        let v = engine.verify_applied(&created);
+        assert!(
+            v.target_exists && v.readable && v.content_matches_intent,
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn test_engine_verify_applied_detects_tampering_after_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("main.rs"), "old line\n");
+        let engine = ChangeEngine::new(dir.path(), &[], false);
+        let prepared = engine.prepare("main.rs", "old line", "new line").unwrap();
+        engine.apply(&prepared).unwrap();
+        // A later writer replaces the content: the apply is no longer what
+        // is on disk, and verification must say so instead of trusting the
+        // earlier Ok.
+        write(&dir.path().join("main.rs"), "someone rewrote this\n");
+        let v = engine.verify_applied(&prepared);
+        assert!(v.target_exists && v.readable, "{v:?}");
+        assert!(!v.content_matches_intent, "{v:?}");
+        assert!(!v.verified(), "{v:?}");
+    }
+
+    #[test]
+    fn test_engine_rollback_change_restores_and_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("main.rs"), "original\n");
+        let engine = ChangeEngine::new(dir.path(), &[], false);
+
+        let modified = engine.prepare("main.rs", "original", "changed").unwrap();
+        engine.apply(&modified).unwrap();
+        engine.rollback_change(&modified).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "original\n"
+        );
+
+        let created = engine.prepare("src/new.rs", "", "content\n").unwrap();
+        engine.apply(&created).unwrap();
+        engine.rollback_change(&created).unwrap();
+        assert!(!dir.path().join("src/new.rs").exists());
+    }
+
+    #[test]
+    fn test_engine_verify_applied_detects_missing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ChangeEngine::new(dir.path(), &[], false);
+        let prepared = engine.prepare("src/new.rs", "", "content\n").unwrap();
+        engine.apply(&prepared).unwrap();
+        std::fs::remove_file(dir.path().join("src/new.rs")).unwrap();
+        let v = engine.verify_applied(&prepared);
+        assert!(!v.target_exists, "{v:?}");
+        assert!(!v.verified(), "{v:?}");
     }
 
     #[test]

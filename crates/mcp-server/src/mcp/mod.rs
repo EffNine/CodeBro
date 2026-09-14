@@ -352,6 +352,19 @@ impl CodeBroMcpServer {
                 {
                     tracing::warn!("execution journal record failed (non-fatal): {e}");
                 }
+                // Post-run state, assessed AFTER this run's record landed:
+                // the agent sees whether the current tree is verified,
+                // still carries unresolved failures, or lacks evidence.
+                // Deterministic read of durable evidence; never prose.
+                let assessment = crate::sandbox::evidence_journal::assess_for_tree(
+                    &ws.canonical_root,
+                    tree_hash,
+                    now,
+                );
+                obj.insert(
+                    "execution_state".to_string(),
+                    serde_json::to_value(&assessment).unwrap_or(json!({})),
+                );
             }
         }
         // Root-cause hypotheses for failures: deterministic ranking over
@@ -462,6 +475,10 @@ impl CodeBroMcpServer {
             .as_ref()
             .and_then(|id| id.architecture_summary.clone())
             .unwrap_or_default();
+        // Authoritative execution state: what recorded build/test evidence
+        // says about the CURRENT working tree (read-only, deterministic).
+        let execution_state =
+            crate::sandbox::evidence_journal::assess(&ws.canonical_root, now_secs);
 
         let payload = json!({
             "workspace_root": ws.canonical_root.display().to_string(),
@@ -495,6 +512,7 @@ impl CodeBroMcpServer {
                 "status": freshness_str,
                 "persisted": persisted_index,
             },
+            "execution_state": execution_state,
             "architecture": {
                 "summary": arch_summary,
             },
@@ -729,7 +747,7 @@ impl CodeBroMcpServer {
     /// engine: path-boundary enforcement, plan awareness, stale-content
     /// protection and audit. No blind overwrites.
     #[tool(
-        description = "Apply a guarded change to a single workspace file through the change engine. Provide the exact old text to replace (or empty old to create a new file). Enforces workspace boundary and refuses stale or ambiguous edits."
+        description = "Apply a guarded change to a single workspace file via the change engine. Pass exact old text (or old=\"\" to create). Enforces the workspace boundary and refuses stale/ambiguous edits. Result stays applied-unverified until a build/test passes."
     )]
     async fn apply_change(
         &self,
@@ -744,9 +762,31 @@ impl CodeBroMcpServer {
         let prepared = engine
             .prepare(&args.path, &args.old, &args.new)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        let _apply_result = engine
+        engine
             .apply(&prepared)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Post-apply read-back: an apply that returned Ok is a successful
+        // write call, not proof the requested change is on disk. On
+        // mismatch, restore the preparation-time snapshot and fail the
+        // call — a failed edit must never be reported as applied.
+        let edit_verification = engine.verify_applied(&prepared);
+        if !edit_verification.verified() {
+            let rollback_note = match engine.rollback_change(&prepared) {
+                Ok(()) => "workspace restored from the preparation-time snapshot".to_string(),
+                Err(e) => format!(
+                    "WARNING: rollback failed ({e}) — inspect '{}' manually",
+                    prepared.path.display()
+                ),
+            };
+            return Err(McpError::internal_error(
+                format!(
+                    "edit verification failed for '{}': {} — {rollback_note}",
+                    args.path,
+                    serde_json::to_string(&edit_verification).unwrap_or_default()
+                ),
+                None,
+            ));
+        }
         // Analyze which existing facts may be stale due to this mutation.
         // The edited line range (from the old-text position in the
         // pre-change content) narrows test recommendations to symbols the
@@ -798,8 +838,12 @@ impl CodeBroMcpServer {
 
         let response = json!({
             "applied": true,
+            "status": "applied_unverified",
             "path": args.path,
             "preview": prepared.preview,
+            "edit_verification": edit_verification,
+            "verification_status": "unverified",
+            "verification_note": "the edit is on disk but no passing build/test evidence exists for the resulting working tree — run sandbox_build/sandbox_test before claiming the implementation is complete",
             "affected_fact_ids": advisory.affected_fact_ids,
             "affected_symbols": advisory.affected_symbols,
             "affected_modules": advisory.affected_modules,
@@ -819,7 +863,7 @@ impl CodeBroMcpServer {
     /// refuses stale or ambiguous edits, and detects conflicts across the
     /// whole set before writing anything.
     #[tool(
-        description = "Apply a multi-file transaction through the ChangeEngine. All-or-nothing: changes are validated against current content, then applied with automatic rollback if any write fails. For new files pass old as an empty string. Use apply_change for single-file edits."
+        description = "Apply a multi-file transaction through the ChangeEngine. All-or-nothing: changes are validated against current content, then applied with automatic rollback if any write fails. For new files pass old=\"\". Result stays applied-unverified until a build/test passes."
     )]
     async fn apply_changes(
         &self,
@@ -847,6 +891,27 @@ impl CodeBroMcpServer {
         let report = engine
             .apply_transaction(&prepared)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Post-apply read-back for every file: all-or-nothing includes
+        // "the files on disk are exactly the prepared results". Any
+        // mismatch rolls the whole set back and fails the call.
+        let mismatched: Vec<String> = prepared
+            .changes
+            .iter()
+            .filter(|c| !engine.verify_applied(c).verified())
+            .map(|c| c.path.display().to_string())
+            .collect();
+        if !mismatched.is_empty() {
+            let rolled_back = engine.rollback_changes(&prepared, &report.applied);
+            return Err(McpError::internal_error(
+                format!(
+                    "transaction verification failed for {}: rollback restored {} file(s) \
+                     from the preparation-time snapshot",
+                    mismatched.join(", "),
+                    rolled_back.len()
+                ),
+                None,
+            ));
+        }
         if report.success() {
             for change in &args.changes {
                 self.remember_edit(&ws, &change.path, Vec::new());
@@ -884,10 +949,17 @@ impl CodeBroMcpServer {
 
         let response = json!({
             "applied": report.success(),
+            "status": "applied_unverified",
             "applied_count": report.applied.len(),
             "created": report.created.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             "rolled_back": report.rolled_back.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             "preview": prepared.preview(),
+            "edit_verification": {
+                "files_checked": prepared.changes.len(),
+                "all_content_matches_intent": true,
+            },
+            "verification_status": "unverified",
+            "verification_note": "the edits are on disk but no passing build/test evidence exists for the resulting working tree — run sandbox_build/sandbox_test before claiming the implementation is complete",
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1472,7 +1544,7 @@ impl CodeBroMcpServer {
     /// Auto-detects the project type and runs the appropriate test command.
     /// Returns execution result plus pass/fail verification.
     #[tool(
-        description = "Run the project's tests and return structured verification evidence: execution result plus pass/fail verification with exit code, stdout, stderr, duration, and expectation violations."
+        description = "Run the project's tests and return structured verification evidence: execution result plus pass/fail verification with exit code, stdout, stderr, duration, and expectation violations. Failures are recorded durably and block task completion until resolved by a passing re-run."
     )]
     async fn sandbox_test(
         &self,
@@ -1540,7 +1612,7 @@ impl CodeBroMcpServer {
     /// Auto-detects the project type and runs the appropriate build command.
     /// Returns execution result plus pass/fail verification.
     #[tool(
-        description = "Build or check the project and return structured verification evidence: execution result plus pass/fail verification with exit code, stdout, stderr, duration, and expectation violations."
+        description = "Build or check the project and return structured verification evidence: execution result plus pass/fail verification with exit code, stdout, stderr, duration, and expectation violations. Failures are recorded durably and block task completion until resolved by a passing re-run."
     )]
     async fn sandbox_build(
         &self,
@@ -4003,7 +4075,7 @@ impl CodeBroMcpServer {
     }
 
     #[tool(
-        description = "Durable engineering task runtime: create, start, pause, resume, checkpoint, validate, complete, fail, cancel, list, inspect, stale, outcome. Tasks persist across sessions with immutable checkpoints, worker leases with fencing, and a validated lifecycle; OpenCode remains the executor."
+        description = "Durable engineering task runtime: create, start, pause, resume, checkpoint, validate, complete, fail, cancel, list, inspect, stale, outcome. Immutable checkpoints, worker leases with fencing, validated lifecycle. complete/outcome=success are refused while unresolved build/test failures stand."
     )]
     async fn task(
         &self,
@@ -4112,9 +4184,12 @@ impl CodeBroMcpServer {
                 let snapshot = store
                     .task_resume_snapshot(&ws_root, &task_id, now)
                     .map_err(Self::task_error)?;
+                let execution_state =
+                    crate::sandbox::evidence_journal::assess(&ws.canonical_root, now);
                 serde_json::json!({
                     "action": "inspect",
                     "snapshot": snapshot,
+                    "execution_state": execution_state,
                 })
             }
             "start" => {
@@ -4286,6 +4361,25 @@ impl CodeBroMcpServer {
                     .ok_or_else(|| {
                         McpError::invalid_params(format!("task {task_id} does not exist"), None)
                     })?;
+                // Authoritative gate: completion may not be claimed while
+                // CodeBro holds unresolved compile/test failure evidence
+                // for the current working tree. Evidence is resolved only
+                // by a later passing run of the same invocation — never by
+                // prose. Reporting failure/partial via `outcome` remains
+                // available.
+                let execution_state =
+                    crate::sandbox::evidence_journal::assess(&ws.canonical_root, now);
+                if execution_state.blocks_completion() {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "task cannot complete: unresolved build/test failure evidence exists \
+                             for the current working tree [{}]. {}",
+                            execution_state.failure_summary(),
+                            execution_state.note,
+                        ),
+                        None,
+                    ));
+                }
                 let task = store
                     .complete_task(
                         &Self::task_ctx(
@@ -4303,6 +4397,7 @@ impl CodeBroMcpServer {
                 serde_json::json!({
                     "action": "complete",
                     "task": Self::task_payload(&task),
+                    "execution_state": execution_state,
                 })
             }
             "fail" => {
@@ -4386,6 +4481,26 @@ impl CodeBroMcpServer {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| McpError::invalid_params("outcome requires 'summary'", None))?;
+                // Truthfulness gate: a `success` report is refused while
+                // unresolved authoritative failure evidence applies to the
+                // current working tree. The evidence — not prose — decides
+                // whether the work can be reported as successful; failure
+                // and partial reports remain fully available.
+                let execution_state =
+                    crate::sandbox::evidence_journal::assess(&ws.canonical_root, now);
+                if classification == crate::context_runtime::OutcomeClassification::Success
+                    && execution_state.blocks_completion()
+                {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "success outcome refused: unresolved build/test failure evidence \
+                             exists for the current working tree [{}]. {}",
+                            execution_state.failure_summary(),
+                            execution_state.note,
+                        ),
+                        None,
+                    ));
+                }
                 let input = crate::context_runtime::tasks::TaskOutcomeInput {
                     classification,
                     summary,
@@ -4406,6 +4521,7 @@ impl CodeBroMcpServer {
                     "duplicate": record.duplicate,
                     "classification": record.classification.as_str(),
                     "authority": record.authority,
+                    "execution_state": execution_state,
                 })
             }
             other => {
@@ -7027,6 +7143,39 @@ mod tests {
         assert!(v.get("recommendation").is_some());
     }
 
+    /// Reliability contract: an applied edit is `applied_unverified`, never
+    /// presented as a verified implementation; the response carries
+    /// read-back edit verification evidence and an explicit next step.
+    #[tokio::test]
+    async fn apply_change_reports_applied_unverified_with_edit_verification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("demo.txt"), "hello world").expect("write");
+        let server = local_sandbox_server(&dir);
+
+        let out = call_tool_text(
+            &server,
+            "apply_change",
+            json!({"path": "demo.txt", "old": "hello world", "new": "hello codebro"}),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["status"], "applied_unverified");
+        assert_eq!(v["verification_status"], "unverified");
+        assert!(v["verification_note"]
+            .as_str()
+            .unwrap()
+            .contains("sandbox_build"));
+        assert_eq!(v["edit_verification"]["target_exists"], true);
+        assert_eq!(v["edit_verification"]["readable"], true);
+        assert_eq!(v["edit_verification"]["content_matches_intent"], true);
+        // The bytes on disk are exactly the requested result.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("demo.txt")).unwrap(),
+            "hello codebro"
+        );
+    }
+
     /// M2: path normalization — leading "./" matches correctly.
     #[tokio::test]
     async fn apply_change_path_normalization() {
@@ -7095,6 +7244,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(v["applied"], true);
         assert_eq!(v["applied_count"], 2);
+        // Transaction results are applied-unverified too: every file was
+        // read back and matched its prepared intent.
+        assert_eq!(v["status"], "applied_unverified");
+        assert_eq!(v["verification_status"], "unverified");
+        assert_eq!(v["edit_verification"]["files_checked"], 2);
+        assert_eq!(v["edit_verification"]["all_content_matches_intent"], true);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt"))
                 .unwrap()
@@ -14308,6 +14463,190 @@ mod task_tests {
         assert!(
             !text.contains(secret),
             "snapshot must not leak outcome secrets"
+        );
+    }
+
+    // ── Execution-state gate (reliability) ──────────────────────────────
+
+    /// Git fixture whose server state dir is ignored, so the tree hash is
+    /// stable across task/state writes (evidence association requires it).
+    fn init_git_fixture(dir: &std::path::Path) {
+        std::fs::write(dir.join(".gitignore"), "state/\n.codebro/\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git {args:?} failed");
+        }
+    }
+
+    fn current_tree_hash(root: &std::path::Path) -> String {
+        codebro_core::RepoState::capture(&root.to_path_buf())
+            .expect("git repo")
+            .working_tree_hash
+    }
+
+    /// Record one execution exactly as the sandbox tools do (journal entry
+    /// bound to the CURRENT tree hash).
+    fn record_execution(
+        root: &std::path::Path,
+        command: &str,
+        success: bool,
+        classification: &str,
+        at: u64,
+    ) {
+        use crate::sandbox::evidence_journal::{record, JournalInput};
+        let tree_hash = current_tree_hash(root);
+        let input = JournalInput {
+            execution_id: if success { "exec-pass" } else { "exec-fail" },
+            project_id: None,
+            tree_hash: &tree_hash,
+            command,
+            test_filter: &[],
+            exit_code: if success { 0 } else { 1 },
+            classification,
+            success,
+            timed_out: false,
+            duration_ms: 5,
+            diagnostics: &[],
+            affected_modules: &[],
+        };
+        record(root, &input, at).expect("journal record");
+    }
+
+    /// The reliability gate: recorded authoritative failures block
+    /// `complete` and `outcome=success` until a later passing run of the
+    /// same invocation resolves them. A passed validation record is prose —
+    /// it never overrides held evidence.
+    #[tokio::test]
+    async fn completion_and_success_outcome_refused_until_failure_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+        init_git_fixture(dir.path());
+        let s = server(&dir);
+        let id = create(&s, "reliability gate").await;
+        call(&s, json!({ "action": "start", "task_id": id })).await;
+
+        // A failing validation is recorded (what sandbox_test does when the
+        // runner reports a defect).
+        record_execution(dir.path(), "cargo test", false, "test_failure", 1);
+
+        // Even a passed validation record cannot make completion legal.
+        call(
+            &s,
+            json!({ "action": "validate", "task_id": id, "what": "cargo test" }),
+        )
+        .await;
+        call(
+            &s,
+            json!({ "action": "validation_result", "task_id": id, "result": "passed", "what": "cargo test" }),
+        )
+        .await;
+        let err = call_err(
+            &s,
+            json!({ "action": "complete", "task_id": id, "reason": "all green" }),
+        )
+        .await;
+        assert!(err.contains("unresolved build/test failure"), "got: {err}");
+
+        // A success outcome is refused for the same reason.
+        let err = call_err(
+            &s,
+            json!({ "action": "outcome", "task_id": id, "classification": "success", "summary": "done" }),
+        )
+        .await;
+        assert!(err.contains("success outcome refused"), "got: {err}");
+
+        // Honest reporting stays available and carries the state.
+        let out = call(
+            &s,
+            json!({ "action": "outcome", "task_id": id, "classification": "failure", "summary": "tests failing" }),
+        )
+        .await;
+        assert_eq!(out["classification"], "failure");
+        assert_eq!(out["execution_state"]["state"], "failed");
+
+        // A later passing run of the SAME invocation resolves the failure.
+        record_execution(dir.path(), "cargo test", true, "success", 2);
+        let out = call(
+            &s,
+            json!({ "action": "complete", "task_id": id, "reason": "fixed and verified" }),
+        )
+        .await;
+        assert_eq!(out["task"]["status"], "completed");
+        assert_eq!(out["execution_state"]["state"], "verified");
+    }
+
+    #[tokio::test]
+    async fn failure_evidence_surfaces_in_inspect_and_workspace_context() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+        init_git_fixture(dir.path());
+        let s = server(&dir);
+        let id = create(&s, "surface state").await;
+        record_execution(dir.path(), "cargo build", false, "compile_error", 1);
+
+        let inspected = call(&s, json!({ "action": "inspect", "task_id": id })).await;
+        assert_eq!(inspected["execution_state"]["state"], "failed");
+        assert_eq!(inspected["execution_state"]["unresolved_failures_total"], 1);
+        assert_eq!(
+            inspected["execution_state"]["unresolved_failures"][0]["classification"],
+            "compile_error"
+        );
+
+        let p: WorkspaceContextArgs = serde_json::from_value(json!({})).unwrap();
+        let r = s.workspace_context(Parameters(p)).await.expect("wc");
+        let v: serde_json::Value = serde_json::from_str(&text_of(r)).unwrap();
+        assert_eq!(v["execution_state"]["state"], "failed");
+        assert!(v["execution_state"]["unresolved_failures"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("cargo build"));
+    }
+
+    /// Inconclusive failures (timeout/unknown) are surfaced as unverified,
+    /// never presented as verified and never blocking on their own.
+    #[tokio::test]
+    async fn inconclusive_failure_does_not_block_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+        init_git_fixture(dir.path());
+        let s = server(&dir);
+        let id = create(&s, "inconclusive").await;
+        call(&s, json!({ "action": "start", "task_id": id })).await;
+        record_execution(dir.path(), "cargo test", false, "timeout", 1);
+        call(
+            &s,
+            json!({ "action": "validate", "task_id": id, "what": "cargo test" }),
+        )
+        .await;
+        call(
+            &s,
+            json!({ "action": "validation_result", "task_id": id, "result": "passed", "what": "cargo test" }),
+        )
+        .await;
+        let out = call(&s, json!({ "action": "complete", "task_id": id })).await;
+        assert_eq!(out["task"]["status"], "completed");
+        assert_eq!(out["execution_state"]["state"], "unverified");
+        assert_eq!(
+            out["execution_state"]["inconclusive_failures_total"], 1,
+            "timeout evidence must stay visible, not silently dropped"
         );
     }
 }
