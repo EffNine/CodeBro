@@ -586,15 +586,39 @@ impl ExecutionStateAssessment {
     }
 }
 
+/// Does this token reference a filter entry (exact or wrapped, e.g. go's
+/// `^TestFoo$`)?
+fn filter_entry_token(token: &str, filter: &[String]) -> bool {
+    filter
+        .iter()
+        .any(|f| !f.is_empty() && (token == f.as_str() || token.contains(f.as_str())))
+}
+
+/// Is this token part of a filter expression rather than runner/scope
+/// configuration? Filter entries, the selector syntax that embeds them
+/// (`-k`, `-run`, pytest's `or`), and wrapped entries qualify; runner and
+/// scope selectors (`-p crateA`, `--manifest-path`, `--release`, ...) do
+/// not.
+fn filter_expression_token(token: &str, filter: &[String]) -> bool {
+    matches!(token, "-k" | "-run" | "or") || filter_entry_token(token, filter)
+}
+
 /// Does a later successful full run of the same runner exercise the
 /// selection that failed?
 ///
 /// The MCP resolver embeds filter names in the resolved command (cargo:
 /// `cargo test adds`; pytest: `python -m pytest -q --tb=long -k a or b`;
 /// go: `go test -run ^X$ ./...`), so a later unfiltered run of the same
-/// runner does not share the exact command string. A passing full run
-/// covers the filtered selection when its command tokens appear in order
-/// within the failing command (same runner only).
+/// runner does not share the exact command string.
+///
+/// A passing full run covers the filtered selection only when the full
+/// command is exactly the failing command with ONE contiguous filter
+/// expression removed, every removed token is filter-related, and at least
+/// one removed token references a filter entry. This keeps every
+/// auto-generated shape covering while refusing to treat an unexplained
+/// scope as verified: a root `cargo test` after an explicit
+/// `cargo test -p crateA adds` failure is not evidence that crateA (which
+/// need not be a default workspace member) was exercised.
 fn full_run_covers(success: &ExecutionEvidenceRecord, failure: &ExecutionEvidenceRecord) -> bool {
     if !success.test_filter.is_empty() || failure.test_filter.is_empty() {
         return false;
@@ -607,10 +631,22 @@ fn full_run_covers(success: &ExecutionEvidenceRecord, failure: &ExecutionEvidenc
     if success_tokens.is_empty() || success_tokens.len() >= failure_tokens.len() {
         return false;
     }
-    let mut failure_iter = failure_tokens.iter();
-    success_tokens
-        .iter()
-        .all(|token| failure_iter.any(|candidate| candidate == token))
+    (0..failure_tokens.len()).any(|start| {
+        ((start + 1)..=failure_tokens.len()).any(|end| {
+            let removed = &failure_tokens[start..end];
+            removed
+                .iter()
+                .all(|token| filter_expression_token(token, &failure.test_filter))
+                && removed
+                    .iter()
+                    .any(|token| filter_entry_token(token, &failure.test_filter))
+                && failure_tokens[..start]
+                    .iter()
+                    .chain(failure_tokens[end..].iter())
+                    .copied()
+                    .eq(success_tokens.iter().copied())
+        })
+    })
 }
 
 /// Does a later success record resolve an earlier failure record?
@@ -1556,6 +1592,45 @@ mod tests {
             ExecutionStateKind::Failed,
             "a different runner must not resolve the failure"
         );
+    }
+
+    /// Red-team regression: a later full run must NOT be treated as
+    /// coverage when the failing command carried unexplained scope such as
+    /// an explicit package selector. A root `cargo test` does not prove a
+    /// package outside the default workspace members was exercised, so
+    /// the failure stays unresolved.
+    #[test]
+    fn assessment_full_run_does_not_cover_unexplained_scope() {
+        let dir = temp_root();
+        let f: Vec<String> = vec!["adds".into()];
+        record_at(
+            dir.path(),
+            "treeT",
+            "cargo test -p crateA adds",
+            &f,
+            false,
+            100,
+        );
+        record_at(dir.path(), "treeT", "cargo test", &[], true, 200);
+        let a = assess_for_tree(dir.path(), "treeT", 300);
+        assert_eq!(
+            a.state,
+            ExecutionStateKind::Failed,
+            "an unexplained package scope must not be covered by a root full run"
+        );
+        assert_eq!(a.unresolved_failures_total, 1);
+    }
+
+    /// Tightened coverage still resolves when the full command repeats the
+    /// selector syntax exactly (the scope is visible on both sides).
+    #[test]
+    fn assessment_full_run_covers_matching_explicit_scope() {
+        let dir = temp_root();
+        let f: Vec<String> = vec!["adds".into()];
+        record_at(dir.path(), "treeT", "cargo test --lib adds", &f, false, 100);
+        record_at(dir.path(), "treeT", "cargo test --lib", &[], true, 200);
+        let a = assess_for_tree(dir.path(), "treeT", 300);
+        assert_eq!(a.state, ExecutionStateKind::Verified);
     }
 
     #[test]

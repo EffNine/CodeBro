@@ -764,6 +764,25 @@ mod tests {
         assert!(!dir.path().join("src/new.rs").exists());
     }
 
+    /// A rollback that cannot restore the path must surface an error —
+    /// the caller then reports an UNCERTAIN workspace, never a clean one.
+    #[test]
+    fn test_engine_rollback_change_reports_uncertainty_when_restore_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("main.rs"), "original\n");
+        let engine = ChangeEngine::new(dir.path(), &[], false);
+        let prepared = engine.prepare("main.rs", "original", "changed").unwrap();
+        engine.apply(&prepared).unwrap();
+
+        // Replace the file with a directory: the atomic restore cannot
+        // rewrite the path as a file (independent of permission bits).
+        std::fs::remove_file(dir.path().join("main.rs")).unwrap();
+        std::fs::create_dir(dir.path().join("main.rs")).unwrap();
+
+        let err = engine.rollback_change(&prepared).unwrap_err();
+        assert!(err.to_string().contains("rollback failed"), "got: {err}");
+    }
+
     #[test]
     fn test_engine_verify_applied_detects_missing_target() {
         let dir = tempfile::tempdir().unwrap();

@@ -38,6 +38,39 @@ pub struct PreparedTransaction {
     pub changes: Vec<PreparedChange>,
 }
 
+/// Outcome of a rollback attempt over already-applied files.
+///
+/// Rollback is filesystem work and can itself fail (permissions, a path
+/// swapped for a directory, I/O errors). The caller must distinguish
+/// "restored exactly" from "restore attempted" — a partial restore is an
+/// UNCERTAIN workspace state and must never be reported as clean.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RollbackReport {
+    /// Files restored from their preparation-time snapshot (created files
+    /// removed, modified files rewritten with their original bytes).
+    pub restored: Vec<PathBuf>,
+    /// Files that could NOT be restored, with the reason.
+    pub failed: Vec<(PathBuf, String)>,
+}
+
+impl RollbackReport {
+    /// Every attempted rollback succeeded and the workspace is back at its
+    /// exact pre-transaction state.
+    pub fn complete(&self) -> bool {
+        self.failed.is_empty()
+    }
+
+    /// Bounded human-readable description of the files that could not be
+    /// restored (for error surfaces).
+    pub fn failure_detail(&self) -> String {
+        self.failed
+            .iter()
+            .map(|(path, reason)| format!("{} ({reason})", path.display()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
 impl PreparedTransaction {
     /// Combined per-file diff preview for review before applying.
     pub fn preview(&self) -> String {
@@ -160,7 +193,7 @@ impl ChangeEngine {
         // Apply pass with rollback.
         let mut applied: Vec<PathBuf> = Vec::new();
         let mut created: Vec<PathBuf> = Vec::new();
-        let mut rolled_back: Vec<PathBuf> = Vec::new();
+        let rolled_back: Vec<PathBuf> = Vec::new();
         for c in &tx.changes {
             match self.apply(c) {
                 Ok(_) => {
@@ -171,11 +204,21 @@ impl ChangeEngine {
                 }
                 Err(e) => {
                     // Roll back in reverse apply order.
-                    rolled_back = self.rollback_changes(tx, &applied);
+                    let rollback = self.rollback_changes(tx, &applied);
+                    let detail = if rollback.complete() {
+                        format!("rolled back {} file(s)", rollback.restored.len())
+                    } else {
+                        format!(
+                            "ROLLBACK INCOMPLETE: restored {} file(s) but FAILED to restore {} — \
+                             workspace state is UNCERTAIN, inspect these files manually: {}",
+                            rollback.restored.len(),
+                            rollback.failed.len(),
+                            rollback.failure_detail(),
+                        )
+                    };
                     return Err(crate::error::CodeBroError::Patch(format!(
-                        "transaction failed at '{}': {e}; rolled back {} file(s)",
+                        "transaction failed at '{}': {e}; {detail}",
                         c.path.display(),
-                        rolled_back.len()
                     )));
                 }
             }
@@ -191,27 +234,43 @@ impl ChangeEngine {
 
     /// Restore every file in `applied` (in reverse order) to its
     /// preparation-time snapshot: modified files are rewritten with their
-    /// original bytes; created files are deleted. Returns the paths that
-    /// were rolled back.
+    /// original bytes; created files are deleted. The returned
+    /// [`RollbackReport`] separates restored files from files the rollback
+    /// could not restore — a non-empty `failed` list means the workspace is
+    /// in an uncertain state that the caller must surface honestly.
     ///
     /// Public because it is the reusable core of mid-transaction rollback;
     /// also exercised directly by tests since inducing real write failures
     /// is environment-dependent (root ignores permission bits).
-    pub fn rollback_changes(&self, tx: &PreparedTransaction, applied: &[PathBuf]) -> Vec<PathBuf> {
-        let mut rolled_back = Vec::with_capacity(applied.len());
+    pub fn rollback_changes(
+        &self,
+        tx: &PreparedTransaction,
+        applied: &[PathBuf],
+    ) -> RollbackReport {
+        let mut report = RollbackReport::default();
         for done in applied.iter().rev() {
             let Some(original) = tx.changes.iter().find(|c| &c.path == done) else {
                 continue;
             };
             if original.created {
-                let _ = std::fs::remove_file(done);
-            } else if let Err(restore_err) =
-                codebro_core::persistence::write_atomic(done, original.backup.as_bytes())
-            {
-                tracing::error!("rollback of {} failed: {restore_err}", done.display());
+                match std::fs::remove_file(done) {
+                    Ok(()) => report.restored.push(done.clone()),
+                    // Already gone: the rollback goal holds.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        report.restored.push(done.clone())
+                    }
+                    Err(e) => report.failed.push((done.clone(), e.to_string())),
+                }
+            } else {
+                match codebro_core::persistence::write_atomic(done, original.backup.as_bytes()) {
+                    Ok(()) => report.restored.push(done.clone()),
+                    Err(e) => {
+                        tracing::error!("rollback of {} failed: {e}", done.display());
+                        report.failed.push((done.clone(), e.to_string()));
+                    }
+                }
             }
-            rolled_back.push(done.clone());
         }
-        rolled_back
+        report
     }
 }

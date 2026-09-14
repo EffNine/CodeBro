@@ -774,7 +774,8 @@ impl CodeBroMcpServer {
             let rollback_note = match engine.rollback_change(&prepared) {
                 Ok(()) => "workspace restored from the preparation-time snapshot".to_string(),
                 Err(e) => format!(
-                    "WARNING: rollback failed ({e}) — inspect '{}' manually",
+                    "ROLLBACK INCOMPLETE: the workspace state is UNCERTAIN — failed to restore \
+                     '{}' ({e}); inspect it manually",
                     prepared.path.display()
                 ),
             };
@@ -901,13 +902,25 @@ impl CodeBroMcpServer {
             .map(|c| c.path.display().to_string())
             .collect();
         if !mismatched.is_empty() {
-            let rolled_back = engine.rollback_changes(&prepared, &report.applied);
+            let rollback = engine.rollback_changes(&prepared, &report.applied);
+            let rollback_note = if rollback.complete() {
+                format!(
+                    "rollback restored {} file(s) from the preparation-time snapshot",
+                    rollback.restored.len()
+                )
+            } else {
+                format!(
+                    "ROLLBACK INCOMPLETE: restored {} file(s) but FAILED to restore {} — the \
+                     workspace state is UNCERTAIN, inspect these files manually: {}",
+                    rollback.restored.len(),
+                    rollback.failed.len(),
+                    rollback.failure_detail(),
+                )
+            };
             return Err(McpError::internal_error(
                 format!(
-                    "transaction verification failed for {}: rollback restored {} file(s) \
-                     from the preparation-time snapshot",
+                    "transaction verification failed for {}: {rollback_note}",
                     mismatched.join(", "),
-                    rolled_back.len()
                 ),
                 None,
             ));

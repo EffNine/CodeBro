@@ -303,6 +303,12 @@ fn edit_verify_gate_loop_over_real_binary() {
         }),
     );
     assert!(err.contains("stale content"), "edit must fail: {err}");
+    // Scenario 5: the failed edit leaves no verified completion behind —
+    // the task cannot complete (still running), and the file is untouched.
+    let _ = s.call_err(
+        "task",
+        serde_json::json!({"action": "complete", "task_id": t2_id, "reason": "trust me"}),
+    );
     // The task is untouched: still running, never auto-completed.
     let inspected = s.call(
         "task",
@@ -367,7 +373,9 @@ fn failure_state_is_visible_at_session_start() {
 }
 
 /// A task whose failure was recorded in a DIFFERENT tree state is not
-/// blocked: the evidence no longer applies once the tree changes.
+/// blocked: the evidence no longer applies once the tree changes. The new
+/// tree inherits NEITHER the failure NOR any verification — completion is
+/// possible only as `unverified`, never as `verified`.
 #[test]
 fn stale_tree_failure_does_not_block_after_edit() {
     let fx = Fixture::new();
@@ -401,4 +409,95 @@ fn stale_tree_failure_does_not_block_after_edit() {
     assert_eq!(wc["execution_state"]["state"], "unverified");
     assert_eq!(wc["execution_state"]["unresolved_failures_total"], 0);
     assert!(root.join(".codebro/execution_evidence.json").exists());
+
+    // Scenario 4: the task can be completed on the new tree, but the
+    // completion response must say UNVERIFIED — the new tree inherits no
+    // verification from the pre-edit tree, and a prose validation record
+    // never manufactures one.
+    let created = s.call(
+        "task",
+        serde_json::json!({"action": "create", "title": "edited without retest"}),
+    );
+    let task_id = created["task"]["task_id"].as_str().unwrap().to_string();
+    s.call(
+        "task",
+        serde_json::json!({"action": "start", "task_id": task_id}),
+    );
+    s.call(
+        "task",
+        serde_json::json!({"action": "validate", "task_id": task_id, "what": "cargo test"}),
+    );
+    s.call(
+        "task",
+        serde_json::json!({
+            "action": "validation_result", "task_id": task_id,
+            "result": "passed", "what": "cargo test",
+        }),
+    );
+    let done = s.call(
+        "task",
+        serde_json::json!({"action": "complete", "task_id": task_id, "reason": "fixed"}),
+    );
+    assert_eq!(done["task"]["status"], "completed");
+    assert_eq!(done["execution_state"]["state"], "unverified");
+    assert_eq!(done["execution_state"]["evidence_records"], 0);
+}
+
+/// Phase 4: CodeBro observes workspace changes made OUTSIDE its own
+/// mutation path through the working-tree hash — no filesystem watcher.
+/// A recorded pass stops applying to a natively edited tree: the state
+/// drops to `unverified` and completion can never claim `verified`.
+#[test]
+fn native_edit_invalidates_verification_without_polling() {
+    let fx = Fixture::new();
+    let root = fx.dir.path();
+    let mut s = Server::start(root);
+
+    // Passing run on the pristine tree.
+    let tested = s.call("sandbox_test", serde_json::json!({}));
+    assert_eq!(tested["verification"]["verified"], true);
+    assert_eq!(
+        tested["verification"]["execution_state"]["state"],
+        "verified"
+    );
+
+    let created = s.call(
+        "task",
+        serde_json::json!({"action": "create", "title": "native edit"}),
+    );
+    let task_id = created["task"]["task_id"].as_str().unwrap().to_string();
+    s.call(
+        "task",
+        serde_json::json!({"action": "start", "task_id": task_id}),
+    );
+
+    // Native edit through the filesystem (NOT apply_change), no re-run.
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(2 + 2, 4);\n    }\n}\n// native edit\n",
+    )
+    .unwrap();
+
+    let wc = s.call("workspace_context", serde_json::json!({}));
+    assert_eq!(wc["execution_state"]["state"], "unverified");
+    assert_eq!(wc["execution_state"]["evidence_records"], 0);
+
+    // Completion remains possible, but only as unverified.
+    s.call(
+        "task",
+        serde_json::json!({"action": "validate", "task_id": task_id, "what": "cargo test"}),
+    );
+    s.call(
+        "task",
+        serde_json::json!({
+            "action": "validation_result", "task_id": task_id,
+            "result": "passed", "what": "cargo test",
+        }),
+    );
+    let done = s.call(
+        "task",
+        serde_json::json!({"action": "complete", "task_id": task_id, "reason": "edited"}),
+    );
+    assert_eq!(done["task"]["status"], "completed");
+    assert_eq!(done["execution_state"]["state"], "unverified");
 }

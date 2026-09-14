@@ -87,8 +87,9 @@ fn mid_transaction_failure_rolls_back_applied_changes() {
     );
     assert!(dir.path().join("new.txt").exists());
 
-    let rolled_back = engine.rollback_changes(&tx, &report.applied);
-    assert_eq!(rolled_back.len(), 2);
+    let rollback = engine.rollback_changes(&tx, &report.applied);
+    assert!(rollback.complete(), "{rollback:?}");
+    assert_eq!(rollback.restored.len(), 2);
     assert_eq!(
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
         "keep me",
@@ -97,6 +98,56 @@ fn mid_transaction_failure_rolls_back_applied_changes() {
     assert!(
         !dir.path().join("new.txt").exists(),
         "created file must be removed on rollback"
+    );
+}
+
+/// A rollback that cannot restore a file must report it as `failed` —
+/// never as rolled back. The workspace state is then uncertain and the
+/// caller is told exactly which paths need inspection.
+#[test]
+fn rollback_failure_is_reported_not_hidden() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "keep me").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "other").unwrap();
+
+    let engine = engine_at(dir.path());
+    let tx = engine
+        .prepare_changes(&[
+            TransactionRequest {
+                path: "a.txt".into(),
+                old: "keep".into(),
+                new: "KEEP".into(),
+            },
+            TransactionRequest {
+                path: "b.txt".into(),
+                old: "other".into(),
+                new: "OTHER".into(),
+            },
+        ])
+        .unwrap();
+    let report = engine.apply_transaction(&tx).unwrap();
+    assert!(report.success());
+
+    // Replace a.txt with a DIRECTORY: the atomic restore cannot rewrite
+    // the path as a file and must fail. (os error EISDIR/ENOTDIR;
+    // independent of permission bits, so it works as root too.)
+    std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+    std::fs::create_dir(dir.path().join("a.txt")).unwrap();
+
+    let rollback = engine.rollback_changes(&tx, &report.applied);
+    assert!(!rollback.complete(), "{rollback:?}");
+    assert_eq!(rollback.restored, vec![dir.path().join("b.txt")]);
+    assert_eq!(rollback.failed.len(), 1);
+    assert_eq!(rollback.failed[0].0, dir.path().join("a.txt"));
+    assert!(
+        rollback.failure_detail().contains("a.txt"),
+        "{}",
+        rollback.failure_detail()
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "other",
+        "the restorable file is still restored"
     );
 }
 

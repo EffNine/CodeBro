@@ -277,8 +277,19 @@ Three distinct claims — never conflated:
   execution and produces NO durable validation evidence.
 - **Failures are resolved only by evidence.** A recorded failure is resolved
   by a later recorded success of the same invocation (identical command;
-  identical filter or a full run) on the same tree. Prose — including a
+  identical filter, or a full run) on the same tree. Prose — including a
   `task validate` / `validation_result passed` record — never clears it.
+- **Full-run coverage is structural, not token-occurrence.** A filtered
+  failure is covered by a later full run only when the full command is the
+  failing command with ONE contiguous filter expression removed and every
+  removed token is filter-related (`-k`/`-run`/`or` or a filter entry). An
+  explicit scope (`cargo test -p crateA adds`) is not covered by a root
+  `cargo test`: the full run is not evidence that an unlisted scope ran.
+- **Rollback honesty.** If a post-apply verification mismatch requires
+  rollback and the rollback itself cannot restore a file, the response is an
+  error stating `ROLLBACK INCOMPLETE` with the exact failed paths — the
+  workspace state is presented as UNCERTAIN, never as clean. The same
+  applies to mid-transaction rollback failures.
 - **Authoritative vs inconclusive failures.** `compile_error` and
   `test_failure` are authoritative (the toolchain ran and reported a defect)
   and set `execution_state: failed`. `timeout` / `unknown_failure` are
@@ -295,10 +306,25 @@ Three distinct claims — never conflated:
   failure evidence (command, classification, exit code, failed tests,
   diagnostics, age).
 
-Limits (honest): CodeBro-native edits through `sandbox_exec` are untracked
-by design; non-git workspaces have no tree identity (`unknown`); a direct
-host `cargo test` run by the agent is invisible to CodeBro. The gate can only
-speak about evidence CodeBro actually observed.
+Limits (honest): `sandbox_exec` is raw execution and produces NO durable
+validation evidence; non-git workspaces have no tree identity (`unknown`);
+a direct host `cargo test` run by the agent is invisible to CodeBro unless
+it is routed through `sandbox_test`/`sandbox_build`; gitignored files and
+untracked files above 512 KiB (path+size only) can change without changing
+the tree hash, so evidence is bound to the git-visible tree. The local
+sandbox backend executes all commands at the workspace root (the
+`working_directory` argument is not currently honoured there), so the
+working directory is not part of invocation identity; the OpenSandbox
+backend honours it but reports the workspace root in the execution envelope,
+so the journal cannot yet distinguish two same-command runs in different
+directories. A journal write failure is non-fatal (the run's response still
+reports its real outcome, but the durable gate cannot see it). Tasks are
+request-driven: an agent may end a session without completing a task, and
+nothing auto-completes it — an unfinished task is never reported as
+successful, but compliance with the P9 outcome convention stays
+workflow-level (measurable via the existing per-call stderr line ratio).
+
+The gate can only speak about evidence CodeBro actually observed.
 
 ## Development workflow
 
