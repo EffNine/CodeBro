@@ -61,6 +61,7 @@ pub mod recall;
 pub mod repo_index;
 pub mod retrieval;
 pub mod skill_approvals;
+pub mod skill_reuse;
 pub mod skill_selection;
 pub mod skills;
 pub mod store;
@@ -90,6 +91,7 @@ pub mod context_runtime {
         repo_index::{self, RepoIndexRecord, RepoIndexStatus, RepoIndexUpsert},
         retrieval,
         skill_approvals::{self, ApprovalResponse, ApprovalStatus, SkillApprovalRequest},
+        skill_reuse::{self, ReuseCandidateView, ReuseReport},
         skill_selection::{self, RankedSkill, SkillContextPacket, SkillSelectionRequest},
         skills,
         skills::{

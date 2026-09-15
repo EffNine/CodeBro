@@ -3665,7 +3665,7 @@ impl CodeBroMcpServer {
     }
 
     #[tool(
-        description = "CodeBro skill registry (MCP; not OpenCode's native Skill loader): discover, propose, inspect, validate, approve, reject, deprecate, rollback, health, applicable selection, skill_context packets, request_approval/respond. CodeBro owns persistence; OpenCode executes natively."
+        description = "CodeBro skill registry (MCP; not OpenCode's native Skill loader): discover, propose, inspect, validate, approve, reject, deprecate, rollback, health, applicable selection, skill_context packets, request_approval/respond, detect_reuse. CodeBro owns persistence; OpenCode executes natively."
     )]
     async fn skill(
         &self,
@@ -4536,8 +4536,61 @@ impl CodeBroMcpServer {
                     .map_err(|e| McpError::internal_error(e, None))?;
                 Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
             }
+            // ── P11: skill reuse detector ─────────────────────────────
+            //
+            // Why an action on the existing `skill` tool rather than a new
+            // tool: the detector is a candidate *source* for the skill
+            // registry (same tables, same lifecycle, same approval
+            // protocol). A separate tool would fragment the 25-tool
+            // contract and duplicate the workspace/scope/visibility
+            // vocabulary; an action keeps one registry surface. The
+            // detector is explicitly invoked here — never scheduled,
+            // never backgrounded — and it never publishes: validated
+            // candidates still need `request_approval` + `respond`.
+            "detect_reuse" => {
+                let _guard = ws.mutation_lock.lock().await;
+                let scope = match args.scope.as_deref().map(str::trim) {
+                    None | Some("") | Some("project") => {
+                        crate::context_runtime::LearnScope::Project
+                    }
+                    Some("task") => crate::context_runtime::LearnScope::Task,
+                    Some("global") => crate::context_runtime::LearnScope::Global,
+                    Some(other) => {
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "unknown detect_reuse scope '{other}': use project, task, or global"
+                            ),
+                            None,
+                        ));
+                    }
+                };
+                let report = store
+                    .detect_skill_reuse(Some(&ws_root), task_id, scope, now)
+                    .map_err(|e| match e {
+                        crate::context_runtime::store::ContextError::Validation(msg) => {
+                            McpError::invalid_params(msg, None)
+                        }
+                        other => McpError::internal_error(other.to_string(), None),
+                    })?;
+                let status = report.status.clone();
+                let next_action = report.next_action.clone();
+                let payload = serde_json::json!({
+                    "action": "detect_reuse",
+                    "status": status,
+                    "scope": report.scope,
+                    "workspace_root": ws_root,
+                    "task_id": task_id,
+                    "patterns_considered": report.patterns_considered,
+                    "candidates": report.candidates,
+                    "next_action": next_action,
+                    "note": report.note,
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
             _ => Err(McpError::invalid_params(
-                "unknown skill action: use discover, propose, inspect, validate, approve, reject, deprecate, rollback, health, applicable, skill_context, request_approval, or respond",
+                "unknown skill action: use discover, propose, inspect, validate, approve, reject, deprecate, rollback, health, applicable, skill_context, request_approval, respond, or detect_reuse",
                 None,
             )),
         }
@@ -5327,7 +5380,9 @@ pub struct SkillArgs {
     /// (record usage outcome), applicable (ranked context-aware skill
     /// selection), skill_context (minimal first-class skill context packet),
     /// request_approval (emit a human-in-the-loop interaction request),
-    /// respond (consume an approval response: approve/reject/modify/defer).
+    /// respond (consume an approval response: approve/reject/modify/defer),
+    /// detect_reuse (P11: mine repeated successful workflows into
+    /// evidence-backed candidates; explicitly invoked, never publishes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
     /// Skill candidate id for inspect, validate, approve, reject.
