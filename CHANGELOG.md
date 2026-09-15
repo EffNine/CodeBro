@@ -30,6 +30,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.0] - 2026-09-16
+
+Persistent-intelligence v1 consolidation (P11–P17): skill reuse, skill
+evolution, evolution validation, production hardening, and the production
+acceptance soak suite. No new MCP tool (stays 25), no schema change,
+no autonomous publishing/rollback/evolution — the 25-tool surface,
+approval lifecycle, and execution/completion gates are frozen.
+
+### Added
+- **Skill reuse (P11)** — new `skill` action `detect_reuse`: repeated successful tool-sequence workflows mined deterministically from history into evidence-backed candidates (P3 learning → automated validation → human approval → active skill). Explicitly invoked, never publishes, re-runs converge (`already_exists`).
+- **Skill evolution (P13)** — new `skill` action `detect_evolution`: recurring skill-linked failures mined into successor-version candidates (`supersedes_skill` + `based_on_version` lineage, same approval protocol). `skill health` recordings now also capture a skill-linked history event with bounded failure context (`reason`), so the detector mines real executions.
+- **Skill evolution validation (P15)** — new `skill` actions `validate_evolution` / `compare_versions`: deterministic read-only comparison of two skill versions on attributed execution evidence with a conservative improvement verdict (`improved | regressed | unchanged | insufficient_evidence`). Never publishes, never rolls back; the human decides via the existing approve/rollback seams.
+- **Production hardening (P14)** — approval TTL expiry enforced inline (expired requests never consumable; dedup ignores expired rows so retries mint fresh requests); human `modify` supersedes the parent candidate (no forked approvable lineages); `Validated → Active` / `Validated → Superseded` transition edges legalized to match the publish transaction; skill-ref writes refused on terminal tasks; superseded-scope notices on the pre-MCP design docs.
+- **Production acceptance soak suite (P16)** — `crates/mcp-server/tests/p16_soak_e2e.rs` (14 tests, hermetic tempdirs, real `codebro serve` over stdio, no network/models/secrets) plus `crates/mcp-server/tests/skill_evolution_e2e.rs`.
+- **Docs** — `validate_evolution`/`compare_versions` documented in the skill action surface (`docs/MCP_API_V1.md`, `AGENTS.md`); 25-tool inventory (`ARCHITECTURE.md`, `README.md`).
+
+### Fixed
+- **`sk-` secret-heuristic false positive (P17 release-smoke finding)** — the bare `sk-` substring flagged ordinary hyphenated English (`task-list`, `desk-review`, `risk-register`, `ask-bob`) and every task-derived reuse name (`reuse-task-remember-task`), making P11 reuse candidates unvalidatable whenever task events participate (always, in production: every task transition/outcome is history). `sk-` now matches only at a token boundary (start-of-string or preceding non-alphanumeric); pasted keys (`sk-abc123…`) still hit. Fail-closed throughout — no bad publish ever occurred. Regressions: `validate_skill_content_rejects_bare_sk_key`, `validate_skill_content_accepts_task_hyphen_words`.
+
+### Tests
+- **1614/1614 pass** (1612 P16 baseline + 2 P17 regression tests), 0 failed; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; P16 soak 14/14; real-binary MCP boundary smoke (25 tools, valid/invalid requests, bounded responses, stdout purity, no panic) and full lifecycle smoke (learn → reuse → approval → v1 → contextual reuse → evolution → approval → v2 → honest validation → rollback) green against the release binary.
+
+---
+
 ## [1.0.0] - 2026-09-10
 
 ### Added

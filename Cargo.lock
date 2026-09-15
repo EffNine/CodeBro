@@ -247,7 +247,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codebro-change-engine"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "codebro-core",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-context-runtime"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "codebro-core",
  "rusqlite",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-fact-store"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "codebro-core",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-identity-runtime"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "codebro-core",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-impact-engine"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "codebro-core",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-indexer"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-mcp-server"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-memory-runtime"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "codebro-core",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-parsers"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "codebro-sandbox-runtime"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
