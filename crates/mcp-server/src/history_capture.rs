@@ -37,6 +37,10 @@ use std::path::Path;
 
 use crate::context_runtime::{HistoryInput, HistoryKind};
 
+/// Maximum characters of caller-supplied skill-health failure context kept
+/// in the captured summary (the history seam redacts + truncates further).
+pub const HEALTH_REASON_MAX_CHARS: usize = 240;
+
 /// One capturable moment: what happened, where, with what outcome.
 pub struct HistoryCapture {
     pub kind: HistoryKind,

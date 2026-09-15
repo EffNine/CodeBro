@@ -2521,6 +2521,15 @@ impl ContextStore {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             let mut task = Self::load_task_for(&tx, &ws, task_id)?;
+            // Terminal tasks are frozen: a skill-ref write would bump the
+            // version counter on a completed/failed/cancelled task and
+            // rewrite its audit tail. Refuse, never silently append.
+            if task.status.is_terminal() {
+                return Err(ContextError::Validation(format!(
+                    "task {task_id} is '{}': terminal tasks reject skill-ref writes",
+                    task.status
+                )));
+            }
             if let Some(anchor) = based_on_version {
                 if anchor != task.current_version {
                     return Err(ContextError::Validation(format!(
@@ -3525,6 +3534,25 @@ mod tests {
             .set_task_skill_refs("/repo-a", &task.task_id, vec!["sk::abc".into()], None, 120)
             .unwrap();
         assert_eq!(ok.skill_refs, vec!["sk::abc".to_string()]);
+    }
+
+    #[test]
+    fn skill_refs_rejected_on_terminal_tasks() {
+        // Terminal tasks are frozen: a skill-ref write must be refused,
+        // never bump the version counter on a completed audit tail.
+        let dir = tempfile::tempdir().unwrap();
+        let (s, task, _worker) = running_task(dir.path());
+        let version_before = task.current_version;
+        s.cancel_task("/repo-a", &task.task_id, Some("superseded"), None, 130)
+            .unwrap();
+        let err = s
+            .set_task_skill_refs("/repo-a", &task.task_id, vec!["sk::abc".into()], None, 140)
+            .unwrap_err();
+        assert!(err.to_string().contains("terminal"), "got: {err}");
+        let after = s.get_task("/repo-a", &task.task_id).unwrap().unwrap();
+        assert!(after.status.is_terminal());
+        assert_eq!(after.current_version, version_before + 1);
+        assert!(after.skill_refs.is_empty());
     }
 
     #[test]

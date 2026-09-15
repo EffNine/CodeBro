@@ -326,9 +326,11 @@ impl ContextStore {
     ///   content is approvable — the existing lifecycle gate);
     /// - the requesting workspace/task scope must match the candidate's
     ///   (project/task candidates never leak across workspaces);
-    /// - at most one pending request per candidate: a second request for
-    ///   the same candidate returns the existing pending row (idempotent —
-    ///   OpenCode retries must not mint duplicate interactions).
+    /// - at most one unexpired pending request per candidate+action: a
+    ///   second request for the same candidate returns the existing pending
+    ///   row (idempotent — OpenCode retries must not mint duplicate
+    ///   interactions); expired rows are invisible to dedup so post-expiry
+    ///   retries mint a fresh request.
     pub fn create_skill_approval_request(
         &self,
         candidate_id: &str,
@@ -398,17 +400,21 @@ impl ContextStore {
         .to_string();
 
         self.with_conn(|conn| {
-            // Idempotency: a pending request for the same candidate+action
-            // from the same workspace is the same interaction — return it.
+            // Idempotency: an unexpired pending request for the same
+            // candidate+action from the same workspace is the same
+            // interaction — return it. Expired rows are invisible here so
+            // a retry after expiry mints a fresh request (the expired row
+            // stays for audit; respond refuses it — see expiry guard).
             let existing: Option<SkillApprovalRequest> = conn
                 .query_row(
                     &format!(
                         "SELECT {APPROVAL_COLUMNS} FROM skill_approval_requests \
-                         WHERE candidate_id = ?1 AND proposed_action = ?2 \
-                           AND workspace_root = ?3 AND status = 'pending' \
-                         ORDER BY created_at DESC LIMIT 1"
+                          WHERE candidate_id = ?1 AND proposed_action = ?2 \
+                            AND workspace_root = ?3 AND status = 'pending' \
+                            AND (expires_at IS NULL OR expires_at > ?4) \
+                          ORDER BY created_at DESC LIMIT 1"
                     ),
-                    params![candidate_id, action, req_ws],
+                    params![candidate_id, action, req_ws, now as i64],
                     row_to_approval,
                 )
                 .optional()
@@ -541,11 +547,13 @@ impl ContextStore {
     ///
     /// Verification (in order, every failure is a refusal):
     /// 1. the request exists;
-    /// 2. the request is still pending (replay of a consumed request is
+    /// 2. the request has not expired (expired requests are never
+    ///    consumable — request again for the current content);
+    /// 3. the request is still pending (replay of a consumed request is
     ///    refused — a request transitions exactly once);
-    /// 3. the workspace/task scope matches the request;
-    /// 4. the response names a valid option;
-    /// 5. the candidate still exists, is still `validated`, still carries
+    /// 4. the workspace/task scope matches the request;
+    /// 5. the response names a valid option;
+    /// 6. the candidate still exists, is still `validated`, still carries
     ///    the requested content hash, and still anchors the requested
     ///    version (stale candidates are refused, never published).
     ///
@@ -580,6 +588,21 @@ impl ContextStore {
             .ok_or_else(|| {
                 ContextError::Validation(format!("approval request not found: {request_id}"))
             })?;
+        // Expiry enforcement: approval TTLs have no sweeping scheduler
+        // (request-driven runtime), so expiry is enforced inline on every
+        // response attempt — an expired request is never consumable,
+        // whatever its stored status.
+        if let Some(exp) = request.expires_at {
+            if now >= exp {
+                // Best-effort janitor: flip the row to expired so pending
+                // listings converge. Refusal is unconditional either way,
+                // so a janitor failure still cannot publish.
+                let _ = self.expire_skill_approval_requests(now);
+                return Err(ContextError::Validation(format!(
+                    "approval request {request_id} expired — request again for the current content"
+                )));
+            }
+        }
         if !request.is_pending() {
             return Err(ContextError::Validation(format!(
                 "approval request {request_id} is '{}': requests are single-use and \
@@ -840,8 +863,9 @@ impl ContextStore {
                     Ok::<_, ContextError>(())
                 })?;
                 // Successor request requires a validated candidate; an
-                // invalid modification leaves the parent superseded with
-                // the reason pointing at the new candidate id.
+                // invalid modification leaves the parent candidate
+                // `validated` so a fresh request can still recover the
+                // lineage (only the request is consumed as superseded).
                 let successor = if revalidated.status == SkillCandidateStatus::Validated.as_str() {
                     Some(self.create_skill_approval_request_inner(
                         &revalidated,
@@ -853,6 +877,21 @@ impl ContextStore {
                     None
                 };
                 let successor_id = successor.as_ref().map(|r| r.request_id.clone());
+                // Parent lineage closure: a valid modification forks a
+                // successor that carries the content forward, so the parent
+                // candidate is superseded — it must never stay approvable
+                // alongside its own replacement (two validated lineages for
+                // one skill would fork the publish path).
+                if successor.is_some() {
+                    self.transition_skill_candidate(
+                        &request.candidate_id,
+                        SkillCandidateStatus::Superseded,
+                        Some(&format!(
+                            "superseded by modified successor {new_candidate_id}"
+                        )),
+                        now,
+                    )?;
+                }
                 let updated = self.transition_approval_request(
                     request_id,
                     ApprovalStatus::Superseded,
@@ -1382,6 +1421,130 @@ mod tests {
         assert_eq!(done.status, "approved");
         let published = std::fs::read_to_string(skills.join("modify-me").join("SKILL.md")).unwrap();
         assert!(published.contains("Revised procedure body."));
+    }
+
+    #[test]
+    fn expired_request_is_refused_not_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(dir.path());
+        let skills = skills_dir(dir.path());
+        seed_validated(&store, "sc::exp001", "expiry-skill", "/repo");
+        let created_at = test_now() + 10;
+        let req = store
+            .create_skill_approval_request("sc::exp001", "/repo", None, "approve", None, created_at)
+            .unwrap();
+        assert!(req.is_pending());
+        // Past the 30-day TTL the request is unconsumable: approve,
+        // reject, and defer are all refused with an expiry error.
+        let past_expiry = created_at + SKILL_APPROVAL_TTL_SECS + 1;
+        for response in [
+            ApprovalResponse::Approve,
+            ApprovalResponse::Reject,
+            ApprovalResponse::Defer,
+        ] {
+            let err = store
+                .respond_to_skill_approval_request(
+                    &req.request_id,
+                    "/repo",
+                    None,
+                    response,
+                    None,
+                    None,
+                    Some(&skills),
+                    past_expiry,
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("expired"), "got: {err}");
+        }
+        // Nothing was published or transitioned by the refused attempts.
+        assert!(store.get_skill_by_name("expiry-skill").unwrap().is_none());
+        assert_eq!(
+            store
+                .get_skill_candidate("sc::exp001")
+                .unwrap()
+                .unwrap()
+                .status,
+            "validated"
+        );
+        // The janitor flipped the row to expired.
+        assert_eq!(
+            store
+                .get_skill_approval_request(&req.request_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "expired"
+        );
+        // A retry after expiry mints a fresh request (dedup ignores the
+        // expired row) and the fresh request is consumable.
+        let fresh = store
+            .create_skill_approval_request(
+                "sc::exp001",
+                "/repo",
+                None,
+                "approve",
+                None,
+                past_expiry + 1,
+            )
+            .unwrap();
+        assert_ne!(fresh.request_id, req.request_id);
+        assert!(fresh.is_pending());
+        let done = store
+            .respond_to_skill_approval_request(
+                &fresh.request_id,
+                "/repo",
+                None,
+                ApprovalResponse::Approve,
+                None,
+                None,
+                Some(&skills),
+                past_expiry + 2,
+            )
+            .unwrap();
+        assert_eq!(done.status, "approved");
+    }
+
+    #[test]
+    fn modify_supersedes_parent_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(dir.path());
+        seed_validated(&store, "sc::modpar001", "modify-parent", "/repo");
+        let req = store
+            .create_skill_approval_request(
+                "sc::modpar001",
+                "/repo",
+                None,
+                "approve",
+                None,
+                test_now() + 10,
+            )
+            .unwrap();
+        let new_content = valid_content("modify-parent")
+            .replace("Test procedure body.", "Revised procedure body.");
+        let outcome = store
+            .respond_to_skill_approval_request(
+                &req.request_id,
+                "/repo",
+                None,
+                ApprovalResponse::Modify,
+                Some("make it project-specific"),
+                Some(&new_content),
+                None,
+                test_now() + 20,
+            )
+            .unwrap();
+        assert!(outcome.successor_request_id.is_some());
+        // The parent candidate is superseded by its successor: it must
+        // never stay approvable alongside its own replacement.
+        let parent = store.get_skill_candidate("sc::modpar001").unwrap().unwrap();
+        assert_eq!(parent.status, "superseded");
+        // Direct publication of the parent is refused — the successor
+        // lineage is the only live path.
+        let skills = skills_dir(dir.path());
+        let err = store
+            .approve_skill_candidate("sc::modpar001", Some("/repo"), &skills, test_now() + 30)
+            .unwrap_err();
+        assert!(err.to_string().contains("superseded"), "got: {err}");
     }
 
     #[test]

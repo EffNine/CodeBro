@@ -11,7 +11,7 @@ exposed over MCP stdio (`codebro serve`).
 AI Coding Agent (OpenCode / Claude Code / Cursor)
         │  MCP over stdio (rmcp)
         ▼
-CodeBroMcpServer ──── crates/mcp-server/src/mcp/  (17 tools, frozen v1 contract)
+CodeBroMcpServer ──── crates/mcp-server/src/mcp/  (25 tools: 17-tool frozen v1 contract + 8 additive)
         │              mutating tools serialize on a per-workspace lock
         ▼
 Engineering Runtime (crates/)
@@ -48,7 +48,7 @@ The legacy TUI architecture was deleted from `main` (ADR-012); it is preserved
 only on the `tui-legacy` branch and tags, with mechanical guards in
 `crates/mcp-server/tests/legacy_isolation.rs`.
 
-## The 17 MCP tools
+## The 25 MCP tools (17 frozen v1 + 8 additive)
 
 | # | Tool | Kind |
 |---|------|------|
@@ -69,6 +69,17 @@ only on the `tui-legacy` branch and tags, with mechanical guards in
 | 15 | `reindex` | rebuild |
 | 16 | `repository_health` | read |
 | 17 | `consult` | external call |
+| 18 | `context` | read (always-available packet) |
+| 19 | `remember` | write (confirmed user context) |
+| 20 | `forget` (confirm-gated) | write (retire user context) |
+| 21 | `recall` | read (historical evidence) |
+| 22 | `learn` | read + guarded write (hypotheses) |
+| 23 | `skill` | write (skill registry) |
+| 24 | `task` | write (durable task runtime) |
+| 25 | `engineering_brief` | read (decision support) |
+
+Frozen v1 contract: [`docs/MCP_API_V1.md`](docs/MCP_API_V1.md)
+(additive tools documented under "Frozen tool inventory" / "Additive tools").
 
 Frozen contract: [`docs/MCP_API_V1.md`](docs/MCP_API_V1.md).
 Full design: [`docs/design/MCP_SERVER.md`](docs/design/MCP_SERVER.md).

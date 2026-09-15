@@ -1,7 +1,8 @@
 //! Global MCP response bounding.
 //!
-//! Every MCP tool response passes through [`bounded_response`] before it is
-//! serialized to the wire. The pipeline is:
+//! Every post-P0 MCP tool response passes through [`bounded_response`]
+//! before it is serialized to the wire. (V1-era tools predate the envelope
+//! and serialize their payloads directly.) The pipeline is:
 //!
 //! ```text
 //! domain result → compact projection → bounded projection → valid JSON

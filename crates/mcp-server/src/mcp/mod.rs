@@ -3665,7 +3665,7 @@ impl CodeBroMcpServer {
     }
 
     #[tool(
-        description = "CodeBro skill registry (MCP; not OpenCode's native Skill loader): discover, propose, inspect, validate, approve, reject, deprecate, rollback, health, applicable selection, skill_context packets, request_approval/respond, detect_reuse. CodeBro owns persistence; OpenCode executes natively."
+        description = "CodeBro skill registry (MCP; not OpenCode's native Skill loader): discover, propose, inspect, validate, approve, reject, deprecate, rollback, health, applicable, skill_context, request_approval/respond, detect_reuse, detect_evolution, validate_evolution/compare_versions. CodeBro owns persistence."
     )]
     async fn skill(
         &self,
@@ -4182,6 +4182,62 @@ impl CodeBroMcpServer {
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?
                     .ok_or_else(|| McpError::invalid_params("skill not found", None))?;
 
+                // P13 execution evidence: every recorded skill use is also a
+                // skill-linked history event (tool=skill, summary names the
+                // skill), so the evolution detector mines real executions —
+                // not bare counters. Best-effort: capture never fails the
+                // recording. The optional `reason` carries bounded failure
+                // context (redacted + truncated at the history seam), which
+                // lets the detector classify the weakness honestly.
+                let reason = args
+                    .reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(|r| {
+                        r.chars()
+                            .take(crate::history_capture::HEALTH_REASON_MAX_CHARS)
+                            .collect::<String>()
+                    });
+                let summary = match (&reason, success) {
+                    (Some(r), false) => format!(
+                        "skill '{}' execution recorded as failure (v{}): {}",
+                        skill.name, skill.current_version, r
+                    ),
+                    (Some(r), true) => format!(
+                        "skill '{}' execution recorded as success (v{}): {}",
+                        skill.name, skill.current_version, r
+                    ),
+                    (None, false) => format!(
+                        "skill '{}' execution recorded as failure (v{})",
+                        skill.name, skill.current_version
+                    ),
+                    (None, true) => format!(
+                        "skill '{}' execution recorded as success (v{})",
+                        skill.name, skill.current_version
+                    ),
+                };
+                crate::history_capture::capture(
+                    &store,
+                    &ws.canonical_root,
+                    crate::history_capture::HistoryCapture {
+                        kind: crate::context_runtime::HistoryKind::ToolExecution,
+                        summary,
+                        tool: Some("skill".to_string()),
+                        path: None,
+                        outcome: Some(if success {
+                            "success".to_string()
+                        } else {
+                            "failure".to_string()
+                        }),
+                        payload: Some(format!(
+                            "{{\"authority\":\"observed\",\"skill_id\":{:?},\"skill_name\":{:?},\"version\":{}}}",
+                            skill.skill_id, skill.name, skill.current_version,
+                        )),
+                        task_id: task_id.map(str::to_string),
+                    },
+                );
+
                 let payload = serde_json::json!({
                     "action": "health",
                     "skill": skill,
@@ -4589,8 +4645,119 @@ impl CodeBroMcpServer {
                     .map_err(|e| McpError::internal_error(e, None))?;
                 Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
             }
+            // ── P13: skill evolution detector ─────────────────────────
+            //
+            // Why an action on the existing `skill` tool rather than a new
+            // tool: an evolution candidate IS a skill candidate (same row,
+            // same lifecycle, same approval protocol, lineage via
+            // supersedes_skill + based_on_version). A separate tool would
+            // fragment the 25-tool contract and duplicate the
+            // workspace/scope/visibility vocabulary; an action keeps one
+            // registry surface. The detector is explicitly invoked here —
+            // never scheduled, never backgrounded — and it never publishes:
+            // validated candidates still need `request_approval` + `respond`.
+            "detect_evolution" => {
+                let _guard = ws.mutation_lock.lock().await;
+                let selector = args
+                    .skill_id
+                    .as_deref()
+                    .or(args.name.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let report = store
+                    .detect_skill_evolution(&ws_root, selector, task_id, now)
+                    .map_err(|e| match e {
+                        crate::context_runtime::store::ContextError::Validation(msg) => {
+                            McpError::invalid_params(msg, None)
+                        }
+                        other => McpError::internal_error(other.to_string(), None),
+                    })?;
+                let status = report.status.clone();
+                let next_action = report.next_action.clone();
+                let payload = serde_json::json!({
+                    "action": "detect_evolution",
+                    "status": status,
+                    "workspace_root": ws_root,
+                    "skill_selector": report.skill_selector,
+                    "skills_considered": report.skills_considered,
+                    "candidates": report.candidates,
+                    "next_action": next_action,
+                    "note": report.note,
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            // ── P15: skill-evolution validation ─────────────────────────
+            //
+            // Why an action on the existing `skill` tool rather than a new
+            // tool: a version comparison IS a skill-registry read (same
+            // rows, same lineage, same visibility vocabulary). A separate
+            // tool would fragment the 25-tool contract; an action keeps one
+            // registry surface. Read-only (no mutation lock): validation
+            // never publishes, never rolls back, never proposes — it only
+            // recommends, and the human decides through the existing
+            // approve/rollback seams. `compare_versions` is the same
+            // handler under its comparison name.
+            "validate_evolution" | "compare_versions" => {
+                let selector = args
+                    .skill_id
+                    .as_deref()
+                    .or(args.name.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        McpError::invalid_params(
+                            "validate_evolution requires skill_id or name",
+                            None,
+                        )
+                    })?;
+                // `version` remains the rollback target elsewhere; for
+                // validation the explicit from/to pair wins, falling back
+                // to `version` as the newer side when only it is given.
+                let to_v = args.to_version.or(args.version);
+                let report = store
+                    .validate_skill_evolution(
+                        &ws_root,
+                        selector,
+                        args.from_version,
+                        to_v,
+                        args.weakness_kind.as_deref(),
+                    )
+                    .map_err(|e| match e {
+                        crate::context_runtime::store::ContextError::Validation(msg) => {
+                            McpError::invalid_params(msg, None)
+                        }
+                        other => McpError::internal_error(other.to_string(), None),
+                    })?;
+                let verdict = report.verdict.clone();
+                let next_action = report.next_action.clone();
+                let message = report.message.clone();
+                let payload = serde_json::json!({
+                    "action": "validate_evolution",
+                    "status": verdict,
+                    "workspace_root": ws_root,
+                    "skill": report.skill,
+                    "skill_id": report.skill_id,
+                    "from_version": report.from_version,
+                    "to_version": report.to_version,
+                    "weakness_kind": report.weakness_kind,
+                    "from": report.from_stats,
+                    "to": report.to_stats,
+                    "success_rate_delta": report.success_rate_delta,
+                    "targeted_delta": report.targeted_delta,
+                    "verdict": report.verdict,
+                    "confidence": report.confidence,
+                    "message": message,
+                    "next_action": next_action,
+                    "note": report.note,
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
             _ => Err(McpError::invalid_params(
-                "unknown skill action: use discover, propose, inspect, validate, approve, reject, deprecate, rollback, health, applicable, skill_context, request_approval, respond, or detect_reuse",
+                "unknown skill action: use discover, propose, inspect, validate, approve, reject, deprecate, rollback, health, applicable, skill_context, request_approval, respond, detect_reuse, detect_evolution, validate_evolution, or compare_versions",
                 None,
             )),
         }
@@ -5382,7 +5549,14 @@ pub struct SkillArgs {
     /// request_approval (emit a human-in-the-loop interaction request),
     /// respond (consume an approval response: approve/reject/modify/defer),
     /// detect_reuse (P11: mine repeated successful workflows into
-    /// evidence-backed candidates; explicitly invoked, never publishes).
+    /// evidence-backed candidates; explicitly invoked, never publishes),
+    /// detect_evolution (P13: mine recurring skill-linked failures into
+    /// evidence-backed successor-version candidates; explicitly invoked,
+    /// never publishes),
+    /// validate_evolution (P15: compare two skill versions on attributed
+    /// execution evidence with a conservative improvement verdict;
+    /// explicitly invoked, read-only, never publishes; alias
+    /// compare_versions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
     /// Skill candidate id for inspect, validate, approve, reject.
@@ -5428,7 +5602,11 @@ pub struct SkillArgs {
     /// Maximum results for discover (default 20).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
-    /// Rejection/deprecation reason.
+    /// Rejection/deprecation reason. Also reused as bounded failure context
+    /// for `health` recordings (P13 execution evidence): a short human line
+    /// describing the failure, recorded into the skill-linked history event
+    /// so weakness classification stays honest (redacted + truncated at the
+    /// history seam).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Target version for rollback.
@@ -5468,6 +5646,19 @@ pub struct SkillArgs {
     /// Custom question for `request_approval` (defaults to naming the skill).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<String>,
+    /// Older version for `validate_evolution` / `compare_versions` (defaults
+    /// to the previous version when omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_version: Option<u32>,
+    /// Newer version for `validate_evolution` / `compare_versions` (defaults
+    /// to the latest version when omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<u32>,
+    /// Weakness kind that caused the successor for `validate_evolution`:
+    /// `verification_gap` | `timeout_gap` | `reliability_gap`. When omitted,
+    /// overall outcomes compare without targeted-pattern analysis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weakness_kind: Option<String>,
     /// Optional workspace root to operate against. When omitted, the
     /// server's configured default workspace is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -15334,5 +15525,282 @@ mod task_tests {
             out["execution_state"]["inconclusive_failures_total"], 1,
             "timeout evidence must stay visible, not silently dropped"
         );
+    }
+}
+
+// ── P15 skill-evolution validation over the MCP boundary ─────────────────
+
+#[cfg(test)]
+mod skill_validation_mcp_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn text_of(result: CallToolResult) -> String {
+        result
+            .content
+            .into_iter()
+            .find_map(|b| match b {
+                rmcp::model::ContentBlock::Text(t) => Some(t.text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn server(dir: &tempfile::TempDir) -> CodeBroMcpServer {
+        CodeBroMcpServer::with_state_dir(dir.path().to_path_buf(), dir.path().join("state"))
+    }
+
+    async fn call(server: &CodeBroMcpServer, args: serde_json::Value) -> serde_json::Value {
+        let p: SkillArgs = serde_json::from_value(args).unwrap();
+        let r = server
+            .skill(Parameters(p))
+            .await
+            .expect("skill call succeeds");
+        serde_json::from_str(&text_of(r)).unwrap_or(json!({}))
+    }
+
+    async fn call_err(server: &CodeBroMcpServer, args: serde_json::Value) -> String {
+        let p: SkillArgs = serde_json::from_value(args).unwrap();
+        server
+            .skill(Parameters(p))
+            .await
+            .expect_err("must fail")
+            .to_string()
+    }
+
+    fn valid_content(name: &str, marker: &str) -> String {
+        format!(
+            "---\nname: {name}\ndescription: A test skill for {name} ({marker})\n---\n\n\
+             # Purpose\n\nBody for {marker}.\n\n# Procedure\n\n1. Do.\n2. Verify.\n"
+        )
+    }
+
+    /// Seed one skill-linked execution straight into the server's store
+    /// (deterministic timestamps; the MCP boundary under test is the
+    /// validate_evolution read path, not the health write path).
+    fn seed(
+        store: &crate::context_runtime::ContextStore,
+        ws: &str,
+        skill: &str,
+        outcome: &str,
+        summary: &str,
+        at: u64,
+    ) {
+        use crate::context_runtime::{HistoryInput, HistoryKind, OpenSession};
+        let session = store.open_session(ws, &OpenSession::default(), at).unwrap();
+        let mut input = HistoryInput::new(ws, HistoryKind::ToolExecution, summary);
+        input.session_id = Some(session.id.clone());
+        input.tool = Some("skill".to_string());
+        input.outcome = Some(outcome.to_string());
+        input.payload = Some(format!(
+            "{{\"authority\":\"observed\",\"skill_name\":\"{skill}\"}}"
+        ));
+        input.created_at = Some(at);
+        store.record_history(&input, at).unwrap();
+    }
+
+    /// Publish v1 → v2 through the real store lifecycle with deterministic
+    /// activation times, then seed the CASE-A window (v1: 7S/3F over 10,
+    /// v2: 11S/1F over 12).
+    fn seed_case_a(
+        store: &crate::context_runtime::ContextStore,
+        skills: &std::path::Path,
+        ws: &str,
+    ) {
+        use crate::context_runtime::{
+            SkillApplicability, SkillCandidate, SkillCandidateStatus, SkillScope,
+        };
+        const NOW: u64 = 1_700_000_000;
+        let name = "mcp-tool-change";
+        let mk = |content: String, based_on: Option<u32>, at: u64| SkillCandidate {
+            candidate_id: crate::context_runtime::mint_skill_candidate_id(
+                &SkillScope::Project,
+                Some(ws),
+                None,
+                name,
+                &content,
+            ),
+            workspace_root: Some(ws.to_string()),
+            task_id: None,
+            scope: "project".to_string(),
+            name: name.to_string(),
+            description: format!("Skill {name}"),
+            purpose: "P15 MCP probe".to_string(),
+            applicability: SkillApplicability::default(),
+            source_learning_candidates: Vec::new(),
+            supporting_evidence: vec![1, 2, 3],
+            contradicting_evidence: Vec::new(),
+            proposed_content: content,
+            status: SkillCandidateStatus::Candidate.as_str().to_string(),
+            confidence: 0.75,
+            validation: None,
+            eval_reason: None,
+            rejection_reason: None,
+            supersedes_skill: None,
+            based_on_version: based_on,
+            created_at: at,
+            updated_at: at,
+            expires_at: None,
+        };
+        let c1 = mk(valid_content(name, "v1"), None, NOW - 1000);
+        let c1_id = c1.candidate_id.clone();
+        store.insert_skill_candidate(&c1).unwrap();
+        store.evaluate_candidate_content(&c1_id, NOW - 999).unwrap();
+        store
+            .approve_skill_candidate(&c1_id, Some(ws), skills, NOW - 998)
+            .unwrap();
+        for i in 0..7 {
+            seed(
+                store,
+                ws,
+                name,
+                "success",
+                &format!("skill '{name}' execution recorded as success (v1): clean {i}"),
+                NOW - 900 + i,
+            );
+        }
+        for i in 0..3 {
+            seed(
+                store,
+                ws,
+                name,
+                "failure",
+                &format!("skill '{name}' execution recorded as failure (v1): deploy stall {i}"),
+                NOW - 800 + i,
+            );
+        }
+        let c2 = mk(valid_content(name, "v2"), Some(1), NOW - 400);
+        let c2_id = c2.candidate_id.clone();
+        store.insert_skill_candidate(&c2).unwrap();
+        store.evaluate_candidate_content(&c2_id, NOW - 399).unwrap();
+        store
+            .approve_skill_candidate(&c2_id, Some(ws), skills, NOW - 398)
+            .unwrap();
+        for i in 0..11 {
+            seed(
+                store,
+                ws,
+                name,
+                "success",
+                &format!("skill '{name}' execution recorded as success (v2): clean {i}"),
+                NOW - 300 + i,
+            );
+        }
+        seed(
+            store,
+            ws,
+            name,
+            "failure",
+            &format!("skill '{name}' execution recorded as failure (v2): deploy stall"),
+            NOW - 200,
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_evolution_reports_improved_over_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let ws = dir.path().to_str().unwrap().to_string();
+        // State dir doubles as the canonical workspace root here.
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        seed_case_a(&s.context_store(), &skills, &ws);
+
+        let out = call(
+            &s,
+            json!({ "action": "validate_evolution", "name": "mcp-tool-change", "workspace_root": ws }),
+        )
+        .await;
+        assert_eq!(out["action"], "validate_evolution");
+        assert_eq!(out["verdict"], "improved", "{out}");
+        assert_eq!(out["status"], "improved");
+        assert_eq!(out["next_action"], "keep_v2");
+        assert_eq!(out["from_version"], 1);
+        assert_eq!(out["to_version"], 2);
+        assert_eq!(out["from"]["executions"], 10);
+        assert_eq!(out["to"]["executions"], 12);
+        assert!(
+            out["message"].as_str().unwrap().contains("improved"),
+            "{out}"
+        );
+        // No implementation internals leak to the model surface.
+        let text = serde_json::to_string(&out).unwrap().to_ascii_lowercase();
+        for leaked in [
+            "sqlite",
+            "tree_hash",
+            "tree-hash",
+            "journal",
+            "rowid",
+            "fts5",
+            "wal",
+        ] {
+            assert!(
+                !text.contains(leaked),
+                "MCP surface must not expose {leaked}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compare_versions_alias_matches_validate_evolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let ws = dir.path().to_str().unwrap().to_string();
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        seed_case_a(&s.context_store(), &skills, &ws);
+
+        let a = call(
+            &s,
+            json!({ "action": "validate_evolution", "name": "mcp-tool-change", "workspace_root": ws }),
+        )
+        .await;
+        let b = call(
+            &s,
+            json!({ "action": "compare_versions", "name": "mcp-tool-change", "workspace_root": ws }),
+        )
+        .await;
+        assert_eq!(a["verdict"], b["verdict"]);
+        assert_eq!(a["from"], b["from"]);
+        assert_eq!(a["to"], b["to"]);
+    }
+
+    #[tokio::test]
+    async fn validate_evolution_rejects_bad_input_over_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(&dir);
+        let ws = dir.path().to_str().unwrap().to_string();
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        seed_case_a(&s.context_store(), &skills, &ws);
+
+        // Missing selector.
+        let err = call_err(
+            &s,
+            json!({ "action": "validate_evolution", "workspace_root": ws }),
+        )
+        .await;
+        assert!(err.contains("skill_id or name"), "{err}");
+        // Unknown skill.
+        let err = call_err(
+            &s,
+            json!({ "action": "validate_evolution", "name": "ghost-skill", "workspace_root": ws }),
+        )
+        .await;
+        assert!(err.contains("skill not found"), "{err}");
+        // Unknown weakness kind.
+        let err = call_err(
+            &s,
+            json!({ "action": "validate_evolution", "name": "mcp-tool-change", "workspace_root": ws, "weakness_kind": "turbo_gap" }),
+        )
+        .await;
+        assert!(err.contains("unknown weakness kind"), "{err}");
+        // Stale version.
+        let err = call_err(
+            &s,
+            json!({ "action": "validate_evolution", "name": "mcp-tool-change", "workspace_root": ws, "from_version": 1, "to_version": 99 }),
+        )
+        .await;
+        assert!(err.contains("stale"), "{err}");
     }
 }

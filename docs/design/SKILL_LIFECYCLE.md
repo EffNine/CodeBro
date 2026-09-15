@@ -1,5 +1,15 @@
 # Skill Lifecycle — P6 Design Specification
 
+> **Superseded-scope notice (P14):** this pre-MCP design spec is retained for
+> history only. The implemented system differs throughout: there is no
+> `SkillManager` / `~/.codebro/skill-registry.json`; skills persist in the
+> user-level SQLite state.db with publication to
+> `~/.config/opencode/skills/<name>/SKILL.md`, governed by the
+> `request_approval` → `respond` human-approval protocol. Source of truth:
+> `crates/context-runtime/src/skills.rs`,
+> `crates/context-runtime/src/skill_approvals.rs`, and
+> `docs/evolution/P4_IMPLEMENTATION.md` / `P10_IMPLEMENTATION.md`.
+
 **Document:** `docs/design/SKILL_LIFECYCLE.md`
 **Version:** 1.0.0
 **Phase:** P6 — Adaptive Intelligence

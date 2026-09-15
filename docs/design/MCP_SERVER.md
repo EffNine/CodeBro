@@ -1,5 +1,13 @@
 # MCP Server — Engineering Runtime Interface
 
+> **Partially-superseded-scope notice (P14):** this doc froze at the P7-era
+> v1 surface. It remains accurate for transport, positioning, and the v1
+> tools it covers, but it does not document the additive tools
+> (`apply_changes`, `context`, `remember`, `forget`, `recall`, `learn`,
+> `skill`, `task`, `engineering_brief`), the execution-state verification
+> gate, root authorization (`--allow-root`), or response bounding. Source
+> of truth for the live 25-tool surface: `docs/MCP_API_V1.md`.
+
 **Document:** `docs/design/MCP_SERVER.md`
 **Version:** 2.0.0
 **Phase:** P7+ — MCP Server + Sandbox Execution

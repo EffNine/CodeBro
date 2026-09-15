@@ -188,15 +188,22 @@ impl SkillCandidateStatus {
     /// Valid predecessor states for a forward transition.
     ///
     /// The documented chain is Candidate → Evaluating → Draft → Validated
-    /// → Approved → Active. Side exits: rejection from any pre-active
+    /// → Active. Side exits: rejection from any pre-active
     /// state, expiry from the low-commitment states (Candidate/Evaluating/
-    /// Deferred — drafted/validated/approved content never silently
-    /// expires), deprecation and supersession from post-activation.
+    /// Deferred — drafted/validated content never silently
+    /// expires), deprecation and supersession from post-activation, plus
+    /// Validated → Superseded when a human `modify` forks a successor
+    /// lineage (the parent must never stay approvable alongside it).
     /// Deferred may be re-evaluated or explicitly rejected.
     /// P10 adds Validated → Deferred: a human approver may defer a
     /// validated candidate through the approval protocol (resumable via
     /// Deferred → Evaluating re-evaluation); the automated pass never
     /// defers on its own.
+    /// Note: `Approved` remains a reserved state with no writer —
+    /// publication transitions Validated → Active directly inside the
+    /// publish transaction (candidate, skill, and version rows commit
+    /// atomically). The Approved edges below are kept as reserved
+    /// protocol space, not live paths.
     pub fn can_transition_to(&self, target: &SkillCandidateStatus) -> bool {
         use SkillCandidateStatus::*;
         matches!(
@@ -211,9 +218,11 @@ impl SkillCandidateStatus {
                 | (Evaluating, Expired)
                 | (Draft, Validated)
                 | (Draft, Rejected)
+                | (Validated, Active)
                 | (Validated, Approved)
                 | (Validated, Rejected)
                 | (Validated, Deferred)
+                | (Validated, Superseded)
                 | (Approved, Active)
                 | (Approved, Rejected)
                 | (Approved, Superseded)
@@ -660,6 +669,37 @@ const SECRET_PATTERNS: &[&str] = &[
     "xoxp-",
 ];
 
+/// Match one secret pattern against lowercased content.
+fn secret_pattern_hit(content_lower: &str, pattern: &str) -> bool {
+    if pattern == "sk-" {
+        return contains_sk_key(content_lower);
+    }
+    content_lower.contains(&pattern.to_lowercase())
+}
+
+/// `sk-` (OpenAI-style key prefix) matches only at a token boundary: a bare
+/// substring scan false-positives on ordinary hyphenated English
+/// (`task-list`, `desk-review`, `risk-register`, `ask-bob`) and — worse —
+/// on every reuse-derived skill name containing the `task` tool
+/// (`reuse-task-remember-task`), which made P11 reuse candidates
+/// unvalidatable whenever task events participate (they always do in
+/// production: every task transition/outcome is history). A pasted key
+/// starts a token (`sk-abc123…`), so requiring start-of-string or a
+/// preceding non-alphanumeric keeps the true-positive class while dropping
+/// the English-word class.
+fn contains_sk_key(content_lower: &str) -> bool {
+    let bytes = content_lower.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = content_lower[start..].find("sk-") {
+        let abs = start + rel;
+        if abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric() {
+            return true;
+        }
+        start = abs + 3;
+    }
+    false
+}
+
 /// OpenCode skill-name rule: `^[a-z0-9]+(-[a-z0-9]+)*$`, 1–64 chars
 /// (no leading/trailing `-`, no consecutive `--`). Uppercase, underscores,
 /// and other characters would be silently ignored by OpenCode's loader.
@@ -757,11 +797,11 @@ pub fn validate_skill_content(
     let content_lower = content.to_lowercase();
     let secret_safe = !SECRET_PATTERNS
         .iter()
-        .any(|pat| content_lower.contains(&pat.to_lowercase()));
+        .any(|pat| secret_pattern_hit(&content_lower, pat));
     if !secret_safe {
         let found: Vec<&str> = SECRET_PATTERNS
             .iter()
-            .filter(|pat| content_lower.contains(&pat.to_lowercase()))
+            .filter(|pat| secret_pattern_hit(&content_lower, pat))
             .copied()
             .collect();
         errors.push(format!(
@@ -1174,10 +1214,11 @@ impl ContextStore {
     /// same row. That is only safe when the stored row is still an
     /// open-evidence draft (`candidate`/`evaluating`/`deferred`): a
     /// pending proposal against a row already in the review pipeline
-    /// (draft/validated/approved/active) is refused rather than merged,
-    /// and terminal rows (rejected/superseded/expired/deprecated) are
+    /// (draft/validated/active) is refused rather than merged,
+    /// and terminal rows (rejected/superseded/expired) are
     /// never resurrected — new evidence must come through a new identity
     /// (typically a renamed skill or a fresh learning candidate).
+    /// (`deprecated` is a skill-row state, never a candidate state.)
     pub fn insert_skill_candidate(&self, candidate: &SkillCandidate) -> Result<(), ContextError> {
         self.with_conn(|conn| {
             let existing: Option<SkillCandidate> = conn
@@ -2655,6 +2696,11 @@ mod tests {
         assert!(Draft.can_transition_to(&Validated));
         assert!(Validated.can_transition_to(&Approved));
         assert!(Approved.can_transition_to(&Active));
+        // P14: publish writes Validated → Active directly inside the
+        // publish transaction; modify supersedes a validated parent when
+        // it forks a successor. Both edges must be matrix-legal.
+        assert!(Validated.can_transition_to(&Active));
+        assert!(Validated.can_transition_to(&Superseded));
         assert!(Active.can_transition_to(&Deprecated));
         assert!(Active.can_transition_to(&Superseded));
         assert!(Deferred.can_transition_to(&Evaluating));
@@ -3650,6 +3696,30 @@ mod tests {
         let result = validate_skill_content(content, "test", None);
         assert!(!result.valid);
         assert!(!result.secret_safe);
+    }
+
+    #[test]
+    fn validate_skill_content_rejects_bare_sk_key() {
+        // `sk-` at a token boundary is still a key: the api_key-adjacent
+        // wording is not required for the hit.
+        let content = "---\nname: test\ndescription: x\n---\n\n# Purpose\n\nKey sk-abc123def456.";
+        let result = validate_skill_content(content, "test", None);
+        assert!(!result.valid);
+        assert!(!result.secret_safe);
+        assert!(result.errors.iter().any(|e| e.contains("sk-")));
+    }
+
+    #[test]
+    fn validate_skill_content_accepts_task_hyphen_words() {
+        // P17 release-smoke finding: reuse-derived names/bodies containing
+        // the `task` tool (`reuse-task-remember-task`, `task-list`,
+        // `desk-review`, `risk-register`, `ask-bob`) tripped the bare `sk-`
+        // substring and made P11 reuse candidates unvalidatable whenever
+        // task events participate. Token-boundary matching keeps those.
+        let content = "---\nname: reuse-task-remember-task\ndescription: Repeated task workflow\n---\n\n# Purpose\n\nRun the task-list then desk-review then risk-register; ask-bob when blocked.\n\n# Procedure\n\n1. Run `task` as observed.\n2. Run `remember` as observed.\n";
+        let result = validate_skill_content(content, "reuse-task-remember-task", None);
+        assert!(result.secret_safe, "errors: {:?}", result.errors);
+        assert!(result.valid, "errors: {:?}", result.errors);
     }
 
     #[test]

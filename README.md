@@ -68,7 +68,7 @@ opencode mcp add codebro -- "$(which codebro) serve"
 
 For a complete Conductor setup guide, see [`docs/CONDUCTOR_HOWTO.md`](docs/CONDUCTOR_HOWTO.md).
 
-## What CodeBro Provides (v1 contract: 17 tools)
+## What CodeBro Provides (25 tools: v1 contract of 17 + 8 additive)
 
 | Surface | Tools | Purpose |
 |---------|-------|---------|
@@ -79,6 +79,9 @@ For a complete Conductor setup guide, see [`docs/CONDUCTOR_HOWTO.md`](docs/CONDU
 | Guarded changes | `apply_change`, `apply_changes` | Single-file guarded mutation; multi-file all-or-nothing transaction with rollback |
 | Execution evidence | `sandbox_status`, `sandbox_exec`, `sandbox_test`, `sandbox_build` | Policy-gated commands with full evidence envelopes (git revision, exit code, reproducibility, environment) |
 | Consultant | `consult` | Ask Conductor-backed providers for architecture/debug/review opinions |
+| Persistent context | `context`, `remember`, `forget`, `recall` | Always-available context packet; confirmed user context with provenance; query-driven history |
+| Learning & skills | `learn`, `skill`, `task` | Cautious hypotheses; human-approved skill registry with reuse/evolution detectors; durable task runtime |
+| Decision support | `engineering_brief` | Bounded deterministic brief for planning |
 
 ## Trust Model
 
