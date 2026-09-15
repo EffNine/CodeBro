@@ -462,6 +462,336 @@ pub fn summarize_prior(
     }
 }
 
+// ── Current-tree execution state ─────────────────────────────────────────
+//
+// The journal answers "what happened before?" at the next run. This section
+// answers the complementary question the runtime must answer at any time:
+// "does the CURRENT working tree have unresolved failing evidence?"
+//
+// Semantics (deterministic, no model input):
+// - Evidence is associated with the working tree it was observed against
+//   (tree hash). Any edit changes the hash, so stale evidence never applies
+//   to the new state — the state becomes `unverified` until re-run.
+// - A failure is RESOLVED only by a later recorded success of the same
+//   invocation (identical command; identical filter, or a full run with no
+//   filter — including a full run of the same runner that covers a
+//   filtered selection) on the same tree. Prose never resolves a failure.
+// - `compile_error` and `test_failure` are AUTHORITATIVE: the toolchain ran
+//   and reported a defect in the code. They block a "completed" claim.
+// - `timeout` / `unknown_failure` are inconclusive (environmental,
+//   truncated, or unparsed): surfaced as `unverified`, never blocking on
+//   their own — the runtime does not pretend to know what it cannot.
+
+/// Failure classifications that authoritatively indicate a code defect.
+pub const AUTHORITATIVE_FAILURE_CLASSES: [&str; 2] = ["compile_error", "test_failure"];
+
+/// Maximum unresolved failures serialized per assessment (bounded output).
+pub const MAX_ASSESSED_FAILURES: usize = 3;
+
+/// The execution-state vocabulary for one working tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStateKind {
+    /// At least one unresolved authoritative (compile/test) failure exists
+    /// for the current working tree. Completion must not be claimed.
+    Failed,
+    /// Recorded passing execution evidence exists for the current tree and
+    /// no unresolved failure contradicts it.
+    Verified,
+    /// No sufficient evidence: no records for this tree, or only
+    /// inconclusive (timeout/unknown) failures. Never presented as success.
+    Unverified,
+    /// The workspace has no capturable tree identity (not a git repository,
+    /// or git unavailable), so evidence cannot be associated.
+    Unknown,
+}
+
+impl ExecutionStateKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExecutionStateKind::Failed => "failed",
+            ExecutionStateKind::Verified => "verified",
+            ExecutionStateKind::Unverified => "unverified",
+            ExecutionStateKind::Unknown => "unknown",
+        }
+    }
+}
+
+/// One failure still applicable to the current working tree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnresolvedFailure {
+    pub command: String,
+    pub classification: String,
+    pub exit_code: i32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_tests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_summary: Vec<String>,
+    pub age_seconds: u64,
+    pub execution_id: String,
+}
+
+/// The most recent passing execution observed on the current working tree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LastSuccess {
+    pub command: String,
+    pub classification: String,
+    pub age_seconds: u64,
+    pub execution_id: String,
+}
+
+/// Deterministic assessment of the evidence applicable to one tree state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionStateAssessment {
+    pub state: ExecutionStateKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_hash: Option<String>,
+    /// Unresolved authoritative failures (max [`MAX_ASSESSED_FAILURES`] shown).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_failures: Vec<UnresolvedFailure>,
+    /// Total unresolved authoritative failures (may exceed the shown list).
+    #[serde(default)]
+    pub unresolved_failures_total: usize,
+    /// Unresolved inconclusive failures (timeout/unknown; shown, non-blocking).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inconclusive_failures: Vec<UnresolvedFailure>,
+    #[serde(default)]
+    pub inconclusive_failures_total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success: Option<LastSuccess>,
+    /// Records considered for this tree.
+    pub evidence_records: usize,
+    /// Honest one-line description of what the state means.
+    pub note: String,
+}
+
+impl ExecutionStateAssessment {
+    /// True when unresolved authoritative failures forbid a success claim.
+    pub fn blocks_completion(&self) -> bool {
+        self.state == ExecutionStateKind::Failed
+    }
+
+    /// Compact single-line evidence summary for refusal messages.
+    pub fn failure_summary(&self) -> String {
+        self.unresolved_failures
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} → {} (exit {}, {}s ago)",
+                    f.command, f.classification, f.exit_code, f.age_seconds
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// Does this token reference a filter entry (exact or wrapped, e.g. go's
+/// `^TestFoo$`)?
+fn filter_entry_token(token: &str, filter: &[String]) -> bool {
+    filter
+        .iter()
+        .any(|f| !f.is_empty() && (token == f.as_str() || token.contains(f.as_str())))
+}
+
+/// Is this token part of a filter expression rather than runner/scope
+/// configuration? Filter entries, the selector syntax that embeds them
+/// (`-k`, `-run`, pytest's `or`), and wrapped entries qualify; runner and
+/// scope selectors (`-p crateA`, `--manifest-path`, `--release`, ...) do
+/// not.
+fn filter_expression_token(token: &str, filter: &[String]) -> bool {
+    matches!(token, "-k" | "-run" | "or") || filter_entry_token(token, filter)
+}
+
+/// Does a later successful full run of the same runner exercise the
+/// selection that failed?
+///
+/// The MCP resolver embeds filter names in the resolved command (cargo:
+/// `cargo test adds`; pytest: `python -m pytest -q --tb=long -k a or b`;
+/// go: `go test -run ^X$ ./...`), so a later unfiltered run of the same
+/// runner does not share the exact command string.
+///
+/// A passing full run covers the filtered selection only when the full
+/// command is exactly the failing command with ONE contiguous filter
+/// expression removed, every removed token is filter-related, and at least
+/// one removed token references a filter entry. This keeps every
+/// auto-generated shape covering while refusing to treat an unexplained
+/// scope as verified: a root `cargo test` after an explicit
+/// `cargo test -p crateA adds` failure is not evidence that crateA (which
+/// need not be a default workspace member) was exercised.
+fn full_run_covers(success: &ExecutionEvidenceRecord, failure: &ExecutionEvidenceRecord) -> bool {
+    if !success.test_filter.is_empty() || failure.test_filter.is_empty() {
+        return false;
+    }
+    if success.runner.is_none() || success.runner != failure.runner {
+        return false;
+    }
+    let success_tokens: Vec<&str> = success.command.split_whitespace().collect();
+    let failure_tokens: Vec<&str> = failure.command.split_whitespace().collect();
+    if success_tokens.is_empty() || success_tokens.len() >= failure_tokens.len() {
+        return false;
+    }
+    (0..failure_tokens.len()).any(|start| {
+        ((start + 1)..=failure_tokens.len()).any(|end| {
+            let removed = &failure_tokens[start..end];
+            removed
+                .iter()
+                .all(|token| filter_expression_token(token, &failure.test_filter))
+                && removed
+                    .iter()
+                    .any(|token| filter_entry_token(token, &failure.test_filter))
+                && failure_tokens[..start]
+                    .iter()
+                    .chain(failure_tokens[end..].iter())
+                    .copied()
+                    .eq(success_tokens.iter().copied())
+        })
+    })
+}
+
+/// Does a later success record resolve an earlier failure record?
+/// Identical command with an identical filter or a full run, or a full run
+/// of the same runner that covers a filtered failure.
+fn success_supersedes_same_tree(
+    success: &ExecutionEvidenceRecord,
+    failure: &ExecutionEvidenceRecord,
+) -> bool {
+    success.success
+        && success.recorded_at_unix >= failure.recorded_at_unix
+        && ((success.command.trim() == failure.command.trim()
+            && (success.test_filter == failure.test_filter || success.test_filter.is_empty()))
+            || full_run_covers(success, failure))
+}
+
+/// Assess the CURRENT working tree: capture its identity and reduce the
+/// recorded evidence that applies to it. Read-only (never writes).
+pub fn assess(workspace_root: &Path, now_unix: u64) -> ExecutionStateAssessment {
+    let root = workspace_root.to_path_buf();
+    match codebro_core::RepoState::capture(&root) {
+        Some(state) => assess_for_tree(workspace_root, &state.working_tree_hash, now_unix),
+        None => ExecutionStateAssessment {
+            state: ExecutionStateKind::Unknown,
+            tree_hash: None,
+            unresolved_failures: Vec::new(),
+            unresolved_failures_total: 0,
+            inconclusive_failures: Vec::new(),
+            inconclusive_failures_total: 0,
+            last_success: None,
+            evidence_records: 0,
+            note: "workspace is not a git repository (or git is unavailable): \
+                   execution evidence cannot be associated with the current state"
+                .to_string(),
+        },
+    }
+}
+
+/// Assess one explicit tree state. Deterministic; the ceiling on parsed
+/// records is [`MAX_RECORDS`] by file retention.
+pub fn assess_for_tree(
+    workspace_root: &Path,
+    tree_hash: &str,
+    now_unix: u64,
+) -> ExecutionStateAssessment {
+    let file = load(workspace_root);
+    let records: Vec<&ExecutionEvidenceRecord> = file
+        .records
+        .iter()
+        .filter(|r| r.tree_hash == tree_hash)
+        .collect();
+
+    let mut unresolved: Vec<UnresolvedFailure> = Vec::new();
+    let mut inconclusive: Vec<UnresolvedFailure> = Vec::new();
+    for (idx, r) in records.iter().enumerate() {
+        if r.success {
+            continue;
+        }
+        let resolved = records[idx + 1..]
+            .iter()
+            .any(|s| success_supersedes_same_tree(s, r));
+        if resolved {
+            continue;
+        }
+        let entry = UnresolvedFailure {
+            command: r.command.clone(),
+            classification: r.classification.clone(),
+            exit_code: r.exit_code,
+            failed_tests: r.failed_tests.clone(),
+            diagnostic_summary: r.diagnostic_summary.clone(),
+            age_seconds: now_unix.saturating_sub(r.recorded_at_unix),
+            execution_id: r.execution_id.clone(),
+        };
+        if AUTHORITATIVE_FAILURE_CLASSES.contains(&r.classification.as_str()) {
+            unresolved.push(entry);
+        } else {
+            inconclusive.push(entry);
+        }
+    }
+    // Most recent first, then bounded.
+    let by_recency =
+        |a: &UnresolvedFailure, b: &UnresolvedFailure| a.age_seconds.cmp(&b.age_seconds);
+    unresolved.sort_by(by_recency);
+    inconclusive.sort_by(by_recency);
+    let unresolved_total = unresolved.len();
+    let inconclusive_total = inconclusive.len();
+    unresolved.truncate(MAX_ASSESSED_FAILURES);
+    inconclusive.truncate(MAX_ASSESSED_FAILURES);
+
+    let last_success = records
+        .iter()
+        .rev()
+        .find(|r| r.success)
+        .map(|r| LastSuccess {
+            command: r.command.clone(),
+            classification: r.classification.clone(),
+            age_seconds: now_unix.saturating_sub(r.recorded_at_unix),
+            execution_id: r.execution_id.clone(),
+        });
+
+    let state = if unresolved_total > 0 {
+        ExecutionStateKind::Failed
+    } else if inconclusive_total > 0 {
+        ExecutionStateKind::Unverified
+    } else if last_success.is_some() {
+        ExecutionStateKind::Verified
+    } else {
+        ExecutionStateKind::Unverified
+    };
+    let note = match state {
+        ExecutionStateKind::Failed => format!(
+            "current working tree has {unresolved_total} unresolved compile/test failure(s) \
+             recorded by CodeBro — resolve and re-run the same verification command \
+             successfully, or report an explicit failure/partial outcome; prose cannot clear this"
+        ),
+        ExecutionStateKind::Unverified if inconclusive_total > 0 => format!(
+            "current working tree has {inconclusive_total} unresolved inconclusive failure(s) \
+             (timeout/unknown) — the outcome is unverified, not verified"
+        ),
+        ExecutionStateKind::Verified => {
+            "current working tree has recorded passing execution evidence".to_string()
+        }
+        ExecutionStateKind::Unverified => {
+            "no execution evidence is recorded for the current working tree — the outcome is \
+             unverified until sandbox_build/sandbox_test passes"
+                .to_string()
+        }
+        ExecutionStateKind::Unknown => {
+            "execution evidence cannot be associated with the current state".to_string()
+        }
+    };
+
+    ExecutionStateAssessment {
+        state,
+        tree_hash: Some(tree_hash.to_string()),
+        unresolved_failures: unresolved,
+        unresolved_failures_total: unresolved_total,
+        inconclusive_failures: inconclusive,
+        inconclusive_failures_total: inconclusive_total,
+        last_success,
+        evidence_records: records.len(),
+        note,
+    }
+}
+
 // ── Read-only health status ──────────────────────────────────────────
 
 /// Read-only health summary for `doctor` / `repository_health`.
@@ -1084,5 +1414,285 @@ mod tests {
         let st = status(dir.path(), 1);
         assert!(st.exists);
         assert!(!st.valid);
+    }
+
+    // ── Current-tree execution state assessment ─────────────────────────
+
+    fn timeout_input<'a>(tree: &'a str, cmd: &'a str) -> JournalInput<'a> {
+        JournalInput {
+            execution_id: "exec-timeout",
+            project_id: None,
+            tree_hash: tree,
+            command: cmd,
+            test_filter: &[],
+            exit_code: -1,
+            classification: "timeout",
+            success: false,
+            timed_out: true,
+            duration_ms: 120_000,
+            diagnostics: &[],
+            affected_modules: &[],
+        }
+    }
+
+    #[test]
+    fn assessment_without_records_is_unverified_not_verified() {
+        let dir = temp_root();
+        let a = assess_for_tree(dir.path(), "treeT", 100);
+        assert_eq!(a.state, ExecutionStateKind::Unverified);
+        assert!(!a.blocks_completion());
+        assert!(a.last_success.is_none());
+        assert_eq!(a.unresolved_failures_total, 0);
+    }
+
+    #[test]
+    fn assessment_passing_run_is_verified() {
+        let dir = temp_root();
+        record_at(dir.path(), "treeT", "cargo test", &[], true, 100);
+        let a = assess_for_tree(dir.path(), "treeT", 160);
+        assert_eq!(a.state, ExecutionStateKind::Verified);
+        assert!(!a.blocks_completion());
+        let last = a.last_success.expect("success recorded");
+        assert_eq!(last.command, "cargo test");
+        assert_eq!(last.age_seconds, 60);
+    }
+
+    #[test]
+    fn assessment_unresolved_failure_is_failed_and_blocks() {
+        let dir = temp_root();
+        record_at(dir.path(), "treeT", "cargo test", &[], false, 100);
+        let a = assess_for_tree(dir.path(), "treeT", 200);
+        assert_eq!(a.state, ExecutionStateKind::Failed);
+        assert!(a.blocks_completion());
+        assert_eq!(a.unresolved_failures_total, 1);
+        let f = &a.unresolved_failures[0];
+        assert_eq!(f.classification, "test_failure");
+        assert_eq!(f.exit_code, 1);
+        assert_eq!(f.failed_tests, vec!["adds".to_string()]);
+        assert!(a.failure_summary().contains("cargo test"));
+        assert!(a.note.contains("unresolved"));
+    }
+
+    #[test]
+    fn assessment_same_invocation_success_resolves_failure() {
+        let dir = temp_root();
+        let f: Vec<String> = vec!["adds".into()];
+        record_at(dir.path(), "treeT", "cargo test --lib", &f, false, 100);
+        record_at(dir.path(), "treeT", "cargo test --lib", &f, true, 200);
+        let a = assess_for_tree(dir.path(), "treeT", 300);
+        assert_eq!(a.state, ExecutionStateKind::Verified);
+        assert!(!a.blocks_completion());
+        assert_eq!(a.unresolved_failures_total, 0);
+    }
+
+    #[test]
+    fn assessment_different_command_success_does_not_resolve_failure() {
+        let dir = temp_root();
+        record_at(dir.path(), "treeT", "cargo test", &[], false, 100);
+        record_at(dir.path(), "treeT", "cargo clippy", &[], true, 200);
+        let a = assess_for_tree(dir.path(), "treeT", 300);
+        assert_eq!(
+            a.state,
+            ExecutionStateKind::Failed,
+            "a passing different invocation must not resolve the failure"
+        );
+        assert_eq!(a.unresolved_failures_total, 1);
+    }
+
+    #[test]
+    fn assessment_full_run_success_resolves_filtered_failure() {
+        // Realistic auto-resolved cargo shape: the filter is embedded in
+        // the recorded command ("cargo test adds"), so a later full run
+        // ("cargo test", empty filter) must still resolve it.
+        let cargo = temp_root();
+        let f: Vec<String> = vec!["adds".into()];
+        record_at(cargo.path(), "treeT", "cargo test adds", &f, false, 100);
+        record_at(cargo.path(), "treeT", "cargo test", &[], true, 200);
+        let a = assess_for_tree(cargo.path(), "treeT", 300);
+        assert_eq!(
+            a.state,
+            ExecutionStateKind::Verified,
+            "a later full cargo run exercises the filtered tests"
+        );
+
+        // Go inserts the filter before the package args.
+        let go = temp_root();
+        let gf: Vec<String> = vec!["TestFoo".into()];
+        record_at(
+            go.path(),
+            "treeG",
+            "go test -run ^TestFoo$ ./...",
+            &gf,
+            false,
+            100,
+        );
+        record_at(go.path(), "treeG", "go test ./...", &[], true, 200);
+        let a = assess_for_tree(go.path(), "treeG", 300);
+        assert_eq!(a.state, ExecutionStateKind::Verified, "go full run covers");
+
+        // Pytest appends `-k <names>`.
+        let py = temp_root();
+        let pf: Vec<String> = vec!["adds".into(), "subs".into()];
+        record_at(
+            py.path(),
+            "treeP",
+            "python -m pytest -q --tb=long -k adds or subs",
+            &pf,
+            false,
+            100,
+        );
+        record_at(
+            py.path(),
+            "treeP",
+            "python -m pytest -q --tb=long",
+            &[],
+            true,
+            200,
+        );
+        let a = assess_for_tree(py.path(), "treeP", 300);
+        assert_eq!(
+            a.state,
+            ExecutionStateKind::Verified,
+            "pytest full run covers"
+        );
+
+        // A passing DIFFERENT selection does not cover: still failed.
+        let partial = temp_root();
+        record_at(partial.path(), "treeX", "cargo test adds", &f, false, 100);
+        let sf: Vec<String> = vec!["subs".into()];
+        record_at(partial.path(), "treeX", "cargo test subs", &sf, true, 200);
+        let a = assess_for_tree(partial.path(), "treeX", 300);
+        assert_eq!(
+            a.state,
+            ExecutionStateKind::Failed,
+            "a different filtered selection must not resolve the failure"
+        );
+
+        // A different runner's full pass does not cover: still failed.
+        let other_runner = temp_root();
+        record_at(
+            other_runner.path(),
+            "treeY",
+            "cargo test adds",
+            &f,
+            false,
+            100,
+        );
+        record_at(
+            other_runner.path(),
+            "treeY",
+            "go test ./...",
+            &[],
+            true,
+            200,
+        );
+        let a = assess_for_tree(other_runner.path(), "treeY", 300);
+        assert_eq!(
+            a.state,
+            ExecutionStateKind::Failed,
+            "a different runner must not resolve the failure"
+        );
+    }
+
+    /// Red-team regression: a later full run must NOT be treated as
+    /// coverage when the failing command carried unexplained scope such as
+    /// an explicit package selector. A root `cargo test` does not prove a
+    /// package outside the default workspace members was exercised, so
+    /// the failure stays unresolved.
+    #[test]
+    fn assessment_full_run_does_not_cover_unexplained_scope() {
+        let dir = temp_root();
+        let f: Vec<String> = vec!["adds".into()];
+        record_at(
+            dir.path(),
+            "treeT",
+            "cargo test -p crateA adds",
+            &f,
+            false,
+            100,
+        );
+        record_at(dir.path(), "treeT", "cargo test", &[], true, 200);
+        let a = assess_for_tree(dir.path(), "treeT", 300);
+        assert_eq!(
+            a.state,
+            ExecutionStateKind::Failed,
+            "an unexplained package scope must not be covered by a root full run"
+        );
+        assert_eq!(a.unresolved_failures_total, 1);
+    }
+
+    /// Tightened coverage still resolves when the full command repeats the
+    /// selector syntax exactly (the scope is visible on both sides).
+    #[test]
+    fn assessment_full_run_covers_matching_explicit_scope() {
+        let dir = temp_root();
+        let f: Vec<String> = vec!["adds".into()];
+        record_at(dir.path(), "treeT", "cargo test --lib adds", &f, false, 100);
+        record_at(dir.path(), "treeT", "cargo test --lib", &[], true, 200);
+        let a = assess_for_tree(dir.path(), "treeT", 300);
+        assert_eq!(a.state, ExecutionStateKind::Verified);
+    }
+
+    #[test]
+    fn assessment_other_tree_failure_does_not_apply() {
+        let dir = temp_root();
+        record_at(dir.path(), "treeOld", "cargo test", &[], false, 100);
+        let a = assess_for_tree(dir.path(), "treeNew", 200);
+        assert_eq!(a.state, ExecutionStateKind::Unverified);
+        assert!(!a.blocks_completion());
+        assert_eq!(a.unresolved_failures_total, 0);
+        assert_eq!(a.evidence_records, 0);
+    }
+
+    #[test]
+    fn assessment_timeout_is_inconclusive_and_not_blocking() {
+        let dir = temp_root();
+        let inp = timeout_input("treeT", "cargo test");
+        record(dir.path(), &inp, 100).unwrap();
+        let a = assess_for_tree(dir.path(), "treeT", 200);
+        assert_eq!(a.state, ExecutionStateKind::Unverified);
+        assert!(!a.blocks_completion());
+        assert_eq!(a.unresolved_failures_total, 0);
+        assert_eq!(a.inconclusive_failures_total, 1);
+        assert!(a.note.contains("inconclusive"));
+    }
+
+    #[test]
+    fn assessment_later_success_resolves_timeout_too() {
+        let dir = temp_root();
+        let inp = timeout_input("treeT", "cargo test");
+        record(dir.path(), &inp, 100).unwrap();
+        record_at(dir.path(), "treeT", "cargo test", &[], true, 200);
+        let a = assess_for_tree(dir.path(), "treeT", 300);
+        assert_eq!(a.state, ExecutionStateKind::Verified);
+        assert_eq!(a.inconclusive_failures_total, 0);
+    }
+
+    #[test]
+    fn assessment_shown_failures_are_bounded_but_total_is_honest() {
+        let dir = temp_root();
+        for i in 0..6 {
+            record_at(
+                dir.path(),
+                "treeT",
+                &format!("cargo test -p p{i}"),
+                &[],
+                false,
+                100 + i,
+            );
+        }
+        let a = assess_for_tree(dir.path(), "treeT", 500);
+        assert_eq!(a.state, ExecutionStateKind::Failed);
+        assert_eq!(a.unresolved_failures.len(), MAX_ASSESSED_FAILURES);
+        assert_eq!(a.unresolved_failures_total, 6);
+    }
+
+    #[test]
+    fn assessment_non_git_workspace_is_unknown() {
+        let dir = temp_root();
+        let a = assess(dir.path(), 100);
+        assert_eq!(a.state, ExecutionStateKind::Unknown);
+        assert!(a.tree_hash.is_none());
+        assert!(!a.blocks_completion());
     }
 }

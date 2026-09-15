@@ -60,6 +60,11 @@ pub mod learning;
 pub mod recall;
 pub mod repo_index;
 pub mod retrieval;
+pub mod skill_approvals;
+pub mod skill_evolution;
+pub mod skill_reuse;
+pub mod skill_selection;
+pub mod skill_validation;
 pub mod skills;
 pub mod store;
 pub mod tasks;
@@ -86,7 +91,13 @@ pub mod context_runtime {
         lifecycle_for_authority,
         recall::{self, RecallGroup, RecallHit, RecallOutcome, RecallQuery, RecallScope},
         repo_index::{self, RepoIndexRecord, RepoIndexStatus, RepoIndexUpsert},
-        retrieval, skills,
+        retrieval,
+        skill_approvals::{self, ApprovalResponse, ApprovalStatus, SkillApprovalRequest},
+        skill_evolution::{self, EvolutionCandidateView, EvolutionReport, EvolutionWeakness},
+        skill_reuse::{self, ReuseCandidateView, ReuseReport},
+        skill_selection::{self, RankedSkill, SkillContextPacket, SkillSelectionRequest},
+        skill_validation::{self, ValidationReport, VersionWindowStats},
+        skills,
         skills::{
             content_hash, is_valid_skill_name, mint_skill_candidate_id, mint_skill_id,
             mint_version_id, validate_skill_content, Skill, SkillApplicability, SkillCandidate,
@@ -124,6 +135,9 @@ pub use repo_index::{RepoIndexRecord, RepoIndexStatus, RepoIndexUpsert};
 pub use retrieval::{
     decay_rate_per_month, decayed_confidence, ContextRetriever, RankedRecord, RecordQuery,
 };
+pub use skill_approvals::{ApprovalResponse, ApprovalStatus, SkillApprovalRequest};
+pub use skill_evolution::{EvolutionCandidateView, EvolutionReport, EvolutionWeakness};
+pub use skill_validation::{ValidationReport, VersionWindowStats};
 pub use skills::{
     Skill, SkillApplicability, SkillCandidate, SkillCandidateStatus, SkillError, SkillHealth,
     SkillScope, SkillStatus, SkillValidation, SkillVersion, SkillVersionStatus,

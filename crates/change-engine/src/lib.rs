@@ -13,4 +13,4 @@ pub use codebro_core::{error, tools};
 pub mod coding;
 
 pub use coding::{ChangeEngine, PreparedChange};
-pub use coding::{PreparedTransaction, TransactionReport, TransactionRequest};
+pub use coding::{PreparedTransaction, RollbackReport, TransactionReport, TransactionRequest};

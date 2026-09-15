@@ -15,7 +15,7 @@ pub const STATE_DB_FILE: &str = "state.db";
 /// Current schema version. Bump on every additive schema change and append
 /// a matching migration step in [`migrate`]. Steps are sequential: a v1
 /// database applies only the v2+v3+v4 steps, never a re-run of the whole batch.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -352,6 +352,16 @@ fn lock_contention_error() -> DbError {
 /// Storing only counts + status keeps the user-level SQLite small,
 /// workspace-scoped, and restart-safe while giving freshness,
 /// cache-invalidation, and impact/health queries a single lookup.
+///
+/// Schema v8 (P10: skill-approval requests): one new table.
+/// `skill_approval_requests` holds human-in-the-loop interaction state for
+/// the skill lifecycle: which validated candidate an approval was requested
+/// for, the content hash + version anchor it was requested against (stale
+/// detection), the requesting workspace/task scope, the question + options
+/// OpenCode presents, and the single-use response. Pending rows survive
+/// restarts (hard-kill recovery); consumed rows stay for audit. No backfill:
+/// requests are created going forward; absent rows mean "no pending
+/// approval" (never a fabricated interaction).
 fn migrate(conn: &Connection) -> Result<(), DbError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let tx = conn.unchecked_transaction()?;
@@ -375,6 +385,9 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
     }
     if version < 7 {
         migrate_v7(&tx)?;
+    }
+    if version < 8 {
+        migrate_v8(&tx)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -699,6 +712,44 @@ fn migrate_v7(conn: &Connection) -> Result<(), DbError> {
         );
         CREATE INDEX IF NOT EXISTS idx_repo_indexes_status
             ON repo_indexes(index_status, updated_at DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn migrate_v8(conn: &Connection) -> Result<(), DbError> {
+    // P10: human-in-the-loop skill-approval requests. One new table with
+    // IF NOT EXISTS — crash-safe resume, restart-safe, repeatable. No
+    // backfill: requests are created going forward; absent rows mean "no
+    // pending approval". A request is single-use (pending → terminal
+    // exactly once, enforced by the store's guarded UPDATE … WHERE
+    // status='pending'); consumed rows stay for audit.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS skill_approval_requests (
+            request_id              TEXT PRIMARY KEY,
+            candidate_id            TEXT NOT NULL,
+            candidate_content_hash  TEXT NOT NULL,
+            based_on_version        INTEGER,
+            workspace_root          TEXT NOT NULL,
+            task_id                 TEXT,
+            proposed_action         TEXT NOT NULL DEFAULT 'approve',
+            question                TEXT NOT NULL DEFAULT '',
+            options_json            TEXT NOT NULL DEFAULT '[]',
+            status                  TEXT NOT NULL DEFAULT 'pending',
+            response                TEXT,
+            modification            TEXT,
+            successor_request_id    TEXT,
+            parent_request_id       TEXT,
+            created_at              INTEGER NOT NULL,
+            updated_at              INTEGER NOT NULL,
+            responded_at            INTEGER,
+            expires_at              INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_skill_approval_pending
+            ON skill_approval_requests(workspace_root, status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_skill_approval_candidate
+            ON skill_approval_requests(candidate_id, status);
         "#,
     )?;
     Ok(())

@@ -315,6 +315,12 @@ pub struct EngineeringContextPacket {
     #[serde(default)]
     pub evidence: Vec<EvidenceItem>,
     pub evidence_provenance: ContextProvenance,
+    /// Authoritative execution state for the CURRENT working tree: whether
+    /// recorded build/test evidence shows unresolved failures, a verified
+    /// pass, or no sufficient evidence. Observed machine evidence — never
+    /// model prose. Absent only when assessment itself is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_state: Option<crate::sandbox::evidence_journal::ExecutionStateAssessment>,
     #[serde(default)]
     pub records: Vec<ContextRecordExcerpt>,
     pub records_provenance: ContextProvenance,
@@ -378,6 +384,19 @@ pub fn compose(
     // ── Evidence (observed): read-only journal status + recent summaries ──
     let (evidence, mut notes) = read_evidence(workspace_root);
 
+    // ── Execution state (observed): current-tree failure/verification state ──
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let execution_state = crate::sandbox::evidence_journal::assess(workspace_root, now_secs);
+    if execution_state.blocks_completion() {
+        notes.push(
+            "current working tree has unresolved compile/test failure evidence (see `execution_state`) — completion must not be claimed until the same verification command passes"
+                .to_string(),
+        );
+    }
+
     // ── Freshness (derived) ──
     let freshness_str = freshness.to_string();
     if freshness == crate::mcp::facts::FreshnessStatus::Stale {
@@ -409,6 +428,7 @@ pub fn compose(
         memory_provenance: ContextProvenance::Recorded,
         evidence,
         evidence_provenance: ContextProvenance::Observed,
+        execution_state: Some(execution_state),
         records: records.to_vec(),
         records_provenance: ContextProvenance::Recorded,
         impact: ImpactGuidance {
@@ -442,6 +462,17 @@ pub fn compose_structural(
         "structural digest — no task supplied, so facts/memory were not ranked; describe the task to get task-relevant context"
             .to_string(),
     );
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let execution_state = crate::sandbox::evidence_journal::assess(workspace_root, now_secs);
+    if execution_state.blocks_completion() {
+        notes.push(
+            "current working tree has unresolved compile/test failure evidence (see `execution_state`) — completion must not be claimed until the same verification command passes"
+                .to_string(),
+        );
+    }
     Ok(EngineeringContextPacket {
         repository: repository_section(
             workspace_root,
@@ -458,6 +489,7 @@ pub fn compose_structural(
         memory_provenance: ContextProvenance::Recorded,
         evidence,
         evidence_provenance: ContextProvenance::Observed,
+        execution_state: Some(execution_state),
         records: records.to_vec(),
         records_provenance: ContextProvenance::Recorded,
         impact: ImpactGuidance {

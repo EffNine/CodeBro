@@ -14,4 +14,4 @@ pub mod change_engine;
 pub mod transaction;
 
 pub use change_engine::{ChangeEngine, PreparedChange};
-pub use transaction::{PreparedTransaction, TransactionReport, TransactionRequest};
+pub use transaction::{PreparedTransaction, RollbackReport, TransactionReport, TransactionRequest};

@@ -135,4 +135,29 @@ mod tests {
         let plan = ChangePlan::propose_between(&path, "", "hello\n").unwrap();
         assert!(plan.preview().contains("+hello"));
     }
+
+    /// Regression: the patch seam must write exactly the declared target
+    /// content. Line-based reconstruction used to append a trailing newline
+    /// even when the caller requested content without one — an edit that
+    /// "succeeded" while producing bytes nobody asked for.
+    #[test]
+    fn test_apply_preserves_absent_final_newline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let no_newline = dir.path().join("no_newline.txt");
+        fs::write(&no_newline, "hello world").unwrap();
+        let mut plan = ChangePlan::propose(&no_newline, "hello codebro").unwrap();
+        plan.apply().unwrap();
+        assert_eq!(fs::read_to_string(&no_newline).unwrap(), "hello codebro");
+
+        // Adding a trailing newline where there was none still works.
+        let mut add_newline = ChangePlan::propose(&no_newline, "hello codebro\n").unwrap();
+        add_newline.apply().unwrap();
+        assert_eq!(fs::read_to_string(&no_newline).unwrap(), "hello codebro\n");
+
+        // And removing it again works.
+        let mut remove_newline = ChangePlan::propose(&no_newline, "done").unwrap();
+        remove_newline.apply().unwrap();
+        assert_eq!(fs::read_to_string(&no_newline).unwrap(), "done");
+    }
 }

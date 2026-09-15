@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Execution-state reliability gate (edit → verification → completion)** — closes the failure class where an agent claims an implementation succeeded although the edit failed, applied partially, produced invalid code, or left the build/tests broken. No new MCP tool (stays 25), no schema change (stays v7).
+  (1) **Post-apply edit verification** — `ChangeEngine::verify_applied` re-reads every written file after `apply`/`apply_transaction` and confirms the on-disk bytes equal the prepared intent (`target_exists`, `readable`, `content_matches_intent`); a mismatch rolls the change (or the whole transaction) back from the preparation-time snapshot and returns a tool error — a failed edit is never reported as applied. `apply_change`/`apply_changes` responses carry `status: "applied_unverified"`, the `edit_verification` evidence, and `verification_status: "unverified"` until a build/test passes.
+  (2) **Current-tree execution state** — `evidence_journal::assess` reduces the durable execution-evidence journal for the CURRENT working-tree hash into a deterministic `execution_state` (`failed | verified | unverified | unknown`) with bounded unresolved-failure evidence (command, classification, exit code, failed tests, diagnostic digests, age). Any edit changes the tree hash, so stale evidence never applies; a failure is resolved only by a later recorded success of the same invocation (identical command; identical filter or a full run) — prose never clears evidence. `compile_error`/`test_failure` are authoritative and block; `timeout`/`unknown_failure` are inconclusive, surfaced as `unverified` without blocking.
+  (3) **Completion gate** — `task complete` and `task outcome classification=success` are refused while authoritative unresolved failures apply to the current tree, with the failure evidence in the bounded error; `failure`/`partial` reports remain available.
+  (4) **Surfacing** — `execution_state` appears in `workspace_context`, `context` (packet + `notes`), `task inspect`, `task complete/outcome` responses, and every `sandbox_test`/`sandbox_build` verification result.
+  (5) **Exact write semantics** — `PatchEngine` now writes the declared target content exactly with an exactness gate that refuses a reconstruction diverging from the declared target.
+
+### Hardened (red-team pass over the reliability gate)
+- **Full-run coverage is now structural.** A filtered failure was considered resolved by a later unfiltered run when the full command's tokens merely appeared in order in the failing command. That let an explicit scope be laundered as verified: after `cargo test -p crateA adds` failed, a passing root `cargo test` produced `execution_state: verified` even though crateA need not be a default workspace member. Coverage now requires the full command to be the failing command with ONE contiguous filter expression removed, every removed token filter-related (`-k`/`-run`/`or` or a filter entry), and at least one removed token referencing a filter entry. All auto-generated shapes (cargo/go/pytest, single and multi-filter) still resolve; explicit unexplained scope no longer does. Regressions: `assessment_full_run_does_not_cover_unexplained_scope`, `assessment_full_run_covers_matching_explicit_scope`.
+- **Rollback cannot be reported as clean when it fails.** `ChangeEngine::rollback_changes` now returns a `RollbackReport` separating `restored` from `failed`, and both mid-transaction rollback and the post-apply verification rollback surface `ROLLBACK INCOMPLETE` with the exact paths when any file could not be restored — the workspace state is presented as UNCERTAIN, never as cleaned. Regression: `rollback_failure_is_reported_not_hidden` (induces a real restore failure by replacing an applied path with a directory; independent of permission bits, so valid under root).
+- **Documented evidence boundaries** (no code change): working directory is not part of invocation identity today (local backend ignores it; the OpenSandbox envelope reports the workspace root), gitignored/oversized-untracked files do not move the tree hash, a journal write failure is non-fatal, and no session-finalization hook auto-completes tasks (request-driven contract; unfinished work is never represented as successful).
+
+### Fixed
+- **Patch seam trailing-newline drift** — applying an edit to a file without a trailing newline silently appended one; the reconstructed bytes differed from the requested `new` content. `PatchEngine::apply` now verifies reconstruction against the declared target and refuses on divergence. Regression: `test_apply_preserves_absent_final_newline` (`crates/core/src/tools/change.rs`); the transaction fixture's documented normalization expectation was corrected.
+
+### Tests
+- 10 evidence-journal assessment unit tests (unresolved vs superseded vs inconclusive, tree scoping, shown-bound vs honest totals, non-git workspace); 4 ChangeEngine post-apply/rollback tests; 3 MCP execution-state gate tests (refusal until resolved, session-start/inspect surfacing, inconclusive non-blocking); 2 apply-response semantics tests. New real-binary E2E suite `crates/mcp-server/tests/execution_state_e2e.rs` (3 probes: edit → fail → blocked completion/outcome → fix → verified → complete; failure state visible at session start; stale-tree failure invalidated by a new edit). Existing suite green, clippy `-D warnings` clean, fmt clean, dependency-direction check OK. Red-team additions: 2 full-run-coverage unit tests, 1 rollback-honesty transaction test, and the E2E suite extended to 4 probes (native host edit invalidates recorded verification without a watcher; post-edit completion is allowed only as `unverified`, never `verified`; failed edits leave no completable success).
+
+---
+
+## [1.1.0] - 2026-09-16
+
+Persistent-intelligence v1 consolidation (P11–P17): skill reuse, skill
+evolution, evolution validation, production hardening, and the production
+acceptance soak suite. No new MCP tool (stays 25), no schema change,
+no autonomous publishing/rollback/evolution — the 25-tool surface,
+approval lifecycle, and execution/completion gates are frozen.
+
+### Added
+- **Skill reuse (P11)** — new `skill` action `detect_reuse`: repeated successful tool-sequence workflows mined deterministically from history into evidence-backed candidates (P3 learning → automated validation → human approval → active skill). Explicitly invoked, never publishes, re-runs converge (`already_exists`).
+- **Skill evolution (P13)** — new `skill` action `detect_evolution`: recurring skill-linked failures mined into successor-version candidates (`supersedes_skill` + `based_on_version` lineage, same approval protocol). `skill health` recordings now also capture a skill-linked history event with bounded failure context (`reason`), so the detector mines real executions.
+- **Skill evolution validation (P15)** — new `skill` actions `validate_evolution` / `compare_versions`: deterministic read-only comparison of two skill versions on attributed execution evidence with a conservative improvement verdict (`improved | regressed | unchanged | insufficient_evidence`). Never publishes, never rolls back; the human decides via the existing approve/rollback seams.
+- **Production hardening (P14)** — approval TTL expiry enforced inline (expired requests never consumable; dedup ignores expired rows so retries mint fresh requests); human `modify` supersedes the parent candidate (no forked approvable lineages); `Validated → Active` / `Validated → Superseded` transition edges legalized to match the publish transaction; skill-ref writes refused on terminal tasks; superseded-scope notices on the pre-MCP design docs.
+- **Production acceptance soak suite (P16)** — `crates/mcp-server/tests/p16_soak_e2e.rs` (14 tests, hermetic tempdirs, real `codebro serve` over stdio, no network/models/secrets) plus `crates/mcp-server/tests/skill_evolution_e2e.rs`.
+- **Docs** — `validate_evolution`/`compare_versions` documented in the skill action surface (`docs/MCP_API_V1.md`, `AGENTS.md`); 25-tool inventory (`ARCHITECTURE.md`, `README.md`).
+
+### Fixed
+- **`sk-` secret-heuristic false positive (P17 release-smoke finding)** — the bare `sk-` substring flagged ordinary hyphenated English (`task-list`, `desk-review`, `risk-register`, `ask-bob`) and every task-derived reuse name (`reuse-task-remember-task`), making P11 reuse candidates unvalidatable whenever task events participate (always, in production: every task transition/outcome is history). `sk-` now matches only at a token boundary (start-of-string or preceding non-alphanumeric); pasted keys (`sk-abc123…`) still hit. Fail-closed throughout — no bad publish ever occurred. Regressions: `validate_skill_content_rejects_bare_sk_key`, `validate_skill_content_accepts_task_hyphen_words`.
+
+### Tests
+- **1614/1614 pass** (1612 P16 baseline + 2 P17 regression tests), 0 failed; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; P16 soak 14/14; real-binary MCP boundary smoke (25 tools, valid/invalid requests, bounded responses, stdout purity, no panic) and full lifecycle smoke (learn → reuse → approval → v1 → contextual reuse → evolution → approval → v2 → honest validation → rollback) green against the release binary.
+
+---
+
 ## [1.0.0] - 2026-09-10
 
 ### Added

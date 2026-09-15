@@ -29,7 +29,7 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 | `crates/memory-runtime/src/engineering_memory/` | Persistent engineering memory runtime (load, record, update, delete, snapshot, resolve) |
 | `crates/identity-runtime/src/project_identity/` | Project identity runtime |
 | `crates/change-engine/src/coding/` | ChangeEngine: guarded mutation seam |
-| `crates/context-runtime/src/` | User-context foundation: context records (preference/intent/pattern/experience), sessions + history + recall + learning/inference + skills + durable tasks + P6 repo-index metadata over SQLite+FTS5 (schema v7) (`~/.codebro/state.db`) |
+| `crates/context-runtime/src/` | User-context foundation: context records (preference/intent/pattern/experience), sessions + history + recall + learning/inference + skills + skill-approval requests + durable tasks + P6 repo-index metadata over SQLite+FTS5 (schema v8) (`~/.codebro/state.db`) |
 | `crates/parsers/src/intelligence/` | Tree-sitter parser platform (Rust, Go, Python, JS, TS) |
 | `crates/core/src/` | Shared primitives (provenance, error, config, persistence, tools) |
 
@@ -42,7 +42,7 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 5. **Mock providers in tests.** Implement the `Provider` trait directly (see `crates/mcp-server/src/consultant/providers/mock.rs`).
 6. **Temp directories via `tempfile::tempdir()` for all filesystem tests.** Never write to `/tmp` directly.
 7. **Imports edge direction.** `RelationshipKind::Imports` facts store source=importer → target=imported, matching `Calls` (caller→callee) and `dep::<a>-><b>`. Do not flip orientation in producers or consumers.
-8. **User-context state lives in SQLite, not JSON.** `~/.codebro/state.db` (`crates/context-runtime/`) is the only SQLite store: context records, events, sessions, learning/skill tables, P5 tasks/checkpoints, and P6 repo-index metadata (schema v7; `repo_indexes` holds derived counts/status only — never file contents, symbols, or edges). It is user-level and global across workspaces — rows are scoped by `workspace_root`, never by file. JSON stores (facts/memory/identity) are per-project and must never be moved into it. `CODEBRO_STATE_DIR` overrides the state dir (hermetic tests).
+8. **User-context state lives in SQLite, not JSON.** `~/.codebro/state.db` (`crates/context-runtime/`) is the only SQLite store: context records, events, sessions, learning/skill tables, P5 tasks/checkpoints, P6 repo-index metadata, and P10 skill-approval requests (schema v8; `repo_indexes` holds derived counts/status only — never file contents, symbols, or edges). It is user-level and global across workspaces — rows are scoped by `workspace_root`, never by file. JSON stores (facts/memory/identity) are per-project and must never be moved into it. `CODEBRO_STATE_DIR` overrides the state dir (hermetic tests).
 9. **Context records are never auto-confirmed.** `AiInferred`/`Observed` records MUST cite evidence event ids (store-enforced, existence-checked against the events table). Promotion to `UserConfirmed` goes through supersede, keeping the audit trail. `USER_CONFIRMED` via the `remember` tool requires the explicit `user_confirmed` flag (caller-principal rule). Task-scoped records require `task_id`. Nothing in context-runtime can write facts/memory/identity files.
 
 ## MCP contract
@@ -51,18 +51,18 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 
 | Tool | R/W | Description |
 |---|---|---|
-| `workspace_context` | read | Project orientation: identity, root, fact counts |
+| `workspace_context` | read | Project orientation: identity, root, fact counts, `execution_state` (current-tree failure/verification evidence) |
 | `engineering_facts` | read | Relevance-ranked fact retrieval (lexical matching, not embeddings). Filters: `query`, `kind`, `path`, `limit` |
 | `engineering_memory` | read | Resolve persistent memory by task keywords. Entries carry confidence, source, tags |
 | `memory_stats` | read | Store stats: entry count, token budget, tag distribution, confidence, recency |
 | `record_memory` | write | Upsert a memory entry (secret-redacted). Updating a key replaces the full logical entry |
 | `delete_memory` | write | Delete by exact key. **Requires `confirm=true`** — omitting is a no-op |
 | `update_identity` | write | Update project identity (`.codebro/project_identity.json`). Requires existing identity. All free-text fields (decisions, constraints, summaries, roadmap, milestones) secret-redacted at write |
-| `apply_change` | write | Guarded single-file mutation via ChangeEngine. For new files pass `old=""` |
-| `apply_changes` | write | Transactional multi-file mutation: validate → conflict check → apply with rollback |
-| `sandbox_exec` | write | Execute command in isolated sandbox. Read-only build/test/lint only |
-| `sandbox_test` | write | Run tests with structured verification. Auto-detects project type |
-| `sandbox_build` | write | Build/check with structured verification |
+| `apply_change` | write | Guarded single-file mutation via ChangeEngine. For new files pass `old=""`. Post-apply read-back verification (`edit_verification`); response is `status=applied_unverified`, `verification_status=unverified` until a build/test passes |
+| `apply_changes` | write | Transactional multi-file mutation: validate → conflict check → apply with rollback; every file read back after apply, any mismatch rolls the whole set back and fails the call. Same `applied_unverified` response semantics |
+| `sandbox_exec` | write | Execute command in isolated sandbox. Read-only build/test/lint only. Raw execution — does NOT produce durable validation evidence |
+| `sandbox_test` | write | Run tests with structured verification. Auto-detects project type. Passing/failing runs are recorded durably per tree hash and returned as `execution_state` |
+| `sandbox_build` | write | Build/check with structured verification. Passing/failing runs are recorded durably per tree hash and returned as `execution_state` |
 | `sandbox_status` | read | Sandbox runtime status and capabilities |
 | `impact_analyze` | read | Structural impact: directed edges, related tests, provenance |
 | `reindex` | write | Full fact reindex via `codebro init` pipeline |
@@ -73,8 +73,8 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 | `forget` | write | Retire a context record by id/namespace (reversible reject; `permanent=true` removes). Requires `confirm=true`. Workspace-confined. Serializes on the workspace mutation lock |
 | `recall` | read | Query-driven historical evidence: session-grouped bounded excerpts (decisions, failures, validations, changes) with session/timestamp/scope/task provenance. Task history invisible without its task; `scope=global` opts into cross-workspace search. Read-only — recalls write nothing |
 | `learn` | write | Cautious hypotheses from history: run/propose detect recurring patterns (deterministic, ≥3 support); list/get inspect with explanations; evaluate weighs supporting vs contradicting evidence (bounded confidence); accepted hypotheses persist as AI_INFERRED (never USER_CONFIRMED); confirm requires user_confirmed=true; reject preserves negative knowledge. No learn action writes history. Serializes mutating actions on the workspace mutation lock |
-| `skill` | write | Skill lifecycle: discover, propose, inspect, validate, approve, reject, deprecate, rollback, health. Evidence-backed candidates (accepted P3 learning only), immutable versioned publication, secret-redacted descriptions/purposes at propose (all identity free-text likewise redacted at update_identity), `user_confirmed`-gated approval, optimistic-concurrency stale-writer refusal, workspace/scope enforcement on every action, atomic + symlink-safe SKILL.md publication, deprecation removes the artifact. CodeBro owns lifecycle; OpenCode executes skills natively |
-| `task` | write | Durable engineering task runtime: list, stale, create, inspect, start, pause, resume, checkpoint, validate, validation_result, complete, fail, cancel, outcome (P9: structured outcome evidence — classification + bounded evidence + authority, no transition), skill_refs. Strict lifecycle (pending → running → paused/validating → completed/failed/cancelled) with a completion gate (passed validation required), immutable versioned checkpoints (atomic row+pointer+event in one tx), worker leases with fencing (`wkr::` ids, `lease_version`; stale workers refused), `based_on_version` optimistic concurrency, idempotency-key dedup, interrupted tasks recoverable only via explicit resume (never auto-completed), bounded resume snapshots, workspace isolation at every seam, every free-text field (incl. skill refs) redacted. Request-driven — no scheduler/daemon; OpenCode remains the executor |
+| `skill` | write | Skill lifecycle: discover, propose, inspect, validate, approve, reject, deprecate, rollback, health, applicable (deterministic context-aware selection with reasons), skill_context (minimal first-class packet: required/optional/constraints, bounded excerpts), request_approval (emits needs_input + question + options for OpenCode's native UI), respond (approve/reject/modify/defer with replay + stale + scope + expiry guards; modify supersedes the parent candidate when it forks a successor), detect_reuse (P11: mine repeated successful workflows into evidence-backed candidates; explicitly invoked, never publishes), detect_evolution (P13: mine recurring skill-linked failures into evidence-backed successor-version candidates; explicitly invoked, never publishes), validate_evolution / compare_versions (P15: compare two skill versions on attributed execution evidence with a conservative improvement verdict; explicitly invoked read-only comparison — never publishes, never rolls back). Evidence-backed candidates (accepted P3 learning only), immutable versioned publication, secret-redacted descriptions/purposes at propose (all identity free-text likewise redacted at update_identity), `user_confirmed`-gated approval, optimistic-concurrency stale-writer refusal, workspace/scope enforcement on every action, atomic + symlink-safe SKILL.md publication, deprecation removes the artifact. Approval decisions persist as history evidence (`user_confirmed` for human answers, `ai_inferred` for model-initiated requests). CodeBro owns lifecycle; OpenCode executes skills natively |
+| `task` | write | Durable engineering task runtime: list, stale, create, inspect, start, pause, resume, checkpoint, validate, validation_result, complete, fail, cancel, outcome (P9: structured outcome evidence — classification + bounded evidence + authority, no transition), skill_refs. Strict lifecycle (pending → running → paused/validating → completed/failed/cancelled) with a completion gate (passed validation required) and the execution-state gate (`complete` and `outcome=success` refused while unresolved compile/test failures apply to the current tree), immutable versioned checkpoints (atomic row+pointer+event in one tx), worker leases with fencing (`wkr::` ids, `lease_version`; stale workers refused), `based_on_version` optimistic concurrency, idempotency-key dedup, interrupted tasks recoverable only via explicit resume (never auto-completed), bounded resume snapshots, workspace isolation at every seam, every free-text field (incl. skill refs) redacted. Request-driven — no scheduler/daemon; OpenCode remains the executor |
 | `engineering_brief` | read | P7 decision support: bounded deterministic brief (task + repo intelligence + impact + health + history + memory + learning + skills + task state + constraints/decisions/risks/unknowns). Read-only; OpenCode decides |
 
 ## P8 integration contract (agent clients)
@@ -252,6 +252,79 @@ it through CodeBro sandbox tools.
 `crates/mcp-server/src/debugging/` turns failure evidence (parsed diagnostics, failing-test linkage, recent-edit correlation, bounded impact context) into deterministic ranked hypotheses embedded additively in `sandbox_test`/`sandbox_build` responses as `root_cause`. Invariants: hypotheses are derived runtime evidence — never persisted, never written to the fact store or engineering memory; ranking is transparent heuristic weights with dedup by (kind, source); correlated representations of one event cannot stack (weaker location channels are subsumed by stronger ones, and a diagnostic without line precision never earns exact-location weight); serialized evidence is exactly what was scored; freshness/ambiguity reduce confidence; "changed recently" is never claimed as "caused". Consult `mode=debugging` injects the latest analysis as `codebro://root-cause-hypotheses` file context.
 
 For normal coding edits use your native editing tools. `apply_change` is for controlled/autonomous workflows.
+
+## Execution-state & verification gate (reliability contract)
+
+Three distinct claims — never conflated:
+
+| Claim | Meaning | Where it lives |
+|---|---|---|
+| **operation succeeded** | the tool call itself completed (write returned, command ran) | tool result (`applied: true`, `execution.success`) |
+| **change completed** | the on-disk state matches the requested change | `edit_verification` on `apply_change`/`apply_changes` (read-back: `target_exists`, `readable`, `content_matches_intent`) |
+| **change verified** | the current working tree has passing build/test evidence | `execution_state` (`failed | verified | unverified | unknown`) |
+
+- **Post-apply read-back is enforced.** `apply_change` / `apply_changes`
+  re-read every written file after apply. A mismatch rolls the change (or the
+  whole transaction) back from the preparation-time snapshot and returns a
+  tool error — a failed edit is never reported as applied. Successful
+  responses are `status: "applied_unverified"` with
+  `verification_status: "unverified"` until a build/test passes.
+- **Evidence is bound to the tree hash.** `sandbox_test` / `sandbox_build`
+  record every run durably in `.codebro/execution_evidence.json`
+  (`.codebro/` is excluded from the hash). Any edit — CodeBro or native —
+  changes the working-tree hash, so old evidence never applies to the new
+  state; it becomes `unverified` until re-run. `sandbox_exec` is raw
+  execution and produces NO durable validation evidence.
+- **Failures are resolved only by evidence.** A recorded failure is resolved
+  by a later recorded success of the same invocation (identical command;
+  identical filter, or a full run) on the same tree. Prose — including a
+  `task validate` / `validation_result passed` record — never clears it.
+- **Full-run coverage is structural, not token-occurrence.** A filtered
+  failure is covered by a later full run only when the full command is the
+  failing command with ONE contiguous filter expression removed and every
+  removed token is filter-related (`-k`/`-run`/`or` or a filter entry). An
+  explicit scope (`cargo test -p crateA adds`) is not covered by a root
+  `cargo test`: the full run is not evidence that an unlisted scope ran.
+- **Rollback honesty.** If a post-apply verification mismatch requires
+  rollback and the rollback itself cannot restore a file, the response is an
+  error stating `ROLLBACK INCOMPLETE` with the exact failed paths — the
+  workspace state is presented as UNCERTAIN, never as clean. The same
+  applies to mid-transaction rollback failures.
+- **Authoritative vs inconclusive failures.** `compile_error` and
+  `test_failure` are authoritative (the toolchain ran and reported a defect)
+  and set `execution_state: failed`. `timeout` / `unknown_failure` are
+  inconclusive: surfaced as `unverified`, never silently upgraded and never
+  blocking on their own.
+- **Completion gate.** `task complete` and `task outcome
+  classification=success` are refused while authoritative unresolved
+  failures apply to the current working tree; the bounded error carries the
+  evidence. `failure` / `partial` reports remain available. A passing re-run
+  of the same invocation clears the gate.
+- **Surfacing.** `workspace_context`, `context` (packet + notes), `task
+  inspect`, `task complete/outcome` responses, and every `sandbox_test`/
+  `sandbox_build` verification result include `execution_state` with bounded
+  failure evidence (command, classification, exit code, failed tests,
+  diagnostics, age).
+
+Limits (honest): `sandbox_exec` is raw execution and produces NO durable
+validation evidence; non-git workspaces have no tree identity (`unknown`);
+a direct host `cargo test` run by the agent is invisible to CodeBro unless
+it is routed through `sandbox_test`/`sandbox_build`; gitignored files and
+untracked files above 512 KiB (path+size only) can change without changing
+the tree hash, so evidence is bound to the git-visible tree. The local
+sandbox backend executes all commands at the workspace root (the
+`working_directory` argument is not currently honoured there), so the
+working directory is not part of invocation identity; the OpenSandbox
+backend honours it but reports the workspace root in the execution envelope,
+so the journal cannot yet distinguish two same-command runs in different
+directories. A journal write failure is non-fatal (the run's response still
+reports its real outcome, but the durable gate cannot see it). Tasks are
+request-driven: an agent may end a session without completing a task, and
+nothing auto-completes it — an unfinished task is never reported as
+successful, but compliance with the P9 outcome convention stays
+workflow-level (measurable via the existing per-call stderr line ratio).
+
+The gate can only speak about evidence CodeBro actually observed.
 
 ## Development workflow
 

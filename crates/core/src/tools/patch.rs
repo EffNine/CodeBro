@@ -17,6 +17,11 @@ pub struct FilePatch {
     pub path: PathBuf,
     pub hunks: Vec<PatchHunk>,
     pub unified_diff: String,
+    /// The exact declared target content. The source of truth for apply:
+    /// reconstruction from the patch must reproduce this byte-for-byte
+    /// (line-based reconstruction alone cannot express a missing final
+    /// newline, so this field pins the intended bytes).
+    pub new_content: String,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +38,7 @@ impl PatchEngine {
             path: path.clone(),
             hunks,
             unified_diff,
+            new_content: new_content.to_string(),
         })
     }
 
@@ -54,6 +60,16 @@ impl PatchEngine {
                 .map_err(|e| CodeBroError::Patch(format!("Failed to read file: {}", e)))?,
             patch,
         )?;
+        // Exactness gate: never write a reconstruction that does not
+        // reproduce the declared target byte-for-byte. A silent divergence
+        // (e.g. trailing-newline drift) would be an edit that "succeeded"
+        // while producing content other than the one requested.
+        if new_content != patch.new_content {
+            return Err(CodeBroError::Patch(format!(
+                "patch reconstruction does not match the declared target content for {} — refusing to write",
+                patch.path.display()
+            )));
+        }
 
         std::fs::write(&patch.path, new_content)
             .map_err(|e| CodeBroError::Patch(format!("Failed to write file: {}", e)))?;
@@ -221,6 +237,19 @@ impl PatchEngine {
             for line in &after {
                 result.push_str(line);
                 result.push('\n');
+            }
+        }
+
+        // Line-based reconstruction always terminates with a newline.
+        // Align the final-newline state with the declared target so an
+        // edit to a file without a trailing newline round-trips exactly.
+        if patch.new_content.ends_with('\n') {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+        } else {
+            while result.ends_with('\n') {
+                result.pop();
             }
         }
 

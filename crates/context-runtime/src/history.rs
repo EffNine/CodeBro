@@ -199,6 +199,18 @@ pub enum HistoryKind {
     /// travels in the event's outcome label + payload; interpretation
     /// stays with P3 learning. Append-only like all history.
     TaskOutcome,
+    /// P10 skill-approval evidence: human decisions on skill proposals.
+    /// Structural (what the human decided about which candidate/request),
+    /// not semantic — interpretation stays with P3 learning. The authority
+    /// travels in the payload (`user_confirmed` for human responses vs
+    /// `ai_inferred` for model-initiated proposals), so future learning can
+    /// distinguish "the user approved this skill" from "the model inferred
+    /// this skill is useful". Append-only like all history.
+    SkillApprovalRequested,
+    SkillApproved,
+    SkillRejected,
+    SkillDeferred,
+    SkillModified,
 }
 
 impl HistoryKind {
@@ -232,6 +244,11 @@ impl HistoryKind {
             HistoryKind::HealthAnalyzed => "health_analyzed",
             HistoryKind::RepositoryDiscovered => "repository_discovered",
             HistoryKind::TaskOutcome => "task_outcome",
+            HistoryKind::SkillApprovalRequested => "skill_approval_requested",
+            HistoryKind::SkillApproved => "skill_approved",
+            HistoryKind::SkillRejected => "skill_rejected",
+            HistoryKind::SkillDeferred => "skill_deferred",
+            HistoryKind::SkillModified => "skill_modified",
         }
     }
 
@@ -259,6 +276,11 @@ impl HistoryKind {
             | HistoryKind::TaskResumed
             | HistoryKind::TaskValidationStarted => 60,
             HistoryKind::TaskCheckpoint => 50,
+            HistoryKind::SkillApprovalRequested => 75,
+            HistoryKind::SkillApproved
+            | HistoryKind::SkillRejected
+            | HistoryKind::SkillDeferred
+            | HistoryKind::SkillModified => 80,
             HistoryKind::SessionStarted | HistoryKind::SessionEnded => 60,
             HistoryKind::UserMessage => 60,
             HistoryKind::AssistantMessage => 50,
@@ -313,6 +335,11 @@ impl std::str::FromStr for HistoryKind {
             "health_analyzed" => Ok(HistoryKind::HealthAnalyzed),
             "repository_discovered" => Ok(HistoryKind::RepositoryDiscovered),
             "task_outcome" => Ok(HistoryKind::TaskOutcome),
+            "skill_approval_requested" => Ok(HistoryKind::SkillApprovalRequested),
+            "skill_approved" => Ok(HistoryKind::SkillApproved),
+            "skill_rejected" => Ok(HistoryKind::SkillRejected),
+            "skill_deferred" => Ok(HistoryKind::SkillDeferred),
+            "skill_modified" => Ok(HistoryKind::SkillModified),
             other => Err(format!("unknown history kind: {other}")),
         }
     }

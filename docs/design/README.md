@@ -42,7 +42,7 @@ This directory contains the complete architectural blueprint for the Adaptive De
 
 | Document | Status | Summary |
 |----------|--------|---------|
-| [MCP_SERVER.md](./MCP_SERVER.md) | **Implemented** | Engineering context layer as an MCP server (`codebro serve`/`init`/`doctor`, 7 tools); verified end-to-end with OpenCode incl. A/B comparison (§9) and auto-detection tests (§10) |
+| [MCP_SERVER.md](./MCP_SERVER.md) | **Partially superseded** | Engineering context layer as an MCP server (`codebro serve`/`init`/`doctor`; documents the early 7-tool surface — the live surface is 25 tools, see `../MCP_API_V1.md`); verified end-to-end with OpenCode incl. A/B comparison (§9) and auto-detection tests (§10) |
 
 ---
 
