@@ -80,8 +80,6 @@ only on the `tui-legacy` branch and tags, with mechanical guards in
 
 Frozen v1 contract: [`docs/MCP_API_V1.md`](docs/MCP_API_V1.md)
 (additive tools documented under "Frozen tool inventory" / "Additive tools").
-
-Frozen contract: [`docs/MCP_API_V1.md`](docs/MCP_API_V1.md).
 Full design: [`docs/design/MCP_SERVER.md`](docs/design/MCP_SERVER.md).
 
 ## Trust model

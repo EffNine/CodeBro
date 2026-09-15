@@ -119,6 +119,7 @@ codebro auth status # Check consultant provider auth
 ## Links
 
 - [Frozen v1 MCP Contract](docs/MCP_API_V1.md)
+- [v1.1.0 Release Notes](docs/RELEASE_v1.1.0.md)
 - [v1.0.0 Release Notes](docs/RELEASE_v1.0.0.md)
 - [Conductor Setup HOWTO](docs/CONDUCTOR_HOWTO.md)
 - [Architecture Decision Records](docs/ADR/)
@@ -127,11 +128,7 @@ codebro auth status # Check consultant provider auth
 
 ---
 
-<<<<<<< HEAD
-*Current public release: 1.0.0.*
-=======
-*Current public release: [v1.0.0](https://github.com/EffNine/CodeBro/releases/tag/v1.0.0).*
->>>>>>> ab0734496666231d0871c21ff4b6ea870d526af7
+*Current public release: [v1.1.0](https://github.com/EffNine/CodeBro/releases/tag/v1.1.0).*
 
 The former chat TUI is preserved on the `tui-legacy` branch; the development
 line is MCP-first only.
