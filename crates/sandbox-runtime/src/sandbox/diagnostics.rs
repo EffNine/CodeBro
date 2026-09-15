@@ -71,7 +71,17 @@ impl ParsedDiagnostic {
 pub fn parse_diagnostics(output: &str) -> Vec<ParsedDiagnostic> {
     let mut diags: Vec<ParsedDiagnostic> = Vec::new();
     let mut in_failures_block = false;
-    for line in output.lines().take(MAX_PARSE_LINES) {
+    for raw in output.lines().take(MAX_PARSE_LINES) {
+        // Color first: toolchains emit ANSI-colored human format whenever
+        // color is forced on (`CARGO_TERM_COLOR=always`, `CLICOLOR_FORCE=1`,
+        // `term.color` config). Without stripping, `error[E0308]` arrives as
+        // `ESC[1mESC[91merrorESC[0m…` and no severity parser matches — a real
+        // compile error degrades to `unknown_failure` with empty hypotheses
+        // (P17 CI finding: the CI env sets `CARGO_TERM_COLOR: always`).
+        // Stripping per line also keeps raw escape bytes out of the
+        // structured messages surfaced over MCP.
+        let stripped = strip_ansi_line(raw);
+        let line: &str = &stripped;
         if let Some(d) = parse_rustc_diagnostic(line) {
             diags.push(d);
             in_failures_block = false;
@@ -133,6 +143,39 @@ pub fn parse_diagnostics(output: &str) -> Vec<ParsedDiagnostic> {
     }
     diags.dedup();
     diags
+}
+
+/// Strip ANSI terminal escape sequences from one output line.
+///
+/// Handles CSI sequences (`ESC [` + parameter bytes + one final byte in
+/// `@`..=`~`, e.g. `\x1b[1m`, `\x1b[91m`, `\x1b[0m`) and drops any other
+/// lone `ESC`. Lines without escapes are returned borrowed (zero cost on
+/// the common path). Operates on `char`s so multibyte text passes through
+/// untouched; an unterminated trailing sequence is dropped rather than
+/// leaked into parsed messages.
+fn strip_ansi_line(line: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if !line.contains('\u{1b}') {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // ESC: consume a CSI sequence if one follows, else drop the lone ESC.
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break; // final byte consumed; sequence dropped
+                }
+            }
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// rustc human-format severity lines: `error[E0308]: msg`, `warning: msg`.
@@ -420,6 +463,51 @@ warning: unused variable: `y`
         assert_eq!(diags[0].column, Some(34));
         assert_eq!(diags[1].severity, "warning");
         assert_eq!(diags[1].file.as_deref(), Some("src/main.rs"));
+    }
+
+    #[test]
+    fn parses_ansi_colored_diagnostics() {
+        // P17 CI finding: the CI env sets `CARGO_TERM_COLOR: always`, so
+        // rustc/cargo emit colorized diagnostics and the severity parsers
+        // saw `ESC[1mESC[91merror…` — a real compile error degraded to
+        // `unknown_failure` with empty hypotheses. Colors must not change
+        // the parse.
+        let esc = '\u{1b}';
+        let output = format!(
+            "{esc}[1m{esc}[92m    Checking{esc}[0m broken v0.1.0 (/tmp/x)\n\
+             {esc}[1m{esc}[91merror[E0308]{esc}[0m{esc}[1m: mismatched types{esc}[0m\n\
+             {esc}[1m{esc}[94m-->{esc}[0m src/lib.rs:2:18\n\
+             {esc}[1m{esc}[91merror{esc}[0m: could not compile `broken` (lib) due to 1 previous error"
+        );
+        let diags = parse_diagnostics(&output);
+        assert_eq!(diags.len(), 2, "colored output parses: {diags:?}");
+        assert_eq!(diags[0].severity, "error");
+        assert_eq!(diags[0].code.as_deref(), Some("E0308"));
+        assert_eq!(diags[0].file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(diags[0].line, Some(2));
+        assert_eq!(diags[0].column, Some(18));
+        assert_eq!(diags[1].severity, "error");
+        assert!(diags[1].message.contains("could not compile"));
+        for d in &diags {
+            assert!(!d.message.contains(esc), "no escapes leak into messages");
+        }
+        assert_eq!(
+            classify_failure(false, false, false, &diags),
+            "compile_error"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_line_leaves_plain_and_unicode_text_alone() {
+        assert_eq!(strip_ansi_line("plain line"), "plain line");
+        assert_eq!(
+            strip_ansi_line("mismatched types — déjå ✓"),
+            "mismatched types — déjå ✓"
+        );
+        // Unterminated trailing sequence is dropped, not leaked.
+        assert_eq!(strip_ansi_line("oops\x1b[91"), "oops");
+        // Lone ESC is dropped, surrounding text kept.
+        assert_eq!(strip_ansi_line("a\x1bb"), "ab");
     }
 
     #[test]
