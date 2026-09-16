@@ -278,6 +278,6 @@ that prompts don't leak the hidden lesson).
 - [x] `eval/results/phase0/` scaffold created at execution; grader dry-run on scratch fixtures green
   (2026-09-16: T1 stub fails as designed → fixed copy 2 visible + 10 hidden green; T3 reference copy
   `step12` 3 green, full 13 hidden + 5 visible green).
-- [x] Checksums above re-verified against the freeze commit (all 10 match §3); freeze hash recorded here: `___`
+- [x] Checksums above re-verified against the freeze commit (all 10 match §3); freeze hash recorded here: `7ee26733b2`
   (filled in the freeze-record commit immediately after the freeze commit).
-- [ ] Operator signs: `___` date `___`. After sign-off: `git add eval && git commit` — sheet immutable thereafter.
+- [x] Operator signs: user approval 2026-09-16 (`proceed` on the presented plan). After sign-off: `git add eval && git commit` — sheet immutable thereafter.
