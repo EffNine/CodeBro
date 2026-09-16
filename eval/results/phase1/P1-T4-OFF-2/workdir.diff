@@ -1,0 +1,36 @@
+Only in P1-T4-OFF-2/work: Cargo.lock
+diff -r P1-T4-OFF-2/work-fresh/src/lib.rs P1-T4-OFF-2/work/src/lib.rs
+22,24c22,29
+<         let cmd = match Self::get_str(line, "cmd") {
+<             Some(c) => c,
+<             None => return "{\"ok\":false,\"err\":\"bad-request\"}".to_string(),
+---
+>         let command = Self::get_str(line, "cmd").unwrap_or_default();
+>         let response = self.handle_command(&command, line);
+>         let outcome = if response.contains("\"ok\":true") {
+>             "ok"
+>         } else if response.contains("\"err\":\"missing\"") {
+>             "missing"
+>         } else {
+>             "bad-request"
+26c31,36
+<         match cmd.as_str() {
+---
+>         log_diagnostic(format!("command={} outcome={}", command, outcome));
+>         response
+>     }
+> 
+>     fn handle_command(&mut self, command: &str, line: &str) -> String {
+>         match command {
+48c58
+< // TODO: wire diagnostics properly.
+---
+> /// Diagnostics go to stderr; stdout is reserved for protocol responses.
+50c60
+<     println!("LOG {}", msg);
+---
+>     eprintln!("{}", msg);
+diff -r P1-T4-OFF-2/work-fresh/src/main.rs P1-T4-OFF-2/work/src/main.rs
+11d10
+<         qserver::log_diagnostic(format!("handled {} bytes -> {}", line.len(), resp));
+Only in P1-T4-OFF-2/work: target

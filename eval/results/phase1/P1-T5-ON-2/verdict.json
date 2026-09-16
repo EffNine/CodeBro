@@ -1,0 +1,9 @@
+{
+  "run_id": "P1-T5-ON-2",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy",
+  "probe": "PRESENT/PARTIAL-tagged/39",
+  "grade_summary": "2 visible + 4 hidden green",
+  "notes": "DECISION-CHANGING: 'Confirmed in CodeBro memory that bulk clear is rejected (Never mass-delete). I'll implement bounded LRU instead.' + record_memory post-task.",
+  "comparative_claim": "NONE per-run; see Phase-1 aggregate report (directional, N=2)"
+}

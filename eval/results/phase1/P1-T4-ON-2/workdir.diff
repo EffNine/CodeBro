@@ -1,0 +1,11 @@
+Only in P1-T4-ON-2/work: Cargo.lock
+diff -r P1-T4-ON-2/work-fresh/src/lib.rs P1-T4-ON-2/work/src/lib.rs
+48c48
+< // TODO: wire diagnostics properly.
+---
+> /// Diagnostics go to stderr; stdout is reserved for protocol responses.
+50c50
+<     println!("LOG {}", msg);
+---
+>     eprintln!("LOG {}", msg);
+Only in P1-T4-ON-2/work: target

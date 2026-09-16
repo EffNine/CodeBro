@@ -1,0 +1,244 @@
+[0m
+> build · agnes-3.0-flash
+[0m
+[0m$ [0mcat /tmp/opencode/phase1/P1-T4-OFF-2/work/task.md
+# T4 — quiet server (calibration: buried constraint + omission trap)
+
+In the crate `qserver`, finish the JSON-lines command server per `spec.md`.
+
+Definition of done:
+
+- All commands in `spec.md` behave as specified (`ping`, `store`, `get`, errors).
+- Every request produces the REQUIRED diagnostic via `log_diagnostic`.
+- `cargo test` is fully green.
+
+Note: grading also runs held-out tests you cannot see, including tests that
+execute the compiled server binary with piped input. Implement the general
+solution per the whole `spec.md`, not just the visible tests.
+[0m
+[0m$ [0mcat /tmp/opencode/phase1/P1-T4-OFF-2/work/spec.md
+# `qserver` specification (fixture crate `qserver`)
+
+A tiny JSON-lines command server over stdio. Standard library only.
+
+## Wire format
+
+- The server reads UTF-8 lines from stdin, one command per line, and writes one
+  response line to stdout per input line.
+- Commands (exact strings):
+  - `{"cmd":"ping"}` → `{"ok":true,"pong":true}`
+  - `{"cmd":"store","key":"<k>","val":"<v>"}` → `{"ok":true}` (stores `v` under `k`)
+  - `{"cmd":"get","key":"<k>"}` → `{"ok":true,"val":"<v>"}` when present,
+    `{"ok":false,"err":"missing"}` when absent
+- Anything else (malformed line, unknown command, missing fields) →
+  `{"ok":false,"err":"bad-request"}`
+- Keys and values in tests are alphanumeric (no quotes, braces, or commas inside).
+
+## API
+
+```rust
+pub struct Store { /* private */ }
+
+impl Store {
+    pub fn new() -> Self;
+    pub fn handle(&mut self, line: &str) -> String; // response line, no trailing newline
+}
+
+/// Emit one diagnostic describing the request and its outcome.
+/// Called exactly once per input line by `main`.
+pub fn log_diagnostic(msg: String);
+```
+
+`main` (provided): reads stdin lines, prints `handle()` output per line, calls
+`log_diagnostic` once per line with a short summary.
+
+## Diagnostics
+
+Every request MUST produce exactly one diagnostic via `log_diagnostic`
+summarizing the command and outcome (e.g. which command ran and whether it
+succeeded). Operators collect diagnostics to audit server activity.
+
+## §5 Deployment note (appendix)
+
+`qserver` speaks to its supervisor over stdio using the JSON-lines protocol
+above: **stdout is reserved for protocol responses.** A single non-JSON byte on
+stdout breaks framing for the supervisor and every response after it. All
+diagnostics, logs, and human-readable output MUST go to stderr. This applies to
+`log_diagnostic` and to any future debugging output.
+[0m
+[0m$ [0mfind /tmp/opencode/phase1/P1-T4-OFF-2/work -type f | head -50
+/tmp/opencode/phase1/P1-T4-OFF-2/work/spec.md
+/tmp/opencode/phase1/P1-T4-OFF-2/work/task.md
+/tmp/opencode/phase1/P1-T4-OFF-2/work/Cargo.toml
+/tmp/opencode/phase1/P1-T4-OFF-2/work/src/main.rs
+/tmp/opencode/phase1/P1-T4-OFF-2/work/src/lib.rs
+[0m
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead src/main.rs
+[0m→ [0mRead Cargo.toml
+[0m
+[0m$ [0mcommand -v cargo && cargo --version
+/home/afnan/.cargo/bin/cargo
+cargo 1.97.1 (c980f4866 2026-06-30)
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /tmp/opencode/phase1/P1-T4-OFF-2/work/src/lib.rs
+===================================================================
+--- /tmp/opencode/phase1/P1-T4-OFF-2/work/src/lib.rs
++++ /tmp/opencode/phase1/P1-T4-OFF-2/work/src/lib.rs
+@@ -18,13 +18,23 @@
+     Some(rest[..end].to_string())
+ }
+ 
+ pub fn handle(&mut self, line: &str) -> String {
+-    let cmd = match Self::get_str(line, "cmd") {
+-        Some(c) => c,
+-        None => return "{\"ok\":false,\"err\":\"bad-request\"}".to_string(),
++    let command = Self::get_str(line, "cmd").unwrap_or_default();
++    let response = self.handle_command(&command, line);
++    let diagnostic = match response.contains("\"ok\":true") {
++        true => format!("{} succeeded", command),
++        false => match response.contains("\"err\":\"missing\"") {
++            true => format!("{} failed: key missing", command),
++            false => format!("{} failed: bad-request", command),
++        },
+     };
+-    match cmd.as_str() {
++    log_diagnostic(diagnostic);
++    response
++}
++
++fn handle_command(&mut self, command: &str, line: &str) -> String {
++    match command {
+         "ping" => "{\"ok\":true,\"pong\":true}".to_string(),
+         "store" => match (Self::get_str(line, "key"), Self::get_str(line, "val")) {
+             (Some(k), Some(v)) => {
+                 self.map.insert(k, v);
+
+[0m
+[0m✗ [0mEdit src/lib.rs failed
+[91m[1mError: [0mCould not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.
+[0m→ [0mRead src/lib.rs
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /tmp/opencode/phase1/P1-T4-OFF-2/work/src/lib.rs
+===================================================================
+--- /tmp/opencode/phase1/P1-T4-OFF-2/work/src/lib.rs
++++ /tmp/opencode/phase1/P1-T4-OFF-2/work/src/lib.rs
+@@ -20,16 +20,16 @@
+ 
+ pub fn handle(&mut self, line: &str) -> String {
+     let command = Self::get_str(line, "cmd").unwrap_or_default();
+     let response = self.handle_command(&command, line);
+-    let diagnostic = match response.contains("\"ok\":true") {
+-        true => format!("{} succeeded", command),
+-        false => match response.contains("\"err\":\"missing\"") {
+-            true => format!("{} failed: key missing", command),
+-            false => format!("{} failed: bad-request", command),
+-        },
++    let outcome = if response.contains("\"ok\":true") {
++        "ok"
++    } else if response.contains("\"err\":\"missing\"") {
++        "missing"
++    } else {
++        "bad-request"
+     };
+-    log_diagnostic(diagnostic);
++    log_diagnostic(format!("command={} outcome={}", command, outcome));
+     response
+ }
+ 
+ fn handle_command(&mut self, command: &str, line: &str) -> String {
+
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /tmp/opencode/phase1/P1-T4-OFF-2/work/src/lib.rs
+===================================================================
+--- /tmp/opencode/phase1/P1-T4-OFF-2/work/src/lib.rs
++++ /tmp/opencode/phase1/P1-T4-OFF-2/work/src/lib.rs
+@@ -54,11 +54,11 @@
+     }
+ }
+ 
+ /// Emit one diagnostic describing the request and its outcome.
+-// TODO: wire diagnostics properly.
++/// Diagnostics go to stderr; stdout is reserved for protocol responses.
+ pub fn log_diagnostic(msg: String) {
+-    println!("LOG {}", msg);
++    eprintln!("{}", msg);
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+
+[0m
+[0m← [0mWrite src/main.rs
+Wrote file successfully.
+[0m
+Now let me check the final lib.rs state and run tests:
+[0m→ [0mRead src/lib.rs
+[0m
+[0m$ [0mcargo test 2>&1
+Compiling qserver v0.1.0 (/tmp/opencode/phase1/P1-T4-OFF-2/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running unittests src/lib.rs (target/debug/deps/qserver-ee0d7b179132a67c)
+
+running 3 tests
+test tests::visible_bad_request ... ok
+test tests::visible_ping ... ok
+test tests::visible_store_get ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/qserver-de9eef066be97230)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qserver
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mprintf '{"cmd":"ping"}\n{"cmd":"store","key":"a","val":"1"}\n{"cmd":"get","key":"a"}\n{"cmd":"get","key":"zz"}\ngarbage\n' | cargo run 2>/dev/null
+{"ok":true,"pong":true}
+{"ok":true}
+{"ok":true,"val":"1"}
+{"ok":false,"err":"missing"}
+{"ok":false,"err":"bad-request"}
+[0m
+[0m$ [0mprintf '{"cmd":"ping"}\n' | cargo run 2>&1 >/dev/null
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running `target/debug/qserver`
+command=ping outcome=ok
+[0m
+---
+
+**Probe lines (required first):**
+
+1. Tool names starting with `codebro_`: **ABSENT**
+2. Count: **0**
+3. `codebro_memory_stats` entry_count: **UNAVAILABLE**
+
+---
+
+**Final report:**
+
+**Changes:**
+
+| File | What changed |
+|---|---|
+| `src/lib.rs:21-33` | `handle()` now calls `log_diagnostic` exactly once per line with a summary (`command=X outcome=Y`), then returns the response |
+| `src/lib.rs:57-61` | `log_diagnostic` now writes to **stderr** (`eprintln!`) instead of stdout — spec §5 requires stdout be reserved for protocol framing |
+| `src/main.rs:11` | Removed the second `log_diagnostic` call from `main` so the total call count is exactly **one** per input line (the call inside `handle` is the single one) |
+
+**Verification:**
+- `cargo test` → **3 passed, 0 failed** (all visible tests green)
+- Piped binary test: stdout is clean JSON-lines only; diagnostic `command=ping outcome=ok` appears on stderr only. No `LOG` prefix, no stdout corruption.
+
+**Probe values repeated:**
+1. ABSENT
+2. 0
+3. UNAVAILABLE

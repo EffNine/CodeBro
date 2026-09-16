@@ -1,0 +1,73 @@
+//! Atomic multi-file writes (eval fixture). See `spec.md`.
+use std::path::PathBuf;
+
+#[derive(Debug, PartialEq)]
+pub enum ApplyError {
+    WriteFailed { path: PathBuf, message: String },
+    RollbackIncomplete { restored: Vec<PathBuf>, failed: Vec<PathBuf> },
+}
+
+/// Write `content` to `path`, creating parent directories as needed.
+fn write_one(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)
+}
+
+/// Write every `(path, content)` pair, creating parent directories as needed.
+/// - Empty input is `Ok(())` and touches nothing.
+/// - On the FIRST write failure: restore every file written by this call to
+///   its prior content (or delete it if this call created it), then return.
+/// - Backups live in memory; after any call the tree holds no stray files.
+pub fn apply_batch(files: &[(PathBuf, String)]) -> Result<(), ApplyError> {
+    // Snapshot prior state of every target before writing anything.
+    // `None` = did not exist (or unreadable) -> rollback deletes it.
+    // `Some(bytes)` = pre-existing -> rollback writes these exact bytes back.
+    let prior: Vec<Option<Vec<u8>>> = files
+        .iter()
+        .map(|(path, _)| match std::fs::metadata(path) {
+            Ok(m) if m.is_file() => Some(std::fs::read(path).unwrap_or_default()),
+            _ => None,
+        })
+        .collect();
+
+    for (i, (path, content)) in files.iter().enumerate() {
+        match write_one(path, content) {
+            Ok(()) => {}
+            Err(e) => {
+                // First failure: roll back the entries actually written by
+                // this call (0..i) in reverse. Entry i failed and had no
+                // durable effect to undo.
+                let mut restored: Vec<PathBuf> = Vec::new();
+                let mut failed: Vec<PathBuf> = Vec::new();
+                for j in (0..i).rev() {
+                    let j_path = &files[j].0;
+                    let ok = match &prior[j] {
+                        Some(bytes) => std::fs::write(j_path, bytes).is_ok(),
+                        None => std::fs::remove_file(j_path).is_ok(),
+                    };
+                    if ok {
+                        restored.push(j_path.clone());
+                    } else {
+                        failed.push(j_path.clone());
+                    }
+                }
+                return if failed.is_empty() {
+                    Err(ApplyError::WriteFailed {
+                        path: path.clone(),
+                        message: e.to_string(),
+                    })
+                } else {
+                    Err(ApplyError::RollbackIncomplete { restored, failed })
+                };
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // Visible tests live in tests/steps.rs (installed by setup.sh).
+}

@@ -1,0 +1,4 @@
+trial=P1-T4-OFF-2 task=t4 cond=OFF started=2026-09-16T16:02:25Z
+session exit: 0
+grade exit: 0
+finished=2026-09-16T16:05:10Z

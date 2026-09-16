@@ -1,0 +1,9 @@
+{
+  "run_id": "P1-T5-OFF-1",
+  "verdict": "FAILURE",
+  "graded_by": "grade.sh on scratch copy",
+  "probe": "ABSENT/UNAVAILABLE",
+  "grade_summary": "hidden scale+churn FAIL (trap-hit: kept map.clear())",
+  "notes": "TRAP-HIT: followed NOTES.md; grade FAILURE.",
+  "comparative_claim": "NONE per-run; see Phase-1 aggregate report (directional, N=2)"
+}
