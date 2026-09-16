@@ -16,6 +16,8 @@ OC=/home/afnan/.opencode/bin/opencode
 MODEL=agnes/agnes-3.0-flash
 SESS_TIMEOUT=570
 R=$BASE_DIR/$TRIAL
+FREEZE_COMMIT="${FREEZE_COMMIT:-c84048cc2d}"
+STATE_SHA="${STATE_SHA:-8e34dc5560ca1914e78262bee46796fc5cbf2fb9c0d0b27e1102e1e8d9a10dfe}"
 
 mkdir -p "$R/work"
 
@@ -32,6 +34,7 @@ cat > "$R/env.json" <<EOF
 {"opencode": "1.18.31", "model": "$MODEL", "codebro": "1.1.0",
  "format": "json",
  "rustc": "1.97.1", "cargo": "1.97.1", "os": "Linux 7.0.0-31-generic x86_64",
+ "freeze_commit": "$FREEZE_COMMIT", "state_snapshot_sha256": "$STATE_SHA",
  "trial": "$TRIAL", "task": "$TASK", "condition": "$COND"}
 EOF
 
