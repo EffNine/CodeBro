@@ -1,0 +1,33 @@
+   Compiling fleet v0.1.0 (/tmp/opencode/phase2/P2-T8-ON-1/work-grade)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (/tmp/opencode/phase2/P2-T8-ON-1/work-grade/target/debug/deps/fleet-7e8bca81064e8556)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hidden.rs (/tmp/opencode/phase2/P2-T8-ON-1/work-grade/target/debug/deps/hidden-9c1eabe560b62f9a)
+
+running 4 tests
+test hidden_express_new_fare_via_reexport ... ok
+test hidden_registry_stable ... ok
+test hidden_standard_new_fare ... ok
+test hidden_staff_meal_untouched ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/steps.rs (/tmp/opencode/phase2/P2-T8-ON-1/work-grade/target/debug/deps/steps-84bb3b4ff132cddb)
+
+running 3 tests
+test step_registry_keys ... ok
+test step_staff_meal_unchanged ... ok
+test step_standard_new_fare ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests fleet
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

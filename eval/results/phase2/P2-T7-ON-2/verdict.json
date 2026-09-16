@@ -1,0 +1,9 @@
+{
+  "run_id": "P2-T7-ON-2",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy",
+  "probe": "PRESENT/COMPLETE/45",
+  "grade_summary": "2 vis + 4 hidden green",
+  "notes": "Retrieval present (memory+recall x2+facts); redacted. Conversion attribution: model security priors likely sufficient (see OFF arms).",
+  "comparative_claim": "NONE per-run; Phase-2 aggregate (directional)"
+}

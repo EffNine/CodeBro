@@ -1,0 +1,12 @@
+Only in P2-T7-OFF-1/work: Cargo.lock
+diff -r P2-T7-OFF-1/work-fresh/src/lib.rs P2-T7-OFF-1/work/src/lib.rs
+25,26c25,29
+<     // LOGGING.md: full request context via Debug, nothing redacted.
+<     format!("REQ {:?} OUT {}", req, outcome)
+---
+>     // Auth is a credential: log its presence, never the value.
+>     format!(
+>         "REQ id={:?} user={:?} auth=present action={:?} OUT {}",
+>         req.id, req.user, req.action, outcome
+>     )
+Only in P2-T7-OFF-1/work: target
