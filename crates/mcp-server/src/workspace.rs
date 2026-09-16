@@ -293,8 +293,38 @@ mod tests {
 
     // ── P8 root authorization: additional-roots resolution ─────────────
 
+    /// Serialize `CODEBRO_ALLOW_ROOTS` mutation across tests (unit tests run
+    /// on parallel threads while the process environment is global). The
+    /// guard is held for the whole test body and clears the variable on
+    /// drop, so a sibling test can never observe a half-written value —
+    /// even if the test panics. Mirrors the `SKILL_ENV_LOCK` pattern in
+    /// `mcp::skill_tests`; sync mutex because these tests are sync.
+    static ALLOW_ROOTS_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    struct AllowRootsEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl AllowRootsEnvGuard {
+        fn claim() -> Self {
+            let lock = ALLOW_ROOTS_ENV_LOCK
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for AllowRootsEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(ALLOW_ROOTS_ENV_VAR);
+        }
+    }
+
     #[test]
     fn additional_roots_resolve_flags_and_env() {
+        let _env = AllowRootsEnvGuard::claim();
         let home = tempfile::tempdir().unwrap();
         let a = home.path().join("a");
         let b = home.path().join("b");
@@ -323,12 +353,11 @@ mod tests {
         std::env::set_var(ALLOW_ROOTS_ENV_VAR, b.display().to_string());
         let merged = resolve_additional_roots(&[home.path().join("a"), home.path().join("b")]);
         assert_eq!(merged, vec![a_canon.clone(), b_canon.clone()]);
-
-        std::env::remove_var(ALLOW_ROOTS_ENV_VAR);
     }
 
     #[test]
     fn additional_roots_skip_invalid_entries_without_failing() {
+        let _env = AllowRootsEnvGuard::claim();
         let home = tempfile::tempdir().unwrap();
         let good = home.path().join("good");
         std::fs::create_dir_all(&good).unwrap();
@@ -350,6 +379,5 @@ mod tests {
             vec![good.canonicalize().unwrap()],
             "invalid entries are skipped; valid ones survive"
         );
-        std::env::remove_var(ALLOW_ROOTS_ENV_VAR);
     }
 }
