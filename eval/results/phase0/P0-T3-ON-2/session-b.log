@@ -1,0 +1,125 @@
+[0m
+> build · agnes-3.0-flash
+[0m
+[0m✗ [0mRead continuation.md failed
+[91m[1mError: [0mFile not found: /tmp/opencode/phase0/P0-T3-ON-2/work/continuation.md
+[0m⚙ [0mcodebro_memory_stats Unknown
+[0m→ [0mRead spec.md
+[0m⚙ [0mcodebro_engineering_memory {"task_keywords":["P0-T3","ON-2","registry","TaskRegistry","continuation"]}
+[0m✱ [0mGlob "**/*"[90m in . · 100 matches[0m
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead tests/steps.rs
+[0m✗ [0mcodebro_apply_change {"new":"    // --- Step 3 ---\n    pub fn save(&self, path: &Path) -> std::io::Result<()> {\n        let mut s = String::new();\n        for (id, title) in self.list() {\n            s.push_str(&format!(\"{}:{}\\n\", id, title));\n        }\n        std::fs::write(path, s)\n    }\n\n    pub fn load(path: &Path) -> std::io::Result<Self> {\n        let s = std::fs::read_to_string(path)?;\n        let mut r = Self::new();\n        for line in s.lines() {\n            match line.split_once(':') {\n                Some((id, title)) => {\n                    r.tasks.insert(id.to_string(), title.to_string());\n                }\n                None => {\n                    return Err(std::io::Error::new(\n                        std::io::ErrorKind::InvalidData,\n                        format!(\"malformed line (missing ':'): {:?}\", line),\n                    ));\n                }\n            }\n        }\n        Ok(r)\n    }\n\n    // --- Step 4 ---\n    pub fn rename(&mut self, id: &str, new_title: &str) -> Result<(), String> {\n        if new_title.is_empty() {\n            return Err(\"new title must not be empty\".to_string());\n        }\n        match self.tasks.get_mut(id) {\n            Some(title) => {\n                *title = new_title.to_string();\n                Ok(())\n            }\n            None => Err(format!(\"id '{}' not found\", id)),\n        }\n    }","old":"    // --- Step 3 ---\n    pub fn save(&self, _path: &Path) -> std::io::Result<()> {\n        unimplemented!()\n    }\n\n    pub fn load(_path: &Path) -> std::io::Result<Self> {\n        unimplemented!()\n    }\n\n    // --- Step 4 ---\n    pub fn rename(&mut self, _id: &str, _new_title: &str) -> Result<(), String> {\n        unimplemented!()\n    }","path":"src/lib.rs"} failed
+[91m[1mError: [0mMCP error -32602: Patch error: cannot create '/home/afnan/projects/active/codebro/src/lib.rs': the file does not exist — to create it pass old="" with the full content as new
+codebro_ tool availability: PRESENT. Count: 20 (3 ainotebook + 17 codebro). memory_stats reachable: entry_count = 37.
+
+Continuation.md does not exist in this workspace; proceeding per spec.md steps 3-4 with the visible tests as acceptance criteria.
+CodeBro's workspace is a different root; the apply API targets CodeBro's workspace, not this fixture. Falling back to native editing.
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /tmp/opencode/phase0/P0-T3-ON-2/work/src/lib.rs
+===================================================================
+--- /tmp/opencode/phase0/P0-T3-ON-2/work/src/lib.rs
++++ /tmp/opencode/phase0/P0-T3-ON-2/work/src/lib.rs
+@@ -45,17 +45,45 @@
+         self.tasks.remove(id).is_some()
+     }
+ 
+     // --- Step 3 ---
+-    pub fn save(&self, _path: &Path) -> std::io::Result<()> {
+-        unimplemented!()
++    pub fn save(&self, path: &Path) -> std::io::Result<()> {
++        let mut s = String::new();
++        for (id, title) in self.list() {
++            s.push_str(&format!("{}:{}\n", id, title));
++        }
++        std::fs::write(path, s)
+     }
+ 
+-    pub fn load(_path: &Path) -> std::io::Result<Self> {
+-        unimplemented!()
++    pub fn load(path: &Path) -> std::io::Result<Self> {
++        let s = std::fs::read_to_string(path)?;
++        let mut r = Self::new();
++        for line in s.lines() {
++            match line.split_once(':') {
++                Some((id, title)) => {
++                    r.tasks.insert(id.to_string(), title.to_string());
++                }
++                None => {
++                    return Err(std::io::Error::new(
++                        std::io::ErrorKind::InvalidData,
++                        format!("malformed line (missing ':'): {:?}", line),
++                    ));
++                }
++            }
++        }
++        Ok(r)
+     }
+ 
+     // --- Step 4 ---
+-    pub fn rename(&mut self, _id: &str, _new_title: &str) -> Result<(), String> {
+-        unimplemented!()
++    pub fn rename(&mut self, id: &str, new_title: &str) -> Result<(), String> {
++        if new_title.is_empty() {
++            return Err("new title must not be empty".to_string());
++        }
++        match self.tasks.get_mut(id) {
++            Some(title) => {
++                *title = new_title.to_string();
++                Ok(())
++            }
++            None => Err(format!("id '{}' not found", id)),
++        }
+     }
+ }
+
+[0m
+[0m$ [0mcargo test 2>&1
+Compiling registry v0.1.0 (/tmp/opencode/phase0/P0-T3-ON-2/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/registry-1cc24ae0aa6d7b21)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/steps.rs (target/debug/deps/steps-3554b0ae3c4765e3)
+
+running 5 tests
+test step12_add_get ... ok
+test step12_list_sorted ... ok
+test step34_rename ... ok
+test step12_remove ... ok
+test step34_save_load ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests registry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+All 5 tests pass.
+
+codebro_ tools: PRESENT / 20 / 37
+
+## Session B report
+
+**Changed** (src/lib.rs, steps 3-4; API signatures unchanged):
+- `save` — writes one `id:title\n` line per entry, sorted by id (via `list()`), creating/truncating the file.
+- `load` — reads the file (missing file → `Err` via `read_to_string`), splits each line at the FIRST `:` only (`split_once`), malformed line (no `:`) → `Err(InvalidData)`; reconstructs the registry.
+- `rename` — `Err` when `id` unknown or `new_title` empty; otherwise updates title in place.
+
+**Verification** — full `cargo test` green, 5/5:
+```
+test step12_add_get ... ok
+test step12_list_sorted ... ok
+test step34_rename ... ok
+test step12_remove ... ok
+test step34_save_load ... ok
+test result: ok. 5 passed; 0 failed
+```
+
+**Probe values repeated** (spec-mandated, confirmed): `continuation.md` NOT found in work dir (task text treated as authoritative); entry_count = 37; no API signature changes; steps 1-2 untouched and still green.

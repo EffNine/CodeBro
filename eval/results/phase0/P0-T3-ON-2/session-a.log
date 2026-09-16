@@ -1,0 +1,145 @@
+[0m
+> build · agnes-3.0-flash
+[0m
+[0m✗ [0mRead task.md failed
+[91m[1mError: [0mFile not found: /tmp/opencode/phase0/P0-T3-ON-2/work/task.md
+[0m→ [0mRead spec.md
+[0m⚙ [0mcodebro_memory_stats Unknown
+PRESENT
+14
+37
+
+Let me look at the work directory.
+[0m⚙ [0mcodebro_recall {"query":"P0-T3 TaskRegistry fixture session A steps 1-2 add get list remove"}
+[0m
+[0m$ [0mls -la /tmp/opencode/phase0/P0-T3-ON-2/work/
+total 8
+drwxrwxr-x 4 afnan afnan  120 Sep 16 23:34 .
+drwxrwxr-x 4 afnan afnan  200 Sep 16 23:34 ..
+-rw-rw-r-- 1 afnan afnan   63 Sep 16 23:34 Cargo.toml
+-rw-rw-r-- 1 afnan afnan 1932 Sep 16 23:34 spec.md
+drwxrwxr-x 2 afnan afnan   60 Sep 16 23:34 src
+drwxrwxr-x 2 afnan afnan   60 Sep 16 23:34 tests
+[0m
+[0m→ [0mRead src
+[0m→ [0mRead tests
+[0m→ [0mRead Cargo.toml
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead tests/steps.rs
+The task.md file wasn't found, but the user referenced it. Let me check if it exists elsewhere.
+[0m
+[0m$ [0mls /tmp/opencode/phase0/P0-T3-ON-2/ && find /tmp/opencode/phase0/P0-T3-ON-2 -name "task.md" 2>/dev/null
+env.json
+meta.txt
+on.jsonc
+prompt-a.md
+prompt.md
+session-a.log
+state
+work
+[0m
+[0m→ [0mRead /tmp/opencode/phase0/P0-T3-ON-2/prompt.md
+[0m→ [0mRead /tmp/opencode/phase0/P0-T3-ON-2/prompt-a.md
+task.md doesn't exist in work/ but I have spec.md which fully defines the task. I'll proceed with spec.md as the authoritative source. Now let me implement steps 1-2.
+[0m⚙ [0mcodebro_engineering_brief {"task":"Implement TaskRegistry steps 1-2 (add, get, list, remove) in fixture crate `registry`; leave steps 3-4 unimplemented."}
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /tmp/opencode/phase0/P0-T3-ON-2/work/src/lib.rs
+===================================================================
+--- /tmp/opencode/phase0/P0-T3-ON-2/work/src/lib.rs
++++ /tmp/opencode/phase0/P0-T3-ON-2/work/src/lib.rs
+@@ -14,23 +14,36 @@
+     }
+ }
+ 
+ // --- Step 1 ---
+-pub fn add(&mut self, _id: &str, _title: &str) -> Result<(), String> {
+-    unimplemented!()
++pub fn add(&mut self, id: &str, title: &str) -> Result<(), String> {
++    if id.is_empty() {
++        return Err("id must not be empty".to_string());
++    }
++    if title.is_empty() {
++        return Err("title must not be empty".to_string());
++    }
++    if self.tasks.contains_key(id) {
++        return Err(format!("id '{}' already exists", id));
++    }
++    self.tasks.insert(id.to_string(), title.to_string());
++    Ok(())
+ }
+ 
+-pub fn get(&self, _id: &str) -> Option<String> {
+-    unimplemented!()
++pub fn get(&self, id: &str) -> Option<String> {
++    self.tasks.get(id).cloned()
+ }
+ 
+ // --- Step 2 ---
+ pub fn list(&self) -> Vec<(String, String)> {
+-    unimplemented!()
++    let mut entries: Vec<(String, String)> =
++        self.tasks.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
++    entries.sort_by(|a, b| a.0.cmp(&b.0));
++    entries
+ }
+ 
+-pub fn remove(&mut self, _id: &str) -> bool {
+-    unimplemented!()
++pub fn remove(&mut self, id: &str) -> bool {
++    self.tasks.remove(id).is_some()
+ }
+ 
+ // --- Step 3 ---
+ pub fn save(&self, _path: &Path) -> std::io::Result<()> {
+
+[0m
+[0m$ [0mcargo test step12 --manifest-path /tmp/opencode/phase0/P0-T3-ON-2/work/Cargo.toml 2>&1
+Compiling registry v0.1.0 (/tmp/opencode/phase0/P0-T3-ON-2/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s
+     Running unittests src/lib.rs (target/debug/deps/registry-1cc24ae0aa6d7b21)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/steps.rs (target/debug/deps/steps-3554b0ae3c4765e3)
+
+running 3 tests
+test step12_add_get ... ok
+test step12_list_sorted ... ok
+test step12_remove ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+[0m
+[0m✗ [0mcodebro_task {"action":"outcome","classification":"success","reason":"Session A: TaskRegistry steps 1-2 (add/get/list/remove) implemented per spec.md; cargo test step12 green (3 passed, 2 filtered out for steps 3-4). Steps 3-4 left unimplemented as required."} failed
+[91m[1mError: [0mMCP error -32602: task action 'outcome' requires task_id
+All 3 `step12` tests pass. Now record the outcome:
+[0m⚙ [0mcodebro_task {"action":"create","idempotency_key":"p0-t3-session-a","title":"P0-T3 Session A: TaskRegistry steps 1-2"}
+[0m✗ [0mcodebro_task {"action":"outcome","classification":"success","reason":"Session A complete: TaskRegistry steps 1-2 (add/get/list/remove) implemented per spec.md. cargo test step12 green: 3 passed, 2 filtered out (steps 3-4 remain unimplemented as required).","task_id":"task::f2fb5888b24912c0"} failed
+[91m[1mError: [0mMCP error -32602: outcome requires 'summary'
+[0m⚙ [0mcodebro_task {"action":"outcome","classification":"success","reason":"Session A complete: TaskRegistry steps 1-2 (add/get/list/remove) implemented per spec.md. cargo test step12 green: 3 passed, 2 filtered out (steps 3-4 remain unimplemented as required).","summary":"Implemented add (empty-id/empty-title/dup-id validation), get (clone or None), list (sorted by id), remove (bool) in src/lib.rs. Steps 3-4 left unimplemented!() as required by Session A scope. Verified: cargo test step12 → 3 passed, 0 failed.","task_id":"task::f2fb5888b24912c0"}
+## Final Report
+
+**Probe values (required 3 lines):**
+1. `codebro_` tools: PRESENT
+2. Count: 14
+3. entry_count: 37
+
+**What changed:**
+- `src/lib.rs`: implemented steps 1–2 only
+  - `add`: validates empty id, empty title, duplicate id; stores entry
+  - `get`: returns cloned title or `None`
+  - `list`: returns `(id, title)` pairs sorted by id ascending
+  - `remove`: returns `true` if removed, `false` if unknown
+- Steps 3–4 (`save`, `load`, `rename`): left as `unimplemented!()` unchanged
+
+**Verification output:**
+```
+cargo test step12 → 3 passed; 0 failed; 2 filtered out
+  step12_add_get     ... ok
+  step12_list_sorted ... ok
+  step12_remove      ... ok
+```
+
+**STOPPED at step 2 as instructed. Not touching steps 3–4.**

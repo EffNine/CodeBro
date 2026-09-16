@@ -1,0 +1,89 @@
+Only in P0-T3-OFF-2/work: Cargo.lock
+diff -r P0-T3-OFF-2/work-fresh/src/lib.rs P0-T3-OFF-2/work/src/lib.rs
+18,19c18,26
+<     pub fn add(&mut self, _id: &str, _title: &str) -> Result<(), String> {
+<         unimplemented!()
+---
+>     pub fn add(&mut self, id: &str, title: &str) -> Result<(), String> {
+>         if id.is_empty() || title.is_empty() {
+>             return Err("empty id or title".to_string());
+>         }
+>         if self.tasks.contains_key(id) {
+>             return Err(format!("id already exists: {}", id));
+>         }
+>         self.tasks.insert(id.to_string(), title.to_string());
+>         Ok(())
+22,23c29,30
+<     pub fn get(&self, _id: &str) -> Option<String> {
+<         unimplemented!()
+---
+>     pub fn get(&self, id: &str) -> Option<String> {
+>         self.tasks.get(id).cloned()
+28c35,38
+<         unimplemented!()
+---
+>         let mut pairs: Vec<(String, String)> =
+>             self.tasks.iter().map(|(id, title)| (id.clone(), title.clone())).collect();
+>         pairs.sort_by(|a, b| a.0.cmp(&b.0));
+>         pairs
+31,32c41,42
+<     pub fn remove(&mut self, _id: &str) -> bool {
+<         unimplemented!()
+---
+>     pub fn remove(&mut self, id: &str) -> bool {
+>         self.tasks.remove(id).is_some()
+36,41c46,76
+<     pub fn save(&self, _path: &Path) -> std::io::Result<()> {
+<         unimplemented!()
+<     }
+< 
+<     pub fn load(_path: &Path) -> std::io::Result<Self> {
+<         unimplemented!()
+---
+>     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+>         use std::fs;
+>         use std::io::Write;
+> 
+>         let mut file = fs::File::create(path)?;
+>         let entries = self.list();
+>         for (id, title) in entries {
+>             writeln!(file, "{}:{}", id, title)?;
+>         }
+>         Ok(())
+>     }
+> 
+>     pub fn load(path: &Path) -> std::io::Result<Self> {
+>         use std::fs;
+> 
+>         let content = fs::read_to_string(path)?;
+>         let mut tasks = HashMap::new();
+>         for line in content.lines() {
+>             if line.is_empty() {
+>                 continue;
+>             }
+>             let split = line.split_once(':').ok_or_else(|| {
+>                 std::io::Error::new(
+>                     std::io::ErrorKind::InvalidData,
+>                     format!("malformed line: {}", line),
+>                 )
+>             })?;
+>             let (id, title) = split;
+>             tasks.insert(id.to_string(), title.to_string());
+>         }
+>         Ok(Self { tasks })
+45,46c80,90
+<     pub fn rename(&mut self, _id: &str, _new_title: &str) -> Result<(), String> {
+<         unimplemented!()
+---
+>     pub fn rename(&mut self, id: &str, new_title: &str) -> Result<(), String> {
+>         if new_title.is_empty() {
+>             return Err("empty title".to_string());
+>         }
+>         match self.tasks.get_mut(id) {
+>             Some(title) => {
+>                 *title = new_title.to_string();
+>                 Ok(())
+>             }
+>             None => Err(format!("unknown id: {}", id)),
+>         }
+Only in P0-T3-OFF-2/work: target

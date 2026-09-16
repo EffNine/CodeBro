@@ -1,0 +1,5 @@
+trial=P0-T3-ON-1 task=T3 cond=ON started=2026-09-16T15:24:24Z
+session-a exit: 0
+session-b exit: 0
+grade-work-grade exit: 0
+finished=2026-09-16T15:29:35Z

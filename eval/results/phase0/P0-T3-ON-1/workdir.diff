@@ -1,0 +1,84 @@
+Only in P0-T3-ON-1/work: Cargo.lock
+diff -r P0-T3-ON-1/work-fresh/src/lib.rs P0-T3-ON-1/work/src/lib.rs
+18,19c18,29
+<     pub fn add(&mut self, _id: &str, _title: &str) -> Result<(), String> {
+<         unimplemented!()
+---
+>     pub fn add(&mut self, id: &str, title: &str) -> Result<(), String> {
+>         if id.is_empty() {
+>             return Err("empty id".to_string());
+>         }
+>         if title.is_empty() {
+>             return Err("empty title".to_string());
+>         }
+>         if self.tasks.contains_key(id) {
+>             return Err(format!("id '{}' already exists", id));
+>         }
+>         self.tasks.insert(id.to_string(), title.to_string());
+>         Ok(())
+22,23c32,33
+<     pub fn get(&self, _id: &str) -> Option<String> {
+<         unimplemented!()
+---
+>     pub fn get(&self, id: &str) -> Option<String> {
+>         self.tasks.get(id).cloned()
+28c38,41
+<         unimplemented!()
+---
+>         let mut v: Vec<(String, String)> =
+>             self.tasks.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+>         v.sort_by(|a, b| a.0.cmp(&b.0));
+>         v
+31,32c44,45
+<     pub fn remove(&mut self, _id: &str) -> bool {
+<         unimplemented!()
+---
+>     pub fn remove(&mut self, id: &str) -> bool {
+>         self.tasks.remove(id).is_some()
+36,41c49,71
+<     pub fn save(&self, _path: &Path) -> std::io::Result<()> {
+<         unimplemented!()
+<     }
+< 
+<     pub fn load(_path: &Path) -> std::io::Result<Self> {
+<         unimplemented!()
+---
+>     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+>         let mut out = String::new();
+>         for (id, title) in self.list() {
+>             out.push_str(&format!("{}:{}\n", id, title));
+>         }
+>         std::fs::write(path, out)
+>     }
+> 
+>     pub fn load(path: &Path) -> std::io::Result<Self> {
+>         let contents = std::fs::read_to_string(path)?;
+>         let mut tasks = HashMap::new();
+>         for line in contents.lines() {
+>             if line.is_empty() {
+>                 continue;
+>             }
+>             let idx = line.find(':').ok_or_else(|| {
+>                 std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed line: missing ':' separator")
+>             })?;
+>             let id = &line[..idx];
+>             let title = &line[idx + 1..];
+>             tasks.insert(id.to_string(), title.to_string());
+>         }
+>         Ok(Self { tasks })
+45,46c75,85
+<     pub fn rename(&mut self, _id: &str, _new_title: &str) -> Result<(), String> {
+<         unimplemented!()
+---
+>     pub fn rename(&mut self, id: &str, new_title: &str) -> Result<(), String> {
+>         if new_title.is_empty() {
+>             return Err("empty title".to_string());
+>         }
+>         match self.tasks.get_mut(id) {
+>             Some(title) => {
+>                 *title = new_title.to_string();
+>                 Ok(())
+>             }
+>             None => Err(format!("id '{}' not found", id)),
+>         }
+Only in P0-T3-ON-1/work: target

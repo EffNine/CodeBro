@@ -1,0 +1,44 @@
+   Compiling registry v0.1.0 (/tmp/opencode/phase0/P0-T3-OFF-1/work-grade)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (/tmp/opencode/phase0/P0-T3-OFF-1/work-grade/target/debug/deps/registry-1cc24ae0aa6d7b21)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hidden.rs (/tmp/opencode/phase0/P0-T3-OFF-1/work-grade/target/debug/deps/hidden-92e17f1d79d17a9b)
+
+running 13 tests
+test hidden_add_empty_id_err ... ok
+test hidden_add_duplicate_err ... ok
+test hidden_add_empty_title_err ... ok
+test hidden_list_sorted_after_unordered_adds ... ok
+test hidden_load_missing_file_err ... ok
+test hidden_remove_missing_false ... ok
+test hidden_load_malformed_err ... ok
+test hidden_remove_then_list ... ok
+test hidden_rename_empty_title_err ... ok
+test hidden_rename_missing_err ... ok
+test hidden_rename_ok ... ok
+test hidden_save_file_format ... ok
+test hidden_save_load_roundtrip_multi ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/steps.rs (/tmp/opencode/phase0/P0-T3-OFF-1/work-grade/target/debug/deps/steps-3554b0ae3c4765e3)
+
+running 5 tests
+test step12_add_get ... ok
+test step12_list_sorted ... ok
+test step34_rename ... ok
+test step12_remove ... ok
+test step34_save_load ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests registry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

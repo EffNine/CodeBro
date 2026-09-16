@@ -1,0 +1,1 @@
+Do not do any task. Reply with exactly three lines and nothing else: (1) PRESENT or ABSENT for tools starting with `codebro_` in your toolset, (2) their count as a number, (3) the `entry_count` from `codebro_memory_stats` if reachable, else the word UNAVAILABLE.
