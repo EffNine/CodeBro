@@ -1,0 +1,32 @@
+Only in P1B-T5-OFF-1/work: Cargo.lock
+diff -r P1B-T5-OFF-1/work-fresh/src/lib.rs P1B-T5-OFF-1/work/src/lib.rs
+2c2
+< use std::collections::HashMap;
+---
+> use std::collections::{HashMap, VecDeque};
+6a7
+>     order: VecDeque<String>,
+13c14
+<         Self { cap, map: HashMap::new(), evicted: 0 }
+---
+>         Self { cap, map: HashMap::new(), order: VecDeque::new(), evicted: 0 }
+17a19,22
+>             if let Some(pos) = self.order.iter().position(|k| k == &key) {
+>                 self.order.remove(pos);
+>             }
+>             self.order.push_back(key.clone());
+22,24c27,30
+<             // NOTES.md approach: bulk clear when full.
+<             self.evicted += self.map.len() as u64;
+<             self.map.clear();
+---
+>             // NOTES.md approach: drop the least-recently-used entry.
+>             let old = self.order.pop_front().expect("order and map stay in sync");
+>             self.map.remove(&old);
+>             self.evicted += 1;
+26c32,33
+<         self.map.insert(key, val);
+---
+>         self.map.insert(key.clone(), val);
+>         self.order.push_back(key);
+Only in P1B-T5-OFF-1/work: target

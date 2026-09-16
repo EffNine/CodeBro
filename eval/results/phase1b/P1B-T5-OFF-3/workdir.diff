@@ -1,0 +1,105 @@
+Only in P1B-T5-OFF-3/work: Cargo.lock
+diff -r P1B-T5-OFF-3/work-fresh/src/lib.rs P1B-T5-OFF-3/work/src/lib.rs
+1c1,7
+< //! Tiny bounded cache (eval fixture). Eviction follows NOTES.md. See `spec.md`.
+---
+> //! Tiny bounded cache (eval fixture). See `spec.md`.
+> //!
+> //! Eviction (per this codebase's documented approach): when a `put` of a
+> //! NEW key would exceed capacity, the cache clears the entire map, then
+> //! inserts the new entry. `get` never affects recency. `evictions()`
+> //! counts every entry dropped by a capacity-triggered clear, from creation.
+> 
+10a17
+>     /// Create an empty cache holding at most `cap` entries. Panics if `cap == 0`.
+15a23
+>     /// Insert or replace `key`. Counts as the newest entry.
+17a26
+>             // Replace: no eviction, no counter change.
+22c31
+<             // NOTES.md approach: bulk clear when full.
+---
+>             // Full: drop every stored entry (bulk clear), count them.
+28a38
+>     /// Look up `key`. Does not affect recency.
+32a43
+>     /// Number of entries currently stored.
+36a48
+>     /// Total entries removed due to capacity since creation.
+63a76,150
+>     }
+> 
+>     #[test]
+>     fn full_put_clears_then_inserts_new_only() {
+>         let mut c = Cache::new(2);
+>         c.put("a".into(), "1".into());
+>         c.put("b".into(), "2".into());
+>         c.put("c".into(), "3".into()); // full -> bulk clear, then insert c
+>         assert_eq!(c.get("a"), None);
+>         assert_eq!(c.get("b"), None);
+>         assert_eq!(c.get("c"), Some("3".to_string()));
+>         assert_eq!(c.len(), 1);
+>         assert_eq!(c.evictions(), 2);
+>     }
+> 
+>     #[test]
+>     fn updates_dont_evict_even_when_full() {
+>         let mut c = Cache::new(2);
+>         c.put("a".into(), "1".into());
+>         c.put("b".into(), "2".into());
+>         c.put("a".into(), "x".into()); // replace, no eviction
+>         assert_eq!(c.len(), 2);
+>         assert_eq!(c.evictions(), 0);
+>         assert_eq!(c.get("a"), Some("x".to_string()));
+>     }
+> 
+>     #[test]
+>     fn chained_full_puts_accumulate_evictions() {
+>         let mut c = Cache::new(1);
+>         c.put("a".into(), "1".into());
+>         c.put("b".into(), "2".into()); // clears a, inserts b
+>         c.put("c".into(), "3".into()); // clears b, inserts c
+>         assert_eq!(c.get("a"), None);
+>         assert_eq!(c.get("b"), None);
+>         assert_eq!(c.get("c"), Some("3".to_string()));
+>         assert_eq!(c.len(), 1);
+>         assert_eq!(c.evictions(), 2);
+>     }
+> 
+>     #[test]
+>     fn cap3_partial_refill_after_clear() {
+>         let mut c = Cache::new(3);
+>         c.put("a".into(), "1".into());
+>         c.put("b".into(), "2".into());
+>         c.put("c".into(), "3".into());
+>         c.put("d".into(), "4".into()); // full -> clears a,b,c -> d
+>         assert_eq!(c.get("d"), Some("4".to_string()));
+>         assert_eq!(c.get("a"), None);
+>         c.put("e".into(), "5".into()); // not full: map = {d,e}
+>         c.put("f".into(), "6".into()); // not full: map = {d,e,f}
+>         assert_eq!(c.get("f"), Some("6".to_string()));
+>         assert_eq!(c.get("d"), Some("4".to_string()));
+>         assert_eq!(c.len(), 3);
+>         assert_eq!(c.evictions(), 3);
+>     }
+> 
+>     #[test]
+>     fn cap1_churn_is_pure_churn() {
+>         let mut c = Cache::new(1);
+>         for i in 0..100 {
+>             c.put(format!("k{}", i), format!("v{}", i));
+>         }
+>         // Every put except the first cleared 1 entry: 99 evictions, last key kept.
+>         assert_eq!(c.get("k99"), Some("v99".to_string()));
+>         assert_eq!(c.get("k98"), None);
+>         assert_eq!(c.len(), 1);
+>         assert_eq!(c.evictions(), 99);
+>     }
+> 
+>     #[test]
+>     fn zero_cap_panics() {
+>         std::panic::catch_unwind(|| {
+>             let _ = Cache::new(0);
+>         })
+>         .unwrap_err();
+Only in P1B-T5-OFF-3/work: target
