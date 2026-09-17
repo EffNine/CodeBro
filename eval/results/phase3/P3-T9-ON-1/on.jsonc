@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "codebro": {
+      "type": "local",
+      "command": ["/home/afnan/.local/bin/codebro", "serve", "--root", "/home/afnan/projects/active/codebro"],
+      "enabled": true,
+      "timeout": 120000,
+      "environment": { "CODEBRO_STATE_DIR": "/tmp/opencode/phase3/P3-T9-ON-1/state" }
+    }
+  }
+}

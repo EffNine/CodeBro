@@ -1,0 +1,7 @@
+Only in P3-T9-ON-1/work: Cargo.lock
+diff -r P3-T9-ON-1/work-fresh/src/lib.rs P3-T9-ON-1/work/src/lib.rs
+51c51
+<     store.write("ledger", data, SyncMode::Never)
+---
+>     store.write("ledger", data, SyncMode::Always)
+Only in P3-T9-ON-1/work: target
