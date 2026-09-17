@@ -1664,6 +1664,11 @@ impl CodeBroMcpServer {
                 task_id: None,
             },
         );
+        // Phase-4 Jev shadow sidecar: post-decision observation only. Returns
+        // `()` synchronously (detached task, result discarded); with the
+        // default `JEV_SHADOW_ENABLED=false` this is a zero-cost early return.
+        // It can never alter this response or any execution semantics.
+        crate::jev_shadow_hook::observe_test_classification(&ws.canonical_root, &verification);
         let (message, next_action) = Self::verify_message(&command, "Tests", &verification);
         let payload = json!({
             "message": message,
@@ -1727,6 +1732,11 @@ impl CodeBroMcpServer {
                 task_id: None,
             },
         );
+        // Phase-4 Jev shadow sidecar: post-decision observation only. Returns
+        // `()` synchronously (detached task, result discarded); with the
+        // default `JEV_SHADOW_ENABLED=false` this is a zero-cost early return.
+        // It can never alter this response or any execution semantics.
+        crate::jev_shadow_hook::observe_test_classification(&ws.canonical_root, &verification);
         let (message, next_action) = Self::verify_message(&command, "Build", &verification);
         let payload = json!({
             "message": message,
@@ -4376,6 +4386,25 @@ impl CodeBroMcpServer {
                 // OpenCode-native contract: needs_input prevents false
                 // completion; the interaction carries the question + options
                 // OpenCode renders with its own UI.
+                // Jev advisory integration (jev-baseline-1, informational-only):
+                // post-decision observer for this deterministic escalation
+                // (`needs_input`: human approval required). Detached task,
+                // outcome discarded; with the default
+                // `JEV_SHADOW_ENABLED=false` / `JEV_ADVISORY_ENABLED=false`
+                // this is a zero-cost early return (zero Jev calls, zero
+                // advisory output, response unchanged). Never mutates this
+                // response, task state, sandbox, retry, or policy.
+                crate::jev_shadow_hook::observe_escalation_advisory(
+                    &ws.canonical_root,
+                    "skill",
+                    &format!(
+                        "skill approve candidate={} request={}",
+                        candidate_id, request.request_id
+                    ),
+                    true,
+                    task_id.map(str::to_string),
+                    "codebro:skill:request_approval",
+                );
                 let payload = serde_json::json!({
                     "action": "request_approval",
                     "status": crate::context_runtime::skill_approvals::STATUS_NEEDS_INPUT,

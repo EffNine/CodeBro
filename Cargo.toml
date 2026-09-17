@@ -18,6 +18,7 @@ codebro-memory-runtime = { path = "crates/memory-runtime" }
 codebro-sandbox-runtime = { path = "crates/sandbox-runtime" }
 codebro-impact-engine = { path = "crates/impact-engine" }
 codebro-indexer = { path = "crates/indexer" }
+codebro-jev-shadow = { path = "crates/jev-shadow" }
 codebro-change-engine = { path = "crates/change-engine" }
 codebro-context-runtime = { path = "crates/context-runtime" }
 

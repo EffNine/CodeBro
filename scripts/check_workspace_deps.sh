@@ -20,7 +20,8 @@ allowed() {
         codebro-indexer)           echo "codebro-core codebro-parsers codebro-fact-store codebro-identity-runtime codebro-impact-engine" ;;
         codebro-change-engine)     echo "codebro-core" ;;
         codebro-context-runtime)   echo "codebro-core" ;;
-        codebro-mcp-server)        echo "codebro-core codebro-parsers codebro-fact-store codebro-identity-runtime codebro-memory-runtime codebro-sandbox-runtime codebro-impact-engine codebro-indexer codebro-change-engine codebro-context-runtime" ;;
+        codebro-jev-shadow)        echo "codebro-core" ;;
+        codebro-mcp-server)        echo "codebro-core codebro-parsers codebro-fact-store codebro-identity-runtime codebro-memory-runtime codebro-sandbox-runtime codebro-impact-engine codebro-indexer codebro-change-engine codebro-context-runtime codebro-jev-shadow" ;;
         *)                         echo "" ;;
     esac
 }

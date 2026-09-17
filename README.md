@@ -95,6 +95,23 @@ Three distinct classes of information — never blurred:
 
 Agent-recorded memory is **never** promoted to the verified fact store.
 
+## Jev Advisory (informational only, off by default)
+
+CodeBro can attach a non-authoritative Jev escalation note to skill approval
+requests. Jev never approves, denies, executes, or changes policy — the
+deterministic `needs_input` verdict is computed first, and the observer runs
+detached with its outcome discarded.
+
+- Baseline: `jev-baseline-1` (`jev-1.13.0`, question set v3, confidence ≥ 0.80,
+  escalation-only). Any baseline drift disables advisory automatically.
+- Flags (both default `false`): `JEV_SHADOW_ENABLED`, `JEV_ADVISORY_ENABLED`.
+  Both off means zero Jev calls and unchanged behavior.
+- Output: `JEV ADVISORY: … Informational only.` tracing line plus structured
+  telemetry in `.codebro/jev-advisory.jsonl`. Rollback is
+  `JEV_ADVISORY_ENABLED=false`.
+
+Details: [`docs/JEV_ADVISORY.md`](docs/JEV_ADVISORY.md).
+
 ## Installation
 
 Requires a Rust toolchain (see `rust-toolchain.toml`).
