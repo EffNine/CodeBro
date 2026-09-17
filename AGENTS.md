@@ -19,7 +19,7 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 
 | Crate / path | Role |
 |---|---|
-| `crates/mcp-server/src/mcp/mod.rs` | MCP server: 25 tools over stdio (`rmcp` transport) |
+| `crates/mcp-server/src/mcp/mod.rs` | MCP server: 24 tools over stdio (`rmcp` transport) |
 | `crates/mcp-server/src/mcp/facts.rs` | Relevance-ranked fact retrieval engine |
 | `crates/sandbox-runtime/src/sandbox/` | Sandbox execution abstraction (trait + local + OpenSandbox backends) |
 | `crates/indexer/src/init/` | Fact-store population pipeline (`codebro init`) |
@@ -47,7 +47,7 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 
 ## MCP contract
 
-25 tools over stdio (`rmcp`). Handlers are thin adapters — construct runtimes and delegate, do not duplicate logic. Full design: `docs/design/MCP_SERVER.md`.
+24 tools over stdio (`rmcp`; 25 before `impact_analyze` removal for measured non-use — engine retained in `engineering_brief`). Handlers are thin adapters — construct runtimes and delegate, do not duplicate logic. Full design: `docs/design/MCP_SERVER.md`.
 
 | Tool | R/W | Description |
 |---|---|---|
@@ -64,7 +64,6 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 | `sandbox_test` | write | Run tests with structured verification. Auto-detects project type. Passing/failing runs are recorded durably per tree hash and returned as `execution_state` |
 | `sandbox_build` | write | Build/check with structured verification. Passing/failing runs are recorded durably per tree hash and returned as `execution_state` |
 | `sandbox_status` | read | Sandbox runtime status and capabilities |
-| `impact_analyze` | read | Structural impact: directed edges, related tests, provenance |
 | `reindex` | write | Full fact reindex via `codebro init` pipeline |
 | `repository_health` | read | Workspace health report (delegates to `codebro doctor`) |
 | `consult` | write | Ask Conductor gateway for opinions (provider/mode shaped) |
@@ -79,11 +78,12 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 
 ## P8 integration contract (agent clients)
 
-- **No new tools.** The 25-tool surface IS the client contract; codified in
+- **No new tools.** The 24-tool surface IS the client contract (25 before
+  `impact_analyze` removal for measured non-use); codified in
   `crates/mcp-server/src/integration.rs::contract` and enforced by tests.
 - **Acquisition flow:** orient (`workspace_context`/`context`) → primary
   evidence (`engineering_brief`) → optional targeted follow-up
-  (`engineering_facts`/`impact_analyze`/`recall`/`engineering_memory`/
+  (`engineering_facts`/`recall`/`engineering_memory`/
   `repository_health`) → explicit persistence (`remember`/`record_memory`/
   `task`/`learn`/`skill`). Never chain dozens of low-level calls.
 - **Server identity:** initialize reports `serverInfo: codebro/<version>`.
@@ -132,7 +132,8 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 
 ## P9 outcome & feedback loop (agent clients)
 
-- **No new tools.** The 25-tool surface remains the contract. P9 adds one
+- **No new tools.** The 24-tool surface remains the contract (25 before
+  `impact_analyze` removal). P9 adds one
   `task` action (`outcome`); schema stays v7 with no new tables.
 - **Report outcomes, don't re-execute:** after OpenCode does the work with
   its own tools, it reports structured evidence via

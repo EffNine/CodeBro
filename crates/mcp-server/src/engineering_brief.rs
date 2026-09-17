@@ -101,8 +101,9 @@ pub const MAX_BRIEF_RISKS: usize = 8;
 pub const MAX_BRIEF_RECORDS: usize = 8;
 /// Maximum ambiguity candidates listed for an ambiguous target.
 pub const MAX_BRIEF_AMBIGUITY: usize = 5;
-/// Maximum impact traversal depth for a brief (bounded blast radius; the
-/// full `impact_analyze` tool remains available for deeper traversals).
+/// Maximum impact traversal depth for a brief (bounded blast radius by design;
+/// the brief's embedded traversal is the only impact surface — the standalone
+/// `impact_analyze` tool was removed for non-use, the engine stays here).
 pub const BRIEF_DEPTH_MAX: usize = 2;
 /// Default impact traversal depth.
 pub const BRIEF_DEPTH_DEFAULT: usize = 1;
@@ -193,7 +194,7 @@ impl BriefRequest {
 
     /// Clamped traversal depth. `0` is accepted here (no clamp floor)
     /// but the brief's impact traversal floors at 1 — a brief without a
-    /// traversal has no impact value; `impact_analyze` owns depth 0.
+    /// traversal has no impact value; depth 0 behaves as no traversal.
     pub fn depth(&self) -> usize {
         self.depth.min(BRIEF_DEPTH_MAX)
     }
@@ -2301,7 +2302,7 @@ fn risks_section(
             out.push(BriefRisk {
                 signal: "impact_truncated".to_string(),
                 source: "impact".to_string(),
-                detail: format!("impact traversal hit brief bounds ({} direct, {} transitive shown) — use impact_analyze for the full graph", imp.direct.len(), imp.transitive.len()),
+                detail: format!("impact traversal hit brief bounds ({} direct, {} transitive shown) — bounds are by design; narrow the target for full detail", imp.direct.len(), imp.transitive.len()),
             });
         }
     }

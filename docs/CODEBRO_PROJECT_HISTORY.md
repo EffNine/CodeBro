@@ -828,3 +828,15 @@ an external thinking partner (via `consult`/manual), but it is NO LONGER the pro
 - Standing label: anything without a VERIFIED anchor above is HISTORICAL-CONTEXT until corroborated —
   future agents, corroborate-then-promote; never silently upgrade.
 
+## 32. `impact_analyze` removal (2026-09-17) [VERIFIED]
+
+First measured capability removal. Evidence: 0 agent calls in 19 sessions (ab-v2 + Phase-1/1b/2),
+including two tasks designed for it; agents prefer reading/grep/memory/brief. The standalone MCP
+tool was deleted (handler, schema, dispatch, 15 tool-level tests, contract + inventory updates
+25→24 tools); the `impact-engine` crate, `crate::impact::analyze`, brief's embedded impact section
+(risk signals intact), doctor/debugging consumers, and `HistoryKind::ImpactAnalyzed` were retained.
+P6 risk coverage re-pointed at the brief; absurd-depth gate re-pointed at brief validation; engine
+behavior stays covered by 46 impact-engine unit tests. Lesson institutionalized: non-use measured
+across fair tasks triggers a removal proposal with symmetric keep/cut rules — never silent rot,
+never unilateral deletion (operator-approved per `eval/IMPACT_ANALYZE_REMOVAL_PROPOSAL.md`).
+

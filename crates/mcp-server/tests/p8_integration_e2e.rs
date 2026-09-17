@@ -358,10 +358,10 @@ fn p8_initialize_reports_codebro_server_identity() {
     );
 }
 
-// ── Probe 3: contract surface — 25 tools, P8 intents all routed ───────────
+// ── Probe 3: contract surface — 24 tools, P8 intents all routed ───────────
 
 #[test]
-fn p8_contract_surface_is_the_existing_25_tools() {
+fn p8_contract_surface_is_the_existing_24_tools() {
     let dir = tempfile::tempdir().unwrap();
     seed_repo(dir.path());
     let env = env_new();
@@ -370,8 +370,8 @@ fn p8_contract_surface_is_the_existing_25_tools() {
     let tools = list["result"]["tools"].as_array().expect("tools array");
     assert_eq!(
         tools.len(),
-        25,
-        "P8 must not add tools: got {}",
+        24,
+        "contract surface is 24 tools after impact_analyze removal: got {}",
         tools.len()
     );
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();

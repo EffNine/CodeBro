@@ -11,7 +11,7 @@ exposed over MCP stdio (`codebro serve`).
 AI Coding Agent (OpenCode / Claude Code / Cursor)
         │  MCP over stdio (rmcp)
         ▼
-CodeBroMcpServer ──── crates/mcp-server/src/mcp/  (25 tools: 17-tool frozen v1 contract + 8 additive)
+CodeBroMcpServer ──── crates/mcp-server/src/mcp/  (24 tools: 17-tool frozen v1 contract + 8 additive − 1 removed)
         │              mutating tools serialize on a per-workspace lock
         ▼
 Engineering Runtime (crates/)
@@ -48,10 +48,10 @@ The legacy TUI architecture was deleted from `main` (ADR-012); it is preserved
 only on the `tui-legacy` branch and tags, with mechanical guards in
 `crates/mcp-server/tests/legacy_isolation.rs`.
 
-## The 25 MCP tools (17 frozen v1 + 8 additive)
+## The 24 MCP tools (17 frozen v1 + 8 additive − 1 removed)
 
 | # | Tool | Kind |
-|---|------|------|
+|---|---|---|
 | 1 | `workspace_context` | read |
 | 2 | `engineering_facts` | read |
 | 3 | `engineering_memory` | read |
@@ -65,18 +65,21 @@ only on the `tui-legacy` branch and tags, with mechanical guards in
 | 11 | `sandbox_test` | verified exec |
 | 12 | `sandbox_build` | verified exec |
 | 13 | `sandbox_status` | read |
-| 14 | `impact_analyze` | read |
-| 15 | `reindex` | rebuild |
-| 16 | `repository_health` | read |
-| 17 | `consult` | external call |
-| 18 | `context` | read (always-available packet) |
-| 19 | `remember` | write (confirmed user context) |
-| 20 | `forget` (confirm-gated) | write (retire user context) |
-| 21 | `recall` | read (historical evidence) |
-| 22 | `learn` | read + guarded write (hypotheses) |
-| 23 | `skill` | write (skill registry) |
-| 24 | `task` | write (durable task runtime) |
-| 25 | `engineering_brief` | read (decision support) |
+| 14 | `reindex` | rebuild |
+| 15 | `repository_health` | read |
+| 16 | `consult` | external call |
+| 17 | `context` | read (always-available packet) |
+| 18 | `remember` | write (confirmed user context) |
+| 19 | `forget` (confirm-gated) | write (retire user context) |
+| 20 | `recall` | read (historical evidence) |
+| 21 | `learn` | read + guarded write (hypotheses) |
+| 22 | `skill` | write (skill registry) |
+| 23 | `task` | write (durable task runtime) |
+| 24 | `engineering_brief` | read (decision support) |
+
+(`impact_analyze` removed for measured non-use — 0 agent calls in 19 sessions;
+the impact engine remains inside `engineering_brief`. See
+`eval/IMPACT_ANALYZE_REMOVAL_PROPOSAL.md`.)
 
 Frozen v1 contract: [`docs/MCP_API_V1.md`](docs/MCP_API_V1.md)
 (additive tools documented under "Frozen tool inventory" / "Additive tools").

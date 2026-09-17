@@ -68,12 +68,12 @@ opencode mcp add codebro -- "$(which codebro) serve"
 
 For a complete Conductor setup guide, see [`docs/CONDUCTOR_HOWTO.md`](docs/CONDUCTOR_HOWTO.md).
 
-## What CodeBro Provides (25 tools: v1 contract of 17 + 8 additive)
+## What CodeBro Provides (24 tools: v1 contract of 17 + 8 additive − 1 removed)
 
 | Surface | Tools | Purpose |
 |---------|-------|---------|
 | Orientation | `workspace_context`, `repository_health` | Project identity, fact counts, workspace diagnostics |
-| Verified facts | `engineering_facts`, `reindex`, `impact_analyze` | Relevance-ranked retrieval over the validated fact graph; structural impact with per-edge confidence and evidence |
+| Verified facts | `engineering_facts`, `reindex` | Relevance-ranked retrieval over the validated fact graph (impact evidence arrives via the brief's embedded traversal) |
 | Engineering memory | `engineering_memory`, `memory_stats`, `record_memory`, `delete_memory` | Persistent, trust-aware agent-recorded memory (never promoted into facts) |
 | Identity | `update_identity` | Declared-intent store: constraints, decisions, roadmap |
 | Guarded changes | `apply_change`, `apply_changes` | Single-file guarded mutation; multi-file all-or-nothing transaction with rollback |

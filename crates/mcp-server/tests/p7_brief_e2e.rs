@@ -325,7 +325,11 @@ fn brief_e2e_malformed_inputs_rejected() {
     // Unknown tool surface stays free of CRUD-style getters.
     let r = srv.rpc("tools/list", serde_json::json!({}));
     let tools = r["result"]["tools"].as_array().expect("tools").clone();
-    assert_eq!(tools.len(), 25, "P7 adds exactly one tool");
+    assert_eq!(
+        tools.len(),
+        24,
+        "surface is 24 tools after impact_analyze removal"
+    );
     let names: Vec<String> = tools
         .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_string))

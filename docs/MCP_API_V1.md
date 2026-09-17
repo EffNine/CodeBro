@@ -18,7 +18,7 @@ major version bump plus a migration path.
   P9 outcome reporting, `docs/evolution/P9_IMPLEMENTATION.md`): orient
   (`workspace_context`/`context`) → primary evidence
   (`engineering_brief`) → optional targeted follow-up
-  (`engineering_facts`/`impact_analyze`/`recall`/`engineering_memory`/
+  (`engineering_facts`/`recall`/`engineering_memory`/
   `repository_health`) → OpenCode reasons/codes/executes with its own
   tools → explicit persistence
   (`remember`/`record_memory`/`task`/`learn`/`skill`), including
@@ -73,7 +73,7 @@ All tools return JSON-RPC errors via MCP:
 Deterministic zero-result responses (e.g. fact search misses) are **not**
 errors — they return structured payloads with recovery hints.
 
-## Frozen tool inventory (17 frozen + additive additions: `context`, `remember`, `forget`, `recall`, `learn`, `skill`, `task`, `engineering_brief`)
+## Frozen tool inventory (17 frozen + additive additions: `context`, `remember`, `forget`, `recall`, `learn`, `skill`, `task`, `engineering_brief` — minus `impact_analyze`, removed post-v1.1.0 for measured non-use: 0 agent calls in 19 sessions; impact engine retained inside `engineering_brief`. See `eval/IMPACT_ANALYZE_REMOVAL_PROPOSAL.md`. Surface total: 24.)
 
 > Additive optional request arguments accepted since the freeze (backwards
 > compatible): `apply_change` responses carry advisory/test-recommendation
@@ -94,6 +94,13 @@ errors — they return structured payloads with recovery hints.
 > `repository_health` gains `engineering_health` / `engineering_languages`
 > checks (evidence-based findings, no scores).
 >
+> Removal (post-v1.1.0, `eval/IMPACT_ANALYZE_REMOVAL_PROPOSAL.md`): the standalone
+> `impact_analyze` tool was removed after measurement (0 agent calls in 19 sessions
+> across ab-v2/Phase-1/1b/2, including two tasks designed for it). The impact ENGINE
+> (`impact-engine` crate: BFS traversal, confidence+reason edges, risk signals) is
+> retained and continues to serve `engineering_brief`'s embedded impact section,
+> doctor/debugging paths, and `HistoryKind::ImpactAnalyzed` records. Surface: 24 tools.
+>
 > Freshness honesty: live `freshness` compares the stored generation hash
 > against the current working-tree hash (tracked files + diff + untracked
 > names and bounded contents, excluding derived `.codebro/` output). Outside
@@ -110,8 +117,9 @@ errors — they return structured payloads with recovery hints.
 > reserved for JSON-RPC (tracing/indexer report on stderr), `initialize`
 > reports `serverInfo: codebro/<version>`, and every tool call emits one
 > bounded stderr observability line (client identity, tool, duration,
-> status, bytes — redacted, never persisted). The 25-tool surface is the
-> codified client contract (`crates/mcp-server/src/integration.rs`).
+> status, bytes — redacted, never persisted). The 24-tool surface is the
+> codified client contract (`crates/mcp-server/src/integration.rs`; 25 before
+> `impact_analyze` removal for measured non-use).
 
 ### Additive tools (minor version)
 
@@ -134,7 +142,6 @@ errors — they return structured payloads with recovery hints.
 | `engineering_facts` | `query` (required unless `kind`/`path`), `kind` ∈ {workspace, module, package, symbol, test, build_target, dependency, relationship, reference, diagnostic, architecture_rule, language, framework, entry_point}, `path`, `limit ≤ 50` | deterministic ranked records: score desc → kind → name → path; provenance summary; freshness |
 | `engineering_memory` | `task_keywords[]`, `active_file_tags[]` | bounded entries (≤20, token budget 500, min confidence 0.3) ranked importance → confidence; expired/superseded entries excluded; explicit truncation markers |
 | `memory_stats` | – | entry count, tag distribution, average confidence, oldest/newest |
-| `impact_analyze` | `target`, `target_type` {symbol,file,module,package}, optional `depth ≤ 5`, `direction`, `relationship_types[]`, `max_nodes` (default 1000) | status (incl. ambiguity matches), direct/transitive relationships each carrying `confidence` ∈ [0,1] (verified 0.95 / heuristic 0.55 / unknown 0.35, ×0.85 per hop), `reason`, evidence records, affected tests/modules/packages, completeness, traversal metadata, freshness, P6: `risk` (level + ≤8 sorted indicators + blast-radius summary; signals, not guarantees) |
 | `sandbox_status` | – | backend {local,opensandbox}, availability, capability descriptor |
 | `repository_health` | – | per-check results over workspace/.codebro/identity/facts/memory/git, P6: + `engineering_health` (CYCLE/HIGH_FANOUT/HIGH_FANIN/ORPHAN/UNRESOLVED_REFERENCE/STALE_INDEX/MISSING_TEST_ASSOCIATION/LARGE_MODULE findings with severity/evidence/location/confidence) + `engineering_languages` |
 

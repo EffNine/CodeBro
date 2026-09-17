@@ -508,9 +508,9 @@ fn gate_malformed_input_is_rejected_safely() {
     assert!(ok4, "large limit must clamp, not error: {t4}");
 
     let (ok5, t5) = s.call_raw(
-        "impact_analyze",
+        "engineering_brief",
         serde_json::json!({
-            "workspace_root": ws, "target": "malapp_alpha", "depth": 999
+            "workspace_root": ws, "task": "x", "depth": 999
         }),
     );
     assert!(!ok5, "depth 999 must be rejected: {t5}");

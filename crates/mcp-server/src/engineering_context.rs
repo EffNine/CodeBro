@@ -29,7 +29,8 @@
 //!   prose, observed execution history, durable user context, and derived
 //!   summaries.
 //! - **No decisions made.** The packet contains evidence and pointers
-//!   (including which `impact_analyze` call to make next); OpenCode remains
+//!   (including which `engineering_brief` target to request next for bounded
+//!   impact evidence); OpenCode remains
 //!   the planner and decision-maker.
 //!
 //! # Provenance tags
@@ -433,7 +434,7 @@ pub fn compose(
         records_provenance: ContextProvenance::Recorded,
         impact: ImpactGuidance {
             provenance: ContextProvenance::Derived,
-            note: "call impact_analyze with one specific symbol, file, module, or package — this packet only suggests starting points, it performs no traversal itself".to_string(),
+            note: "call engineering_brief with one specific target_symbol, target_path, or target_module for bounded impact evidence — this packet only suggests starting points, it performs no traversal itself".to_string(),
             suggested_targets,
         },
         validation: vec![

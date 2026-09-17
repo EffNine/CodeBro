@@ -384,7 +384,7 @@ fn workspace_isolation_for_indexes() {
 // ── MCP: semantic tools, no CRUD leakage, bounded ─────────────────────
 
 #[test]
-fn mcp_lists_exactly_25_tools_and_no_crud() {
+fn mcp_lists_exactly_24_tools_and_no_crud() {
     let dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     seed_repo(dir.path());
@@ -392,7 +392,9 @@ fn mcp_lists_exactly_25_tools_and_no_crud() {
     let r = srv.rpc("tools/list", serde_json::json!({}));
     let tools = r["result"]["tools"].as_array().expect("tools").clone();
     // P7 adds exactly one semantic capability (`engineering_brief`); no CRUD.
-    assert_eq!(tools.len(), 25, "P7 adds one tool: {}", tools.len());
+    // (The standalone `impact_analyze` tool was later removed for non-use;
+    // impact evidence now arrives via the brief's embedded traversal.)
+    assert_eq!(tools.len(), 24, "surface is 24 tools: {}", tools.len());
     let names: Vec<String> = tools
         .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_string))
@@ -412,7 +414,6 @@ fn mcp_lists_exactly_25_tools_and_no_crud() {
     for required in [
         "workspace_context",
         "engineering_facts",
-        "impact_analyze",
         "repository_health",
         "reindex",
         "context",
@@ -474,14 +475,15 @@ fn real_binary_e2e_index_query_modify_impact_health_restart() {
     let counts2 = re2["fact_counts"]["symbols"].as_u64().unwrap();
     assert!(counts2 >= counts1, "added symbol must appear");
 
-    // 4. Impact + health.
-    let impact = srv.call(
-        "impact_analyze",
-        serde_json::json!({"target": "alpha", "depth": 2}),
+    // 4. Impact (via the brief's embedded traversal) + health.
+    let brief = srv.call(
+        "engineering_brief",
+        serde_json::json!({"target_symbol": "alpha"}),
     );
+    let impact = &brief["impact"];
     assert!(
-        impact.get("risk").is_some(),
-        "P6 risk must be present: {impact:?}"
+        impact.is_object() && !impact["direct"].as_array().unwrap().is_empty(),
+        "P6 impact must surface via the brief: {brief:?}"
     );
     let health = srv.call("repository_health", serde_json::json!({}));
     assert!(health.get("checks").is_some());

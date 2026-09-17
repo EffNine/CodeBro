@@ -1762,79 +1762,6 @@ impl CodeBroMcpServer {
         )]))
     }
 
-    // ── Tool 12: impact analysis ──────────────────────────────────────
-
-    /// Analyze what is structurally affected by changing a target symbol,
-    /// file, module, or package. Returns directed relationship edges,
-    /// related tests, owning module/package, and provenance metadata —
-    /// descriptive evidence only, no risk scoring or prescriptions.
-    #[tool(
-        description = "Analyze structural impact of changing a symbol, file, module, or package. Returns directed relationship edges (bounded transitive traversal), related tests, owning module/package, provenance, and deterministic risk signals. Descriptive evidence only — OpenCode decides."
-    )]
-    async fn impact_analyze(
-        &self,
-        Parameters(args): Parameters<ImpactArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
-        let store = self.fact_store(&ws);
-
-        let target = match args.target_type.as_deref() {
-            None | Some("symbol") => {
-                // Try exact id first, then fall back to name-based lookup.
-                let exact = crate::engineering_facts::SymbolId::new(args.target.clone());
-                if store.collection().symbol(&exact).is_some() {
-                    crate::impact::ImpactTarget::Symbol(exact)
-                } else {
-                    match crate::impact::resolve_symbol_name(&store, &args.target) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            return Err(McpError::invalid_params(e, None));
-                        }
-                    }
-                }
-            }
-            Some("file") => crate::impact::ImpactTarget::File(args.target.clone()),
-            Some("module") => {
-                let mod_id = crate::engineering_facts::ModuleId::new(args.target.clone());
-                crate::impact::ImpactTarget::Module(mod_id)
-            }
-            Some("package") => {
-                let pkg_id = crate::engineering_facts::PackageId::new(args.target.clone());
-                crate::impact::ImpactTarget::Package(pkg_id)
-            }
-            other => {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "unknown target_type '{:?}' — use symbol, file, module, or package",
-                        other
-                    ),
-                    None,
-                ))
-            }
-        };
-
-        let opts = crate::impact::ImpactOptions {
-            max_results: args.max_results.unwrap_or(50),
-            include_tests: args.include_tests.unwrap_or(true),
-            include_references: args.include_references.unwrap_or(true),
-            depth: args.depth.unwrap_or(1),
-            direction: args.direction.unwrap_or_else(|| "both".to_string()),
-            relationship_types: args.relationship_types.clone(),
-            max_nodes: args.max_nodes.unwrap_or(crate::impact::DEFAULT_MAX_NODES),
-        };
-
-        if let Err(e) = crate::impact::validate_opts(&opts) {
-            return Err(McpError::invalid_params(e.0, None));
-        }
-
-        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
-        let store = self.fact_store(&ws);
-        let result = crate::impact::analyze(&store, target, &opts, Some(&ws.canonical_root));
-        let payload = serde_json::to_string_pretty(&result)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
-    }
-
     // ── Tool 13: reindex ─────────────────────────────────────────────
 
     /// Perform a full engineering fact reindex. Regenerates
@@ -4597,7 +4524,7 @@ impl CodeBroMcpServer {
             // Why an action on the existing `skill` tool rather than a new
             // tool: the detector is a candidate *source* for the skill
             // registry (same tables, same lifecycle, same approval
-            // protocol). A separate tool would fragment the 25-tool
+            // protocol). A separate tool would fragment the 24-tool
             // contract and duplicate the workspace/scope/visibility
             // vocabulary; an action keeps one registry surface. The
             // detector is explicitly invoked here — never scheduled,
@@ -4651,7 +4578,7 @@ impl CodeBroMcpServer {
             // tool: an evolution candidate IS a skill candidate (same row,
             // same lifecycle, same approval protocol, lineage via
             // supersedes_skill + based_on_version). A separate tool would
-            // fragment the 25-tool contract and duplicate the
+            // fragment the 24-tool contract and duplicate the
             // workspace/scope/visibility vocabulary; an action keeps one
             // registry surface. The detector is explicitly invoked here —
             // never scheduled, never backgrounded — and it never publishes:
@@ -4693,7 +4620,7 @@ impl CodeBroMcpServer {
             // Why an action on the existing `skill` tool rather than a new
             // tool: a version comparison IS a skill-registry read (same
             // rows, same lineage, same visibility vocabulary). A separate
-            // tool would fragment the 25-tool contract; an action keeps one
+            // tool would fragment the 24-tool contract; an action keeps one
             // registry surface. Read-only (no mutation lock): validation
             // never publishes, never rolls back, never proposes — it only
             // recommends, and the human decides through the existing
@@ -5330,8 +5257,8 @@ pub struct EngineeringBriefArgs {
     /// Extra keyword hints for evidence retrieval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keywords: Option<Vec<String>>,
-    /// Impact traversal depth (default 1, max 2; deeper graphs belong to
-    /// `impact_analyze`).
+    /// Impact traversal depth (default 1, max 2; the brief bounds depth
+    /// by design — no deeper traversal surface exists).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth: Option<usize>,
     /// Optional workspace root to operate against. When omitted, the
@@ -6228,45 +6155,6 @@ pub struct SandboxBuildArgs {
     pub workspace_root: Option<String>,
 }
 
-/// Argument schema for `impact_analyze`.
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct ImpactArgs {
-    /// The target to analyze: a symbol id, file path, module id, or package id.
-    pub target: String,
-    /// Target type: symbol, file, module, or package. Defaults to symbol.
-    #[serde(default)]
-    pub target_type: Option<String>,
-    /// Maximum number of results per category (0 = no limit). Defaults to 50.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_results: Option<usize>,
-    /// Whether to include related tests (default true).
-    #[serde(default)]
-    pub include_tests: Option<bool>,
-    /// Whether to include cross-references (default true).
-    #[serde(default)]
-    pub include_references: Option<bool>,
-    /// Bounded BFS depth. 0 = target only, 1 = direct relationships (default),
-    /// up to 5. Values above 5 are rejected as invalid parameters.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub depth: Option<usize>,
-    /// Edge direction for traversal: "both" (default, preserves legacy behaviour),
-    /// "outgoing", or "incoming".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub direction: Option<String>,
-    /// Optional subset of relationship kinds to traverse (e.g. ["calls", "imports"]).
-    /// Empty means all kinds. Only known kinds are accepted.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub relationship_types: Vec<String>,
-    /// Hard ceiling on distinct graph nodes visited during traversal
-    /// (default 1000). When exceeded the result is marked partial.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_nodes: Option<usize>,
-    /// Optional workspace root to operate against. When omitted, the
-    /// server's configured default workspace is used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_root: Option<String>,
-}
-
 /// Argument schema for `workspace_context`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct WorkspaceContextArgs {
@@ -6740,10 +6628,10 @@ impl rmcp::ServerHandler for CodeBroMcpServer {
                  For everyday shell use prefer your native bash; for authoritative verification \
                  that unblocks task completion use codebro_sandbox_test/codebro_sandbox_build \
                  (a native shell test run does not unblock completion).\n\
-               - To understand what is structurally affected by changing a symbol, file, module, \
-                 or package, call codebro_impact_analyze (returns directed relationship edges, \
-                 related tests, owning module/package, provenance, and deterministic risk \
-                 signals — descriptive evidence only; OpenCode decides).\n\
+                - To understand what is structurally affected by changing a symbol, file, module, \
+                  or package, call codebro_engineering_brief with a target: it assembles bounded \
+                  impact evidence (edges, tests, risk signals) plus health, history, and memory — \
+                  descriptive evidence only; OpenCode decides.\n\
               - To check the health of the CodeBro workspace (project identity, fact store, \
                   engineering memory, git status), call codebro_repository_health (returns \
                   structured exit code, status, per-check results, and summary).\n\
@@ -6884,7 +6772,6 @@ mod tests {
             "sandbox_test",
             "sandbox_build",
             "sandbox_status",
-            "impact_analyze",
             "reindex",
             "repository_health",
             "update_identity",
@@ -6959,7 +6846,6 @@ mod tests {
             "sandbox_test",
             "sandbox_build",
             "sandbox_status",
-            "impact_analyze",
             "reindex",
             "repository_health",
             "update_identity",
@@ -6978,30 +6864,6 @@ mod tests {
                 "tool {expected} missing from tool handler"
             );
         }
-    }
-
-    /// Hardening (doc-drift regression): the `impact_analyze` description
-    /// must reflect the P6 deterministic risk signals and must NOT repeat
-    /// the pre-P6 "no risk scores" claim. Descriptions are client-visible
-    /// contract surface; drift here misleads the agent's tool selection.
-    #[test]
-    fn impact_description_mentions_risk_signals() {
-        let server = CodeBroMcpServer::new(PathBuf::from("/tmp/unused-root"));
-        let tool = server
-            .get_tool("impact_analyze")
-            .expect("impact_analyze missing from tool handler");
-        let desc = tool
-            .description
-            .as_deref()
-            .expect("impact_analyze has no description");
-        assert!(
-            desc.contains("risk signal"),
-            "impact_analyze description must mention deterministic risk signals: {desc}"
-        );
-        assert!(
-            !desc.to_lowercase().contains("no risk scores"),
-            "impact_analyze description must not claim 'no risk scores' (P6 added signals): {desc}"
-        );
     }
 
     /// P8: the MCP handshake must identify the server as the product
@@ -10755,14 +10617,6 @@ mod tests {
                 let r = server.sandbox_status().await.map_err(|e| e.to_string())?;
                 text_of(r)
             }
-            "impact_analyze" => {
-                let p: ImpactArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                let r = server
-                    .impact_analyze(Parameters(p))
-                    .await
-                    .map_err(|e| e.to_string())?;
-                text_of(r)
-            }
             "reindex" => {
                 let r = server
                     .reindex(Parameters(ReindexArgs {
@@ -11653,281 +11507,6 @@ mod tests {
         assert!(rs["working_tree_dirty"].is_boolean());
     }
 
-    /// P2.1: `impact_analyze` on a symbol returns structural relationships.
-    #[tokio::test]
-    async fn impact_analyze_symbol_returns_structural_relationships() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub struct UserService;\npub fn get_user() {}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("src/handler.rs"),
-            "use crate::lib::*;\npub fn handle() { get_user(); }\n",
-        )
-        .unwrap();
-
-        // Run init to populate facts.
-        crate::init::run(dir.path()).expect("init failed");
-
-        let server = local_sandbox_server(&dir);
-
-        // Query the symbol.
-        let out = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({"target": "get_user", "target_type": "symbol"}),
-        )
-        .await;
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert_eq!(v["status"], "ok");
-        assert_eq!(v["target"]["kind"], "symbol");
-        assert_eq!(v["target"]["name"], "get_user");
-        // Must have target info and some structure.
-        assert!(v.get("direct_relationships").is_some());
-        assert!(v.get("affected_tests").is_some());
-        assert!(v.get("affected_modules").is_some());
-        assert!(v["completeness"].is_object());
-    }
-
-    /// P2.1: `impact_analyze` on a file path resolves the owning module.
-    #[tokio::test]
-    async fn impact_analyze_file_resolves_module() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn hello() -> i32 { 42 }\n",
-        )
-        .unwrap();
-        crate::init::run(dir.path()).expect("init failed");
-
-        let server = local_sandbox_server(&dir);
-
-        let out = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({"target": "src/lib.rs", "target_type": "file"}),
-        )
-        .await;
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert_eq!(v["status"], "ok");
-        assert_eq!(v["target"]["kind"], "module");
-        assert_eq!(v["target"]["path"], "src/lib.rs");
-    }
-
-    /// P2.1: `impact_analyze` on an unknown symbol returns an error.
-    #[tokio::test]
-    async fn impact_analyze_unknown_symbol_returns_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
-        crate::init::run(dir.path()).expect("init failed");
-
-        let server = local_sandbox_server(&dir);
-
-        let err = call_tool_err(
-            &server,
-            "impact_analyze",
-            json!({"target": "nonexistent_symbol_xyz", "target_type": "symbol"}),
-        )
-        .await;
-        assert!(err.contains("no symbol found") || err.contains("ambiguous"));
-    }
-
-    /// P2.1: `impact_analyze` rejects an invalid target_type.
-    #[tokio::test]
-    async fn impact_analyze_rejects_invalid_target_type() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let server = local_sandbox_server(&dir);
-
-        let err = call_tool_err(
-            &server,
-            "impact_analyze",
-            json!({"target": "x", "target_type": "bogus"}),
-        )
-        .await;
-        assert!(err.contains("target_type") || err.contains("bogus"));
-    }
-
-    /// P2.2: `impact_analyze` on a caller symbol returns a verified
-    /// `calls` relationship when the AST contains an actual call expression.
-    #[tokio::test]
-    async fn impact_analyze_ast_call_is_verified() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        // lib.rs defines `get_user`.
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn get_user() -> i32 { 42 }\n",
-        )
-        .unwrap();
-        // handler.rs calls `get_user()`.
-        std::fs::write(
-            dir.path().join("src/handler.rs"),
-            "use crate::lib::get_user;\npub fn handle() { let x = get_user(); }\n",
-        )
-        .unwrap();
-
-        crate::init::run(dir.path()).expect("init failed");
-
-        let server = local_sandbox_server(&dir);
-
-        // Query the callee — should find incoming call from handler.
-        let out = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({"target": "get_user", "target_type": "symbol"}),
-        )
-        .await;
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert_eq!(v["status"], "ok");
-        assert_eq!(v["target"]["kind"], "symbol");
-        assert_eq!(v["target"]["name"], "get_user");
-
-        // Must have at least one incoming relationship (the call from
-        // handler::handle).
-        let rels: Vec<&serde_json::Value> = v["direct_relationships"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|r| r["relationship_kind"] == "calls" && r["direction"] == "incoming")
-            .collect();
-        assert!(
-            !rels.is_empty(),
-            "expected at least 1 incoming calls relationship, got: {:?}",
-            v["direct_relationships"]
-        );
-        // The call relationship must be verified (not heuristic).
-        assert_eq!(rels[0]["provenance"], "verified");
-    }
-
-    /// P2.2: AST-derived call edges are deduplicated — same call found
-    /// by both name-coincidence heuristic and AST extraction produces
-    /// only one verified edge.
-    #[tokio::test]
-    async fn impact_analyze_no_duplicate_edges() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn helper() -> i32 { 1 }\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("src/main.rs"),
-            "use crate::lib::helper;\npub fn main() { helper(); }\n",
-        )
-        .unwrap();
-
-        crate::init::run(dir.path()).expect("init failed");
-
-        let server = local_sandbox_server(&dir);
-
-        let out = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({"target": "helper", "target_type": "symbol"}),
-        )
-        .await;
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert_eq!(v["status"], "ok");
-
-        // Count incoming calls edges — should be exactly 1 (deduplicated).
-        let incoming_calls: Vec<&serde_json::Value> = v["direct_relationships"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|r| r["relationship_kind"] == "calls" && r["direction"] == "incoming")
-            .collect();
-        assert_eq!(
-            incoming_calls.len(),
-            1,
-            "expected exactly 1 incoming call edge (deduplication), got {}: {:?}",
-            incoming_calls.len(),
-            incoming_calls
-        );
-        assert_eq!(incoming_calls[0]["provenance"], "verified");
-    }
-
-    /// P2.2: A resolved AST call produces a verified edge, including calls
-    /// to private same-module symbols — visibility does not suppress real
-    /// call evidence. (Regression guard: before caller resolution was
-    /// fixed, these edges existed in the store but were invisible to
-    /// impact analysis because their source ids dangled.)
-    #[tokio::test]
-    async fn impact_analyze_unresolved_call_has_no_verified_edge() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        // Define a function but don't export it.
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "fn internal() -> i32 { 1 }\npub fn runner() { internal(); }\n",
-        )
-        .unwrap();
-
-        crate::init::run(dir.path()).expect("init failed");
-
-        let server = local_sandbox_server(&dir);
-
-        let out = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({"target": "runner", "target_type": "symbol"}),
-        )
-        .await;
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert_eq!(v["status"], "ok");
-
-        // internal() is a private function, but the AST call from runner
-        // is real evidence and must surface as a verified edge now that
-        // caller resolution works.
-        let verified_calls: Vec<&serde_json::Value> = v["direct_relationships"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|r| r["relationship_kind"] == "calls" && r["provenance"] == "verified")
-            .collect();
-        assert!(
-            verified_calls
-                .iter()
-                .any(|r| r["target_name"] == "internal"),
-            "expected a verified call edge runner -> internal, got {verified_calls:?}"
-        );
-    }
-
     /// `update_identity` records goals/constraints/decisions into the
     /// persistent project identity and reports duplicates as skipped.
     #[tokio::test]
@@ -12012,228 +11591,6 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "expected error without identity");
-    }
-
-    // ── P2.3 bounded transitive traversal MCP tests ───────────────────────
-
-    /// P2.3: default impact_analyze (depth=1) returns direct relationships
-    /// with depth metadata and new result fields present.
-    #[tokio::test]
-    async fn impact_analyze_default_depth_one() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn get_user() -> i32 { 42 }\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("src/handler.rs"),
-            "use crate::lib::get_user;\npub fn handle() { let x = get_user(); }\n",
-        )
-        .unwrap();
-        crate::init::run(dir.path()).expect("init failed");
-
-        let server = local_sandbox_server(&dir);
-        let out = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({"target": "get_user", "target_type": "symbol"}),
-        )
-        .await;
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert_eq!(v["status"], "ok");
-        // New fields must be present.
-        assert!(v.get("transitive_relationships").is_some());
-        assert!(v.get("provenance_summary").is_some());
-        assert!(v.get("traversal_metadata").is_some());
-        assert_eq!(v["traversal_metadata"]["depth_limit"], 1);
-        // Each direct relationship carries depth=1.
-        for rel in v["direct_relationships"].as_array().unwrap() {
-            assert_eq!(rel["depth"], 1);
-        }
-    }
-
-    /// P2.3: depth=0 returns target only with no relationships.
-    #[tokio::test]
-    async fn impact_analyze_depth_zero_returns_target_only() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn hello() -> i32 { 42 }\n",
-        )
-        .unwrap();
-        crate::init::run(dir.path()).expect("init failed");
-
-        let server = local_sandbox_server(&dir);
-        let out = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({"target": "hello", "target_type": "symbol", "depth": 0}),
-        )
-        .await;
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert_eq!(v["status"], "ok");
-        assert_eq!(
-            v["direct_relationships"].as_array().map(|a| a.len()),
-            Some(0)
-        );
-        assert_eq!(
-            v["transitive_relationships"].as_array().map(|a| a.len()),
-            Some(0)
-        );
-        assert_eq!(v["traversal_metadata"]["depth_limit"], 0);
-    }
-
-    /// P2.3: invalid depth (>5) is rejected as invalid params.
-    #[tokio::test]
-    async fn impact_analyze_invalid_depth_rejected() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn hello() -> i32 { 42 }\n",
-        )
-        .unwrap();
-        crate::init::run(dir.path()).expect("init failed");
-
-        let server = local_sandbox_server(&dir);
-        let err = call_tool_err(
-            &server,
-            "impact_analyze",
-            json!({"target": "hello", "target_type": "symbol", "depth": 10}),
-        )
-        .await;
-        assert!(
-            err.contains("depth") || err.contains("maximum"),
-            "expected depth validation error, got: {err}"
-        );
-    }
-
-    /// P2.3: direction=outgoing restricts results to outgoing edges only.
-    #[tokio::test]
-    async fn impact_analyze_direction_outgoing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn get_user() -> i32 { 42 }\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("src/handler.rs"),
-            "use crate::lib::get_user;\npub fn handle() { let x = get_user(); }\n",
-        )
-        .unwrap();
-        crate::init::run(dir.path()).expect("init failed");
-
-        let server = local_sandbox_server(&dir);
-        // Query the callee — with direction=outgoing, we should only see
-        // outgoing edges from get_user (if any), not the incoming call from handle.
-        let out = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({"target": "get_user", "target_type": "symbol", "direction": "outgoing"}),
-        )
-        .await;
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert_eq!(v["status"], "ok");
-        for rel in v["direct_relationships"].as_array().unwrap() {
-            assert_eq!(rel["direction"], "outgoing");
-        }
-    }
-
-    /// P2.3: provenance_summary reflects verified vs heuristic edge counts.
-    #[tokio::test]
-    async fn impact_analyze_provenance_summary() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn helper() -> i32 { 1 }\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("src/main.rs"),
-            "use crate::lib::helper;\npub fn main() { helper(); }\n",
-        )
-        .unwrap();
-        crate::init::run(dir.path()).expect("init failed");
-
-        let server = local_sandbox_server(&dir);
-        let out = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({"target": "helper", "target_type": "symbol"}),
-        )
-        .await;
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert_eq!(v["status"], "ok");
-        let summary = &v["provenance_summary"];
-        assert!(summary.is_object());
-        assert!(summary["verified_edges"].is_number());
-        assert!(summary["heuristic_edges"].is_number());
-        assert!(summary["unknown_edges"].is_number());
-    }
-
-    /// P2.3: traversal_metadata includes depth_limit, direction, truncated flag.
-    #[tokio::test]
-    async fn impact_analyze_traversal_metadata() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn hello() -> i32 { 42 }\n",
-        )
-        .unwrap();
-        crate::init::run(dir.path()).expect("init failed");
-
-        let server = local_sandbox_server(&dir);
-        let out = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({"target": "hello", "target_type": "symbol", "depth": 2, "direction": "outgoing"}),
-        )
-        .await;
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert_eq!(v["status"], "ok");
-        let meta = &v["traversal_metadata"];
-        assert_eq!(meta["depth_limit"], 2);
-        assert_eq!(meta["direction"], "outgoing");
-        assert!(meta["nodes_visited"].is_number());
-        assert!(meta["edges_traversed"].is_number());
-        assert_eq!(meta["truncated"], false);
     }
 
     // ── P2.4 engineering_facts enrichment tests ─────────────────────────
@@ -12471,24 +11828,7 @@ mod tests {
             .collect();
         assert!(!affected_fact_ids.is_empty(), "must have affected fact IDs");
 
-        // Step 2: impact_analyze on the changed symbol to get correlation IDs.
-        let impact_out = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({
-                "target": "foo",
-                "target_type": "symbol"
-            }),
-        )
-        .await;
-        let impact_v: serde_json::Value = serde_json::from_str(&impact_out).expect("valid json");
-        // Freshness must be present (store has generation state and dir is a git repo... or not, but field exists).
-        assert!(
-            impact_v.get("freshness").is_some(),
-            "freshness field must be present"
-        );
-
-        // Step 3: sandbox_test with the affected fact IDs as correlation.
+        // Step 2: sandbox_test with the affected fact IDs as correlation.
         let test_out = call_tool_text(
             &server,
             "sandbox_test",
@@ -13742,48 +13082,6 @@ mod tests {
         .await;
         let facts_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
         assert_eq!(facts_b["returned"].as_u64().unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn impact_analyze_is_workspace_isolated() {
-        let ws_a = tempfile::tempdir().unwrap();
-        let ws_b = tempfile::tempdir().unwrap();
-        let root_a = ws_a.path();
-        let root_b = ws_b.path();
-        std::fs::write(root_a.join("marker.txt"), "ALPHA").unwrap();
-        std::fs::write(root_a.join("main.rs"), "fn main() {}\n").unwrap();
-        crate::init::run(root_a).unwrap();
-        std::fs::write(root_b.join("marker.txt"), "BRAVO").unwrap();
-        std::fs::write(root_b.join("main.rs"), "fn main() {}\n").unwrap();
-        crate::init::run(root_b).unwrap();
-
-        let server = hermetic_multiws_server(root_a, &[root_b]);
-
-        let out_a = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({
-                "target": "main",
-                "target_type": "symbol",
-                "workspace_root": root_a.to_string_lossy().to_string(),
-            }),
-        )
-        .await;
-        let impact_a: serde_json::Value = serde_json::from_str(&out_a).unwrap();
-        assert!(impact_a.get("target").is_some());
-
-        let out_b = call_tool_text(
-            &server,
-            "impact_analyze",
-            json!({
-                "target": "main",
-                "target_type": "symbol",
-                "workspace_root": root_b.to_string_lossy().to_string(),
-            }),
-        )
-        .await;
-        let impact_b: serde_json::Value = serde_json::from_str(&out_b).unwrap();
-        assert!(impact_b.get("target").is_some());
     }
 
     #[tokio::test]

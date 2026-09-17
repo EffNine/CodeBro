@@ -41,8 +41,8 @@
 
 ## Decision (fill on resolution)
 
-- [ ] APPROVE (A) — schedule removal as normal change with the verification above
+- [x] APPROVE (A) — schedule removal as normal change with the verification above
 - [ ] REJECT — tool stays; record what evidence would reopen (proposer: a task where the
   affected set is unknowable by reading AND an ON session demonstrably uses the tool to win)
 - [ ] DEFER — revisit after: _______________
-- Decided by: ______ date: ______ commit: ______
+- Decided by: operator (`okay` on Hermes-track execution) date: 2026-09-17 commit: (this removal)

@@ -5,10 +5,14 @@
 //! reasoning, or agent-loop ownership into CodeBro. It is a thin
 //! integration-contract layer over the mature P0–P7 core:
 //!
-//! - **Contract surface:** the existing 25 MCP tools ARE the contract.
-//!   `engineering_brief` is the primary high-level context surface;
+//! - **Contract surface:** the existing 24 MCP tools ARE the contract.
+//!   `engineering_brief` is the primary high-level context surface — including
+//!   bounded impact evidence, which the brief assembles internally via the
+//!   impact engine (the standalone `impact_analyze` tool was removed after
+//!   measurement showed zero agent use across 19 sessions; see
+//!   eval/IMPACT_ANALYZE_REMOVAL_PROPOSAL.md);
 //!   `context` the always-available packet; `recall`/`engineering_facts`/
-//!   `impact_analyze`/`repository_health` targeted follow-up; `remember`/
+//!   `repository_health` targeted follow-up; `remember`/
 //!   `record_memory`/`task`/`learn`/`skill` the explicit persistence path.
 //!   P8 adds NO new tools — every capability already exists.
 //! - **Protocol hygiene:** a stdio MCP server must keep stdout reserved
@@ -146,7 +150,7 @@ pub fn bounded_error_summary(msg: &str) -> String {
 
 /// The P8 integration contract, expressed as data for tests and docs.
 ///
-/// Codifies what the 25 existing tools mean *to an agent client* so the
+/// Codifies what the 24 existing tools mean *to an agent client* so the
 /// contract is enforceable by regression tests instead of existing only
 /// in prose. Every entry maps an agent-client intent to the exact tool
 /// that serves it — the point of P8 §6 ("avoid the client manually calling
@@ -166,8 +170,10 @@ pub mod contract {
     pub const WORKSPACE_ORIENTATION_TOOL: &str = "workspace_context";
     /// Targeted follow-up: verified repository facts.
     pub const FACTS_TOOL: &str = "engineering_facts";
-    /// Targeted follow-up: structural impact of a change.
-    pub const IMPACT_TOOL: &str = "impact_analyze";
+    /// Targeted follow-up: structural impact of a change, served by the
+    /// brief's embedded bounded traversal (the standalone `impact_analyze`
+    /// tool was removed for non-use; the engine remains inside the brief).
+    pub const IMPACT_TOOL: &str = "engineering_brief";
     /// Targeted follow-up: historical evidence (decisions/failures).
     pub const HISTORY_TOOL: &str = "recall";
     /// Targeted follow-up: engineering memory resolution.
@@ -282,7 +288,7 @@ mod tests {
     #[test]
     fn contract_intents_cover_the_p8_flow_without_new_tools() {
         let intents = contract::intents();
-        // Every intent maps to one of the existing 25 tools — P8 adds none.
+        // Every intent maps to one of the existing 24 tools — P8 adds none.
         for (_, tool) in intents {
             assert!(
                 matches!(
@@ -291,7 +297,6 @@ mod tests {
                         | "context"
                         | "workspace_context"
                         | "engineering_facts"
-                        | "impact_analyze"
                         | "recall"
                         | "engineering_memory"
                         | "repository_health"
