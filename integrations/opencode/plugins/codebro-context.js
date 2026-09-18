@@ -76,12 +76,27 @@ export function renderDigest(packet, maxChars, root) {
     const note = execution.note ? ` — ${trim(execution.note, 160)}` : "";
     lines.push(`Execution state: ${execution.state}${note}`);
   }
+  const guard = packet.guard;
+  if (guard && guard.verdict === "review") {
+    const warnings = (Array.isArray(guard.signals) ? guard.signals : [])
+      .filter((signal) => signal && signal.severity === "warn")
+      .map((signal) => trim(signal.detail, 160))
+      .slice(0, 2);
+    lines.push(
+      `Intent guard: review — ${
+        warnings.join("; ") || "possible wrong-project context; verify the repository"
+      }`
+    );
+  }
   const records = Array.isArray(packet.records) ? packet.records : [];
   if (records.length) {
     lines.push("Confirmed user context and intents (respect these):");
     for (const record of records) {
       const tag = [record.kind, record.scope, record.authority].filter(Boolean).join("/");
       lines.push(`- ${record.namespace || record.id} [${tag}]: ${trim(record.content, 240)}`);
+      if (record.guard && record.guard.status) {
+        lines.push(`  guard: ${trim(record.guard.status, 80)}`);
+      }
       const rationale = record.intent && record.intent.rationale;
       if (rationale) lines.push(`  rationale: ${trim(rationale, 120)}`);
     }

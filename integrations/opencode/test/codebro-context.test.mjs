@@ -282,6 +282,41 @@ test("injects into the compaction context", async () => {
   }
 });
 
+test("surfaces intent-guard review findings, and stays silent when aligned", () => {
+  const reviewPacket = {
+    ...PACKET,
+    guard: {
+      verdict: "review",
+      signals: [
+        {
+          code: "identity_mismatch",
+          severity: "warn",
+          detail: 'project identity "Hermes" does not match workspace basename "codebro"',
+        },
+        { code: "no_confirmed_intent", severity: "info", detail: "no actionable intent" },
+      ],
+    },
+    records: [
+      {
+        ...PACKET.records[0],
+        guard: { status: "ambiguous_project_reference", reason: "references multiple projects" },
+      },
+    ],
+  };
+  const digest = renderDigest(reviewPacket, 6000, "/tmp/demo-repo");
+  assert.match(digest, /Intent guard: review/);
+  assert.match(digest, /does not match workspace basename/);
+  assert.doesNotMatch(digest, /no actionable intent/);
+  assert.match(digest, /guard: ambiguous_project_reference/);
+
+  const alignedPacket = {
+    ...PACKET,
+    guard: { verdict: "aligned", signals: [] },
+  };
+  const aligned = renderDigest(alignedPacket, 6000, "/tmp/demo-repo");
+  assert.doesNotMatch(aligned, /Intent guard/);
+});
+
 test("caps the digest size", async () => {
   const long = PACKET.records[0];
   const packet = {
