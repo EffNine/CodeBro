@@ -39,8 +39,8 @@ use rusqlite::{params, OptionalExtension};
 use crate::db;
 use crate::store::{ContextError, ContextStore};
 use crate::types::{
-    EventRecord, MAX_DEDUP_KEY_CHARS, MAX_EVENT_PAYLOAD_BYTES, MAX_HISTORY_SOURCE_CHARS,
-    MAX_HISTORY_SUMMARY_CHARS, MAX_TASK_ID_CHARS,
+    validate_event, EventRecord, MAX_DEDUP_KEY_CHARS, MAX_EVENT_PAYLOAD_BYTES,
+    MAX_HISTORY_SOURCE_CHARS, MAX_HISTORY_SUMMARY_CHARS, MAX_TASK_ID_CHARS,
 };
 use crate::workspace::canonical_workspace_key;
 
@@ -578,6 +578,33 @@ pub(crate) fn clean_payload(raw: &str) -> String {
     format!("{}{}", &redacted[..cut], HISTORY_TRUNCATION_MARKER)
 }
 
+/// Content-addressed idempotency key for imported events that carry none:
+/// the same event imported from any export converges on one local row.
+#[allow(clippy::too_many_arguments)]
+fn import_event_dedup_key(
+    workspace: &str,
+    kind: &str,
+    tool: Option<&str>,
+    path: Option<&str>,
+    outcome: Option<&str>,
+    summary: Option<&str>,
+    payload: Option<&str>,
+    created_at: u64,
+) -> String {
+    let material = format!(
+        "{workspace}\u{1f}{kind}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{created_at}",
+        tool.unwrap_or(""),
+        path.unwrap_or(""),
+        outcome.unwrap_or(""),
+        summary.unwrap_or(""),
+        payload.unwrap_or(""),
+    );
+    format!(
+        "import:{}",
+        crate::store::hex_sha256_for(material.as_bytes())
+    )
+}
+
 fn validate_history_input(input: &HistoryInput) -> Result<(), ContextError> {
     if input.workspace_root.trim().is_empty() {
         return Err(ContextError::Validation(
@@ -746,6 +773,106 @@ impl ContextStore {
             )
             .optional()
             .map_err(|e| ContextError::Decode(e.to_string()))
+        })
+    }
+
+    /// Import seam: insert a session row when its id is absent.
+    ///
+    /// Existing sessions are never overwritten — local session state
+    /// (title, closure, snapshot) is authoritative. The imported row keeps
+    /// its original timestamps; free text is secret-redacted and bounded
+    /// here as defense in depth (export already redacts). The cached
+    /// `event_count` starts at zero and is refreshed by
+    /// [`ContextStore::recount_sessions`] after the events are imported,
+    /// so the counter always reflects actually-linked rows.
+    ///
+    /// Returns `true` when inserted, `false` when the id already exists.
+    pub fn import_session(&self, session: &SessionRecord) -> Result<bool, ContextError> {
+        let id = session.id.trim();
+        if id.is_empty() {
+            return Err(ContextError::Validation(
+                "imported session id must not be empty".to_string(),
+            ));
+        }
+        let ws = canonical_workspace_key(&session.workspace_root);
+        if ws.is_empty() {
+            return Err(ContextError::Validation(format!(
+                "imported session {id} has an empty workspace root"
+            )));
+        }
+        let title = session
+            .title
+            .as_deref()
+            .map(|t| clean_text(t, MAX_SESSION_TITLE_CHARS))
+            .filter(|t| !t.trim().is_empty());
+        let end_reason = session
+            .end_reason
+            .as_deref()
+            .map(|r| clean_text(r, MAX_SESSION_TITLE_CHARS))
+            .filter(|r| !r.trim().is_empty());
+        let snapshot = session
+            .snapshot_json
+            .as_deref()
+            .map(clean_payload)
+            .filter(|s| !s.is_empty());
+        let parent = session
+            .parent_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let task_id = session
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let source = session
+            .source
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        self.with_conn(|conn| {
+            let inserted = conn.execute(
+                "INSERT INTO sessions (
+                    id, workspace_root, task_id, title, status, source,
+                    parent_session_id, opened_at, updated_at, closed_at,
+                    end_reason, event_count, context_snapshot_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)
+                 ON CONFLICT(id) DO NOTHING",
+                params![
+                    id,
+                    ws,
+                    task_id,
+                    title,
+                    session.status.as_str(),
+                    source,
+                    parent,
+                    session.started_at as i64,
+                    session.updated_at as i64,
+                    session.ended_at.map(|t| t as i64),
+                    end_reason,
+                    snapshot,
+                ],
+            )?;
+            Ok(inserted > 0)
+        })
+    }
+
+    /// Recompute cached event counts for the given sessions from the
+    /// `events` table. Import calls this after inserting events so the
+    /// counter reflects actually-linked rows rather than the source
+    /// device's view. Returns the number of sessions touched.
+    pub fn recount_sessions(&self, ids: &[String]) -> Result<usize, ContextError> {
+        self.with_conn(|conn| {
+            let mut touched = 0;
+            for id in ids {
+                touched += conn.execute(
+                    "UPDATE sessions
+                     SET event_count = (SELECT count(*) FROM events WHERE session_id = ?1)
+                     WHERE id = ?1",
+                    [id],
+                )?;
+            }
+            Ok(touched)
         })
     }
 
@@ -1071,6 +1198,94 @@ impl ContextStore {
             }
             tx.commit()?;
             Ok((id, false))
+        })
+    }
+
+    /// Import seam for one history event.
+    ///
+    /// Like [`ContextStore::record_history`] the write is secret-redacted,
+    /// bounded, and idempotent — but the event kind stays free-form (the
+    /// closed taxonomy belongs to live capture; storage is open) and the
+    /// source timestamp is preserved. A content-addressed dedup key is
+    /// synthesized when the source event had none, so re-importing the
+    /// same mirror never duplicates history. Session linkage is honored
+    /// only when the session exists locally; unknown session ids are
+    /// dropped to `None` rather than refusing the event.
+    ///
+    /// Returns `(event_id, duplicate)`.
+    pub fn import_event(&self, event: &EventRecord) -> Result<(i64, bool), ContextError> {
+        let ws = canonical_workspace_key(&event.workspace_root);
+        if ws.is_empty() {
+            return Err(ContextError::Validation(
+                "imported event workspace_root must not be empty".to_string(),
+            ));
+        }
+        let kind = event.kind.trim().to_string();
+        if kind.is_empty() {
+            return Err(ContextError::Validation(
+                "imported event kind must not be empty".to_string(),
+            ));
+        }
+        let session_id = match event.session_id.as_deref() {
+            Some(sid) if !sid.trim().is_empty() => {
+                if self.get_session(sid)?.is_some() {
+                    Some(sid.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let summary = event
+            .summary
+            .as_deref()
+            .map(|s| clean_text(s, MAX_HISTORY_SUMMARY_CHARS))
+            .filter(|s| !s.trim().is_empty());
+        let payload = event
+            .payload
+            .as_deref()
+            .map(clean_payload)
+            .filter(|s| !s.is_empty());
+        let dedup_key = event.dedup_key.clone().or_else(|| {
+            Some(import_event_dedup_key(
+                &ws,
+                &kind,
+                event.tool.as_deref(),
+                event.path.as_deref(),
+                event.outcome.as_deref(),
+                summary.as_deref(),
+                payload.as_deref(),
+                event.created_at,
+            ))
+        });
+        let cleaned = EventRecord {
+            id: None,
+            session_id,
+            workspace_root: ws,
+            task_id: event
+                .task_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            kind,
+            tool: event.tool.clone(),
+            path: event.path.clone(),
+            outcome: event.outcome.clone(),
+            summary,
+            payload,
+            dedup_key,
+            source: event.source.clone(),
+            digest: None,
+            created_at: event.created_at,
+        };
+        validate_event(&cleaned).map_err(ContextError::Validation)?;
+        let created_at = cleaned.created_at;
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let (id, dup) = record_event_in_tx(&tx, &cleaned, created_at)?;
+            tx.commit()?;
+            Ok((id, dup))
         })
     }
 

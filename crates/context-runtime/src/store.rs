@@ -92,13 +92,32 @@ impl ContextStore {
     /// namespace) and cited evidence ids are resolved against the `events`
     /// table — inference citing fiction is refused, not stored.
     pub fn put_record(&self, record: &ContextRecord, now: u64) -> Result<(), ContextError> {
+        self.put_record_with_times(record, None, Some(now))
+    }
+
+    /// Import seam: like [`ContextStore::put_record`], but preserves the
+    /// record's own `created_at`/`updated_at` so imported provenance is not
+    /// rewritten to the import time. Evidence citations are still resolved
+    /// against the local `events` table and validation/normalization are
+    /// identical — portability never bypasses the trust boundary.
+    pub fn import_record(&self, record: &ContextRecord) -> Result<(), ContextError> {
+        self.put_record_with_times(record, Some(record.created_at), Some(record.updated_at))
+    }
+
+    fn put_record_with_times(
+        &self,
+        record: &ContextRecord,
+        created_at: Option<u64>,
+        updated_at: Option<u64>,
+    ) -> Result<(), ContextError> {
         let record = normalized_record(record)?;
         self.with_conn(|conn| {
             check_evidence(conn, &record)?;
             let tx = conn.unchecked_transaction()?;
+            let updated_at = updated_at.unwrap_or(0);
             let created_at = match existing_created_at(&tx, &record.id)? {
                 Some(existing) => existing,
-                None => now,
+                None => created_at.unwrap_or(updated_at),
             };
             tx.execute(
                 "INSERT INTO context_records (
@@ -156,7 +175,7 @@ impl ContextStore {
                     serde_json::to_string(&record.related_ids)
                         .map_err(|e| ContextError::Decode(e.to_string()))?,
                     created_at,
-                    now,
+                    updated_at,
                     record.expires_at.map(|t| t as i64),
                     record.task_id.as_deref(),
                     record.extra_json.as_deref(),

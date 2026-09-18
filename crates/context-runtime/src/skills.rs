@@ -1337,6 +1337,210 @@ impl ContextStore {
         })
     }
 
+    /// Import seam for a published skill lineage: insert-if-absent.
+    ///
+    /// Import never transitions candidate state, never mints versions, and
+    /// never overwrites an existing local lineage: the row set is copied
+    /// verbatim after structural validation — safe name, known scope and
+    /// status vocabulary, version numbering consistent with
+    /// `current_version`, and every content hash recomputed from the
+    /// content it claims to describe. An existing lineage returns `false`
+    /// (duplicate) without touching local state; it is never merged.
+    pub fn import_skill_lineage(
+        &self,
+        skill: &Skill,
+        versions: &[SkillVersion],
+    ) -> Result<bool, ContextError> {
+        if skill.skill_id.trim().is_empty() {
+            return Err(ContextError::Validation(
+                "imported skill id must not be empty".to_string(),
+            ));
+        }
+        if !is_valid_skill_name(&skill.name) {
+            return Err(ContextError::Validation(format!(
+                "imported skill name '{}' is not a safe skill name",
+                skill.name
+            )));
+        }
+        skill.scope.parse::<SkillScope>().map_err(|_| {
+            ContextError::Validation(format!(
+                "imported skill {} has unknown scope '{}'",
+                skill.skill_id, skill.scope
+            ))
+        })?;
+        if !matches!(
+            skill.status.as_str(),
+            "active" | "approved" | "validated" | "deprecated" | "superseded"
+        ) {
+            return Err(ContextError::Validation(format!(
+                "imported skill {} has unknown status '{}'",
+                skill.skill_id, skill.status
+            )));
+        }
+        if versions.is_empty() {
+            return Err(ContextError::Validation(format!(
+                "imported skill {} has no versions",
+                skill.skill_id
+            )));
+        }
+        let mut numbers = std::collections::BTreeSet::new();
+        for version in versions {
+            if version.skill_id != skill.skill_id {
+                return Err(ContextError::Validation(format!(
+                    "imported version {} belongs to a different skill",
+                    version.version_id
+                )));
+            }
+            if version.version_number == 0 || !numbers.insert(version.version_number) {
+                return Err(ContextError::Validation(format!(
+                    "imported skill {} has duplicate or zero version numbers",
+                    skill.skill_id
+                )));
+            }
+            if content_hash(&version.content) != version.content_hash {
+                return Err(ContextError::Validation(format!(
+                    "imported version {} content does not match its recorded hash",
+                    version.version_id
+                )));
+            }
+            version.status.parse::<SkillVersionStatus>().map_err(|_| {
+                ContextError::Validation(format!(
+                    "imported version {} has unknown status '{}'",
+                    version.version_id, version.status
+                ))
+            })?;
+        }
+        if !numbers.contains(&skill.current_version) {
+            return Err(ContextError::Validation(format!(
+                "imported skill {} current_version {} has no version row",
+                skill.skill_id, skill.current_version
+            )));
+        }
+        let skill = skill.clone();
+        let versions = versions.to_vec();
+        self.with_conn(|conn| {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM skills WHERE skill_id = ?1",
+                    [&skill.skill_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|e| ContextError::Decode(e.to_string()))?
+                .is_some();
+            if exists {
+                return Ok(false);
+            }
+            let tx = conn.unchecked_transaction()?;
+            let applicability = serde_json::to_string(&skill.applicability)
+                .map_err(|e| ContextError::Decode(e.to_string()))?;
+            let health = serde_json::to_string(&skill.health)
+                .map_err(|e| ContextError::Decode(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO skills (
+                    skill_id, workspace_root, scope, name, description,
+                    applicability_json, current_version, status, confidence,
+                    health_json, source_candidate_id, superseded_by,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    skill.skill_id,
+                    skill.workspace_root.as_deref(),
+                    skill.scope,
+                    skill.name,
+                    skill.description,
+                    applicability,
+                    skill.current_version as i32,
+                    skill.status,
+                    skill.confidence,
+                    health,
+                    skill.source_candidate_id.as_deref(),
+                    skill.superseded_by.as_deref(),
+                    skill.created_at as i64,
+                    skill.updated_at as i64,
+                ],
+            )?;
+            for version in &versions {
+                let supporting = serde_json::to_string(&version.supporting_evidence)
+                    .map_err(|e| ContextError::Decode(e.to_string()))?;
+                let validation = version
+                    .validation
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| ContextError::Decode(e.to_string()))?;
+                tx.execute(
+                    "INSERT INTO skill_versions (
+                        version_id, skill_id, version_number, content, content_hash,
+                        source_candidate_id, supporting_json, validation_json,
+                        author, status, created_at, parent_version
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        version.version_id,
+                        version.skill_id,
+                        version.version_number as i32,
+                        version.content,
+                        version.content_hash,
+                        version.source_candidate_id.as_deref(),
+                        supporting,
+                        validation,
+                        version.author,
+                        version.status,
+                        version.created_at as i64,
+                        version.parent_version.as_deref(),
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
+    /// Import seam for a skill candidate: insert-if-absent with its status
+    /// preserved verbatim. Import never evaluates, validates, approves, or
+    /// rejects — an imported candidate stays exactly as proposed on the
+    /// source device. Existing candidates are duplicates, never merged.
+    pub fn import_skill_candidate(&self, candidate: &SkillCandidate) -> Result<bool, ContextError> {
+        if candidate.candidate_id.trim().is_empty() {
+            return Err(ContextError::Validation(
+                "imported skill candidate id must not be empty".to_string(),
+            ));
+        }
+        if !is_valid_skill_name(&candidate.name) {
+            return Err(ContextError::Validation(format!(
+                "imported skill candidate name '{}' is not a safe skill name",
+                candidate.name
+            )));
+        }
+        candidate.scope.parse::<SkillScope>().map_err(|_| {
+            ContextError::Validation(format!(
+                "imported skill candidate {} has unknown scope '{}'",
+                candidate.candidate_id, candidate.scope
+            ))
+        })?;
+        if !matches!(
+            candidate.status.as_str(),
+            "candidate"
+                | "evaluating"
+                | "draft"
+                | "validated"
+                | "deferred"
+                | "rejected"
+                | "superseded"
+                | "expired"
+        ) {
+            return Err(ContextError::Validation(format!(
+                "imported skill candidate {} has unknown status '{}'",
+                candidate.candidate_id, candidate.status
+            )));
+        }
+        if self.get_skill_candidate(&candidate.candidate_id)?.is_some() {
+            return Ok(false);
+        }
+        self.insert_skill_candidate(candidate)?;
+        Ok(true)
+    }
+
     /// Get a skill candidate by id.
     pub fn get_skill_candidate(&self, id: &str) -> Result<Option<SkillCandidate>, ContextError> {
         self.with_conn(|conn| {

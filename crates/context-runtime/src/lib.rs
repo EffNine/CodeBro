@@ -57,6 +57,7 @@ pub mod fingerprint;
 pub mod history;
 pub mod intent;
 pub mod learning;
+pub mod portability;
 pub mod recall;
 pub mod repo_index;
 pub mod retrieval;
@@ -89,6 +90,10 @@ pub mod context_runtime {
             self, CandidateKind, CandidateStatus, LearnScope, LearningCandidate, LearningRunOutcome,
         },
         lifecycle_for_authority,
+        portability::{
+            self, ExportReport, ImportOptions, ImportReport, PortableManifest,
+            PORTABLE_FORMAT_VERSION,
+        },
         recall::{self, RecallGroup, RecallHit, RecallOutcome, RecallQuery, RecallScope},
         repo_index::{self, RepoIndexRecord, RepoIndexStatus, RepoIndexUpsert},
         retrieval,
@@ -129,6 +134,9 @@ pub use history::{
 pub use intent::{IntentMetadata, IntentPriority, IntentStatus};
 pub use learning::{
     CandidateKind, CandidateStatus, LearnScope, LearningCandidate, LearningRunOutcome,
+};
+pub use portability::{
+    ExportReport, ImportOptions, ImportReport, PortableManifest, PORTABLE_FORMAT_VERSION,
 };
 pub use recall::{RecallGroup, RecallHit, RecallOutcome, RecallQuery, RecallScope};
 pub use repo_index::{RepoIndexRecord, RepoIndexStatus, RepoIndexUpsert};

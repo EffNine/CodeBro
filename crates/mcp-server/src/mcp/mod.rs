@@ -103,6 +103,20 @@ pub(crate) fn default_state_dir() -> PathBuf {
     crate::config::Config::config_dir()
 }
 
+/// OpenCode skills directory: `CODEBRO_SKILLS_DIR` overrides the default
+/// `~/.config/opencode/skills`. Shared by the `skill` MCP tool and the
+/// `codebro import` CLI verb (import publishes missing SKILL.md artifacts).
+pub(crate) fn default_skills_root() -> Result<PathBuf, String> {
+    if let Ok(dir) = std::env::var("CODEBRO_SKILLS_DIR") {
+        if !dir.trim().is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".config").join("opencode").join("skills"))
+        .ok_or_else(|| "cannot determine HOME".to_string())
+}
+
 #[tool_router]
 impl CodeBroMcpServer {
     /// Create a server bound to a workspace root.
@@ -3672,16 +3686,10 @@ impl CodeBroMcpServer {
 
     /// Skill publication root: `$CODEBRO_SKILLS_DIR` when set (tests and
     /// embedded deployments stay hermetic), otherwise OpenCode's global
-    /// skill directory `~/.config/opencode/skills`.
+    /// skill directory `~/.config/opencode/skills`. Delegates to the shared
+    /// resolver so the MCP tool and the `codebro import` CLI verb agree.
     fn skills_root() -> Result<std::path::PathBuf, McpError> {
-        if let Ok(dir) = std::env::var("CODEBRO_SKILLS_DIR") {
-            if !dir.trim().is_empty() {
-                return Ok(std::path::PathBuf::from(dir));
-            }
-        }
-        dirs::home_dir()
-            .map(|h| h.join(".config").join("opencode").join("skills"))
-            .ok_or_else(|| McpError::internal_error("cannot determine HOME", None))
+        default_skills_root().map_err(|e| McpError::internal_error(e, None))
     }
 
     /// Whether a skill candidate is visible from the requesting

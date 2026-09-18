@@ -79,6 +79,53 @@ enum Commands {
         root: Option<PathBuf>,
     },
 
+    /// Export portable memory (context records, history, skills) to a directory.
+    ///
+    /// Deterministic, versioned manifest + JSONL format, secret-redacted,
+    /// and byte-stable: the same state exports to the same bytes. Move the
+    /// directory to another device and `codebro import` it there.
+    Export {
+        /// Output directory (created when absent; existing files are
+        /// replaced atomically).
+        #[arg(long)]
+        out: PathBuf,
+        /// Print the machine-readable report as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Import a portable memory export into the local CodeBro state.
+    ///
+    /// Two-phase and explicit: everything is verified and validated before
+    /// the first write, authority is preserved verbatim (nothing is ever
+    /// promoted to user_confirmed), newer local state is never overwritten,
+    /// and skills are inserted without transitions. Re-running converges.
+    Import {
+        /// Export directory containing manifest.json and *.jsonl.
+        #[arg(long = "file", value_name = "DIR")]
+        file: PathBuf,
+        /// Local workspace root for project-scoped rows; required unless
+        /// every source root is given an explicit --map.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Explicit source-root=local-root remapping (repeatable).
+        #[arg(long = "map", value_name = "OLD=NEW")]
+        map: Vec<String>,
+        /// Validate and report without writing anything.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Do not publish SKILL.md artifacts for imported active skills.
+        #[arg(long = "no-publish", default_value_t = false)]
+        no_publish: bool,
+        /// Provenance label recorded on imported records (default:
+        /// `import:<directory>`).
+        #[arg(long = "origin")]
+        origin: Option<String>,
+        /// Print the machine-readable report as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// Print the bounded engineering context packet (host/hook integration surface).
     ///
     /// Read-only: identical retrieval semantics, budgets, and provenance to
@@ -281,6 +328,100 @@ pub async fn run() -> Result<()> {
             };
 
             println!("{}", response.answer);
+        }
+        Some(Commands::Export { out, json }) => {
+            let state_dir = crate::mcp::default_state_dir();
+            let db_path = state_dir.join(crate::context_runtime::STATE_DB_FILE);
+            let report = crate::context_runtime::portability::export_mirror(&db_path, &out)
+                .map_err(anyhow::Error::msg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let total: usize = report.counts.values().sum();
+                println!(
+                    "exported {} tables / {} rows to {}",
+                    report.counts.len(),
+                    total,
+                    report.out_dir.display()
+                );
+                println!("data_hash: {}", report.data_hash);
+                println!("redacted string values: {}", report.redacted_values);
+            }
+        }
+        Some(Commands::Import {
+            file,
+            root,
+            map,
+            dry_run,
+            no_publish,
+            origin,
+            json,
+        }) => {
+            use crate::context_runtime::portability::{import_mirror, ImportOptions};
+            use std::collections::BTreeMap;
+            let workspace = match root {
+                Some(path) => Some(crate::workspace::resolve_workspace_root(Some(path))?),
+                None => None,
+            };
+            let mut workspace_map: BTreeMap<String, String> = BTreeMap::new();
+            for entry in &map {
+                let (old, new) = entry
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("--map expects OLD=NEW, got {entry:?}"))?;
+                if old.trim().is_empty() || new.trim().is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "--map expects non-empty OLD=NEW, got {entry:?}"
+                    ));
+                }
+                workspace_map.insert(old.trim().to_string(), new.trim().to_string());
+            }
+            let options = ImportOptions {
+                dry_run,
+                workspace_map,
+                default_workspace: workspace.map(|p| p.display().to_string()),
+                import_origin: origin.unwrap_or_else(|| format!("import:{}", file.display())),
+                skills_root: if no_publish {
+                    None
+                } else {
+                    crate::mcp::default_skills_root().ok()
+                },
+            };
+            let store = crate::context_packet::open_default_store();
+            let report = import_mirror(&store, &file, &options).map_err(anyhow::Error::msg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "{} — integrity: {}{}",
+                    if report.dry_run {
+                        "import dry run"
+                    } else {
+                        "import"
+                    },
+                    report.integrity,
+                    report
+                        .format_version
+                        .map(|v| format!(" (format v{v})"))
+                        .unwrap_or_default()
+                );
+                for (table, outcome) in &report.tables {
+                    println!(
+                        "  {table}: inserted {}, updated {}, duplicates {}, conflicts {}, skipped {}",
+                        outcome.inserted,
+                        outcome.updated,
+                        outcome.duplicates,
+                        outcome.conflicts,
+                        outcome.skipped
+                    );
+                }
+                if !report.not_imported.is_empty() {
+                    let names: Vec<&str> = report.not_imported.keys().map(String::as_str).collect();
+                    println!("  not imported: {}", names.join(", "));
+                }
+                for warning in &report.warnings {
+                    println!("  warning: {warning}");
+                }
+            }
         }
         Some(Commands::Context {
             root,
