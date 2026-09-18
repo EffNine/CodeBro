@@ -324,6 +324,50 @@ pub struct ImpactGuidance {
     pub suggested_targets: Vec<String>,
 }
 
+/// One bounded, advisory skill-applicability nudge.
+///
+/// Descriptive only: CodeBro neither loads nor executes the skill, and the
+/// context path never approves or publishes. OpenCode decides what to do
+/// with the information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillNudge {
+    pub name: String,
+    /// Redacted + bounded at projection time (defense in depth: rows carry
+    /// write-time redaction, legacy rows may not).
+    pub description: String,
+    pub version: u32,
+    pub scope: String,
+    /// Why the skill looks applicable (deterministic selector reason,
+    /// redacted + bounded).
+    pub reason: String,
+}
+
+/// One bounded, advisory pending-approval nudge.
+///
+/// The context path never resolves approvals: `skill respond` is the only
+/// seam, and it stays human-gated. This is a pointer for the human, not an
+/// action for the agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingApprovalNudge {
+    pub name: String,
+    /// Opaque request id for `skill respond` (`apr::<16 hex>`).
+    pub request_id: String,
+    pub proposed_action: String,
+    /// The human-facing question (redacted + bounded).
+    pub question: String,
+}
+
+/// Bounded advisory skill nudges for this viewpoint: applicable published
+/// skills relevant to the task, plus pending approval requests visible from
+/// this workspace/task. Read-only by construction; absent when empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillNudges {
+    #[serde(default)]
+    pub applicable: Vec<SkillNudge>,
+    #[serde(default)]
+    pub pending_approvals: Vec<PendingApprovalNudge>,
+}
+
 /// The bounded, task-relevant context packet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineeringContextPacket {
@@ -360,6 +404,13 @@ pub struct EngineeringContextPacket {
     /// and CLI surfaces always attach it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<crate::intent_guard::IntentGuardReport>,
+    /// Advisory skill nudges: applicable published skills for this task and
+    /// pending approval requests visible from this viewpoint. Bounded,
+    /// deterministic, secret-redacted, read-only — the context path never
+    /// approves, publishes, or mutates a skill. `None` when there is
+    /// nothing to nudge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<SkillNudges>,
 }
 
 impl EngineeringContextPacket {
@@ -473,6 +524,7 @@ pub fn compose(
         ],
         notes,
         guard: None,
+        skills: None,
     })
 }
 
@@ -532,6 +584,7 @@ pub fn compose_structural(
         validation: vec![],
         notes,
         guard: None,
+        skills: None,
     })
 }
 

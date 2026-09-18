@@ -147,7 +147,7 @@ pub fn build_context_packet(
     // simply means the guard cannot check it (verdict `unverified`), never
     // an error. The default snapshot carries the sentinel name "unknown",
     // which must never be treated as a declared identity.
-    let (project_name, repository_url) = {
+    let (project_name, repository_url, languages) = {
         let mut identity_rt = crate::project_identity::ProjectIdentityRuntime::new(workspace_root);
         let loaded = identity_rt.load().is_ok();
         let snapshot = identity_rt.snapshot();
@@ -166,6 +166,7 @@ pub fn build_context_packet(
             } else {
                 None
             },
+            snapshot.languages.clone(),
         )
     };
     let guarded = context_record_excerpts_guarded(
@@ -189,8 +190,144 @@ pub fn build_context_packet(
         ));
     }
     packet.guard = Some(guarded.report);
+    packet.skills = collect_skill_nudges(
+        store,
+        workspace_root,
+        &request.task,
+        &request.keywords(),
+        task_id,
+        &languages,
+    );
     let value = serde_json::to_value(&packet).map_err(|e| e.to_string())?;
     crate::mcp::response_bounds::bounded_response(value)
+}
+
+/// Bound of applicable-skill nudges attached to one context packet.
+const MAX_CONTEXT_APPLICABLE_SKILLS: usize = 3;
+/// Bound of pending-approval nudges attached to one context packet.
+const MAX_CONTEXT_PENDING_APPROVALS: usize = 3;
+const MAX_CONTEXT_SKILL_NAME_CHARS: usize = 120;
+const MAX_CONTEXT_SKILL_DESCRIPTION_CHARS: usize = 160;
+const MAX_CONTEXT_SKILL_REASON_CHARS: usize = 160;
+const MAX_CONTEXT_APPROVAL_QUESTION_CHARS: usize = 200;
+
+/// Redact + collapse whitespace + cap to `max_chars` (UTF-8 safe) for the
+/// advisory projection. Redaction runs again here (defense in depth): rows
+/// carry write-time redaction, but a legacy or externally-seeded row must
+/// never leak a secret through the context path.
+fn redacted_bounded(text: &str, max_chars: usize) -> String {
+    let collapsed = crate::tools::shell::redact_secrets_public(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut out: String = collapsed.chars().take(max_chars).collect();
+    if collapsed.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+/// Collect bounded advisory skill nudges for this viewpoint.
+///
+/// Applicability reuses the single deterministic selector
+/// (`context_runtime::skill_selection`) — no second implementation of the
+/// rule; a skill is nudged only when the canonical selector considers it
+/// applicable (`brief_reason_summary`). Pending approvals come from the
+/// store's workspace/task-scoped listing, so foreign-workspace requests can
+/// never surface here. Expired-but-unswept requests are filtered from the
+/// display (they are not consumable) without mutating the row.
+///
+/// Read-only by construction: nothing in this path approves, publishes,
+/// expires, or mutates a skill. Best-effort: a store error omits the
+/// affected list rather than failing packet composition (fail-open).
+fn collect_skill_nudges(
+    store: &ContextStore,
+    workspace_root: &Path,
+    task: &str,
+    keywords: &[String],
+    task_id: Option<&str>,
+    repo_languages: &[String],
+) -> Option<crate::engineering_context::SkillNudges> {
+    use crate::context_runtime::skill_selection::{
+        brief_reason_summary, select_applicable_skills, SkillSelectionRequest,
+    };
+    let ws = workspace_root.display().to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let has_task = !task.trim().is_empty() || keywords.iter().any(|k| !k.trim().is_empty());
+
+    let mut applicable = Vec::new();
+    if has_task {
+        if let Ok(listed) = store.list_skills(
+            Some(&ws),
+            Some(crate::context_runtime::SkillStatus::Active),
+            100,
+        ) {
+            let request = SkillSelectionRequest {
+                task_text: task.to_string(),
+                keywords: keywords.to_vec(),
+                workspace_root: ws.clone(),
+                task_id: task_id.map(str::to_string),
+                repo_languages: repo_languages.to_vec(),
+                limit: Some(MAX_CONTEXT_APPLICABLE_SKILLS),
+            };
+            for ranked in select_applicable_skills(&listed, &request).applicable {
+                let (is_applicable, reason) = brief_reason_summary(&ranked);
+                if !is_applicable {
+                    continue;
+                }
+                applicable.push(crate::engineering_context::SkillNudge {
+                    name: redacted_bounded(&ranked.name, MAX_CONTEXT_SKILL_NAME_CHARS),
+                    description: redacted_bounded(
+                        &ranked.description,
+                        MAX_CONTEXT_SKILL_DESCRIPTION_CHARS,
+                    ),
+                    version: ranked.version,
+                    scope: ranked.scope,
+                    reason: redacted_bounded(&reason, MAX_CONTEXT_SKILL_REASON_CHARS),
+                });
+                if applicable.len() >= MAX_CONTEXT_APPLICABLE_SKILLS {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut pending_approvals = Vec::new();
+    if let Ok(requests) =
+        store.list_pending_skill_approval_requests(&ws, task_id, MAX_CONTEXT_PENDING_APPROVALS)
+    {
+        for request in requests {
+            if let Some(expires_at) = request.expires_at {
+                if now >= expires_at {
+                    continue;
+                }
+            }
+            let name = store
+                .get_skill_candidate(&request.candidate_id)
+                .ok()
+                .flatten()
+                .map(|candidate| candidate.name)
+                .unwrap_or_else(|| request.candidate_id.clone());
+            pending_approvals.push(crate::engineering_context::PendingApprovalNudge {
+                name: redacted_bounded(&name, MAX_CONTEXT_SKILL_NAME_CHARS),
+                request_id: request.request_id,
+                proposed_action: request.proposed_action,
+                question: redacted_bounded(&request.question, MAX_CONTEXT_APPROVAL_QUESTION_CHARS),
+            });
+        }
+    }
+
+    if applicable.is_empty() && pending_approvals.is_empty() {
+        None
+    } else {
+        Some(crate::engineering_context::SkillNudges {
+            applicable,
+            pending_approvals,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -458,5 +595,449 @@ mod tests {
         let first = build_context_packet(&store, ws.path(), "task", &[], None).unwrap();
         let second = build_context_packet(&store, ws.path(), "task", &[], None).unwrap();
         assert_eq!(first, second, "guard output must be byte-stable");
+    }
+
+    // ── WS6: advisory skill nudges on the context path ───────────────────
+
+    use codebro_context_runtime::{
+        ApprovalResponse, SkillApplicability, SkillCandidate, SkillCandidateStatus,
+    };
+
+    fn valid_skill_content(name: &str) -> String {
+        format!(
+            "---\nname: {name}\ndescription: A test skill for {name}\n---\n\n\
+             # Purpose\n\nTest procedure body."
+        )
+    }
+
+    // Approval TTLs are real-time (the packet filters expired requests from
+    // the display), so fixtures use the wall clock rather than a fixed epoch.
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn seed_candidate(
+        store: &ContextStore,
+        id: &str,
+        name: &str,
+        ws: &str,
+        scope: &str,
+        description: &str,
+    ) -> SkillCandidate {
+        let candidate = SkillCandidate {
+            candidate_id: id.to_string(),
+            workspace_root: Some(ws.to_string()),
+            task_id: None,
+            scope: scope.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+            purpose: "Testing".to_string(),
+            applicability: SkillApplicability::default(),
+            source_learning_candidates: vec![],
+            supporting_evidence: vec![],
+            contradicting_evidence: vec![],
+            proposed_content: valid_skill_content(name),
+            status: "candidate".to_string(),
+            confidence: 0.75,
+            validation: None,
+            eval_reason: None,
+            rejection_reason: None,
+            supersedes_skill: None,
+            based_on_version: None,
+            created_at: 1000,
+            updated_at: 1000,
+            expires_at: None,
+        };
+        store.insert_skill_candidate(&candidate).unwrap();
+        store
+            .transition_skill_candidate(id, SkillCandidateStatus::Evaluating, None, 1001)
+            .unwrap();
+        store
+            .promote_candidate_to_draft(id, &valid_skill_content(name), 1002)
+            .unwrap();
+        store
+            .transition_skill_candidate(id, SkillCandidateStatus::Validated, None, 1003)
+            .unwrap()
+    }
+
+    fn publish_skill(
+        store: &ContextStore,
+        skill_root: &Path,
+        id: &str,
+        name: &str,
+        ws: &str,
+        description: &str,
+    ) {
+        seed_candidate(store, id, name, ws, "global", description);
+        let now = now_secs();
+        let request = store
+            .create_skill_approval_request(id, ws, None, "approve", None, now)
+            .unwrap();
+        let outcome = store
+            .respond_to_skill_approval_request(
+                &request.request_id,
+                ws,
+                None,
+                ApprovalResponse::Approve,
+                None,
+                None,
+                Some(skill_root),
+                now + 1,
+            )
+            .unwrap();
+        assert_eq!(outcome.status, "approved");
+    }
+
+    fn nudge_names(value: &serde_json::Value, section: &str) -> Vec<String> {
+        value["skills"][section]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn applicable_skill_nudge_appears_for_matching_task() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let skill_root = state.path().join("skills");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        let store = ContextStore::at_state_dir(state.path().to_path_buf());
+        let ws_str = ws.path().to_str().unwrap();
+        publish_skill(
+            &store,
+            &skill_root,
+            "sc::nudge01",
+            "parser-refactor",
+            ws_str,
+            "Refactor the parser subsystem safely",
+        );
+
+        let out =
+            build_context_packet(&store, ws.path(), "refactor the parser plumbing", &[], None)
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let names = nudge_names(&value, "applicable");
+        assert_eq!(
+            names,
+            vec!["parser-refactor".to_string()],
+            "matching skill nudged: {names:?}"
+        );
+        let nudge = &value["skills"]["applicable"][0];
+        assert!(nudge["description"].as_str().unwrap().contains("parser"));
+        assert_eq!(nudge["scope"], "global");
+        assert_eq!(nudge["version"], 1);
+        assert!(value["skills"].get("pending_approvals").is_some());
+    }
+
+    #[test]
+    fn irrelevant_skill_is_not_nudged() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let skill_root = state.path().join("skills");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        let store = ContextStore::at_state_dir(state.path().to_path_buf());
+        let ws_str = ws.path().to_str().unwrap();
+        publish_skill(
+            &store,
+            &skill_root,
+            "sc::nudge02",
+            "pasta-cooker",
+            ws_str,
+            "Cooking pasta recipes for family dinner",
+        );
+
+        let out =
+            build_context_packet(&store, ws.path(), "refactor parser plumbing", &[], None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            nudge_names(&value, "applicable").is_empty(),
+            "unrelated skill must not be nudged: {}",
+            value["skills"]
+        );
+        assert!(
+            value.get("skills").is_none(),
+            "no nudges means no skills section"
+        );
+    }
+
+    #[test]
+    fn pending_approval_nudge_appears_for_own_workspace() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = ContextStore::at_state_dir(state.path().to_path_buf());
+        let ws_str = ws.path().to_str().unwrap();
+        seed_candidate(
+            &store,
+            "sc::nudge03",
+            "outcome-reporter",
+            ws_str,
+            "global",
+            "Reports task outcomes",
+        );
+        let request = store
+            .create_skill_approval_request("sc::nudge03", ws_str, None, "approve", None, now_secs())
+            .unwrap();
+
+        let out = build_context_packet(&store, ws.path(), "any task", &[], None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let names = nudge_names(&value, "pending_approvals");
+        assert_eq!(names, vec!["outcome-reporter".to_string()]);
+        let nudge = &value["skills"]["pending_approvals"][0];
+        assert_eq!(nudge["request_id"], request.request_id);
+        assert_eq!(nudge["proposed_action"], "approve");
+        assert!(!nudge["question"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_approval_from_another_workspace_is_not_nudged() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let store = ContextStore::at_state_dir(state.path().to_path_buf());
+        let other_str = other.path().to_str().unwrap();
+        seed_candidate(
+            &store,
+            "sc::nudge04",
+            "foreign-approval",
+            other_str,
+            "global",
+            "Belongs to another workspace",
+        );
+        store
+            .create_skill_approval_request(
+                "sc::nudge04",
+                other_str,
+                None,
+                "approve",
+                None,
+                now_secs(),
+            )
+            .unwrap();
+
+        let out = build_context_packet(&store, ws.path(), "any task", &[], None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            nudge_names(&value, "pending_approvals").is_empty(),
+            "requests scoped to another workspace never surface: {}",
+            value["skills"]
+        );
+    }
+
+    #[test]
+    fn nudges_are_bounded_and_descriptions_capped() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let skill_root = state.path().join("skills");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        let store = ContextStore::at_state_dir(state.path().to_path_buf());
+        let ws_str = ws.path().to_str().unwrap();
+        let long = format!("Refactor parser subsystem {}", "detail ".repeat(400));
+        let now = now_secs();
+        for index in 0..5 {
+            publish_skill(
+                &store,
+                &skill_root,
+                &format!("sc::bound{index:02}"),
+                &format!("parser-skill-{index}"),
+                ws_str,
+                &long,
+            );
+            seed_candidate(
+                &store,
+                &format!("sc::pend{index:02}"),
+                &format!("pending-skill-{index}"),
+                ws_str,
+                "global",
+                "Pending approval fixture",
+            );
+            store
+                .create_skill_approval_request(
+                    &format!("sc::pend{index:02}"),
+                    ws_str,
+                    None,
+                    "approve",
+                    None,
+                    now + index as u64,
+                )
+                .unwrap();
+        }
+
+        let out =
+            build_context_packet(&store, ws.path(), "refactor the parser", &[], None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let applicable = value["skills"]["applicable"].as_array().unwrap();
+        assert_eq!(applicable.len(), MAX_CONTEXT_APPLICABLE_SKILLS);
+        for nudge in applicable {
+            let description = nudge["description"].as_str().unwrap();
+            assert!(
+                description.chars().count() <= MAX_CONTEXT_SKILL_DESCRIPTION_CHARS + 1,
+                "description capped ({} chars)",
+                description.chars().count()
+            );
+        }
+        let pending = value["skills"]["pending_approvals"].as_array().unwrap();
+        assert_eq!(pending.len(), MAX_CONTEXT_PENDING_APPROVALS);
+        for nudge in pending {
+            assert!(
+                nudge["question"].as_str().unwrap().chars().count()
+                    <= MAX_CONTEXT_APPROVAL_QUESTION_CHARS + 1
+            );
+        }
+    }
+
+    #[test]
+    fn secret_shaped_text_in_nudges_is_redacted() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let skill_root = state.path().join("skills");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        let store = ContextStore::at_state_dir(state.path().to_path_buf());
+        let ws_str = ws.path().to_str().unwrap();
+        publish_skill(
+            &store,
+            &skill_root,
+            "sc::redact01",
+            "parser-secrets",
+            ws_str,
+            "Refactor the parser using api_key=sk-abcdefgh12345678 for the gate",
+        );
+        seed_candidate(
+            &store,
+            "sc::redact02",
+            "pending-secrets",
+            ws_str,
+            "global",
+            "Refactor the parser pending approval",
+        );
+        store
+            .create_skill_approval_request(
+                "sc::redact02",
+                ws_str,
+                None,
+                "approve",
+                Some("Approve with token ghp_abcdefghijklmnopqrstuvwxyz0123456789?"),
+                now_secs(),
+            )
+            .unwrap();
+
+        let out =
+            build_context_packet(&store, ws.path(), "refactor the parser", &[], None).unwrap();
+        assert!(
+            !out.contains("sk-abcdefgh12345678"),
+            "secret-shaped skill text must not survive the packet"
+        );
+        assert!(
+            !out.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+            "secret-shaped approval question must not survive the packet"
+        );
+        assert!(out.contains("[REDACTED]"), "redaction marker present");
+    }
+
+    #[test]
+    fn skill_nudges_do_not_disturb_the_intent_guard() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let skill_root = state.path().join("skills");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        let foreign_base = foreign
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let store = ContextStore::at_state_dir(state.path().to_path_buf());
+        let ws_str = ws.path().to_str().unwrap();
+        publish_skill(
+            &store,
+            &skill_root,
+            "sc::guard01",
+            "parser-refactor",
+            ws_str,
+            "Refactor the parser subsystem safely",
+        );
+        put(
+            &store,
+            "ctx::foreign",
+            RecordKind::Preference,
+            RecordScope::Project,
+            "foreign project knowledge",
+            Some(foreign.path().to_str().unwrap()),
+        );
+        put(
+            &store,
+            "ctx::leak",
+            RecordKind::Preference,
+            RecordScope::Global,
+            &format!("In {foreign_base} always run the soak suite"),
+            None,
+        );
+
+        let out =
+            build_context_packet(&store, ws.path(), "refactor the parser", &[], None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["guard"]["verdict"], "review");
+        assert_eq!(value["guard"]["excluded_records"][0], "ctx::leak");
+        assert_eq!(
+            nudge_names(&value, "applicable"),
+            vec!["parser-refactor".to_string()],
+            "guard and skills coexist"
+        );
+    }
+
+    #[test]
+    fn packet_fails_open_when_skill_queries_cannot_run() {
+        // Point the store at a path that can never be a database: skill
+        // queries fail, yet the packet still composes (no skills section).
+        let ws = tempfile::tempdir().unwrap();
+        let broken = ws.path().join("not-a-database");
+        std::fs::write(&broken, b"blocker").unwrap();
+        let store = ContextStore::at_state_dir(broken);
+
+        let out =
+            build_context_packet(&store, ws.path(), "refactor the parser", &[], None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            value.get("skills").is_none(),
+            "unavailable store omits nudges: {}",
+            value["skills"]
+        );
+    }
+
+    #[test]
+    fn structural_digest_still_carries_pending_approvals() {
+        // Session-start digests have no task, so applicability cannot be
+        // ranked — but a pending approval is task-independent and must
+        // still reach the human.
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = ContextStore::at_state_dir(state.path().to_path_buf());
+        let ws_str = ws.path().to_str().unwrap();
+        seed_candidate(
+            &store,
+            "sc::nudge05",
+            "outcome-reporter",
+            ws_str,
+            "global",
+            "Reports task outcomes",
+        );
+        store
+            .create_skill_approval_request("sc::nudge05", ws_str, None, "approve", None, now_secs())
+            .unwrap();
+
+        let out = build_context_packet(&store, ws.path(), "", &[], None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(nudge_names(&value, "applicable").is_empty());
+        assert_eq!(
+            nudge_names(&value, "pending_approvals"),
+            vec!["outcome-reporter".to_string()]
+        );
     }
 }
