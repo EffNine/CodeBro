@@ -2523,6 +2523,45 @@ mod tests {
     }
 
     #[test]
+    fn guard_report_travels_with_the_brief_and_is_omitted_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store = sample_store();
+        let ctx = crate::context_runtime::ContextStore::at_state_dir(state.path().to_path_buf());
+        let identity = blank_identity();
+        let report = crate::intent_guard::IntentGuardReport {
+            verdict: crate::intent_guard::GuardVerdict::Review,
+            identity_checked: true,
+            identity_matched: false,
+            intent_coverage: "none".to_string(),
+            known_workspaces: 1,
+            excluded_records: vec!["ctx::foreign".to_string()],
+            flagged_records: Vec::new(),
+            signals: vec![crate::intent_guard::GuardSignal {
+                code: "identity_mismatch".to_string(),
+                severity: crate::intent_guard::GuardSeverity::Warn,
+                detail: "test finding".to_string(),
+            }],
+        };
+        let mut inputs = temp_inputs(&dir, &state, &store, &ctx, &identity, &[]);
+        inputs.guard = Some(&report);
+        let brief = assemble(&inputs, &brief_request("verify token")).unwrap();
+        let guard = brief.guard.expect("guard travels with the brief");
+        assert_eq!(guard.verdict, crate::intent_guard::GuardVerdict::Review);
+        assert_eq!(guard.excluded_records, vec!["ctx::foreign".to_string()]);
+
+        // Without a guard the field is omitted entirely (byte-compatible).
+        let plain = assemble(
+            &temp_inputs(&dir, &state, &store, &ctx, &identity, &[]),
+            &brief_request("verify token"),
+        )
+        .unwrap();
+        assert!(plain.guard.is_none());
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("guard").is_none());
+    }
+
+    #[test]
     fn ambiguous_keywords_report_ambiguity_without_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();

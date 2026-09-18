@@ -67,6 +67,10 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 pub const MAX_IMPORT_ROWS_PER_TABLE: usize = 50_000;
 /// Total row bound for one import.
 pub const MAX_IMPORT_TOTAL_ROWS: usize = 200_000;
+/// Per-file byte bound for one import section.
+pub const MAX_IMPORT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Total byte bound for one import bundle.
+pub const MAX_IMPORT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Tables written by an export (mirror completeness; matches the existing
 /// `~/memory/export` layout).
@@ -324,10 +328,31 @@ fn load_bundle(dir: &Path) -> Result<LoadedBundle, String> {
 
     let mut rows: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     let mut total = 0usize;
+    let mut total_bytes = 0u64;
     for table in manifest.tables.keys() {
+        // Table names become file names: only known sections are legal.
+        // This is authorization *before* path construction — a crafted
+        // manifest cannot make the importer read outside the bundle.
+        if !EXPORT_TABLES.contains(&table.as_str()) {
+            return Err(format!("malformed manifest: unknown table '{table}'"));
+        }
         let path = dir.join(format!("{table}.jsonl"));
         if !path.is_file() {
             continue; // an absent section is an empty section
+        }
+        let size = std::fs::metadata(&path)
+            .map_err(|e| format!("stat {}: {e}", path.display()))?
+            .len();
+        if size > MAX_IMPORT_FILE_BYTES {
+            return Err(format!(
+                "{table}.jsonl exceeds the {MAX_IMPORT_FILE_BYTES}-byte import bound"
+            ));
+        }
+        total_bytes += size;
+        if total_bytes > MAX_IMPORT_TOTAL_BYTES {
+            return Err(format!(
+                "bundle exceeds the {MAX_IMPORT_TOTAL_BYTES}-byte import bound"
+            ));
         }
         let body =
             std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -1910,6 +1935,36 @@ mod tests {
             .unwrap();
         assert!(!versions[0].content.contains(SECRET));
         assert_eq!(versions[0].content_hash, content_hash(&versions[0].content));
+    }
+
+    #[test]
+    fn crafted_manifest_table_names_cannot_escape_the_bundle() {
+        let parent = tempfile::tempdir().unwrap();
+        let bundle = parent.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(
+            parent.path().join("victim.jsonl"),
+            "{\"id\":\"ctx::victim\"}\n",
+        )
+        .unwrap();
+        let manifest = PortableManifest {
+            format_version: Some(1),
+            generated_at: "0".to_string(),
+            data_hash: "0".repeat(64),
+            counts: BTreeMap::new(),
+            source_db: None,
+            tables: BTreeMap::from([("../victim".to_string(), Vec::new())]),
+        };
+        std::fs::write(
+            bundle.join(MANIFEST_FILE),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let target = tempfile::tempdir().unwrap();
+        let err = import_mirror(&store_at(&target), &bundle, &options("/tmp/ws")).unwrap_err();
+        assert!(err.contains("unknown table"), "unexpected: {err}");
+        assert!(!target.path().join(crate::db::STATE_DB_FILE).exists());
     }
 
     #[test]

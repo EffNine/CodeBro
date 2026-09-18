@@ -131,7 +131,16 @@ codebro facts diff # Diff current repo state vs last index + impact projection
 codebro list-models # List models from configured provider
 codebro consult    # Ask Conductor a question directly
 codebro auth status # Check consultant provider auth
+codebro context    # Bounded context packet (host/hook surface, read-only)
+codebro export     # Export portable memory (records, history, skills)
+codebro import     # Import a portable memory export (verified, redacted)
 ```
+
+Portable memory is explicit and safe: `codebro export --out <dir>` writes a
+versioned, secret-redacted manifest + JSONL bundle; `codebro import --file
+<dir> --root <workspace>` verifies integrity, validates before writing,
+preserves authority verbatim, never overwrites newer local state, and is
+idempotent. See [docs/design/PORTABILITY.md](docs/design/PORTABILITY.md).
 
 ## Links
 

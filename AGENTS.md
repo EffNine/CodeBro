@@ -7,7 +7,7 @@
 - **Positioning:** Engineering context & memory layer for AI coding agents, exposed as an MCP server. OpenCode (or any MCP agent client) is the brain/executor; CodeBro owns context, memory, history, learning, skills lifecycle, durable task state,   repository intelligence, and the Engineering Brief (P8 contract: `docs/evolution/P8_IMPLEMENTATION.md`; P9 outcome loop: `docs/evolution/P9_IMPLEMENTATION.md`).
 - **Tests:** `cargo test`. Focused: `cargo test <module_name>`. Trust current output — test counts evolve.
 - **Build:** `cargo build --release && cargo install --path crates/mcp-server`
-- **CLI:** `codebro serve --root <path>`, `codebro init --root <path>`, `codebro doctor --root <path>`, `codebro list-models`, `codebro facts diff --root <path>`, `codebro context --root <path> [--task <text>] [--keyword <text>]... [--task-id <id>] [--pretty]` (read-only host/hook context packet; same assembly as the MCP `context` tool).
+- **CLI:** `codebro serve --root <path>`, `codebro init --root <path>`, `codebro doctor --root <path>`, `codebro list-models`, `codebro facts diff --root <path>`, `codebro context --root <path> [--task <text>] [--keyword <text>]... [--task-id <id>] [--pretty]` (read-only host/hook context packet; same assembly as the MCP `context` tool), `codebro export --out <dir> [--json]` and `codebro import --file <dir> [--root <ws>] [--map OLD=NEW]... [--dry-run] [--no-publish] [--origin <label>] [--json]` (explicit portable-memory transport; see `docs/design/PORTABILITY.md`).
 - **OpenCode integration:** `integrations/opencode/` — host-driven plugin (`codebro-context.js`) that injects a bounded `codebro context` digest at session start and before compaction. Read-only, fail-open, workspace-gated; no daemon. Tests: `node --test integrations/opencode/test/codebro-context.test.mjs`.
 - **Config:** Optional `~/.codebro/config.toml`. Env vars honoured: `CODEBRO_API_KEY`, `CODEBRO_BASE_URL`, `CODEBRO_MODEL`.
 - **Sandbox config:** `OPEN_SANDBOX_URL` activates the OpenSandbox backend. When configured but unavailable, execution fails closed — no silent Local fallback.
@@ -68,14 +68,14 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 | `reindex` | write | Full fact reindex via `codebro init` pipeline |
 | `repository_health` | read | Workspace health report (delegates to `codebro doctor`) |
 | `consult` | write | Ask Conductor gateway for opinions (provider/mode shaped) |
-| `context` | read | Always-available context packet: repository orientation + fact counts, task-relevant facts/decisions/memory/evidence, and resolved context records (per-namespace task > project > global winners + actionable intents, tagged kind/scope/authority). `task_id` includes task-scoped overrides. Task optional; read-only, never writes project or user state |
+| `context` | read | Always-available context packet: repository orientation + fact counts, task-relevant facts/decisions/memory/evidence, resolved context records (per-namespace task > project > global winners + actionable intents, tagged kind/scope/authority), and the WS4 intent-guard report (`guard`: verdict/signals/excluded ids; foreign global records excluded, cross-project records flagged — see `docs/design/INTENT_GUARD.md`). `task_id` includes task-scoped overrides. Task optional; read-only, never writes project or user state |
 | `remember` | write | Persist explicitly-confirmed user context (preference or intent) with provenance/scope/lifecycle. `USER_CONFIRMED` requires `user_confirmed=true`; observed/inferred require evidence. Serializes on the workspace mutation lock |
 | `forget` | write | Retire a context record by id/namespace (reversible reject; `permanent=true` removes). Requires `confirm=true`. Workspace-confined. Serializes on the workspace mutation lock |
 | `recall` | read/write | Historical evidence on demand (search, default; read-only) plus session lifecycle: `sessions` (read-only inventory), `title` and `close` (explicit writes, serialized on the workspace mutation lock, never automatic). Session-grouped bounded excerpts (decisions, failures, validations, changes) with session/timestamp/scope/task provenance; closed sessions remain searchable and expose their bounded finalization summary; a second `close` returns the durable ending unchanged (no rewrite, no duplicate history). Task history invisible without its task; `scope=global` opts into cross-workspace search. Search/sessions write nothing |
 | `learn` | write | Cautious hypotheses from history: run/propose detect recurring patterns (deterministic, ≥3 support); list/get inspect with explanations; evaluate weighs supporting vs contradicting evidence (bounded confidence); accepted hypotheses persist as AI_INFERRED (never USER_CONFIRMED); confirm requires user_confirmed=true; reject preserves negative knowledge. No learn action writes history. Serializes mutating actions on the workspace mutation lock |
 | `skill` | write | Skill lifecycle: discover, propose, inspect, validate, approve, reject, deprecate, rollback, health, applicable (deterministic context-aware selection with reasons), skill_context (minimal first-class packet: required/optional/constraints, bounded excerpts), request_approval (emits needs_input + question + options for OpenCode's native UI), respond (approve/reject/modify/defer with replay + stale + scope + expiry guards; modify supersedes the parent candidate when it forks a successor), detect_reuse (P11: mine repeated successful workflows into evidence-backed candidates; explicitly invoked, never publishes), detect_evolution (P13: mine recurring skill-linked failures into evidence-backed successor-version candidates; explicitly invoked, never publishes), validate_evolution / compare_versions (P15: compare two skill versions on attributed execution evidence with a conservative improvement verdict; explicitly invoked read-only comparison — never publishes, never rolls back). Evidence-backed candidates (accepted P3 learning only), immutable versioned publication, secret-redacted descriptions/purposes at propose (all identity free-text likewise redacted at update_identity), `user_confirmed`-gated approval, optimistic-concurrency stale-writer refusal, workspace/scope enforcement on every action, atomic + symlink-safe SKILL.md publication, deprecation removes the artifact. Approval decisions persist as history evidence (`user_confirmed` for human answers, `ai_inferred` for model-initiated requests). CodeBro owns lifecycle; OpenCode executes skills natively |
 | `task` | write | Durable engineering task runtime: list, stale, create, inspect, start, pause, resume, checkpoint, validate, validation_result, complete, fail, cancel, outcome (P9: structured outcome evidence — classification + bounded evidence + authority, no transition), skill_refs. Strict lifecycle (pending → running → paused/validating → completed/failed/cancelled) with a completion gate (passed validation required) and the execution-state gate (`complete` and `outcome=success` refused while unresolved compile/test failures apply to the current tree), immutable versioned checkpoints (atomic row+pointer+event in one tx), worker leases with fencing (`wkr::` ids, `lease_version`; stale workers refused), `based_on_version` optimistic concurrency, idempotency-key dedup, interrupted tasks recoverable only via explicit resume (never auto-completed), bounded resume snapshots, workspace isolation at every seam, every free-text field (incl. skill refs) redacted. Request-driven — no scheduler/daemon; OpenCode remains the executor |
-| `engineering_brief` | read | P7 decision support: bounded deterministic brief (task + repo intelligence + impact + health + history + memory + learning + skills + task state + constraints/decisions/risks/unknowns). Read-only; OpenCode decides |
+| `engineering_brief` | read | P7 decision support: bounded deterministic brief (task + repo intelligence + impact + health + history + memory + learning + skills + task state + constraints/decisions/risks/unknowns), plus the same WS4 intent-guard report the `context` packet carries (records are resolved through the same guarded path, so both surfaces agree on what was excluded). Read-only; OpenCode decides |
 
 ## P8 integration contract (agent clients)
 
@@ -327,6 +327,38 @@ successful, but compliance with the P9 outcome convention stays
 workflow-level (measurable via the existing per-call stderr line ratio).
 
 The gate can only speak about evidence CodeBro actually observed.
+
+## Intent guard & portability (WS4/WS5)
+
+**Intent guard (WS4).** Context assembly runs a deterministic, read-only
+guard after fingerprint resolution (`crates/mcp-server/src/intent_guard.rs`,
+`docs/design/INTENT_GUARD.md`). It excludes *global* records that name
+exactly one other known workspace and not the current project, flags
+cross-project records (annotated `ambiguous_project_reference`), never
+excludes intents (only flags), never content-scans project/task-scoped
+records (scope is authoritative), and reports a bounded verdict
+(`aligned | review | unverified`) with `warn`/`info` signals on both the
+`context` packet and the `engineering_brief`. Matching is lexical on
+normalized identifiers — no LLM, no embeddings, no clock. The guard never
+writes and never promotes authority. Known workspaces come from
+`ContextStore::distinct_project_workspace_roots` (project-scoped records
+only). Signal details contain record ids and workspace basenames, never
+record content.
+
+**Portability (WS5).** `codebro export` / `codebro import` move durable
+memory explicitly (no daemon, no sync, no MCP tool; see
+`docs/design/PORTABILITY.md`). Export is deterministic, read-only, and
+redacted. Import verifies integrity (strict hash for v1 bundles, count
+verification for legacy mirrors), validates every row before the first
+write, remaps workspaces (`--map OLD=NEW`, or `--root` for a single-source
+bundle), remaps evidence citations to local event ids (unresolvable
+citations refuse the record), preserves authority verbatim (never promotes
+to `user_confirmed`, never downgrades a confirmed local record), never
+overwrites newer local state, and inserts skills/candidates without
+transitions. History is imported verbatim even when its workspace is
+unmapped so global records' citations resolve; project rows for unmapped
+workspaces are skipped. Import is idempotent — a re-run converges.
+`import` is CLI-only by design: no agent can trigger cross-device merges.
 
 ## Development workflow
 
