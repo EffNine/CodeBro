@@ -52,6 +52,25 @@ const PACKET = {
   memory: [
     { key: "architecture:loop", value: "Curator exports a portable mirror", confidence: 0.9, truncated: false },
   ],
+  skills: {
+    applicable: [
+      {
+        name: "parser-refactor",
+        description: "Refactor parser subsystems safely",
+        version: 1,
+        scope: "global",
+        reason: "task intent overlaps skill purpose/description (parser)",
+      },
+    ],
+    pending_approvals: [
+      {
+        name: "outcome-reporter",
+        request_id: "apr::5af23648513ec61a",
+        proposed_action: "approve",
+        question: "Approve publishing skill 'outcome-reporter'?",
+      },
+    ],
+  },
   notes: ["structural digest"],
 };
 
@@ -142,11 +161,61 @@ test("injects a bounded context digest into the system prompt", async () => {
       assert.match(system[0], /intent\.demo-intent/);
       assert.match(system[0], /Keep the combo simple and seamless/);
       assert.match(system[0], /Execution state: verified/);
+      assert.match(system[0], /applicable skill: parser-refactor/);
+      assert.match(system[0], /pending skill approval: outcome-reporter/);
+      assert.match(system[0], /apr::5af23648513ec61a/);
       assert.match(system[0], /codebro MCP tools/);
     });
   } finally {
     cleanup();
   }
+});
+
+test("skill nudges are advisory, bounded, and optional", () => {
+  const digest = renderDigest(PACKET, 6000, "/tmp/demo-repo");
+  assert.match(digest, /applicable skill: parser-refactor — Refactor parser/);
+  assert.match(digest, /pending skill approval: outcome-reporter/);
+  assert.match(digest, /never publishes or approves automatically/);
+
+  const noSkills = { ...PACKET, skills: undefined };
+  const plain = renderDigest(noSkills, 6000, "/tmp/demo-repo");
+  assert.doesNotMatch(plain, /applicable skill/);
+  assert.doesNotMatch(plain, /pending skill approval/);
+
+  const malformed = {
+    ...PACKET,
+    skills: {
+      applicable: [null, "nope", { name: "ok-skill", description: "x".repeat(500) }],
+      pending_approvals: [null, {}],
+    },
+  };
+  const safe = renderDigest(malformed, 6000, "/tmp/demo-repo");
+  assert.match(safe, /applicable skill: ok-skill/);
+  assert.ok(safe.length > 0);
+
+  const capped = renderDigest(PACKET, 120, "/tmp/demo-repo");
+  assert.ok(capped.length <= 120, `capped (${capped.length})`);
+});
+
+test("skill nudge lines never exceed their per-field trim", () => {
+  const longName = "n".repeat(300);
+  const longDescription = "d".repeat(1000);
+  const packet = {
+    ...PACKET,
+    skills: {
+      applicable: [{ name: longName, description: longDescription }],
+      pending_approvals: [{ name: longName, request_id: "r".repeat(200) }],
+    },
+  };
+  const digest = renderDigest(packet, 6000, "/tmp/demo-repo");
+  const skillLine = digest.split("\n").find((line) => line.startsWith("- applicable skill:"));
+  // Prefix 21 + name ≤80 + separator 3 + description ≤160.
+  assert.ok(skillLine.length <= 264, `bounded skill line (${skillLine.length})`);
+  const approvalLine = digest
+    .split("\n")
+    .find((line) => line.startsWith("- pending skill approval:"));
+  // Prefix 26 + name ≤80 + suffix 28 + " (id)" ≤43.
+  assert.ok(approvalLine.length <= 177, `bounded approval line (${approvalLine.length})`);
 });
 
 test("passes the first user message as the task, once", async () => {

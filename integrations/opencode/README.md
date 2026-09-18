@@ -83,7 +83,10 @@ CodeBro itself is untouched.
 
 ## Scope
 
-Read-only. The plugin never writes to CodeBro stores, never approves skills,
-and never executes project code. Pending skill approvals and learned-pattern
-nudges are deliberately out of scope here (they require approval surfaces
-owned by the host).
+Read-only. The plugin never writes to CodeBro stores, never approves or
+rejects a skill, and never executes project code. Skill nudges in the digest
+are advisory: applicable skills and pending approval requests are surfaced
+for the human, who resolves approvals through the agent's `skill respond`
+path — the plugin itself never mutates a skill and never triggers an agent
+loop. Learned-pattern nudges remain out of scope here (they require approval
+surfaces owned by the host).

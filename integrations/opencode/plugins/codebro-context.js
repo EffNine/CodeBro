@@ -10,6 +10,11 @@
 //   - Workspace-gated: only runs where `.codebro/facts.json` exists (an
 //     indexed workspace), unless CODEBRO_CONTEXT_ALWAYS=1 is set.
 //
+// Skill nudges are advisory only: the digest may surface applicable skills
+// and pending approval requests, but the plugin NEVER approves, rejects,
+// publishes, or mutates a skill, and never triggers an agent loop. Approval
+// stays a human act via the agent's `skill respond` path.
+//
 // Env knobs:
 //   CODEBRO_CONTEXT_DISABLED=1   disable the plugin entirely
 //   CODEBRO_BIN=/path/to/codebro  explicit binary (else PATH, else ~/.local/bin)
@@ -117,6 +122,27 @@ export function renderDigest(packet, maxChars, root) {
           item.truncated ? " …" : ""
         }`
       );
+    }
+  }
+  const skills = packet.skills && typeof packet.skills === "object" ? packet.skills : null;
+  if (skills) {
+    const applicable = Array.isArray(skills.applicable) ? skills.applicable : [];
+    const pending = Array.isArray(skills.pending_approvals) ? skills.pending_approvals : [];
+    if (applicable.length || pending.length) {
+      lines.push("Skills (advisory — CodeBro never publishes or approves automatically):");
+      for (const skill of applicable.slice(0, 5)) {
+        if (!skill || typeof skill !== "object") continue;
+        lines.push(
+          `- applicable skill: ${trim(skill.name, 80)} — ${trim(skill.description, 160)}`
+        );
+      }
+      for (const approval of pending.slice(0, 5)) {
+        if (!approval || typeof approval !== "object") continue;
+        const request = approval.request_id ? ` (${trim(approval.request_id, 40)})` : "";
+        lines.push(
+          `- pending skill approval: ${trim(approval.name, 80)} — approve via skill respond${request}`
+        );
+      }
     }
   }
   lines.push(
