@@ -7,7 +7,8 @@
 - **Positioning:** Engineering context & memory layer for AI coding agents, exposed as an MCP server. OpenCode (or any MCP agent client) is the brain/executor; CodeBro owns context, memory, history, learning, skills lifecycle, durable task state,   repository intelligence, and the Engineering Brief (P8 contract: `docs/evolution/P8_IMPLEMENTATION.md`; P9 outcome loop: `docs/evolution/P9_IMPLEMENTATION.md`).
 - **Tests:** `cargo test`. Focused: `cargo test <module_name>`. Trust current output — test counts evolve.
 - **Build:** `cargo build --release && cargo install --path crates/mcp-server`
-- **CLI:** `codebro serve --root <path>`, `codebro init --root <path>`, `codebro doctor --root <path>`, `codebro list-models`, `codebro facts diff --root <path>`.
+- **CLI:** `codebro serve --root <path>`, `codebro init --root <path>`, `codebro doctor --root <path>`, `codebro list-models`, `codebro facts diff --root <path>`, `codebro context --root <path> [--task <text>] [--keyword <text>]... [--task-id <id>] [--pretty]` (read-only host/hook context packet; same assembly as the MCP `context` tool).
+- **OpenCode integration:** `integrations/opencode/` — host-driven plugin (`codebro-context.js`) that injects a bounded `codebro context` digest at session start and before compaction. Read-only, fail-open, workspace-gated; no daemon. Tests: `node --test integrations/opencode/test/codebro-context.test.mjs`.
 - **Config:** Optional `~/.codebro/config.toml`. Env vars honoured: `CODEBRO_API_KEY`, `CODEBRO_BASE_URL`, `CODEBRO_MODEL`.
 - **Sandbox config:** `OPEN_SANDBOX_URL` activates the OpenSandbox backend. When configured but unavailable, execution fails closed — no silent Local fallback.
 - **stdio hygiene (P8):** `codebro serve` MUST keep stdout reserved for JSON-RPC. tracing and the indexer report write to stderr; never add `println!` to any `serve`-reachable path (the P8 E2E harness fails the suite on any non-JSON-RPC stdout line).

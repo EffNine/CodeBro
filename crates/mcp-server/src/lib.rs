@@ -12,6 +12,7 @@
 
 pub mod cli;
 pub mod consultant;
+pub mod context_packet;
 pub mod credentials;
 pub mod debugging;
 pub mod doctor;

@@ -94,8 +94,9 @@ fn assemble_server_with_registry(
 
 /// State directory for the user-context database: `CODEBRO_STATE_DIR`
 /// overrides the default `~/.codebro`. Resolution happens at construction;
-/// the database itself is opened lazily on first use.
-fn default_state_dir() -> PathBuf {
+/// the database itself is opened lazily on first use. Shared with the
+/// `codebro context` CLI verb via [`crate::context_packet`].
+pub(crate) fn default_state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CODEBRO_STATE_DIR") {
         return PathBuf::from(dir);
     }
@@ -2318,28 +2319,19 @@ impl CodeBroMcpServer {
         Parameters(args): Parameters<ContextArgs>,
     ) -> Result<CallToolResult, McpError> {
         let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
-        let request = crate::engineering_context::EngineeringContextRequest {
-            task: args.task.clone().unwrap_or_default(),
-            task_keywords: args.keywords.clone().unwrap_or_default(),
-            active_file_tags: Vec::new(),
-        };
-        let has_task = !request.is_empty();
         let task_id = args
             .task_id
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let records = self.context_record_excerpts(&ws, task_id, &request.keywords());
-        let packet = if has_task {
-            crate::engineering_context::compose(&ws.canonical_root, &request, &records)
-        } else {
-            crate::engineering_context::compose_structural(&ws.canonical_root, &records)
-        }
+        let payload = crate::context_packet::build_context_packet(
+            &self.context_store(),
+            &ws.canonical_root,
+            args.task.as_deref().unwrap_or_default(),
+            args.keywords.as_deref().unwrap_or_default(),
+            task_id,
+        )
         .map_err(|e| McpError::internal_error(e, None))?;
-        let value = serde_json::to_value(&packet)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let payload = crate::mcp::response_bounds::bounded_response(value)
-            .map_err(|e| McpError::internal_error(e, None))?;
         Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
     }
 
@@ -2361,56 +2353,12 @@ impl CodeBroMcpServer {
         task_id: Option<&str>,
         keywords: &[String],
     ) -> Vec<crate::engineering_context::ContextRecordExcerpt> {
-        use crate::context_runtime::{fingerprint, ContextRetriever};
-        let root = ws.canonical_root.display().to_string();
-        let store = self.context_store();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Fetch generously: resolution reduces, never expands. Keyword-less
-        // first (the always-available fingerprint), keyword matches merged
-        // in when a task narrows relevance.
-        let mut merged: std::collections::BTreeMap<String, crate::context_runtime::RankedRecord> =
-            std::collections::BTreeMap::new();
-        let mut fetch = |kw: Vec<String>| {
-            let query = crate::context_runtime::RecordQuery {
-                workspace_root: Some(root.as_str()),
-                task_id,
-                kind: None,
-                status: None,
-                keywords: kw,
-                limit: 100,
-            };
-            if let Ok(ranked) = ContextRetriever::search(&*store, &query, now) {
-                for r in ranked {
-                    merged.insert(r.record.id.clone(), r);
-                }
-            }
-        };
-        fetch(Vec::new());
-        if !keywords.is_empty() {
-            fetch(keywords.to_vec());
-        }
-        if merged.is_empty() {
-            // Distinguish "store unusable" from "store empty": a failed
-            // keyword-less fetch on an unusable store already degrades to
-            // empty here; warn once for observability.
-            tracing::debug!("context records: no rows visible for this viewpoint");
-        }
-        let scope = fingerprint::ResolutionScope {
-            workspace_key: Some(root.as_str()),
+        crate::context_packet::context_record_excerpts(
+            &self.context_store(),
+            &ws.canonical_root,
             task_id,
-        };
-        let resolved = fingerprint::resolve_context(merged.into_values().collect(), &scope);
-        resolved
-            .intents
-            .iter()
-            .chain(resolved.fingerprint.iter())
-            .chain(resolved.other.iter())
-            .take(crate::engineering_context::MAX_CONTEXT_RECORDS)
-            .map(crate::engineering_context::excerpt_from)
-            .collect()
+            keywords,
+        )
     }
 
     // ── Tool 19: remember (explicit user-context persistence) ──────────

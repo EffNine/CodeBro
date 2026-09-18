@@ -78,6 +78,30 @@ enum Commands {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+
+    /// Print the bounded engineering context packet (host/hook integration surface).
+    ///
+    /// Read-only: identical retrieval semantics, budgets, and provenance to
+    /// the `context` MCP tool. Omit --task for the structural session-start
+    /// digest. Emits one JSON document on stdout so host hooks (e.g. an
+    /// OpenCode plugin) can inject context without an MCP client.
+    Context {
+        /// Workspace root; defaults to CODEBRO_WORKSPACE_ROOT or the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// The task in the agent's own words; omit for a structural digest.
+        #[arg(long)]
+        task: Option<String>,
+        /// Extra keyword hints for fact/memory/record retrieval (repeatable).
+        #[arg(long = "keyword", value_name = "TEXT")]
+        keywords: Vec<String>,
+        /// Task identity for task-scoped context resolution (task > project > global).
+        #[arg(long = "task-id")]
+        task_id: Option<String>,
+        /// Pretty-print the JSON payload (default: single-line, hook-friendly).
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -257,6 +281,31 @@ pub async fn run() -> Result<()> {
             };
 
             println!("{}", response.answer);
+        }
+        Some(Commands::Context {
+            root,
+            task,
+            keywords,
+            task_id,
+            pretty,
+        }) => {
+            let workspace_root = crate::workspace::resolve_workspace_root(root)?;
+            let store = crate::context_packet::open_default_store();
+            let payload = crate::context_packet::build_context_packet(
+                &store,
+                &workspace_root,
+                task.as_deref().unwrap_or_default(),
+                &keywords,
+                task_id.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            )
+            .map_err(anyhow::Error::msg)?;
+            if pretty {
+                let value: serde_json::Value =
+                    serde_json::from_str(&payload).map_err(anyhow::Error::msg)?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("{payload}");
+            }
         }
     }
 
