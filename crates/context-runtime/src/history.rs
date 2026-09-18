@@ -53,6 +53,17 @@ pub const STALE_AFTER_SECS: u64 = 24 * 3600;
 /// Matches the context-excerpt convention (`…[truncated …]` vocabulary).
 pub const HISTORY_TRUNCATION_MARKER: &str = "…[truncated for history budget]";
 
+/// Bounds for explicit session-lifecycle inputs (`recall` actions `title`
+/// and `close`). Titles are human labels; summaries are bounded snapshots
+/// suitable for future recall; reasons are short end notes.
+pub const MAX_SESSION_TITLE_CHARS: usize = 120;
+pub const MAX_SESSION_SUMMARY_CHARS: usize = 2000;
+pub const MAX_SESSION_REASON_CHARS: usize = 200;
+/// Snapshot schema written by [`ContextStore::close_session_with_snapshot`].
+/// Bump only with a reader-compatible migration story; readers must treat
+/// unknown schemas and malformed JSON as "no summary", never as an error.
+pub const SESSION_SNAPSHOT_SCHEMA: u32 = 1;
+
 /// Minimal session lifecycle.
 ///
 /// There is deliberately no `Paused`/`Resumed`: a session is either open
@@ -140,6 +151,10 @@ pub struct SessionRecord {
     pub end_reason: Option<String>,
     /// Cached number of linked history events (maintained by the store).
     pub event_count: u64,
+    /// Finalization snapshot (bounded JSON; internal storage detail, never
+    /// serialized wholesale into responses — readers use [`summary_of`]).
+    #[serde(skip)]
+    pub snapshot_json: Option<String>,
 }
 
 impl SessionRecord {
@@ -629,11 +644,28 @@ pub(crate) fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sessio
         ended_at: row.get::<_, Option<i64>>(9)?.map(|t| t as u64),
         end_reason: row.get(10)?,
         event_count: row.get::<_, i64>(11)? as u64,
+        snapshot_json: row.get(12)?,
     })
 }
 
-const SESSION_COLUMNS: &str = "id, workspace_root, task_id, title, status, source,
-    parent_session_id, opened_at, updated_at, closed_at, end_reason, event_count";
+pub(crate) const SESSION_COLUMNS: &str = "id, workspace_root, task_id, title, status, source,
+    parent_session_id, opened_at, updated_at, closed_at, end_reason, event_count,
+    context_snapshot_json";
+
+/// Extract the human summary from a finalization snapshot, if any.
+///
+/// Defensive by contract: malformed JSON, a missing/non-string summary, or
+/// an unknown schema (forward compatibility) all resolve to `None` — a bad
+/// snapshot degrades recall, it never fails it.
+pub fn summary_of(snapshot_json: Option<&str>) -> Option<String> {
+    let raw = snapshot_json?;
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let summary = value.get("summary")?.as_str()?.trim();
+    if summary.is_empty() {
+        return None;
+    }
+    Some(summary.to_string())
+}
 
 impl ContextStore {
     // ── Sessions ──────────────────────────────────────────────────────
@@ -699,6 +731,7 @@ impl ContextStore {
                 ended_at: None,
                 end_reason: None,
                 event_count: 0,
+                snapshot_json: None,
             })
         })
     }
@@ -727,6 +760,117 @@ impl ContextStore {
         })
     }
 
+    /// Set a session's human-readable title. Explicit and deterministic:
+    /// unknown ids error, blank titles are refused, long input is truncated
+    /// (with the history marker) and secret-redacted, and re-setting the
+    /// same title is a stable no-op. Titles are metadata: `updated_at` is
+    /// deliberately NOT bumped, so staleness keeps its meaning ("last event
+    /// or touch", never "last edit of a label").
+    pub fn set_session_title(&self, id: &str, title: &str) -> Result<SessionRecord, ContextError> {
+        let cleaned = clean_text(title, MAX_SESSION_TITLE_CHARS);
+        let cleaned = cleaned.trim().to_string();
+        if cleaned.is_empty() {
+            return Err(ContextError::Validation(
+                "session title must not be blank".to_string(),
+            ));
+        }
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE sessions SET title = ?1 WHERE id = ?2
+                   AND (title IS NULL OR title != ?1)",
+                params![cleaned, id],
+            )?;
+            let record = conn
+                .query_row(
+                    &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
+                    [id],
+                    row_to_session,
+                )
+                .optional()
+                .map_err(|e| ContextError::Decode(e.to_string()))?;
+            record.ok_or_else(|| ContextError::Validation(format!("session {id} does not exist")))
+        })
+    }
+
+    /// Close a session terminally, atomically persisting a bounded
+    /// finalization snapshot when a non-blank `summary` is supplied.
+    ///
+    /// Only `Active` sessions can close — a second close is refused
+    /// (history must not rewrite an ending), and an unknown id errors.
+    /// Crash-interrupted sessions are never auto-closed here; they surface
+    /// via [`ContextStore::stale_sessions`]. The snapshot is a bounded JSON
+    /// envelope built here ([`SESSION_SNAPSHOT_SCHEMA`]); an absent or
+    /// failed summary never affects the close itself, and readers treat
+    /// malformed snapshots as "no summary" (see [`summary_of`]).
+    pub fn close_session_with_snapshot(
+        &self,
+        id: &str,
+        status: SessionStatus,
+        reason: Option<&str>,
+        summary: Option<&str>,
+        now: u64,
+    ) -> Result<SessionRecord, ContextError> {
+        if !status.is_terminal() {
+            return Err(ContextError::Validation(
+                "close_session requires a terminal status (completed or abandoned)".to_string(),
+            ));
+        }
+        let reason = reason
+            .map(|r| clean_text(r, MAX_SESSION_REASON_CHARS))
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty());
+        let summary = summary
+            .map(|s| clean_text(s, MAX_SESSION_SUMMARY_CHARS))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.with_conn(|conn| {
+            let (current, event_count): (String, i64) = conn
+                .query_row(
+                    "SELECT status, event_count FROM sessions WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| ContextError::Decode(e.to_string()))?
+                .ok_or_else(|| ContextError::Validation(format!("session {id} does not exist")))?;
+            if current != SessionStatus::Active.as_str() {
+                return Err(ContextError::Validation(format!(
+                    "only an active session can be closed (session {id} is {current})"
+                )));
+            }
+            let snapshot = summary.map(|s| {
+                serde_json::json!({
+                    "schema": SESSION_SNAPSHOT_SCHEMA,
+                    "summary": s,
+                    "status": status.as_str(),
+                    "closed_at": now,
+                    "event_count": event_count.max(0) as u64,
+                })
+                .to_string()
+            });
+            conn.execute(
+                "UPDATE sessions SET status = ?1, closed_at = ?2, updated_at = ?2,
+                    end_reason = ?3, context_snapshot_json = ?4
+                 WHERE id = ?5",
+                params![
+                    status.as_str(),
+                    now as i64,
+                    reason.as_deref(),
+                    snapshot.as_deref(),
+                    id
+                ],
+            )?;
+            let record = conn
+                .query_row(
+                    &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
+                    [id],
+                    row_to_session,
+                )
+                .map_err(|e| ContextError::Decode(e.to_string()))?;
+            Ok(record)
+        })
+    }
+
     /// Close a session terminally. Only `Active` sessions can close —
     /// a second close is refused (history must not rewrite an ending),
     /// and an unknown id errors. Crash-interrupted sessions are never
@@ -738,38 +882,7 @@ impl ContextStore {
         reason: Option<&str>,
         now: u64,
     ) -> Result<SessionRecord, ContextError> {
-        if !status.is_terminal() {
-            return Err(ContextError::Validation(
-                "close_session requires a terminal status (completed or abandoned)".to_string(),
-            ));
-        }
-        self.with_conn(|conn| {
-            let current: String = conn
-                .query_row("SELECT status FROM sessions WHERE id = ?1", [id], |row| {
-                    row.get(0)
-                })
-                .optional()
-                .map_err(|e| ContextError::Decode(e.to_string()))?
-                .ok_or_else(|| ContextError::Validation(format!("session {id} does not exist")))?;
-            if current != SessionStatus::Active.as_str() {
-                return Err(ContextError::Validation(format!(
-                    "only an active session can be closed (session {id} is {current})"
-                )));
-            }
-            conn.execute(
-                "UPDATE sessions SET status = ?1, closed_at = ?2, updated_at = ?2, end_reason = ?3
-                 WHERE id = ?4",
-                params![status.as_str(), now as i64, reason, id],
-            )?;
-            let record = conn
-                .query_row(
-                    &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
-                    [id],
-                    row_to_session,
-                )
-                .map_err(|e| ContextError::Decode(e.to_string()))?;
-            Ok(record)
-        })
+        self.close_session_with_snapshot(id, status, reason, None, now)
     }
 
     /// List sessions for a workspace, newest first. Task and status narrow
@@ -1466,5 +1579,193 @@ mod tests {
         assert_ne!(id_a, id_b);
         assert!(a.get_event(id_b).unwrap().is_some());
         assert!(b.get_event(id_a).unwrap().is_some());
+    }
+
+    #[test]
+    fn session_titles_persist_are_stable_and_bounded() {
+        let (_dir, store) = store();
+        let s = store
+            .open_session("/work/repo", &OpenSession::default(), 1000)
+            .unwrap();
+        assert_eq!(s.title, None);
+
+        let titled = store
+            .set_session_title(&s.id, "  SQLite   decision  ")
+            .unwrap();
+        assert_eq!(titled.title.as_deref(), Some("SQLite   decision"));
+        // Re-setting the same title is a stable no-op and never bumps
+        // `updated_at` (staleness means "last event or touch", not "last
+        // edit of a label").
+        let again = store.set_session_title(&s.id, "SQLite   decision").unwrap();
+        assert_eq!(again, titled);
+        assert_eq!(again.updated_at, 1000);
+
+        let changed = store.set_session_title(&s.id, "host integration").unwrap();
+        assert_eq!(changed.title.as_deref(), Some("host integration"));
+        // Blank and unknown ids are refused.
+        assert!(store.set_session_title(&s.id, "   ").is_err());
+        assert!(store
+            .set_session_title("ses::deadbeefdeadbeef", "x")
+            .is_err());
+
+        // Long titles truncate with the honest marker; secrets redact.
+        let long = "x".repeat(MAX_SESSION_TITLE_CHARS + 50);
+        let bounded = store.set_session_title(&s.id, &long).unwrap();
+        let title = bounded.title.unwrap();
+        assert!(title.contains(HISTORY_TRUNCATION_MARKER));
+        assert!(
+            title.chars().count()
+                <= MAX_SESSION_TITLE_CHARS + HISTORY_TRUNCATION_MARKER.chars().count()
+        );
+        let secret = store
+            .set_session_title(&s.id, "sk-probe1234567890")
+            .unwrap();
+        let secret_title = secret.title.unwrap();
+        assert_ne!(secret_title, "sk-probe1234567890");
+        assert!(!secret_title.contains("sk-probe"));
+    }
+
+    #[test]
+    fn close_with_snapshot_is_bounded_and_optional() {
+        let (_dir, store) = store();
+        let s = store
+            .open_session("/work/repo", &OpenSession::default(), 1000)
+            .unwrap();
+        let closed = store
+            .close_session_with_snapshot(
+                &s.id,
+                SessionStatus::Completed,
+                Some("user_done"),
+                Some("Implemented the parser and verified with cargo test"),
+                2000,
+            )
+            .unwrap();
+        assert_eq!(closed.status, SessionStatus::Completed);
+        assert_eq!(closed.ended_at, Some(2000));
+        assert_eq!(closed.end_reason.as_deref(), Some("user_done"));
+        let summary = summary_of(closed.snapshot_json.as_deref()).unwrap();
+        assert!(summary.contains("Implemented the parser"));
+        // The envelope is schema-tagged for forward compatibility.
+        let raw: serde_json::Value =
+            serde_json::from_str(closed.snapshot_json.as_deref().unwrap()).unwrap();
+        assert_eq!(raw["schema"], SESSION_SNAPSHOT_SCHEMA);
+
+        // Oversized inputs truncate with the marker, never fail the close.
+        let s2 = store
+            .open_session("/work/repo", &OpenSession::default(), 3000)
+            .unwrap();
+        let closed2 = store
+            .close_session_with_snapshot(
+                &s2.id,
+                SessionStatus::Abandoned,
+                Some(&"r".repeat(MAX_SESSION_REASON_CHARS + 10)),
+                Some(&"s".repeat(MAX_SESSION_SUMMARY_CHARS + 10)),
+                4000,
+            )
+            .unwrap();
+        let summary2 = summary_of(closed2.snapshot_json.as_deref()).unwrap();
+        assert!(summary2.contains(HISTORY_TRUNCATION_MARKER));
+        assert!(
+            summary2.chars().count()
+                <= MAX_SESSION_SUMMARY_CHARS + HISTORY_TRUNCATION_MARKER.chars().count()
+        );
+        assert!(closed2
+            .end_reason
+            .unwrap()
+            .contains(HISTORY_TRUNCATION_MARKER));
+
+        // No summary => no snapshot, and the close still lands.
+        let s3 = store
+            .open_session("/work/repo", &OpenSession::default(), 5000)
+            .unwrap();
+        let closed3 = store
+            .close_session_with_snapshot(&s3.id, SessionStatus::Completed, None, None, 6000)
+            .unwrap();
+        assert!(closed3.snapshot_json.is_none());
+        assert!(summary_of(closed3.snapshot_json.as_deref()).is_none());
+
+        // The strict store rule is preserved: a second close is refused.
+        assert!(store
+            .close_session(&s.id, SessionStatus::Abandoned, None, 7000)
+            .is_err());
+    }
+
+    #[test]
+    fn summary_of_rejects_malformed_snapshots() {
+        assert!(summary_of(None).is_none());
+        assert!(summary_of(Some("not json")).is_none());
+        assert!(summary_of(Some("{}")).is_none());
+        assert!(summary_of(Some(r#"{"summary": 42}"#)).is_none());
+        assert!(summary_of(Some(r#"{"summary": "   "}"#)).is_none());
+        // Unknown schemas stay readable (forward compatibility).
+        assert!(summary_of(Some(r#"{"schema": 99, "summary": "future"}"#)).is_some());
+        assert_eq!(
+            summary_of(Some(r#"{"summary": "  kept  "}"#)).as_deref(),
+            Some("kept")
+        );
+    }
+
+    #[test]
+    fn session_lifecycle_writes_no_context_records() {
+        let (_dir, store) = store();
+        let before = store.count_visible(Some("/work/repo")).unwrap();
+        let s = store
+            .open_session("/work/repo", &OpenSession::default(), 1000)
+            .unwrap();
+        store.set_session_title(&s.id, "some title").unwrap();
+        store
+            .close_session_with_snapshot(
+                &s.id,
+                SessionStatus::Completed,
+                Some("done"),
+                Some("summary"),
+                2000,
+            )
+            .unwrap();
+        let after = store.count_visible(Some("/work/repo")).unwrap();
+        assert_eq!(
+            before, after,
+            "lifecycle writes must never become context records"
+        );
+    }
+
+    #[test]
+    fn legacy_sessions_without_snapshots_stay_readable() {
+        let (_dir, store) = store();
+        // Simulate legacy rows: a pre-snapshot NULL and a corrupt/foreign
+        // snapshot. Both must load and degrade to "no summary".
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO sessions (id, workspace_root, task_id, title, status, source,
+                        parent_session_id, opened_at, updated_at, closed_at, end_reason, event_count,
+                        context_snapshot_json)
+                     VALUES ('ses::legacy-null', '/work/repo', NULL, NULL, 'active', NULL, NULL, 1, 1, NULL, NULL, 0, NULL)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO sessions (id, workspace_root, task_id, title, status, source,
+                        parent_session_id, opened_at, updated_at, closed_at, end_reason, event_count,
+                        context_snapshot_json)
+                     VALUES ('ses::legacy-bad', '/work/repo', NULL, NULL, 'completed', NULL, NULL, 2, 2, 2, NULL, 0, '{not json')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let listed = store
+            .list_sessions(
+                "/work/repo",
+                &SessionFilter {
+                    limit: 10,
+                    ..SessionFilter::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        for record in &listed {
+            assert!(summary_of(record.snapshot_json.as_deref()).is_none());
+        }
     }
 }

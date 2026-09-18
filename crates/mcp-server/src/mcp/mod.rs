@@ -3012,17 +3012,43 @@ impl CodeBroMcpServer {
     /// Recall relevant previous engineering work: decisions, failures,
     /// validations, and changes from past sessions in this project (or
     /// task). Returns compact provenance-tagged excerpts — the evidence,
-    /// not transcripts. Call when asking "have we tried this before?",
-    /// "why did we choose this?", or "did this fail previously?".
-    /// Read-only: never writes history (recalling must not record), and
-    /// never dumps history into the always-available context packet.
+    /// not transcripts. Also owns explicit session lifecycle: `sessions`
+    /// lists the inventory, `title` names a session, `close` finalizes it
+    /// with an optional bounded summary persisted for future recall.
+    /// Search and sessions are read-only; title/close are explicit writes
+    /// (never automatic) and never write history beyond the close event.
     #[tool(
-        description = "Recall relevant previous engineering work from past sessions: decisions, failures, validations, changes. Returns compact provenance-tagged excerpts (session, timestamp, scope, event type, source). Call when asking 'have we tried this before' or 'why did we choose this'. Read-only."
+        description = "Recall past engineering work (search, default; read-only), list sessions (sessions; read-only), or explicitly manage a session: title sets a human label; close finalizes it with an optional bounded summary persisted for future recall. Search returns provenance-tagged excerpts."
     )]
     async fn recall(
         &self,
         Parameters(args): Parameters<RecallArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let action = args
+            .action
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        match action.as_str() {
+            "" | "search" => self.recall_search(args).await,
+            "sessions" => self.recall_sessions(args).await,
+            "title" | "close" => {
+                // Explicit, deterministic lifecycle writes serialize on the
+                // workspace mutation lock like every other writer.
+                let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+                let _mutation_guard = ws.mutation_lock.lock().await;
+                self.recall_lifecycle(args, &action).await
+            }
+            other => Err(McpError::invalid_params(
+                format!("unknown recall action '{other}': use search, sessions, title, or close"),
+                None,
+            )),
+        }
+    }
+
+    /// Read-only `recall` search action (the default; the v1.3 contract).
+    async fn recall_search(&self, args: RecallArgs) -> Result<CallToolResult, McpError> {
         let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
         // Read-only: no mutation lock. And deliberately no history capture
         // — recalling history must not write history (no recursion).
@@ -3058,7 +3084,7 @@ impl CodeBroMcpServer {
         let outcome = store
             .recall(
                 &crate::context_runtime::RecallQuery {
-                    query: args.query.as_str(),
+                    query: args.query.as_deref().unwrap_or(""),
                     workspace_root: Some(root.as_str()),
                     task_id,
                     scope,
@@ -3111,6 +3137,7 @@ impl CodeBroMcpServer {
                     "session": g.session_id,
                     "session_title": g.session_title,
                     "session_status": g.session_status,
+                    "session_summary": g.session_summary,
                     "session_stale": g.session_stale,
                     "workspace_root": g.workspace_root,
                     "task_id": g.task_id,
@@ -3124,7 +3151,7 @@ impl CodeBroMcpServer {
             .map(|g| g["events"].as_array().map(|e| e.len()).unwrap_or(0))
             .sum();
         let payload = json!({
-            "query": args.query,
+            "query": args.query.as_deref().unwrap_or(""),
             "scope": scope.to_string(),
             "returned": returned,
             "total_matches": outcome.total_matches,
@@ -3136,6 +3163,226 @@ impl CodeBroMcpServer {
         let text = crate::mcp::response_bounds::bounded_response(payload)
             .map_err(|e| McpError::internal_error(e, None))?;
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    /// Read-only `recall` sessions action: bounded session inventory.
+    ///
+    /// Inventory is not recall: task-bound sessions are included (recall
+    /// search enforces task invisibility); titles, status, and staleness
+    /// come from the durable session row. Never writes, never captures
+    /// history.
+    async fn recall_sessions(&self, args: RecallArgs) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let store = self.context_store();
+        let root = ws.canonical_root.display().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let status = match args.status.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(raw) => Some(
+                raw.parse::<crate::context_runtime::SessionStatus>()
+                    .map_err(|e| McpError::invalid_params(e, None))?,
+            ),
+        };
+        let task_id = args
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let limit = args.limit.unwrap_or(20).clamp(1, 50);
+        let sessions = store
+            .list_sessions(
+                &root,
+                &crate::context_runtime::SessionFilter {
+                    task_id,
+                    status,
+                    limit,
+                },
+                now,
+            )
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let items: Vec<serde_json::Value> = sessions.iter().map(|s| session_json(s, now)).collect();
+        let payload = json!({
+            "action": "sessions",
+            "workspace_root": root,
+            "count": items.len(),
+            "sessions": items,
+            "note": "Session inventory: durable rows with title/status/staleness. Search returns the evidence inside a session; closed sessions remain searchable.",
+        });
+        let text = crate::mcp::response_bounds::bounded_response(payload)
+            .map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    /// Explicit `recall` lifecycle writes: `title` and `close`. The caller
+    /// holds the workspace mutation lock. Deterministic and idempotent at
+    /// the action layer while the store keeps its strict rule: history is
+    /// never rewritten (a second close returns the durable ending).
+    async fn recall_lifecycle(
+        &self,
+        args: RecallArgs,
+        action: &str,
+    ) -> Result<CallToolResult, McpError> {
+        let ws = self.resolve_workspace(args.workspace_root.as_deref())?;
+        let store = self.context_store();
+        let root = ws.canonical_root.display().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let session_id = args
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("recall action '{action}' requires session_id"),
+                    None,
+                )
+            })?;
+        match action {
+            "title" => {
+                let title = args
+                    .title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        McpError::invalid_params(
+                            "recall action 'title' requires a non-blank title",
+                            None,
+                        )
+                    })?;
+                let before = store
+                    .get_session(session_id)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    .ok_or_else(|| {
+                        McpError::invalid_params(
+                            format!("session {session_id} does not exist"),
+                            None,
+                        )
+                    })?;
+                let record = store
+                    .set_session_title(session_id, title)
+                    .map_err(|e| match e {
+                        crate::context_runtime::store::ContextError::Validation(msg) => {
+                            McpError::invalid_params(msg, None)
+                        }
+                        other => McpError::internal_error(other.to_string(), None),
+                    })?;
+                let payload = json!({
+                    "action": "title",
+                    "session_id": session_id,
+                    "title": record.title,
+                    "updated": record.title != before.title,
+                    "session": session_json(&record, now),
+                    "note": "Titles are metadata: setting one never changes session status, lifecycle timestamps, or staleness.",
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "close" => {
+                let status = match args.status.as_deref().map(str::trim) {
+                    None | Some("") | Some("completed") => {
+                        crate::context_runtime::SessionStatus::Completed
+                    }
+                    Some("abandoned") => crate::context_runtime::SessionStatus::Abandoned,
+                    Some(other) => {
+                        return Err(McpError::invalid_params(
+                            format!("unknown close status '{other}': use completed or abandoned"),
+                            None,
+                        ))
+                    }
+                };
+                let existing = store
+                    .get_session(session_id)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    .ok_or_else(|| {
+                        McpError::invalid_params(
+                            format!("session {session_id} does not exist"),
+                            None,
+                        )
+                    })?;
+                // Idempotent finalization: a closed session returns its
+                // durable ending; nothing is rewritten and no duplicate
+                // history is emitted.
+                if existing.status.is_terminal() {
+                    return closed_payload(&existing, now, true);
+                }
+                let record = match store.close_session_with_snapshot(
+                    session_id,
+                    status,
+                    args.reason.as_deref(),
+                    args.summary.as_deref(),
+                    now,
+                ) {
+                    Ok(record) => record,
+                    Err(e) => {
+                        // Cross-process race: someone closed it between the
+                        // read and the write. Idempotency still holds.
+                        if let Ok(Some(current)) = store.get_session(session_id) {
+                            if current.status.is_terminal() {
+                                return closed_payload(&current, now, true);
+                            }
+                        }
+                        return Err(match e {
+                            crate::context_runtime::store::ContextError::Validation(msg) => {
+                                McpError::invalid_params(msg, None)
+                            }
+                            other => McpError::internal_error(other.to_string(), None),
+                        });
+                    }
+                };
+                // Structural history: one SessionEnded event linked to the
+                // session, deduplicated by session id so retries can never
+                // duplicate it. A failed append never invalidates the close
+                // (the snapshot is already durable in the same statement).
+                let mut history_captured = true;
+                if let Err(e) = store.record_history(
+                    &crate::context_runtime::HistoryInput {
+                        session_id: Some(session_id.to_string()),
+                        workspace_root: root,
+                        task_id: record.task_id.clone(),
+                        kind: crate::context_runtime::HistoryKind::SessionEnded,
+                        tool: None,
+                        path: None,
+                        outcome: Some(status.as_str().to_string()),
+                        summary: Some(match record.end_reason.as_deref() {
+                            Some(reason) => format!("session closed: {status} — {reason}"),
+                            None => format!("session closed: {status}"),
+                        }),
+                        payload: None,
+                        dedup_key: Some(format!("session-ended:{session_id}")),
+                        source: Some("mcp:recall.close".to_string()),
+                        created_at: None,
+                    },
+                    now,
+                ) {
+                    history_captured = false;
+                    tracing::warn!(
+                        "session close history capture failed (session {session_id}): {e}"
+                    );
+                }
+                let payload = json!({
+                    "action": "close",
+                    "session_id": session_id,
+                    "already_closed": false,
+                    "snapshot_written": crate::context_runtime::summary_of(record.snapshot_json.as_deref()).is_some(),
+                    "history_captured": history_captured,
+                    "session": session_json(&record, now),
+                    "note": "Explicit finalization: status and snapshot are durable; closed sessions remain searchable and are never auto-closed by the runtime.",
+                });
+                let text = crate::mcp::response_bounds::bounded_response(payload)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            _ => unreachable!("recall_lifecycle only handles title and close"),
+        }
     }
 
     // ── Tool 22: learn (cautious hypotheses from history) ─────────────────
@@ -5372,8 +5619,10 @@ pub struct ForgetArgs {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RecallArgs {
     /// The question in the caller's words (e.g. "why are we using SQLite?").
-    /// Must contain at least one searchable token (3+ alphanumeric chars).
-    pub query: String,
+    /// Required for the search action; must contain at least one searchable
+    /// token (3+ alphanumeric chars). Omit for sessions/title/close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
     /// Scope: project (default, this workspace only), task (this workspace
     /// plus task_id), or global (explicit opt-in across all workspaces).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5387,6 +5636,26 @@ pub struct RecallArgs {
     /// Narrow to one session id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Action: search (default; read-only) returns evidence excerpts;
+    /// sessions (read-only) lists the session inventory; title and close are
+    /// explicit lifecycle writes (serialized on the workspace lock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// New human-readable title (action `title`; required there; bounded and
+    /// secret-redacted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Action `close`: terminal status `completed` (default) or `abandoned`.
+    /// Action `sessions`: optional status filter (active|completed|abandoned).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Action `close`: optional short end note (bounded and redacted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Action `close`: optional bounded finalization summary persisted for
+    /// future recall (redacted, truncated to the session summary bound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     /// Maximum excerpts returned (default 10, max 50).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
@@ -5987,6 +6256,46 @@ fn remember_error(e: crate::context_runtime::store::ContextError) -> McpError {
         }
         other => McpError::internal_error(other.to_string(), None),
     }
+}
+
+/// Bounded session projection shared by every `recall` session surface.
+/// Deliberately excludes the raw finalization snapshot: readers get
+/// `has_summary`, and the summary itself only through recall excerpts.
+fn session_json(record: &crate::context_runtime::SessionRecord, now: u64) -> serde_json::Value {
+    json!({
+        "session_id": record.id,
+        "title": record.title,
+        "status": record.status.as_str(),
+        "source": record.source,
+        "task_id": record.task_id,
+        "started_at": record.started_at,
+        "updated_at": record.updated_at,
+        "ended_at": record.ended_at,
+        "end_reason": record.end_reason,
+        "event_count": record.event_count,
+        "stale": record.is_stale(now),
+        "has_summary": crate::context_runtime::summary_of(record.snapshot_json.as_deref()).is_some(),
+    })
+}
+
+/// Idempotent-close response: the durable ending, never rewritten.
+fn closed_payload(
+    record: &crate::context_runtime::SessionRecord,
+    now: u64,
+    already_closed: bool,
+) -> Result<CallToolResult, McpError> {
+    let payload = json!({
+        "action": "close",
+        "session_id": record.id,
+        "already_closed": already_closed,
+        "snapshot_written": crate::context_runtime::summary_of(record.snapshot_json.as_deref()).is_some(),
+        "history_captured": false,
+        "session": session_json(record, now),
+        "note": "Session was already closed; its ending is never rewritten and no duplicate history is emitted.",
+    });
+    let text = crate::mcp::response_bounds::bounded_response(payload)
+        .map_err(|e| McpError::internal_error(e, None))?;
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 /// Trim and require a non-empty string field.
@@ -15077,5 +15386,399 @@ mod skill_validation_mcp_tests {
         )
         .await;
         assert!(err.contains("stale"), "{err}");
+    }
+}
+
+// ── WS3: explicit session lifecycle through `recall` ─────────────────────
+#[cfg(test)]
+mod session_lifecycle_tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Hermetic {
+        _dir: tempfile::TempDir,
+        server: CodeBroMcpServer,
+        root: String,
+    }
+
+    fn hermetic() -> Hermetic {
+        let dir = tempfile::tempdir().unwrap();
+        let server =
+            CodeBroMcpServer::with_state_dir(dir.path().to_path_buf(), dir.path().join("state"));
+        let root = dir.path().to_str().unwrap().to_string();
+        Hermetic {
+            _dir: dir,
+            server,
+            root,
+        }
+    }
+
+    fn text_of(result: CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                rmcp::model::ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    async fn call(server: &CodeBroMcpServer, args: serde_json::Value) -> serde_json::Value {
+        let p: RecallArgs = serde_json::from_value(args).unwrap();
+        let r = server.recall(Parameters(p)).await.expect("recall succeeds");
+        serde_json::from_str(&text_of(r)).expect("bounded JSON payload")
+    }
+
+    async fn call_err(server: &CodeBroMcpServer, args: serde_json::Value) -> String {
+        let p: RecallArgs = serde_json::from_value(args).unwrap();
+        match server.recall(Parameters(p)).await {
+            Ok(_) => panic!("expected recall to fail"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn seed_session(h: &Hermetic, at: u64) -> String {
+        h.server
+            .context_store()
+            .open_session(&h.root, &crate::context_runtime::OpenSession::default(), at)
+            .unwrap()
+            .id
+    }
+
+    #[tokio::test]
+    async fn title_sets_lists_and_is_idempotent() {
+        let h = hermetic();
+        let sid = seed_session(&h, 1000);
+
+        let listed = call(
+            &h.server,
+            json!({
+                "action": "sessions",
+                "workspace_root": &h.root,
+            }),
+        )
+        .await;
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["sessions"][0]["title"], json!(null));
+        assert_eq!(listed["sessions"][0]["has_summary"], json!(false));
+
+        let titled = call(
+            &h.server,
+            json!({
+                "action": "title",
+                "workspace_root": &h.root,
+                "session_id": &sid,
+                "title": "WS3 probe session",
+            }),
+        )
+        .await;
+        assert_eq!(titled["updated"], json!(true));
+        assert_eq!(titled["title"], "WS3 probe session");
+        assert_eq!(titled["session"]["title"], "WS3 probe session");
+
+        // Identical title: deterministic no-op, no timestamp churn.
+        let again = call(
+            &h.server,
+            json!({
+                "action": "title",
+                "workspace_root": &h.root,
+                "session_id": &sid,
+                "title": "WS3 probe session",
+            }),
+        )
+        .await;
+        assert_eq!(again["updated"], json!(false));
+        assert_eq!(again["session"]["updated_at"], json!(1000));
+
+        // Missing/blank/unknown are refused before any write.
+        let err = call_err(
+            &h.server,
+            json!({
+                "action": "title",
+                "workspace_root": &h.root,
+                "title": "no session id",
+            }),
+        )
+        .await;
+        assert!(err.contains("requires session_id"), "{err}");
+        let err = call_err(
+            &h.server,
+            json!({
+                "action": "title",
+                "workspace_root": &h.root,
+                "session_id": &sid,
+                "title": "   ",
+            }),
+        )
+        .await;
+        assert!(err.contains("non-blank"), "{err}");
+        let err = call_err(
+            &h.server,
+            json!({
+                "action": "title",
+                "workspace_root": &h.root,
+                "session_id": "ses::deadbeefdeadbeef",
+                "title": "ghost",
+            }),
+        )
+        .await;
+        assert!(err.contains("does not exist"), "{err}");
+
+        // Secrets are redacted at the store seam.
+        let secret = call(
+            &h.server,
+            json!({
+                "action": "title",
+                "workspace_root": &h.root,
+                "session_id": &sid,
+                "title": "api key sk-probe1234567890",
+            }),
+        )
+        .await;
+        let title = secret["title"].as_str().unwrap();
+        assert!(!title.contains("sk-probe"), "{title}");
+    }
+
+    #[tokio::test]
+    async fn close_finalizes_with_snapshot_and_is_idempotent() {
+        let h = hermetic();
+        let sid = seed_session(&h, 1000);
+        let store = h.server.context_store();
+        let mut decision = crate::context_runtime::HistoryInput::new(
+            &h.root,
+            crate::context_runtime::HistoryKind::Decision,
+            "chose explicit session close semantics",
+        );
+        decision.session_id = Some(sid.clone());
+        store.record_history(&decision, 1100).unwrap();
+        let records_before = store.count_visible(Some(&h.root)).unwrap();
+
+        let closed = call(
+            &h.server,
+            json!({
+                "action": "close",
+                "workspace_root": &h.root,
+                "session_id": &sid,
+                "reason": "probe complete",
+                "summary": "Closed the WS3 probe session after verifying lifecycle semantics",
+            }),
+        )
+        .await;
+        assert_eq!(closed["already_closed"], json!(false));
+        assert_eq!(closed["snapshot_written"], json!(true));
+        assert_eq!(closed["history_captured"], json!(true));
+        assert_eq!(closed["session"]["status"], "completed");
+        assert_eq!(closed["session"]["has_summary"], json!(true));
+        assert_eq!(closed["session"]["end_reason"], "probe complete");
+
+        // One structural SessionEnded event, linked to the session.
+        let events = store.list_session_events(&sid, 20).unwrap();
+        assert!(
+            events.iter().any(|e| e.kind == "session_ended"),
+            "close must record exactly one session_ended event"
+        );
+        let event_count = events.len();
+
+        // Repeated close is idempotent: durable ending returned, nothing
+        // rewritten, no duplicate history.
+        let again = call(
+            &h.server,
+            json!({
+                "action": "close",
+                "workspace_root": &h.root,
+                "session_id": &sid,
+                "status": "abandoned",
+                "summary": "a different summary that must be ignored",
+            }),
+        )
+        .await;
+        assert_eq!(again["already_closed"], json!(true));
+        assert_eq!(again["session"]["status"], "completed");
+        assert_eq!(again["session"]["end_reason"], "probe complete");
+        assert_eq!(
+            store.list_session_events(&sid, 20).unwrap().len(),
+            event_count
+        );
+
+        // Closed sessions stay queryable and expose the bounded summary.
+        let recalled = call(
+            &h.server,
+            json!({
+                "query": "explicit session close",
+                "workspace_root": &h.root,
+            }),
+        )
+        .await;
+        let group = recalled["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["session"] == json!(sid))
+            .expect("closed session must remain searchable");
+        assert_eq!(group["session_status"], "completed");
+        assert_eq!(group["session_stale"], json!(false));
+        assert!(group["session_summary"]
+            .as_str()
+            .unwrap()
+            .contains("WS3 probe session"));
+
+        // Separation: lifecycle never becomes a context record.
+        assert_eq!(store.count_visible(Some(&h.root)).unwrap(), records_before);
+    }
+
+    #[tokio::test]
+    async fn close_refuses_bad_inputs() {
+        let h = hermetic();
+        let sid = seed_session(&h, 1000);
+
+        let err = call_err(
+            &h.server,
+            json!({
+                "action": "close",
+                "workspace_root": &h.root,
+            }),
+        )
+        .await;
+        assert!(err.contains("requires session_id"), "{err}");
+
+        let err = call_err(
+            &h.server,
+            json!({
+                "action": "close",
+                "workspace_root": &h.root,
+                "session_id": &sid,
+                "status": "paused",
+            }),
+        )
+        .await;
+        assert!(err.contains("unknown close status"), "{err}");
+
+        let err = call_err(
+            &h.server,
+            json!({
+                "action": "close",
+                "workspace_root": &h.root,
+                "session_id": "ses::deadbeefdeadbeef",
+            }),
+        )
+        .await;
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_stays_backward_compatible_and_read_only() {
+        let h = hermetic();
+        let sid = seed_session(&h, 1000);
+        let store = h.server.context_store();
+        let mut decision = crate::context_runtime::HistoryInput::new(
+            &h.root,
+            crate::context_runtime::HistoryKind::Decision,
+            "backward compatible search probe",
+        );
+        decision.session_id = Some(sid.clone());
+        store.record_history(&decision, 1100).unwrap();
+        let before = store.list_session_events(&sid, 20).unwrap().len();
+
+        // No `action` (the v1.3 default) behaves as search.
+        let out = call(
+            &h.server,
+            json!({
+                "query": "backward compatible",
+                "workspace_root": &h.root,
+            }),
+        )
+        .await;
+        assert_eq!(out["provenance"], "historical-evidence");
+        assert!(out["history"].as_array().unwrap().len() >= 1);
+        assert_eq!(out["history"][0]["session"], json!(sid));
+        assert_eq!(out["history"][0]["session_summary"], json!(null));
+
+        let before_events = store.list_events(&h.root, 100).unwrap().len();
+        assert_eq!(
+            store.list_session_events(&sid, 20).unwrap().len(),
+            before,
+            "search must write no session events"
+        );
+        assert_eq!(
+            store.list_events(&h.root, 100).unwrap().len(),
+            before_events,
+            "search must write no history at all"
+        );
+
+        // Unknown actions are refused with the action vocabulary.
+        let err = call_err(
+            &h.server,
+            json!({
+                "action": "archive",
+                "query": "x",
+                "workspace_root": &h.root,
+            }),
+        )
+        .await;
+        assert!(err.contains("unknown recall action"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn sessions_action_filters_and_bounds() {
+        let h = hermetic();
+        let a = seed_session(&h, 1000);
+        let _b = seed_session(&h, 1001);
+        call(
+            &h.server,
+            json!({
+                "action": "close",
+                "workspace_root": &h.root,
+                "session_id": &a,
+                "summary": "closed one",
+            }),
+        )
+        .await;
+
+        let completed = call(
+            &h.server,
+            json!({
+                "action": "sessions",
+                "workspace_root": &h.root,
+                "status": "completed",
+            }),
+        )
+        .await;
+        assert_eq!(completed["count"], 1);
+        assert_eq!(completed["sessions"][0]["session_id"], json!(a));
+
+        let active = call(
+            &h.server,
+            json!({
+                "action": "sessions",
+                "workspace_root": &h.root,
+                "status": "active",
+            }),
+        )
+        .await;
+        assert_eq!(active["count"], 1);
+
+        let bounded = call(
+            &h.server,
+            json!({
+                "action": "sessions",
+                "workspace_root": &h.root,
+                "limit": 1,
+            }),
+        )
+        .await;
+        assert_eq!(bounded["count"], 1);
+
+        let err = call_err(
+            &h.server,
+            json!({
+                "action": "sessions",
+                "workspace_root": &h.root,
+                "status": "paused",
+            }),
+        )
+        .await;
+        assert!(!err.is_empty());
     }
 }

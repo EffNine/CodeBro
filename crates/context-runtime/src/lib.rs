@@ -81,7 +81,7 @@ pub mod context_runtime {
         authority_rank, db, decay_rate_per_month, decayed_confidence,
         fingerprint::{self, Lane, ResolutionScope, ResolvedContext},
         history::{
-            self, HistoryInput, HistoryKind, OpenSession, SessionFilter, SessionRecord,
+            self, summary_of, HistoryInput, HistoryKind, OpenSession, SessionFilter, SessionRecord,
             SessionStatus,
         },
         intent::{self, IntentMetadata, IntentPriority, IntentStatus},
@@ -123,8 +123,8 @@ pub mod context_runtime {
 pub use db::{SCHEMA_VERSION, STATE_DB_FILE};
 pub use fingerprint::{Lane, ResolutionScope, ResolvedContext};
 pub use history::{
-    HistoryInput, HistoryKind, OpenSession, SessionFilter, SessionRecord, SessionStatus,
-    STALE_AFTER_SECS,
+    summary_of, HistoryInput, HistoryKind, OpenSession, SessionFilter, SessionRecord,
+    SessionStatus, STALE_AFTER_SECS,
 };
 pub use intent::{IntentMetadata, IntentPriority, IntentStatus};
 pub use learning::{

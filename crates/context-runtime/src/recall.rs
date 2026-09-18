@@ -121,6 +121,10 @@ pub struct RecallGroup {
     pub session_id: Option<String>,
     pub session_title: Option<String>,
     pub session_status: Option<String>,
+    /// Bounded excerpt of a closed session's finalization summary
+    /// (from the snapshot written by `close_session_with_snapshot`).
+    /// `None` for open/unsummarized or malformed-snapshot sessions.
+    pub session_summary: Option<String>,
     pub session_stale: bool,
     pub workspace_root: String,
     pub task_id: Option<String>,
@@ -363,10 +367,10 @@ impl ContextStore {
                     None => {
                         let session = key.as_deref().and_then(|sid| {
                             conn.query_row(
-                                "SELECT id, workspace_root, task_id, title, status, source,
-                                        parent_session_id, opened_at, updated_at, closed_at,
-                                        end_reason, event_count
-                                 FROM sessions WHERE id = ?1",
+                                &format!(
+                                    "SELECT {} FROM sessions WHERE id = ?1",
+                                    crate::history::SESSION_COLUMNS
+                                ),
                                 [sid],
                                 crate::history::row_to_session,
                             )
@@ -383,6 +387,14 @@ impl ContextStore {
                             session_id: key.clone(),
                             session_title: session.as_ref().and_then(|s| s.title.clone()),
                             session_status: session.as_ref().map(|s| s.status.as_str().to_string()),
+                            session_summary: session
+                                .as_ref()
+                                .and_then(|s| {
+                                    crate::history::summary_of(s.snapshot_json.as_deref())
+                                })
+                                .map(|summary| {
+                                    crate::history::clean_text(&summary, MAX_RECALL_EXCERPT_CHARS)
+                                }),
                             session_stale: stale,
                             workspace_root: event.workspace_root.clone(),
                             task_id: event.task_id.clone(),
@@ -402,10 +414,10 @@ impl ContextStore {
                 let task_match = task.is_some() && event.task_id.as_deref() == task.as_deref();
                 let session = key.as_deref().and_then(|sid| {
                     conn.query_row(
-                        "SELECT id, workspace_root, task_id, title, status, source,
-                                parent_session_id, opened_at, updated_at, closed_at,
-                                end_reason, event_count
-                         FROM sessions WHERE id = ?1",
+                        &format!(
+                            "SELECT {} FROM sessions WHERE id = ?1",
+                            crate::history::SESSION_COLUMNS
+                        ),
                         [sid],
                         crate::history::row_to_session,
                     )
@@ -939,6 +951,76 @@ mod tests {
             elapsed.as_secs() < 5,
             "recall over 1000 events took {elapsed:?}"
         );
+    }
+    #[test]
+    fn closed_session_groups_carry_status_and_summary() {
+        let (_dir, store) = store();
+        let s = store
+            .open_session("/proj", &OpenSession::default(), 100)
+            .unwrap();
+        let mut d = input(
+            "/proj",
+            HistoryKind::Decision,
+            "chose bounded sessions for recall",
+        );
+        d.session_id = Some(s.id.clone());
+        store.record_history(&d, 101).unwrap();
+        store
+            .close_session_with_snapshot(
+                &s.id,
+                crate::history::SessionStatus::Completed,
+                Some("done"),
+                Some("Finalized the session lifecycle work"),
+                102,
+            )
+            .unwrap();
+
+        let out = store
+            .recall(
+                &RecallQuery {
+                    query: "bounded sessions",
+                    workspace_root: Some("/proj"),
+                    ..RecallQuery::default()
+                },
+                200,
+            )
+            .unwrap();
+        let group = out
+            .groups
+            .iter()
+            .find(|g| g.session_id.as_deref() == Some(s.id.as_str()))
+            .expect("closed session must remain queryable");
+        assert_eq!(group.session_status.as_deref(), Some("completed"));
+        assert_eq!(
+            group.session_summary.as_deref(),
+            Some("Finalized the session lifecycle work")
+        );
+        assert!(!group.session_stale);
+
+        // An open session with an event but no snapshot has no summary.
+        let open = store
+            .open_session("/proj", &OpenSession::default(), 300)
+            .unwrap();
+        let mut d2 = input("/proj", HistoryKind::Decision, "open session still active");
+        d2.session_id = Some(open.id.clone());
+        store.record_history(&d2, 301).unwrap();
+        let out2 = store
+            .recall(
+                &RecallQuery {
+                    query: "open session",
+                    workspace_root: Some("/proj"),
+                    ..RecallQuery::default()
+                },
+                400,
+            )
+            .unwrap();
+        let group2 = out2
+            .groups
+            .iter()
+            .find(|g| g.session_id.as_deref() == Some(open.id.as_str()))
+            .unwrap();
+        assert_eq!(group2.session_status.as_deref(), Some("active"));
+        assert!(group2.session_summary.is_none());
     }
 }
 
