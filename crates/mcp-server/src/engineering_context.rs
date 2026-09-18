@@ -211,6 +211,20 @@ pub struct ContextRecordExcerpt {
     pub effective_confidence: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Intent-guard annotation (WS4): present only when the guard kept the
+    /// record but flagged it as cross-project. Excluded records never reach
+    /// the packet; the guard report lists their ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<RecordGuardNote>,
+}
+
+/// Why a kept record was flagged by the intent guard.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordGuardNote {
+    /// Stable machine code (e.g. `ambiguous_project_reference`).
+    pub status: String,
+    /// Bounded human-readable reason; never contains record content.
+    pub reason: String,
 }
 
 /// Decoded intent metadata excerpt (bounded rationale).
@@ -229,6 +243,15 @@ pub const MAX_RATIONALE_EXCERPT_CHARS: usize = 160;
 /// Bound an excerpt from a ranked record (content excerpted with the
 /// standard marker when longer than the budget).
 pub fn excerpt_from(ranked: &RankedRecord) -> ContextRecordExcerpt {
+    excerpt_from_guarded(ranked, None)
+}
+
+/// Bound an excerpt, attaching an intent-guard note when the guard kept the
+/// record but flagged it as cross-project.
+pub fn excerpt_from_guarded(
+    ranked: &RankedRecord,
+    guard: Option<RecordGuardNote>,
+) -> ContextRecordExcerpt {
     let mut content: String = ranked
         .record
         .content
@@ -258,6 +281,7 @@ pub fn excerpt_from(ranked: &RankedRecord) -> ContextRecordExcerpt {
         importance: ranked.record.importance,
         effective_confidence: ranked.effective_confidence,
         language: ranked.record.language.clone(),
+        guard,
     }
 }
 
@@ -330,6 +354,12 @@ pub struct EngineeringContextPacket {
     pub validation: Vec<String>,
     #[serde(default)]
     pub notes: Vec<String>,
+    /// WS4 intent-guard report: deterministic wrong-project / wrong-context
+    /// findings for this packet. `None` only when the caller composed the
+    /// packet without a guard (e.g. library callers predating WS4); the MCP
+    /// and CLI surfaces always attach it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<crate::intent_guard::IntentGuardReport>,
 }
 
 impl EngineeringContextPacket {
@@ -442,6 +472,7 @@ pub fn compose(
             "sandbox_test / sandbox_build to verify any change".to_string(),
         ],
         notes,
+        guard: None,
     })
 }
 
@@ -500,6 +531,7 @@ pub fn compose_structural(
         },
         validation: vec![],
         notes,
+        guard: None,
     })
 }
 

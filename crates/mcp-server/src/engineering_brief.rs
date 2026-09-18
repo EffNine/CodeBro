@@ -214,6 +214,9 @@ pub struct BriefInputs<'a> {
     pub identity_loaded: bool,
     pub identity: &'a crate::project_identity::ProjectIdentity,
     pub records: &'a [ContextRecordExcerpt],
+    /// WS4 intent-guard report for the resolved records (same guard run as
+    /// the context packet, so both surfaces agree on what was excluded).
+    pub guard: Option<&'a crate::intent_guard::IntentGuardReport>,
     pub now: u64,
 }
 
@@ -624,6 +627,10 @@ pub struct EngineeringBrief {
     pub bounds: BriefBounds,
     #[serde(default)]
     pub notes: Vec<String>,
+    /// WS4 intent-guard report: deterministic wrong-project findings for
+    /// this brief's viewpoint (same guard the context packet runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<crate::intent_guard::IntentGuardReport>,
 }
 
 impl EngineeringBrief {
@@ -903,6 +910,7 @@ pub fn assemble(
             truncated_sections,
         },
         notes,
+        guard: inputs.guard.cloned(),
     })
 }
 
@@ -2430,6 +2438,7 @@ mod tests {
             identity_loaded: false,
             identity,
             records,
+            guard: None,
             now: 1_800_000_000,
         }
     }

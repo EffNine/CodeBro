@@ -357,6 +357,36 @@ impl ContextStore {
         })
     }
 
+    /// Distinct canonical workspace roots that carry at least one
+    /// project-scoped context record. Read-only, sorted, and hard-bounded.
+    ///
+    /// The intent guard (WS4) uses this to recognize references to *other*
+    /// known workspaces without scanning record content across workspaces:
+    /// only roots the store actually holds project knowledge for are
+    /// considered, never arbitrary path guesses.
+    pub fn distinct_project_workspace_roots(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<String>, ContextError> {
+        let limit = limit.clamp(1, 512) as i64;
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT workspace_root FROM context_records
+                 WHERE scope = ?1 AND workspace_root IS NOT NULL AND workspace_root != ''
+                 ORDER BY workspace_root
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![RecordScope::Project.as_str(), limit], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Number of active records visible from a (workspace, task) viewpoint:
     /// global rows, the workspace's project rows, and — only with a
     /// matching `task_id` — that task's rows. This is the precise counting
@@ -1667,5 +1697,32 @@ mod tests {
             2
         );
         assert_eq!(store.count_visible_with_task(None, None).unwrap(), 1);
+    }
+
+    #[test]
+    fn distinct_project_workspace_roots_is_sorted_unique_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store
+            .put_record(&ws_record("ctx::a", "/work/b", "fp.a", "b knowledge"), 1)
+            .unwrap();
+        store
+            .put_record(&ws_record("ctx::b", "/work/a", "fp.a", "a knowledge"), 1)
+            .unwrap();
+        store
+            .put_record(&ws_record("ctx::c", "/work/a", "fp.c", "a knowledge 2"), 1)
+            .unwrap();
+        // Global rows and task rows never contribute a workspace root.
+        store
+            .put_record(&user_record("ctx::g", "fp.g", "global"), 1)
+            .unwrap();
+        store
+            .put_record(&task_record("ctx::t", "/work/t", "task-1"), 1)
+            .unwrap();
+
+        let roots = store.distinct_project_workspace_roots(64).unwrap();
+        assert_eq!(roots, vec!["/work/a".to_string(), "/work/b".to_string()]);
+        assert_eq!(store.distinct_project_workspace_roots(1).unwrap().len(), 1);
+        assert!(store.distinct_project_workspace_roots(0).unwrap().len() <= 1);
     }
 }

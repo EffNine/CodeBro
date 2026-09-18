@@ -2270,13 +2270,32 @@ impl CodeBroMcpServer {
                 record_keywords.sort();
             }
         }
-        let records = self.context_record_excerpts(&ws, task_id, &record_keywords);
         let (identity_loaded, identity_opt) = self.identity_snapshot(&ws);
         // Absent identity degrades to defaults (the brief records
         // MISSING_IDENTITY); orientation never fails a read.
         let identity = identity_opt.unwrap_or_else(|| {
             crate::project_identity::ProjectIdentityRuntime::new(&ws.canonical_root).snapshot()
         });
+        // Same canonical resolution + WS4 guard as the context packet, so
+        // the brief and the packet never disagree about what was excluded.
+        let guarded = crate::context_packet::context_record_excerpts_guarded(
+            &self.context_store(),
+            &ws.canonical_root,
+            task_id,
+            &record_keywords,
+            &request.task,
+            if identity_loaded {
+                Some(identity.name.as_str())
+            } else {
+                None
+            },
+            if identity_loaded {
+                identity.repository_url.as_deref()
+            } else {
+                None
+            },
+        );
+        let records = guarded.records;
         let store = self.fact_store(&ws);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2292,6 +2311,7 @@ impl CodeBroMcpServer {
             identity_loaded,
             identity: &identity,
             records: &records,
+            guard: Some(&guarded.report),
             now,
         };
         let brief = crate::engineering_brief::assemble(&inputs, &request)
@@ -2333,32 +2353,6 @@ impl CodeBroMcpServer {
         )
         .map_err(|e| McpError::internal_error(e, None))?;
         Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
-    }
-
-    /// Retrieve bounded durable-context excerpts for a workspace.
-    ///
-    /// Resolution (not concatenation): a generous fetch (keyword-less
-    /// importance order plus keyword matches when a task narrows relevance)
-    /// is reduced per (kind, namespace) to one winner by authority rank,
-    /// then scope specificity (task > project > global), decayed
-    /// confidence, recency, and id. Actionable intents surface alongside
-    /// fingerprint winners; losers stay in the store, queryable by id.
-    /// The user-context store is best-effort by design: if it cannot be
-    /// opened (e.g. an unwritable state dir), composition degrades to an
-    /// empty `records` section with a warning rather than failing the whole
-    /// packet — the engineering stores stay authoritative.
-    fn context_record_excerpts(
-        &self,
-        ws: &WorkspaceState,
-        task_id: Option<&str>,
-        keywords: &[String],
-    ) -> Vec<crate::engineering_context::ContextRecordExcerpt> {
-        crate::context_packet::context_record_excerpts(
-            &self.context_store(),
-            &ws.canonical_root,
-            task_id,
-            keywords,
-        )
     }
 
     // ── Tool 19: remember (explicit user-context persistence) ──────────

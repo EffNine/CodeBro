@@ -20,6 +20,7 @@ pub mod engineering_brief;
 pub mod engineering_context;
 pub mod history_capture;
 pub mod integration;
+pub mod intent_guard;
 pub mod jev_shadow_hook;
 pub mod mcp;
 pub mod providers;
