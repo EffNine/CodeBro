@@ -389,6 +389,41 @@ Conventions:
 - Keep MCP handlers thin — delegate to the canonical runtime.
 - `tempfile::tempdir()` for all filesystem tests.
 
+## Learning-loop workflow (host-driven, Hermes loop)
+
+CodeBro is request-driven by design — no daemon, no scheduler, no watcher,
+no autonomous agent loop. The Hermes-like loop (orient → remember → learn →
+skill proposal → approval → publish → auto-use → task outcome → learn again)
+is activated by agent workflow conventions plus host-side wiring, never by
+CodeBro-side automation:
+
+1. **Orient (task start).** Before starting a coding task, call `context`
+   (MCP) or `codebro context --root <ws> [--task <text>] [--task-id <id>]`
+   (host/hook surface). The packet's `skills` section is advisory:
+   `applicable` skill nudges (use `skill_context` for the minimal packet)
+   and `pending_approvals` (surface to the human; resolve with
+   `skill respond` — never approve your own request).
+2. **Outcome (task end).** After completing or failing a task, report one
+   structured `task outcome` (classification + bounded evidence). This is
+   the P9 completion convention; compliance is measurable from the existing
+   per-call stderr ratio — no new telemetry.
+3. **Skill mining (repetition only).** When the same type of work has
+   succeeded repeatedly, explicitly invoke `skill detect_reuse` /
+   `skill detect_evolution` so evidence-backed candidates can emerge.
+   Mining never publishes; approval stays human-gated (`user_confirmed=true`);
+   publication writes SKILL.md into the OpenCode skills directory, and
+   OpenCode loads it natively when its description matches a task.
+4. **Curator (host-side, optional).** The systemd user timer
+   (`codebro-curator.timer` → `~/.config/codebro/scripts/curator.py run`)
+   consolidates learning and exports the portable mirror daily. It is host
+   tooling, not CodeBro machinery; WS5 `codebro export` / `codebro import`
+   is the explicit cross-device transport.
+
+Do not automate these conventions inside CodeBro. Trust gates are unchanged:
+evidence → candidate → human approval → published skill → agent use. Context
+injection never mutates state; the plugin never approves, rejects, publishes,
+or mutates a skill.
+
 ## Repository safety
 
 - `crates/` — canonical source. `Cargo.toml` — package metadata and version. `docs/design/` and `docs/ADR/` — design docs.
