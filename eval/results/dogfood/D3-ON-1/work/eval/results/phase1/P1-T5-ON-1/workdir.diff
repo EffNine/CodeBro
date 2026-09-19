@@ -1,0 +1,29 @@
+Only in P1-T5-ON-1/work: Cargo.lock
+diff -r P1-T5-ON-1/work-fresh/src/lib.rs P1-T5-ON-1/work/src/lib.rs
+1c1,3
+< //! Tiny bounded cache (eval fixture). Eviction follows NOTES.md. See `spec.md`.
+---
+> //! Tiny bounded cache (eval fixture). Eviction per the 2026-02 policy:
+> //! when full, the cache is bulk-cleared on demand, then the new entry is
+> //! inserted. This replaces (supersedes) the stale LRU bookkeeping. See spec.md.
+22c24,25
+<             // NOTES.md approach: bulk clear when full.
+---
+>             // Bulk-clear approach (NOTES.md, supersedes prior LRU design):
+>             // drop the whole map so the new entry lands in a cold cache.
+63a67,80
+>     }
+> 
+>     #[test]
+>     fn bulk_clear_when_full() {
+>         let mut c = Cache::new(3);
+>         c.put("a".into(), "1".into());
+>         c.put("b".into(), "2".into());
+>         c.put("c".into(), "3".into());
+>         c.put("d".into(), "4".into());
+>         // After the bulk clear: only "d" survives; 3 entries were evicted.
+>         assert_eq!(c.len(), 1);
+>         assert_eq!(c.get("d"), Some("4".to_string()));
+>         assert_eq!(c.get("a"), None);
+>         assert_eq!(c.evictions(), 3);
+Only in P1-T5-ON-1/work: target

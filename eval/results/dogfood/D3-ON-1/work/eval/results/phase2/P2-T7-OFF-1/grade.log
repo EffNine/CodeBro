@@ -1,0 +1,26 @@
+   Compiling gatekeeper v0.1.0 (/tmp/opencode/phase2/P2-T7-OFF-1/work-grade)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (/tmp/opencode/phase2/P2-T7-OFF-1/work-grade/target/debug/deps/gatekeeper-fbb6816b9ba9cca6)
+
+running 2 tests
+test tests::visible_errors ... ok
+test tests::visible_ok ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hidden.rs (/tmp/opencode/phase2/P2-T7-OFF-1/work-grade/target/debug/deps/hidden-0c98ea9b3fd76528)
+
+running 4 tests
+test hidden_success_hides_credential ... ok
+test hidden_user_context_preserved ... ok
+test hidden_error_hides_credential ... ok
+test hidden_malformed_hides_credential ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests gatekeeper
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

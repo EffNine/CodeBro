@@ -1,0 +1,9 @@
+{
+  "run_id": "P0-T3-ON-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (grader decides)",
+  "probe": "A PRESENT/38/37, B PRESENT",
+  "grade_summary": "13 hidden + 5 visible green",
+  "notes": "Retry 1 after 600s outer harness window killed healthy B session (attempt1 B log retained; A had completed). Full retry ~5 min. Agent noted continuation.md absent (F-01), proceeded via spec.md.",
+  "comparative_claim": "NONE \u2014 Phase-0 is protocol validation only"
+}

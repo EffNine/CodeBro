@@ -1,0 +1,9 @@
+{
+  "run_id": "D4-ON-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (exit 0: 13 hidden + 5 visible)",
+  "probe": "A PRESENT/reachable, B PRESENT/66/59",
+  "grade_summary": "A step12 green then STOP; B steps 3-4 green, steps 1-2 intact, no API changes",
+  "notes": "A: memory_stats+context then implement. B: memory_stats + codebro_task x7 (task-state use) + read/verify; noted continuation.md absent (F-01), proceeded via spec.md; verified rather than trusted notes. No handoff failure. Tool-count 66 (noise).",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

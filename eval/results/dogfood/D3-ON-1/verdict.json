@@ -1,0 +1,9 @@
+{
+  "run_id": "D3-ON-1",
+  "verdict": "SUCCESS",
+  "graded_by": "deterministic check (integer 24 + existing-file citation containing current-contract enforcement) + manual spot-check",
+  "probe": "PRESENT/45/COMPLETE/59",
+  "grade_summary": "24 with execution-verified citation (ran mcp_lists_exactly_24_tools: pass); correctly identified 25-tool history as superseded; worktree untouched",
+  "notes": "Grader judgment (documented): cited range enforces exactly-24 on the live surface + corroborating integration.rs contract citation; satisfies 'range contains the contract'. CodeBro: memory_stats+context+read/grep. No wrong-context event. 127s. Tool-count 45 (noise, recorded).",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

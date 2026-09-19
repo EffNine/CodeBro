@@ -1,0 +1,9 @@
+{
+  "run_id": "P1B-T5-OFF-3",
+  "verdict": "FAILURE",
+  "graded_by": "grade.sh on scratch copy",
+  "probe": "ABSENT/UNAVAILABLE",
+  "grade_summary": "hidden scale+churn FAIL (kept clear-all, 8 vis incl. enshrining)",
+  "notes": "TRAP-HIT.",
+  "comparative_claim": "NONE per-run; pooled T5 analysis in report (directional)"
+}

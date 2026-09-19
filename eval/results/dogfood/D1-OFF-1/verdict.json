@@ -1,0 +1,9 @@
+{
+  "run_id": "D1-OFF-1",
+  "verdict": "SUCCESS",
+  "graded_by": "deterministic citation check (test -e on 4 cited paths in trial worktree) + manual spot-check",
+  "probe": "ABSENT/0/UNAVAILABLE",
+  "grade_summary": "owning crate change-engine + canonical change_engine.rs + 2 supporting files, all paths exist verbatim; worktree untouched (read-only honored)",
+  "notes": "No CodeBro (ABSENT). Used bash ls/read equivalents (5 bash calls). 62s. Thinking trace mentioned creating dirs but worktree-status empty — no writes occurred.",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

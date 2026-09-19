@@ -1,0 +1,549 @@
+//! `codebro doctor` — engineering-runtime diagnostics (control plane).
+//!
+//! Checks the health of a workspace's CodeBro state: project identity,
+//! fact store, engineering memory and repository status. Emits a summary
+//! and returns a scriptable exit code:
+//!
+//! - `0` — healthy
+//! - `1` — warnings (recoverable)
+//! - `2` — errors (needs `codebro init` or manual repair)
+
+#![allow(dead_code, unused_imports)] // deliberate product surface beyond current callers; revisit at legacy retirement
+use std::path::Path;
+
+use anyhow::Result;
+
+/// Exit code for a fully healthy workspace.
+pub const EXIT_HEALTHY: i32 = 0;
+/// Exit code when only warnings are present.
+pub const EXIT_WARN: i32 = 1;
+/// Exit code when errors are present.
+pub const EXIT_ERROR: i32 = 2;
+
+/// A single diagnostic check result from the doctor.
+#[derive(Debug, Clone)]
+pub struct Check {
+    pub name: String,
+    pub ok: bool,
+    pub detail: Option<String>,
+}
+
+impl Check {
+    fn pass(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Check {
+            name: name.into(),
+            ok: true,
+            detail: Some(detail.into()),
+        }
+    }
+
+    fn warn(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Check {
+            name: name.into(),
+            ok: false,
+            detail: Some(format!("WARN: {}", detail.into())),
+        }
+    }
+
+    fn fail(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Check {
+            name: name.into(),
+            ok: false,
+            detail: Some(format!("ERROR: {}", detail.into())),
+        }
+    }
+}
+
+/// Run diagnostics for a workspace root; returns the scriptable exit code
+/// plus the structured check results. CLI callers use this to print output
+/// and then exit with the returned code.
+pub fn run(workspace_root: &Path) -> Result<i32> {
+    let root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let (code, checks) = report(workspace_root)?;
+    print_report(&checks, code, &root);
+    Ok(code)
+}
+
+/// Run diagnostics and return the exit code plus the raw check results.
+/// This is the machine-readable path used by the MCP `repository_health`
+/// adapter; it does NOT print anything.
+pub fn report(workspace_root: &Path) -> Result<(i32, Vec<Check>)> {
+    let root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let codebro_dir = root.join(".codebro");
+
+    let mut checks: Vec<Check> = Vec::new();
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+
+    // ── 1. Workspace root ─────────────────────────────────────────────
+    if root.is_dir() {
+        checks.push(Check::pass("workspace_root", root.display().to_string()));
+    } else {
+        checks.push(Check::fail("workspace_root", "directory does not exist"));
+        errors += 1;
+    }
+
+    // ── 2. .codebro directory ─────────────────────────────────────────
+    if codebro_dir.is_dir() {
+        checks.push(Check::pass(".codebro", "runtime state directory exists"));
+    } else {
+        checks.push(Check::warn(
+            ".codebro",
+            "not initialized — run `codebro init`",
+        ));
+        warnings += 1;
+    }
+
+    // ── 3. Project identity ───────────────────────────────────────────
+    let identity_path = codebro_dir.join("project_identity.json");
+    let mut identity = crate::project_identity::ProjectIdentityRuntime::new(&root);
+    match identity.load() {
+        Ok(_) => {
+            let snap = identity.snapshot();
+            let langs = snap.languages.join(", ");
+            checks.push(Check::pass(
+                "project_identity",
+                format!("{} ({langs})", snap.name),
+            ));
+        }
+        Err(e) => {
+            let exists = identity_path.exists();
+            checks.push(Check::warn(
+                "project_identity",
+                if exists {
+                    format!("present but failed to load: {e}")
+                } else {
+                    "absent — identity not established".to_string()
+                },
+            ));
+            warnings += 1;
+        }
+    }
+
+    // ── 4. Fact store ─────────────────────────────────────────────────
+    let facts_path = codebro_dir.join("facts.json");
+    match std::fs::read(&facts_path) {
+        Ok(bytes) => match serde_json::from_slice::<crate::engineering_facts::FactsModel>(&bytes) {
+            Ok(model) => {
+                let store = crate::fact_store::FactStore::from_model(&model);
+                let validation = crate::fact_store::validation::FactValidation::validate(&store);
+                let counts = store.collection().counts();
+                let mut breakdown = String::new();
+                for rule in crate::fact_store::validation::FactValidationRule::ALL {
+                    let n = validation.count_by_rule(rule);
+                    if n > 0 {
+                        if !breakdown.is_empty() {
+                            breakdown.push_str(", ");
+                        }
+                        breakdown.push_str(&format!("{}={n}", rule.as_str()));
+                    }
+                }
+                let detail = format!(
+                    "{} facts ({} modules, {} symbols, {} tests) — validation: {} issues{}",
+                    counts.total,
+                    counts.modules,
+                    counts.symbols,
+                    counts.tests,
+                    validation.issue_count(),
+                    if breakdown.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{breakdown}]")
+                    }
+                );
+                if validation.passed() {
+                    checks.push(Check::pass("facts", detail));
+                } else {
+                    checks.push(Check::warn("facts", detail));
+                    warnings += 1;
+                }
+            }
+            Err(e) => {
+                checks.push(Check::fail("facts", format!("unparseable: {e}")));
+                errors += 1;
+            }
+        },
+        Err(_) => {
+            checks.push(Check::warn("facts", "absent — run `codebro init`"));
+            warnings += 1;
+        }
+    }
+
+    // ── 5. Engineering memory ─────────────────────────────────────────
+    let _memory_path = codebro_dir.join("engineering_memory.json");
+    let identity_for_memory = crate::project_identity::ProjectIdentityRuntime::new(&root);
+    let mut memory =
+        crate::engineering_memory::EngineeringMemoryRuntime::new(&root, identity_for_memory);
+    match memory.load() {
+        Ok(count) => {
+            checks.push(Check::pass(
+                "engineering_memory",
+                format!("{count} entries"),
+            ));
+        }
+        Err(crate::engineering_memory::runtime::EngineeringMemoryError::Storage(
+            crate::engineering_memory::store::StorageError::NotFound(_),
+        )) => {
+            checks.push(Check::pass(
+                "engineering_memory",
+                "absent (no entries recorded yet)",
+            ));
+        }
+        Err(e) => {
+            // Any other load failure (corrupt/quarantined, wrong schema,
+            // wrong workspace) is an error condition worth surfacing.
+            checks.push(Check::fail("engineering_memory", e.to_string()));
+            errors += 1;
+        }
+    }
+
+    // ── 6. Execution evidence journal ─────────────────────────────────
+    // Advisory validation history. Absence is normal for a fresh workspace
+    // (pass, not warn). Corruption is a warning, never an error: the
+    // journal is historical context, not structural truth, and a corrupt
+    // file is quarantined lazily on the next validation run — health
+    // checks themselves never mutate the workspace.
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let st = crate::sandbox::evidence_journal::status(&root, now);
+        if !st.exists {
+            checks.push(Check::pass(
+                "execution_evidence",
+                "absent (no executions recorded yet)",
+            ));
+        } else if !st.valid {
+            checks.push(Check::warn(
+                "execution_evidence",
+                "present but unparseable (will be quarantined on next validation run)",
+            ));
+            warnings += 1;
+        } else if st.records == 0 {
+            checks.push(Check::pass(
+                "execution_evidence",
+                format!("present but empty ({} bytes)", st.bytes),
+            ));
+        } else {
+            let age = match st.newest_age_secs {
+                Some(a) => format!(", newest {a}s ago"),
+                None => String::new(),
+            };
+            checks.push(Check::pass(
+                "execution_evidence",
+                format!("{} records, {} bytes{age}", st.records, st.bytes),
+            ));
+        }
+    }
+
+    // ── 7. Git repository state ───────────────────────────────────────
+    let git_status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&root)
+        .output();
+    match git_status {
+        Ok(out) if out.status.success() => {
+            let dirty = String::from_utf8_lossy(&out.stdout).lines().count();
+            if dirty == 0 {
+                checks.push(Check::pass("git", "working tree clean"));
+            } else {
+                checks.push(Check::warn("git", format!("{dirty} uncommitted path(s)")));
+                warnings += 1;
+            }
+        }
+        _ => {
+            checks.push(Check::pass("git", "not a git repository (skipped)"));
+        }
+    }
+
+    // ── 8. P6 engineering intelligence (additive, evidence-based) ───────
+    // These checks never mutate the workspace and never invent scores.
+    // They project the persisted fact store through deterministic
+    // structural queries (stale index, cycles, fanout, orphans, parser
+    // failures, missing tests). Absent facts.json means "unknown", not
+    // failure: the existing `facts` check already covers absence.
+    {
+        let facts_path = codebro_dir.join("facts.json");
+        if let Ok(bytes) = std::fs::read(&facts_path) {
+            if let Ok(model) =
+                serde_json::from_slice::<crate::engineering_facts::FactsModel>(&bytes)
+            {
+                let store = crate::fact_store::FactStore::from_model(&model);
+                // Stale index: generation state vs current HEAD.
+                let gen = model.generation_repo_state();
+                let current = codebro_core::RepoState::capture(&root);
+                let stale = matches!((gen, current.as_ref()), (Some(p), Some(c)) if p.working_tree_hash != c.working_tree_hash);
+                // Health findings (bounded, deterministic). Severity drives
+                // the check outcome: Error → fail, Warning → warn,
+                // Info-only → pass (observations, not bugs). This keeps
+                // tiny healthy workspaces green while still surfacing
+                // structural signals for OpenCode to reason over.
+                let findings = crate::impact::health::analyze_health(&store, stale, 50);
+                if findings.is_empty() {
+                    checks.push(Check::pass(
+                        "engineering_health",
+                        "no structural findings (cycles/fanout/orphans/stale)",
+                    ));
+                } else {
+                    use crate::impact::health::FindingSeverity;
+                    let has_error = findings.iter().any(|f| {
+                        matches!(f.severity, FindingSeverity::Error)
+                            || matches!(
+                                f.finding_type,
+                                crate::impact::health::FindingType::UnresolvedReference
+                            )
+                    });
+                    let has_warning = findings
+                        .iter()
+                        .any(|f| matches!(f.severity, FindingSeverity::Warning));
+                    let summary = summarize_findings(&findings);
+                    if has_error {
+                        checks.push(Check::fail("engineering_health", summary));
+                        errors += 1;
+                    } else if has_warning {
+                        checks.push(Check::warn("engineering_health", summary));
+                        warnings += 1;
+                    } else {
+                        checks.push(Check::pass(
+                            "engineering_health",
+                            format!("{summary} (info only)"),
+                        ));
+                    }
+                }
+                // Parser limitation disclosure: file-level-only languages
+                // present in the tree are reported, never hidden.
+                {
+                    let langs: Vec<String> =
+                        model.languages().iter().map(|l| l.name.clone()).collect();
+                    let detail = if langs.is_empty() {
+                        "no language facts recorded".to_string()
+                    } else {
+                        format!("languages: {}", langs.join(", "))
+                    };
+                    checks.push(Check::pass("engineering_languages", detail));
+                }
+            }
+        } else {
+            checks.push(Check::pass(
+                "engineering_health",
+                "skipped (no facts.json; see `facts` check)",
+            ));
+        }
+    }
+
+    let _ = (errors, warnings);
+    Ok((compute_exit_code(&checks), checks))
+}
+
+/// Deterministic one-line summary of health findings: counts by type.
+fn summarize_findings(findings: &[crate::impact::health::HealthFinding]) -> String {
+    use std::collections::BTreeMap;
+    let mut by_type: BTreeMap<&str, usize> = BTreeMap::new();
+    for f in findings {
+        *by_type.entry(f.finding_type.as_str()).or_default() += 1;
+    }
+    let parts: Vec<String> = by_type
+        .into_iter()
+        .map(|(t, n)| format!("{t}={n}"))
+        .collect();
+    format!(
+        "{} finding(s) [{}] — evidence-based observations, not bugs",
+        findings.len(),
+        parts.join(", ")
+    )
+}
+
+/// Compute the overall exit code from the collected checks.
+fn compute_exit_code(checks: &[Check]) -> i32 {
+    let mut worst: i32 = EXIT_HEALTHY;
+    for check in checks {
+        if !check.ok {
+            let status = if check
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("ERROR"))
+            {
+                EXIT_ERROR
+            } else {
+                EXIT_WARN
+            };
+            worst = worst.max(status);
+        }
+    }
+    worst
+}
+
+/// Print the human-readable report (used by the CLI).
+fn print_report(checks: &[Check], worst: i32, root: &Path) {
+    println!("codebro doctor — {}", root.display());
+    println!();
+    for check in checks {
+        let (icon, status) = if check.ok {
+            ("✓", "ok")
+        } else if check
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.starts_with("ERROR"))
+        {
+            ("✗", "error")
+        } else {
+            ("!", "warn")
+        };
+        println!("  {icon} {:<18} {}", check.name, status);
+        if let Some(detail) = &check.detail {
+            println!("      {detail}");
+        }
+    }
+    println!();
+    let errors = checks
+        .iter()
+        .filter(|c| !c.ok && c.detail.as_deref().is_some_and(|d| d.starts_with("ERROR")))
+        .count();
+    let warnings = checks
+        .iter()
+        .filter(|c| !c.ok && !c.detail.as_deref().is_some_and(|d| d.starts_with("ERROR")))
+        .count();
+    match worst {
+        EXIT_HEALTHY => println!("  All checks passed."),
+        EXIT_WARN => println!("  {errors} error(s), {warnings} warning(s)."),
+        _ => println!("  {errors} error(s), {warnings} warning(s). Run `codebro init` to repair."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn healthy_empty_dir_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = run(dir.path()).unwrap();
+        // Absent .codebro/facts/memory are warnings, not errors -> exit 1.
+        assert_eq!(code, EXIT_WARN);
+    }
+
+    #[test]
+    fn corrupt_facts_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cb = dir.path().join(".codebro");
+        std::fs::create_dir_all(&cb).unwrap();
+        std::fs::write(cb.join("facts.json"), "not json").unwrap();
+        let code = run(dir.path()).unwrap();
+        assert_eq!(code, EXIT_ERROR);
+    }
+
+    #[test]
+    fn corrupt_memory_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cb = dir.path().join(".codebro");
+        std::fs::create_dir_all(&cb).unwrap();
+        std::fs::write(cb.join("engineering_memory.json"), "garbage").unwrap();
+        let code = run(dir.path()).unwrap();
+        assert_eq!(code, EXIT_ERROR);
+    }
+
+    #[test]
+    fn initialized_workspace_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::init::run(dir.path()).unwrap();
+        let code = run(dir.path()).unwrap();
+        // init creates facts; project identity is a separate feature and
+        // its absence is only a warning -> exit is at most WARN, never
+        // ERROR (exit 2).
+        assert!(code <= EXIT_WARN, "got {code}");
+    }
+
+    #[test]
+    fn execution_evidence_absent_is_pass_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (code, checks) = report(dir.path()).unwrap();
+        let check = checks
+            .iter()
+            .find(|c| c.name == "execution_evidence")
+            .expect("execution_evidence check must exist");
+        assert!(check.ok, "absent journal must pass: {check:?}");
+        assert!(
+            check
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("no executions"),
+            "{check:?}"
+        );
+        // Health checks never mutate: no journal file may appear.
+        assert!(!dir.path().join(".codebro/execution_evidence.json").exists());
+        // Absence alone must not escalate beyond WARN (other missing state warns).
+        assert!(code <= EXIT_WARN, "got {code}");
+    }
+
+    #[test]
+    fn execution_evidence_present_reports_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let diags: Vec<crate::sandbox::ParsedDiagnostic> = Vec::new();
+        let modules: Vec<String> = Vec::new();
+        let input = crate::sandbox::evidence_journal::JournalInput {
+            execution_id: "e1",
+            project_id: None,
+            tree_hash: "treeA",
+            command: "cargo test",
+            test_filter: &[],
+            exit_code: 0,
+            classification: "success",
+            success: true,
+            timed_out: false,
+            duration_ms: 10,
+            diagnostics: &diags,
+            affected_modules: &modules,
+        };
+        crate::sandbox::evidence_journal::record(dir.path(), &input, now).unwrap();
+        let (_, checks) = report(dir.path()).unwrap();
+        let check = checks
+            .iter()
+            .find(|c| c.name == "execution_evidence")
+            .expect("execution_evidence check must exist");
+        assert!(check.ok, "{check:?}");
+        assert!(
+            check.detail.as_deref().unwrap_or("").contains("1 records"),
+            "{check:?}"
+        );
+    }
+
+    #[test]
+    fn execution_evidence_corrupt_is_warn_not_error_and_not_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let cb = dir.path().join(".codebro");
+        std::fs::create_dir_all(&cb).unwrap();
+        std::fs::write(cb.join("execution_evidence.json"), b"{not valid json!!").unwrap();
+        let (code, checks) = report(dir.path()).unwrap();
+        let check = checks
+            .iter()
+            .find(|c| c.name == "execution_evidence")
+            .expect("execution_evidence check must exist");
+        assert!(!check.ok, "{check:?}");
+        assert!(
+            check.detail.as_deref().unwrap_or("").starts_with("WARN"),
+            "{check:?}"
+        );
+        // A corrupt journal alone must not escalate to ERROR.
+        assert!(code <= EXIT_WARN, "got {code}");
+        // Health checks never quarantine: no .corrupt-* sidecar may appear.
+        let entries: Vec<String> = std::fs::read_dir(&cb)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !entries.iter().any(|n| n.contains(".corrupt-")),
+            "{entries:?}"
+        );
+    }
+}

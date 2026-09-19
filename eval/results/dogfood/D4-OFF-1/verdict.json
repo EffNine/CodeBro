@@ -1,0 +1,9 @@
+{
+  "run_id": "D4-OFF-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (exit 0)",
+  "probe": "A+B ABSENT/0/UNAVAILABLE (confirmed from logs)",
+  "grade_summary": "A step12 green then STOP; B full green, no API changes",
+  "notes": "OFF handoff clean: B verified continuation.md absent, read spec+source, implemented 3-4 without touching 1-2. B used ainotebook_context_read x4 + search x1 (parity-MCP use, logged per protocol). No handoff failure; re-read counts similar to ON (B read 8 vs ON-B read 7).",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

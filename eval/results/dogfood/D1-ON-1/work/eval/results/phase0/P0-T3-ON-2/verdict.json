@@ -1,0 +1,9 @@
+{
+  "run_id": "P0-T3-ON-2",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (grader decides)",
+  "probe": "A+B PRESENT (B: entry 37)",
+  "grade_summary": "13 hidden + 5 visible green",
+  "notes": "B counted '20 (3 ainotebook + 17 codebro)' \u2014 advisory count noise (F-02).",
+  "comparative_claim": "NONE \u2014 Phase-0 is protocol validation only"
+}

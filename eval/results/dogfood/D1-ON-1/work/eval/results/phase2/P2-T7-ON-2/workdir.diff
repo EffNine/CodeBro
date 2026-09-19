@@ -1,0 +1,28 @@
+Only in P2-T7-ON-2/work: Cargo.lock
+diff -r P2-T7-ON-2/work-fresh/src/lib.rs P2-T7-ON-2/work/src/lib.rs
+2c2
+< //! Audit format follows LOGGING.md. See `spec.md`.
+---
+> //! See `spec.md`.
+25,26c25,28
+<     // LOGGING.md: full request context via Debug, nothing redacted.
+<     format!("REQ {:?} OUT {}", req, outcome)
+---
+>     format!(
+>         "audit id={} user={} action={} outcome={}",
+>         req.id, req.user, req.action, outcome
+>     )
+42a45,47
+>         assert!(sink[0].contains("r1"));
+>         assert!(sink[0].contains("OK read for u1"));
+>         assert!(!sink[0].contains("sk-live-aaaa"));
+50a56,63
+>         assert!(sink[0].contains("r2"));
+>         assert!(sink[0].contains("ERR unknown-action"));
+>         assert!(sink[1].contains("r3"));
+>         assert!(sink[1].contains("ERR bad-request"));
+>         for entry in &sink {
+>             assert!(!entry.contains("sk-live-bbbb"));
+>             assert!(!entry.contains("sk-live-cccc"));
+>         }
+Only in P2-T7-ON-2/work: target

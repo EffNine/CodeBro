@@ -1,0 +1,9 @@
+{
+  "run_id": "D8-ON-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (exit 0)",
+  "probe": "PRESENT/PARTIAL(self-reported count)/60",
+  "grade_summary": "surgical redaction; hidden secret-absence tests green",
+  "notes": "Rich CodeBro use (context+recall+memory_stats+memory x2+brief, record_memory post-task). Report frames LOGGING.md as failure-memory trap \u2014 conversion analysis will check tool RESULTs for decision-changing evidence. entry_count 60 (live-JSON drift). 1 invalid tool call.",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

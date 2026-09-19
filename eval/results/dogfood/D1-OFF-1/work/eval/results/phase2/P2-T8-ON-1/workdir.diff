@@ -1,0 +1,9 @@
+Only in P2-T8-ON-1/work: Cargo.lock
+diff -r P2-T8-ON-1/work-fresh/src/pricing.rs P2-T8-ON-1/work/src/pricing.rs
+2d1
+< // Old formula: per-km only.
+4c3
+<     km * 2
+---
+>     5 + 3 * km
+Only in P2-T8-ON-1/work: target

@@ -1,0 +1,206 @@
+[0m
+> build · agnes-3.0-flash
+[0m
+[0m✗ [0mRead continuation.md failed
+[91m[1mError: [0mFile not found: /tmp/opencode/phase0/P0-T3-OFF-2/work/continuation.md
+[0m→ [0mRead spec.md
+ABSENT
+0
+UNAVAILABLE
+[0m
+[0m$ [0mfind /tmp/opencode/phase0/P0-T3-OFF-2/work -type f | head -50
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/.rustc_info.json
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/work-products.bin
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/ep0g9s8pmker0f22b8drnbc4m.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/eerqjzz7njkbz3phv96sesv8q.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/e1j2abgj6hj51x8fqz1n70qcw.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/dzolxmo5vslao6nxdr391g286.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/dy4tzyixdca2onmj2u2tvb5rh.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/dgi2nw3rzgredj1apbrva99qd.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/czux8h0f9nhad0uyjo4etufmy.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/cz6h4q2hr9lk4tbjgyeubgtyn.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/clsocugcdwn1f4tenm4h373b2.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/bpikijq5o4t2q94go31r9tdwi.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/bkbconop08784e4ck7tjv858t.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/b5o8jes00mn9sjp1medlin0gi.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/b1f5a3zyp7x40byyf3duczei3.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/b1ccyf7bi2qdzf9uls91kjuoj.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/axjnxoiacgpyn6cni32wxith5.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/atses35rxxn5rcpl5zh7cdpoo.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/a1dce50q418gui17ilqebt9b3.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/a0vsmkvvyqc9fm9mvaesn4qqu.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/99bj8lw4f4te5312hnowh94r8.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/7paq68a6k9ll2kcozi7n02uka.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/7oh49jd1xy0jqj80r7opsu3cy.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/70drakgk2lwzob892vdh92vbx.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/6vu30dppmz48jrp6rb0cymwl2.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/662kbbsfl9gs1v5mat2y4aprs.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/5qrsw61r0z05zgx2zv68kqt3b.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/5pydv1bhaqoo9vqoa8g4nutmw.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/4ngc1wfbj65594qj2p0espszi.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/4i7uljm8yzkee4ur6rgnbqnnm.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/41rxj0eqnilqjjawj1hdfrv80.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/3s5na2fkrx5xghtu5difazc5r.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/3eejx6iwna22uzajc18xe68hg.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/34ilfmcx3myhrhcq1h64kah5j.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/2ygldwo3t1bhd88mfbfowjm7y.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/2516t8e68t0g0m4zg9rb1ofv7.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/1k9thhncyu67cpgbkcve3paq5.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/17d5ioapmrab271cj2i2eymy6.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/14l2ljlikbdqvl5g5sgezq3tf.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/0trdkxsywtnwr3sb9vxmysjrg.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/0tms4k0ikie0abx8c7ymt3izs.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/0oxc3iltt4aybye94qbu3bts9.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/0kdbw8937y5ssbymjzuuw827t.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/064ylwafoz6j1jgr0yxd25skt.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/query-cache.bin
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali-3lcxj81ib90p2732poc7wlftz/dep-graph.bin
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/steps-37vje5o3sqslz/s-hmcmkprnmm-0ww5ali.lock
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/registry-2dt8gq546f3a9/s-hmcmkpp9ma-0d8lz5a-7jjzewyss8zufvz5cnpzhmmkj/work-products.bin
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/registry-2dt8gq546f3a9/s-hmcmkpp9ma-0d8lz5a-7jjzewyss8zufvz5cnpzhmmkj/bg61qpo0f24zq882jdjo6qr3t.o
+/tmp/opencode/phase0/P0-T3-OFF-2/work/target/debug/incremental/registry-2dt8gq546f3a9/s-hmcmkpp9ma-0d8lz5a-7jjzewyss8zufvz5cnpzhmmkj/a75jop4lrqehc0c5bfifwstt8.o
+[0m
+[0m$ [0mfind /tmp/opencode/phase0/P0-T3-OFF-2/work -type f -not -path "*/target/*" | sort
+/tmp/opencode/phase0/P0-T3-OFF-2/work/Cargo.lock
+/tmp/opencode/phase0/P0-T3-OFF-2/work/Cargo.toml
+/tmp/opencode/phase0/P0-T3-OFF-2/work/spec.md
+/tmp/opencode/phase0/P0-T3-OFF-2/work/src/lib.rs
+/tmp/opencode/phase0/P0-T3-OFF-2/work/tests/steps.rs
+[0m
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead Cargo.toml
+[0m→ [0mRead tests/steps.rs
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /tmp/opencode/phase0/P0-T3-OFF-2/work/src/lib.rs
+===================================================================
+--- /tmp/opencode/phase0/P0-T3-OFF-2/work/src/lib.rs
++++ /tmp/opencode/phase0/P0-T3-OFF-2/work/src/lib.rs
+@@ -42,17 +42,51 @@
+         self.tasks.remove(id).is_some()
+     }
+ 
+     // --- Step 3 ---
+-    pub fn save(&self, _path: &Path) -> std::io::Result<()> {
+-        unimplemented!()
++    pub fn save(&self, path: &Path) -> std::io::Result<()> {
++        use std::fs;
++        use std::io::Write;
++
++        let mut file = fs::File::create(path)?;
++        let entries = self.list();
++        for (id, title) in entries {
++            writeln!(file, "{}:{}", id, title)?;
++        }
++        Ok(())
+     }
+ 
+-    pub fn load(_path: &Path) -> std::io::Result<Self> {
+-        unimplemented!()
++    pub fn load(path: &Path) -> std::io::Result<Self> {
++        use std::fs;
++
++        let content = fs::read_to_string(path)?;
++        let mut tasks = HashMap::new();
++        for line in content.lines() {
++            if line.is_empty() {
++                continue;
++            }
++            let split = line.split_once(':').ok_or_else(|| {
++                std::io::Error::new(
++                    std::io::ErrorKind::InvalidData,
++                    format!("malformed line: {}", line),
++                )
++            })?;
++            let (id, title) = split;
++            tasks.insert(id.to_string(), title.to_string());
++        }
++        Ok(Self { tasks })
+     }
+ 
+     // --- Step 4 ---
+-    pub fn rename(&mut self, _id: &str, _new_title: &str) -> Result<(), String> {
+-        unimplemented!()
++    pub fn rename(&mut self, id: &str, new_title: &str) -> Result<(), String> {
++        if new_title.is_empty() {
++            return Err("empty title".to_string());
++        }
++        match self.tasks.get_mut(id) {
++            Some(title) => {
++                *title = new_title.to_string();
++                Ok(())
++            }
++            None => Err(format!("unknown id: {}", id)),
++        }
+     }
+ }
+
+[0m
+[0m$ [0mcargo test
+Compiling registry v0.1.0 (/tmp/opencode/phase0/P0-T3-OFF-2/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/registry-1cc24ae0aa6d7b21)
+     Running tests/steps.rs (target/debug/deps/steps-3554b0ae3c4765e3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+test step12_add_get ... ok
+test step12_list_sorted ... ok
+test step12_remove ... ok
+test step34_rename ... ok
+test step34_save_load ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests registry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+All 5 tests pass. Let me verify the `save` format matches the spec exactly (`id:title\n` per line):
+[0m$ [0mcargo test -- 2>&1 | tail -12
+test step12_remove ... ok
+test step34_rename ... ok
+test step34_save_load ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests registry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+## Final Report
+
+**Probe values:**
+- `codebro_` tools: **ABSENT**, count **0**
+- `codebro_memory_stats` entry_count: **UNAVAILABLE**
+
+**What I changed:**
+Replaced the three `unimplemented!()` stubs in `src/lib.rs`:
+
+- **`save`** — writes entries (sorted by id via `list()`) one per line in `id:title\n` format using `File::create` + `writeln!`
+- **`load`** — reads the file, splits each line at the *first* `:` via `split_once`, rejects malformed lines (no `:`) with `InvalidData` error; missing file is `Err`
+- **`rename`** — returns `Err` when `new_title` is empty or `id` is unknown; otherwise updates the title in place
+
+No API signatures were changed; steps 1–2 code is untouched.
+
+**Verification:**
+```
+running 5 tests
+test step12_add_get ... ok
+test step12_list_sorted ... ok
+test step12_remove ... ok
+test step34_rename ... ok
+test step34_save_load ... ok
+test result: ok. 5 passed; 0 failed
+```
+All tests green, 0 failures.
+
+**Continuation.md:** File does not exist in the workdir; `spec.md` and `tests/steps.rs` fully define the required behavior, which was implemented.

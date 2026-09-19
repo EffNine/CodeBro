@@ -1,0 +1,9 @@
+{
+  "run_id": "P3-T9-ON-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy",
+  "probe": "PRESENT/COMPLETE",
+  "grade_summary": "2 vis + 3 hidden green",
+  "notes": "Memory-driven: cited inventory invariant (per-site durability, no bulk changes) against PERF.md; ledger Always.",
+  "comparative_claim": "NONE per-run; Phase-3 aggregate (tie)"
+}

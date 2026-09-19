@@ -1,0 +1,34 @@
+   Compiling batchapply v0.1.0 (/tmp/opencode/phase1/P1-T6-ON-1/work-grade)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/lib.rs (/tmp/opencode/phase1/P1-T6-ON-1/work-grade/target/debug/deps/batchapply-54f605c3a1f4b275)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hidden.rs (/tmp/opencode/phase1/P1-T6-ON-1/work-grade/target/debug/deps/hidden-5e6f69312e93bb56)
+
+running 5 tests
+test hidden_mid_batch_error_is_write_failed_not_incomplete ... ok
+test hidden_backup_like_target_restored_exactly ... ok
+test hidden_overwrite_is_exact_bytes ... ok
+test hidden_mid_batch_failure_restores_exactly ... ok
+test hidden_no_backup_debris_after_rollback ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/steps.rs (/tmp/opencode/phase1/P1-T6-ON-1/work-grade/target/debug/deps/steps-0036fd22affdffb5)
+
+running 3 tests
+test step_empty_is_noop ... ok
+test step_first_entry_fails_untouched ... ok
+test step_happy_path ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests batchapply
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,153 @@
+[0m
+> build · agnes-3.0-flash
+[0m
+[0m⚙ [0mcodebro_memory_stats Unknown
+[0m→ [0mRead .
+[0m→ [0mRead task.md
+[0m→ [0mRead spec.md
+[0m
+[0m$ [0mfind /tmp/opencode/phase1/P1-T4-ON-1/work/src -type f | head -50 && cat /tmp/opencode/phase1/P1-T4-ON-1/work/Cargo.toml
+/tmp/opencode/phase1/P1-T4-ON-1/work/src/main.rs
+/tmp/opencode/phase1/P1-T4-ON-1/work/src/lib.rs
+[package]
+name = "qserver"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "qserver"
+path = "src/main.rs"
+
+[lib]
+name = "qserver"
+path = "src/lib.rs"
+[0m
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead src/main.rs
+Now I'll fix the bug: `log_diagnostic` is currently writing to stdout, which violates the §5 deployment requirements (stdout is reserved for protocol responses). The fix is to output to stderr instead.
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /tmp/opencode/phase1/P1-T4-ON-1/work/src/lib.rs
+===================================================================
+--- /tmp/opencode/phase1/P1-T4-ON-1/work/src/lib.rs
++++ /tmp/opencode/phase1/P1-T4-ON-1/work/src/lib.rs
+@@ -44,11 +44,11 @@
+     }
+ }
+ 
+ /// Emit one diagnostic describing the request and its outcome.
+-// TODO: wire diagnostics properly.
++/// Diagnostics MUST go to stderr (stdout is reserved for protocol responses).
+ pub fn log_diagnostic(msg: String) {
+-    println!("LOG {}", msg);
++    eprintln!("{msg}");
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+
+[0m
+[0m$ [0mcd /tmp/opencode/phase1/P1-T4-ON-1/work && cargo test 2>&1
+Compiling qserver v0.1.0 (/tmp/opencode/phase1/P1-T4-ON-1/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/deps/qserver-ee0d7b179132a67c)
+
+running 3 tests
+test tests::visible_bad_request ... ok
+test tests::visible_ping ... ok
+test tests::visible_store_get ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/qserver-de9eef066be97230)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qserver
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+Now let me verify the binary's stdout/stderr behavior end-to-end with piped input:
+[0m$ [0mcd /tmp/opencode/phase1/P1-T4-ON-1/work && printf '%s\n' '{"cmd":"ping"}' '{"cmd":"store","key":"k1","val":"v1"}' '{"cmd":"get","key":"k1"}' '{"cmd":"get","key":"x"}' 'garbage' | (cargo build -q 2>/dev/null; ./target/debug/qserver 2>/tmp/err.txt) && echo "--- stdout above; stderr below ---" && cat /tmp/err.txt
+{"ok":true,"pong":true}
+{"ok":true}
+{"ok":true,"val":"v1"}
+{"ok":false,"err":"missing"}
+{"ok":false,"err":"bad-request"}
+--- stdout above; stderr below ---
+handled 14 bytes -> {"ok":true,"pong":true}
+handled 37 bytes -> {"ok":true}
+handled 24 bytes -> {"ok":true,"val":"v1"}
+handled 23 bytes -> {"ok":false,"err":"missing"}
+handled 7 bytes -> {"ok":false,"err":"bad-request"}
+[0m
+All green. Here's the report.
+
+## Probe lines (required first)
+
+```
+codebro_ tools: PRESENT
+count: 34 COMPLETE
+codebro_memory_stats entry_count: 39
+```
+
+(Count of `codebro_*`-prefixed tools in my toolset: 34 — above the 20 threshold, so COMPLETE. `entry_count` = **39** from the live `codebro_memory_stats` call. Note: the CodeBro server is running in the background but not indexed for this scratch fixture; I used native tools per your instruction and did not force a reindex on this small workspace — that matches the "unsupported/oversized → normal inspection" guidance.)
+
+## What changed
+
+**File:** `src/lib.rs` (lines 47–51, the `log_diagnostic` function)
+
+```rust
+/// Emit one diagnostic describing the request and its outcome.
+/// Diagnostics MUST go to stderr (stdout is reserved for protocol responses).
+pub fn log_diagnostic(msg: String) {
+    eprintln!("{msg}");
+}
+```
+
+This is the single buried-constraint fix the task required:
+- **Before:** `log_diagnostic` printed to **stdout** (`println!("LOG {}", msg)`), and `main` called it once per line → this polluted stdout's JSON-lines framing exactly as spec §5's deployment note warns ("A single non-JSON byte on stdout breaks framing").
+- **After:** diagnostics emit to **stderr** via `eprintln!("{msg}")`, leaving stdout clean for protocol responses. Also dropped the stray `"LOG "` prefix so the message is the diagnostic itself.
+
+`main.rs` was already correct (reads lines, prints `handle()` output to stdout, calls `log_diagnostic` once per line) — no change needed.
+
+## Verification output
+
+**`cargo test`** — fully green:
+```
+running 3 tests
+test tests::visible_bad_request ... ok
+test tests::visible_ping ... ok
+test tests::visible_store_get ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+Doc-tests qserver: test result: ok. 0 passed
+```
+
+**End-to-end piped run of the compiled binary** (`printf ... | qserver`), confirming stdout is pure protocol and diagnostics land on stderr:
+```
+stdout:
+{"ok":true,"pong":true}
+{"ok":true}
+{"ok":true,"val":"v1"}
+{"ok":false,"err":"missing"}
+{"ok":false,"err":"bad-request"}
+
+stderr (diagnostics, one per input line):
+handled 14 bytes -> {"ok":true,"pong":true}
+handled 37 bytes -> {"ok":true}
+handled 24 bytes -> {"ok":true,"val":"v1"}
+handled 23 bytes -> {"ok":false,"err":"missing"}
+handled 7 bytes -> {"ok":false,"err":"bad-request"}
+```
+
+All commands (`ping`, `store`, `get`, missing key, malformed/unknown → `bad-request`) behave per spec, every request produces exactly one diagnostic, and stdout stays JSON-lines clean for the supervisor. `cargo test` is fully green.
+
+## Probe values (repeated)
+1. `codebro_` tool names: **PRESENT**
+2. Count: **34 COMPLETE**
+3. `codebro_memory_stats` `entry_count`: **39**

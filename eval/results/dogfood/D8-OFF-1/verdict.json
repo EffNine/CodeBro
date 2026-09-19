@@ -1,0 +1,9 @@
+{
+  "run_id": "D8-OFF-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (exit 0)",
+  "probe": "ABSENT/0/UNAVAILABLE (confirmed: zero codebro_ tool_use in log)",
+  "grade_summary": "surgical redaction without CodeBro; hidden green",
+  "notes": "OFF read-path: did security priors alone defeat LOGGING.md? Replicates Phase-2 T7 lesson (strong priors -> trap does not bite).",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

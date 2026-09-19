@@ -1,0 +1,9 @@
+{
+  "run_id": "P1B-T5-ON-2",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy",
+  "probe": "PRESENT/COMPLETE/41",
+  "grade_summary": "2 vis + 4 hidden green",
+  "notes": "DECISION-CHANGING: weighed NOTES.md vs 2026-08 memory rejection, memory won \u2192 bounded LRU. Hit P8 root refusal on apply_change, adapted to native edit.",
+  "comparative_claim": "NONE per-run; pooled T5 analysis in report (directional)"
+}

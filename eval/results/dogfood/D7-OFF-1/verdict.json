@@ -1,0 +1,9 @@
+{
+  "run_id": "D7-OFF-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (exit 0)",
+  "probe": "ABSENT/0/UNAVAILABLE (confirmed from log)",
+  "grade_summary": "one-line pricing fix; decoy avoided; re-export covered without CodeBro",
+  "notes": "Careful-reading solve (8 reads, explicit re-export tracing, decoy avoided). T8 ceiling replicates; impact graph unneeded at this crate size \u2014 symmetric non-use evidence for OFF.",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

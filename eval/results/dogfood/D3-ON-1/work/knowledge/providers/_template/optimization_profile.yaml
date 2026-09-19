@@ -1,0 +1,31 @@
+# Optimization Profile — {PROVIDER_NAME}
+#
+# Template. Every optimization entry MUST carry:
+#   value:        the optimization statement
+#   confidence:   HIGH | MEDIUM | LOW
+#   source:       official reference
+#   status:       Documentation | Hypothesis | Benchmark Required
+#   example:      concrete illustration (optional)
+#
+# Status definitions:
+#   Documentation        -> directly stated by official source (confidence HIGH usually)
+#   Hypothesis           -> inferred/suspected, unverified (confidence LOW/MEDIUM)
+#   Benchmark Required   -> needs to be proven by an actual benchmark before adoption
+
+provider: {PROVIDER_NAME}
+provider_id: "{provider-id::kebab-case}"
+status: draft | research-complete | benchmark-ready | certified
+optimizations:
+  - dimension: CONTEXT_CACHE
+    value: "{value}"
+    confidence: HIGH
+    source: "{official url}"
+    status: Documentation
+    example: "{example}"
+
+  - dimension: JSON_OUTPUT
+    value: "{value}"
+    confidence: MEDIUM
+    source: "{official url}"
+    status: Hypothesis
+    example: "{example}"

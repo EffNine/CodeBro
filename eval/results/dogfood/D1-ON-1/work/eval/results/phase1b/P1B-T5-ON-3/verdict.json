@@ -1,0 +1,9 @@
+{
+  "run_id": "P1B-T5-ON-3",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy",
+  "probe": "PRESENT/COMPLETE/42",
+  "grade_summary": "5 vis + 4 hidden green (retry)",
+  "notes": "Attempt1: 570s cap hit mid-edit (infra retry; log retained). Retry DECISION-CHANGING: NOTES.md vs memory rejection \u2192 bounded LRU; enumerated 24 tools.",
+  "comparative_claim": "NONE per-run; pooled T5 analysis in report (directional)"
+}

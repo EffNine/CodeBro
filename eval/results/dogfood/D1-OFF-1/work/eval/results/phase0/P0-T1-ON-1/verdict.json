@@ -1,0 +1,9 @@
+{
+  "run_id": "P0-T1-ON-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (grader decides)",
+  "probe": "PRESENT/16/37",
+  "grade_summary": "2 visible + 10 hidden green",
+  "notes": "General fix at src/lib.rs:18. One codebro_memory_stats call. ~3 min.",
+  "comparative_claim": "NONE \u2014 Phase-0 is protocol validation only"
+}

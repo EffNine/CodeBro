@@ -1,0 +1,12 @@
+[package]
+name = "qserver"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "qserver"
+path = "src/main.rs"
+
+[lib]
+name = "qserver"
+path = "src/lib.rs"

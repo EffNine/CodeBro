@@ -1,0 +1,22 @@
+Only in P3-T9-ON-2/work: Cargo.lock
+diff -r P3-T9-ON-2/work-fresh/src/lib.rs P3-T9-ON-2/work/src/lib.rs
+51c51
+<     store.write("ledger", data, SyncMode::Never)
+---
+>     store.write("ledger", data, SyncMode::Always)
+90a91,104
+>     }
+> 
+>     #[test]
+>     fn crash_survives_ledger_loses_index_cache() {
+>         let d = tmpdir("crash");
+>         let mut s = Store::open(&d).unwrap();
+>         save_ledger(&mut s, b"L").unwrap();
+>         save_index(&mut s, b"I").unwrap();
+>         save_cache(&mut s, b"C").unwrap();
+>         s.simulate_crash();
+>         assert_eq!(s.read("ledger").unwrap(), b"L");
+>         assert!(s.read("index").is_err());
+>         assert!(s.read("cache").is_err());
+>         std::fs::remove_dir_all(&d).ok();
+Only in P3-T9-ON-2/work: target

@@ -1,0 +1,9 @@
+{
+  "run_id": "P0-T1-OFF-2",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (grader decides)",
+  "probe": "ABSENT/0/UNAVAILABLE",
+  "grade_summary": "2 visible + 10 hidden green",
+  "notes": "Clean ~1.5 min.",
+  "comparative_claim": "NONE \u2014 Phase-0 is protocol validation only"
+}

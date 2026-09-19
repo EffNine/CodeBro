@@ -1,0 +1,86 @@
+Only in P0-T3-ON-2/work: Cargo.lock
+diff -r P0-T3-ON-2/work-fresh/src/lib.rs P0-T3-ON-2/work/src/lib.rs
+18,19c18,29
+<     pub fn add(&mut self, _id: &str, _title: &str) -> Result<(), String> {
+<         unimplemented!()
+---
+>     pub fn add(&mut self, id: &str, title: &str) -> Result<(), String> {
+>         if id.is_empty() {
+>             return Err("id must not be empty".to_string());
+>         }
+>         if title.is_empty() {
+>             return Err("title must not be empty".to_string());
+>         }
+>         if self.tasks.contains_key(id) {
+>             return Err(format!("id '{}' already exists", id));
+>         }
+>         self.tasks.insert(id.to_string(), title.to_string());
+>         Ok(())
+22,23c32,33
+<     pub fn get(&self, _id: &str) -> Option<String> {
+<         unimplemented!()
+---
+>     pub fn get(&self, id: &str) -> Option<String> {
+>         self.tasks.get(id).cloned()
+28c38,41
+<         unimplemented!()
+---
+>         let mut entries: Vec<(String, String)> =
+>             self.tasks.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+>         entries.sort_by(|a, b| a.0.cmp(&b.0));
+>         entries
+31,32c44,45
+<     pub fn remove(&mut self, _id: &str) -> bool {
+<         unimplemented!()
+---
+>     pub fn remove(&mut self, id: &str) -> bool {
+>         self.tasks.remove(id).is_some()
+36,41c49,73
+<     pub fn save(&self, _path: &Path) -> std::io::Result<()> {
+<         unimplemented!()
+<     }
+< 
+<     pub fn load(_path: &Path) -> std::io::Result<Self> {
+<         unimplemented!()
+---
+>     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+>         let mut s = String::new();
+>         for (id, title) in self.list() {
+>             s.push_str(&format!("{}:{}\n", id, title));
+>         }
+>         std::fs::write(path, s)
+>     }
+> 
+>     pub fn load(path: &Path) -> std::io::Result<Self> {
+>         let s = std::fs::read_to_string(path)?;
+>         let mut r = Self::new();
+>         for line in s.lines() {
+>             match line.split_once(':') {
+>                 Some((id, title)) => {
+>                     r.tasks.insert(id.to_string(), title.to_string());
+>                 }
+>                 None => {
+>                     return Err(std::io::Error::new(
+>                         std::io::ErrorKind::InvalidData,
+>                         format!("malformed line (missing ':'): {:?}", line),
+>                     ));
+>                 }
+>             }
+>         }
+>         Ok(r)
+45,46c77,87
+<     pub fn rename(&mut self, _id: &str, _new_title: &str) -> Result<(), String> {
+<         unimplemented!()
+---
+>     pub fn rename(&mut self, id: &str, new_title: &str) -> Result<(), String> {
+>         if new_title.is_empty() {
+>             return Err("new title must not be empty".to_string());
+>         }
+>         match self.tasks.get_mut(id) {
+>             Some(title) => {
+>                 *title = new_title.to_string();
+>                 Ok(())
+>             }
+>             None => Err(format!("id '{}' not found", id)),
+>         }
+Only in P0-T3-ON-2/work: target

@@ -1,0 +1,9 @@
+{
+  "run_id": "D6-OFF-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (exit 0)",
+  "probe": "ABSENT/0/UNAVAILABLE (confirmed from log)",
+  "grade_summary": "exact restore + no debris + honest errors without CodeBro",
+  "notes": "Careful spec-driven implementation first try (in-memory backups, honest WriteFailed/RollbackIncomplete mapping, self-authored probe test then removed). 5 reads + bash + write/edit. T6 ceiling replicates.",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

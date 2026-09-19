@@ -1,0 +1,32 @@
+   Compiling qserver v0.1.0 (/tmp/opencode/phase1/P1-T4-OFF-2/work-grade)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (/tmp/opencode/phase1/P1-T4-OFF-2/work-grade/target/debug/deps/qserver-ee0d7b179132a67c)
+
+running 3 tests
+test tests::visible_bad_request ... ok
+test tests::visible_ping ... ok
+test tests::visible_store_get ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/tmp/opencode/phase1/P1-T4-OFF-2/work-grade/target/debug/deps/qserver-de9eef066be97230)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hidden.rs (/tmp/opencode/phase1/P1-T4-OFF-2/work-grade/target/debug/deps/hidden-dd4de0bc32ad11e0)
+
+running 3 tests
+test hidden_no_log_marker_on_stdout ... ok
+test hidden_diagnostics_exist_on_stderr ... ok
+test hidden_stdout_is_pure_json_lines ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qserver
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

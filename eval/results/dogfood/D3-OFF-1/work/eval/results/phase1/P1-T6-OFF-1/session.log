@@ -1,0 +1,172 @@
+[0m
+> build · agnes-3.0-flash
+[0m
+[0m→ [0mRead spec.md
+[0m→ [0mRead task.md
+[0m
+[0m$ [0mfind /tmp/opencode/phase1/P1-T6-OFF-1/work -type f | head -50
+/tmp/opencode/phase1/P1-T6-OFF-1/work/spec.md
+/tmp/opencode/phase1/P1-T6-OFF-1/work/task.md
+/tmp/opencode/phase1/P1-T6-OFF-1/work/Cargo.toml
+/tmp/opencode/phase1/P1-T6-OFF-1/work/tests/steps.rs
+/tmp/opencode/phase1/P1-T6-OFF-1/work/src/lib.rs
+[0m
+ABSENT
+0
+UNAVAILABLE
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead Cargo.toml
+[0m→ [0mRead tests/steps.rs
+Now I understand the task. Let me implement `apply_batch` per the spec:
+
+- Empty input → `Ok(())`, no side effects
+- Write every `(path, content)`, creating parent dirs as needed
+- Backups in memory only (never extra files in target tree)
+- On first write failure: restore previously-written files to prior content (delete if created by this call), then report `WriteFailed { path, message }`
+- If rollback itself fails on some entries: report `RollbackIncomplete { restored, failed }`
+- No stray files left behind
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /tmp/opencode/phase1/P1-T6-OFF-1/work/src/lib.rs
+===================================================================
+--- /tmp/opencode/phase1/P1-T6-OFF-1/work/src/lib.rs
++++ /tmp/opencode/phase1/P1-T6-OFF-1/work/src/lib.rs
+@@ -6,10 +6,90 @@
+     WriteFailed { path: PathBuf, message: String },
+     RollbackIncomplete { restored: Vec<PathBuf>, failed: Vec<PathBuf> },
+ }
+ 
+-pub fn apply_batch(_files: &[(PathBuf, String)]) -> Result<(), ApplyError> {
+-    unimplemented!()
++pub fn apply_batch(files: &[(PathBuf, String)]) -> Result<(), ApplyError> {
++    if files.is_empty() {
++        return Ok(());
++    }
++
++    // Capture prior state for every path that will be written.
++    // In-memory backups only — never extra files in the target tree.
++    // `Some(bytes)` = file existed before; `None` = this call will create it.
++    let mut backups: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::with_capacity(files.len());
++
++    for (path, content) in files {
++        let prior = if path.exists() {
++            match std::fs::read(path) {
++                Ok(bytes) => Some(bytes),
++                Err(_) => {
++                    // Can't read prior content — treat as created-by-us; on
++                    // rollback we'll attempt to delete.
++                    None
++                }
++            }
++        } else {
++            None
++        };
++        backups.push((path.clone(), prior));
++
++        // Create parent directories if needed.
++        if let Some(parent) = path.parent() {
++            if !parent.exists() {
++                std::fs::create_dir_all(parent).map_err(|e| {
++                    ApplyError::WriteFailed {
++                        path: path.clone(),
++                        message: format!(
++                            "failed to create parent directory {}: {}",
++                            parent.display(),
++                            e
++                        ),
++                    }
++                })?;
++            }
++        }
++
++        match std::fs::write(path, content) {
++            Ok(()) => {}
++            Err(e) => {
++                // Write failed — roll back every file we wrote in this call.
++                let mut restored: Vec<PathBuf> = Vec::new();
++                let mut failed: Vec<PathBuf> = Vec::new();
++
++                // Iterate in reverse so we restore the most-recent write first.
++                for i in (0..files.len()).rev() {
++                    if i >= backups.len() {
++                        continue;
++                    }
++                    let (path, prior) = &backups[i];
++                    let ok = match prior {
++                        Some(bytes) => std::fs::write(path, bytes).is_ok(),
++                        None => std::fs::remove_file(path).is_ok()
++                            || !path.exists(),
++                    };
++                    if ok {
++                        restored.push(path.clone());
++                    } else {
++                        failed.push(path.clone());
++                    }
++                }
++
++                if failed.is_empty() {
++                    Err(ApplyError::WriteFailed {
++                        path: path.clone(),
++                        message: e.to_string(),
++                    })
++                } else {
++                    Err(ApplyError::RollbackIncomplete {
++                        restored,
++                        failed,
++                    })
++                }
++            }
++        }
++    }
++
++    Ok(())
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+
+[0m
+[0m→ [0mRead src/lib.rs
+Wait — there's a subtle bug: the rollback loop uses `(0..files.len()).rev()` but iterates up to `files.len()`, yet `backups` only has entries for files that were *processed before the failure* (i.e., `0..i+1` where `i` is the failed index, so up to `i` in backups). The loop correctly guards with `i >= backups.len()`, but `backups.len()` equals the number of *writes attempted* so far. Actually the failed entry's write didn't succeed but we still pushed its backup. Let me trace: we push to `backups` BEFORE attempting the write. So at the failure at index `i`, `backups` has `i+1` entries (indices 0..=i). The entry at index `i` is the failed one — its write didn't complete, but we still pushed its prior state. Rolling back index `i` would be a no-op or could be wrong. Let me fix: only roll back entries `0..i` (the ones that actually succeeded).
+
+Actually, I need to re-examine: I push to backups and then attempt write. If write fails, that entry in backups has the *prior state of the file before we tried to write* — but we never successfully wrote it. So rolling back index `i` would be restoring prior state of a file we never modified — that's a no-op (write the same bytes back) or deleting a file we never created. So it's harmless but misleading. The spec says "restore every file written by this call" — the failed one wasn't written. So I should only rollback `0..failed_index`. Let me restructure to track the failed index.
+[0m✗ [0mWrite src/lib.rs failed
+[91m[1mError: [0mThe write tool was called with invalid arguments: SchemaError(Missing key
+  at ["content"]).
+Please rewrite the input so it satisfies the expected schema.
+The rollback loop at line 59 iterates `0..files.len()` but `backups` only has entries up to the current index `i` (the failing one). The failing entry shouldn't be rolled back since the write failed (nothing was written). Also, the `create_dir_all` failure at line 38 happens *before* the file write — in that case we've pushed the backup but nothing was written, so rollback should still be clean (just return `WriteFailed`). But the rollback loop would incorrectly include the failing entry. Let me restructure properly:
+[0m
+[0m← [0mWrite src/lib.rs
+Wrote file successfully.
+[0m
+[0m$ [0mcargo test 2>&1
+Compiling batchapply v0.1.0 (/tmp/opencode/phase1/P1-T6-OFF-1/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/batchapply-54f605c3a1f4b275)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/steps.rs (target/debug/deps/steps-0036fd22affdffb5)
+
+running 3 tests
+test step_empty_is_noop ... ok
+test step_first_entry_fails_untouched ... ok
+test step_happy_path ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests batchapply
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+All tests pass.
+
+**Final report**
+
+- **Probe lines**: `ABSENT` / `0` / `UNAVAILABLE`
+- **File changed**: `src/lib.rs` — replaced `unimplemented!()` with full `apply_batch` (lines 10–54) + `rollback` helper (lines 56–98). Backups in memory only; on write failure roll back in reverse and report `WriteFailed` (clean) or `RollbackIncomplete` (dirty); no stray files.
+- **Verification**: `cargo test` → 3 passed, 0 failed (happy path, empty, first-entry-fails-untouched all green).

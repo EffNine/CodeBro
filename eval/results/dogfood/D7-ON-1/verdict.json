@@ -1,0 +1,9 @@
+{
+  "run_id": "D7-ON-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (exit 0)",
+  "probe": "PRESENT/24/COMPLETE/60 (entry_count drift 59->60: D5-ON-1 record_memory wrote live repo JSON; see confounder note)",
+  "grade_summary": "express via re-export fixed; staff untouched; registry stable",
+  "notes": "One-line pricing fix; staff untouched; re-export covered. CodeBro: memory_stats+engineering_memory consulted, solved by reading; NO engineering_facts/brief calls (T8 non-use data point, 6th round). entry_count 60 reflects live-JSON write from D5-ON-1 (isolation caveat, OFF unaffected).",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

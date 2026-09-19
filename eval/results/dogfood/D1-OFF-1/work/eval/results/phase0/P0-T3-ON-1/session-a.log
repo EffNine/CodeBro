@@ -1,0 +1,115 @@
+[0m
+> build · agnes-3.0-flash
+[0m
+[0m$ [0mfind /tmp/opencode/phase0/P0-T3-ON-1/work -type f | head -50
+/tmp/opencode/phase0/P0-T3-ON-1/work/spec.md
+/tmp/opencode/phase0/P0-T3-ON-1/work/Cargo.toml
+/tmp/opencode/phase0/P0-T3-ON-1/work/tests/steps.rs
+/tmp/opencode/phase0/P0-T3-ON-1/work/src/lib.rs
+[0m
+[0m→ [0mRead spec.md
+[0m→ [0mRead Cargo.toml
+[0m→ [0mRead tests/steps.rs
+[0m→ [0mRead src/lib.rs
+[0m✗ [0mRead task.md failed
+[91m[1mError: [0mFile not found: /tmp/opencode/phase0/P0-T3-ON-1/work/task.md
+[0m⚙ [0mcodebro_workspace_context Unknown
+[0m⚙ [0mcodebro_memory_stats Unknown
+[0m⚙ [0mcodebro_engineering_memory {"task_keywords":["t3","registry","step12","phase0","P0-T3-ON-1"]}
+[0m⚙ [0mcodebro_recall {"query":"T3 registry session A steps 1-2 stop"}
+[0m
+[0m$ [0mls -la /tmp/opencode/phase0/P0-T3-ON-1/work/
+total 8
+drwxrwxr-x 4 afnan afnan  120 Sep 16 23:24 .
+drwxrwxr-x 4 afnan afnan  240 Sep 16 23:24 ..
+-rw-rw-r-- 1 afnan afnan   63 Sep 16 23:24 Cargo.toml
+-rw-rw-r-- 1 afnan afnan 1932 Sep 16 23:24 spec.md
+drwxrwxr-x 2 afnan afnan   60 Sep 16 23:24 src
+drwxrwxr-x 2 afnan afnan   60 Sep 16 23:24 tests
+[0m
+Now implement steps 1–2 in src/lib.rs:
+[0m← [0mEdit src/lib.rs
+Index: /tmp/opencode/phase0/P0-T3-ON-1/work/src/lib.rs
+===================================================================
+--- /tmp/opencode/phase0/P0-T3-ON-1/work/src/lib.rs
++++ /tmp/opencode/phase0/P0-T3-ON-1/work/src/lib.rs
+@@ -14,23 +14,36 @@
+     }
+ }
+ 
+ // --- Step 1 ---
+-pub fn add(&mut self, _id: &str, _title: &str) -> Result<(), String> {
+-    unimplemented!()
++pub fn add(&mut self, id: &str, title: &str) -> Result<(), String> {
++    if id.is_empty() {
++        return Err("empty id".to_string());
++    }
++    if title.is_empty() {
++        return Err("empty title".to_string());
++    }
++    if self.tasks.contains_key(id) {
++        return Err(format!("id '{}' already exists", id));
++    }
++    self.tasks.insert(id.to_string(), title.to_string());
++    Ok(())
+ }
+ 
+-pub fn get(&self, _id: &str) -> Option<String> {
+-    unimplemented!()
++pub fn get(&self, id: &str) -> Option<String> {
++    self.tasks.get(id).cloned()
+ }
+ 
+ // --- Step 2 ---
+ pub fn list(&self) -> Vec<(String, String)> {
+-    unimplemented!()
++    let mut v: Vec<(String, String)> =
++        self.tasks.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
++    v.sort_by(|a, b| a.0.cmp(&b.0));
++    v
+ }
+ 
+-pub fn remove(&mut self, _id: &str) -> bool {
+-    unimplemented!()
++pub fn remove(&mut self, id: &str) -> bool {
++    self.tasks.remove(id).is_some()
+ }
+ 
+ // --- Step 3 ---
+ pub fn save(&self, _path: &Path) -> std::io::Result<()> {
+
+[0m
+[0m$ [0mcargo test step12 2>&1
+Compiling registry v0.1.0 (/tmp/opencode/phase0/P0-T3-ON-1/work)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+     Running unittests src/lib.rs (target/debug/deps/registry-1cc24ae0aa6d7b21)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/steps.rs (target/debug/deps/steps-3554b0ae3c4765e3)
+
+running 3 tests
+test step12_add_get ... ok
+test step12_remove ... ok
+test step12_list_sorted ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+[0m
+[0m→ [0mRead src/lib.rs
+All three step12 tests pass. Session A complete.
+PRE — probe line (per instruction): codebro_ tools: PRESENT, count: 38, entry_count: 37
+
+**What changed:** Implemented `add`, `get`, `list`, `remove` in `src/lib.rs` (steps 1–2). Steps 3–4 (`save`, `load`, `rename`) remain `unimplemented!()`. No API signatures changed.
+
+**Verification output (`cargo test step12`):**
+```
+running 3 tests
+test step12_add_get ... ok
+test step12_remove ... ok
+test step12_list_sorted ... ok
+test result: ok. 3 passed; 0 failed
+```
+
+**Probe values repeated:** codebro tools PRESENT / 38 / entry_count = 37

@@ -1,0 +1,9 @@
+{
+  "run_id": "D3-OFF-1",
+  "verdict": "SUCCESS",
+  "graded_by": "deterministic check (integer 24 + existing-file citations incl. range containing engineering_brief) + manual spot-check",
+  "probe": "ANOMALY: log contains two contradictory probe blocks (first ABSENT/0/UNAVAILABLE, final-report PRESENT/1/PARTIAL/UNAVAILABLE); tool-use evidence (zero codebro_ calls, 1 read) confirms OFF isolation held — second block confabulated",
+  "grade_summary": "24 with integration.rs contract citations (159-217 + 289-317 test range containing engineering_brief); no wrong-context event; worktree untouched",
+  "notes": "OFF isolation HELD behaviorally (no CodeBro available or used) despite self-report inconsistency. 24s, 1 tool call. Probe self-report unreliability observed — evidence must come from tool_use parts, not final-report claims.",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

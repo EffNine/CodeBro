@@ -1,0 +1,9 @@
+{
+  "run_id": "P1B-T5-OFF-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy",
+  "probe": "ABSENT/UNAVAILABLE",
+  "grade_summary": "2 vis + 4 hidden green",
+  "notes": "NATIVE ESCAPE: derived bounded LRU from first principles despite stale NOTES.md (ab-v2 pattern).",
+  "comparative_claim": "NONE per-run; pooled T5 analysis in report (directional)"
+}

@@ -1,0 +1,9 @@
+{
+  "run_id": "D2-ON-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (exit 0)",
+  "probe": "PRESENT/COMPLETE/59",
+  "grade_summary": "visible + hidden scale/churn green; bounded LRU implemented",
+  "notes": "DECISION-CHANGING pattern: final report states NOTES.md is stale, rejected in memory (Never mass-delete) -> bounded LRU. CodeBro: memory_stats+engineering_memory+recall+engineering_facts then native read/edit. No trap-hit.",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

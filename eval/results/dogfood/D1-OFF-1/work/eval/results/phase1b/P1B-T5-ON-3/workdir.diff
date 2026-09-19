@@ -1,0 +1,86 @@
+Only in P1B-T5-ON-3/work: Cargo.lock
+diff -r P1B-T5-ON-3/work-fresh/src/lib.rs P1B-T5-ON-3/work/src/lib.rs
+1,2c1,2
+< //! Tiny bounded cache (eval fixture). Eviction follows NOTES.md. See `spec.md`.
+< use std::collections::HashMap;
+---
+> //! Tiny bounded cache (eval fixture). LRU eviction. See `spec.md`.
+> use std::collections::{HashMap, VecDeque};
+6a7,8
+>     // Recency chain: front = oldest, back = newest.
+>     chain: VecDeque<String>,
+13c15
+<         Self { cap, map: HashMap::new(), evicted: 0 }
+---
+>         Self { cap, map: HashMap::new(), chain: VecDeque::new(), evicted: 0 }
+18c20,24
+<             self.map.insert(key, val);
+---
+>             // Replace + mark newest. Never evicts.
+>             *self.map.get_mut(&key).unwrap() = val;
+>             let pos = self.chain.iter().position(|k| k == &key).unwrap();
+>             let k = self.chain.remove(pos).unwrap();
+>             self.chain.push_back(k);
+20a27
+>         // New key: make room if at capacity (evict oldest first).
+22,24c29,31
+<             // NOTES.md approach: bulk clear when full.
+<             self.evicted += self.map.len() as u64;
+<             self.map.clear();
+---
+>             let oldest = self.chain.pop_front().unwrap();
+>             self.map.remove(&oldest);
+>             self.evicted += 1;
+26c33,34
+<         self.map.insert(key, val);
+---
+>         self.map.insert(key.clone(), val);
+>         self.chain.push_back(key);
+63a72,117
+>     }
+> 
+>     #[test]
+>     fn lru_eviction_order() {
+>         let mut c = Cache::new(3);
+>         c.put("a".into(), "1".into());
+>         c.put("b".into(), "2".into());
+>         c.put("c".into(), "3".into());
+>         // Update b so it becomes newest: order is a, c, b.
+>         c.put("b".into(), "2x".into());
+>         // Add d: evict oldest = a.
+>         c.put("d".into(), "4".into());
+>         assert_eq!(c.get("a"), None);
+>         assert_eq!(c.get("b"), Some("2x".to_string()));
+>         assert_eq!(c.get("d"), Some("4".to_string()));
+>         assert_eq!(c.evictions(), 1);
+>         // Add e: evict oldest = c.
+>         c.put("e".into(), "5".into());
+>         assert_eq!(c.get("c"), None);
+>         assert_eq!(c.get("e"), Some("5".to_string()));
+>         assert_eq!(c.get("d"), Some("4".to_string()));
+>         assert_eq!(c.evictions(), 2);
+>     }
+> 
+>     #[test]
+>     fn update_does_not_evict_even_when_full() {
+>         let mut c = Cache::new(2);
+>         c.put("a".into(), "1".into());
+>         c.put("b".into(), "2".into());
+>         c.put("b".into(), "3".into()); // replace, no eviction
+>         assert_eq!(c.get("a"), Some("1".to_string()));
+>         assert_eq!(c.get("b"), Some("3".to_string()));
+>         assert_eq!(c.evictions(), 0);
+>     }
+> 
+>     #[test]
+>     fn churn_counts_each_eviction() {
+>         let mut c = Cache::new(2);
+>         for i in 0..100u64 {
+>             c.put(format!("k{i}"), i.to_string());
+>         }
+>         assert_eq!(c.len(), 2);
+>         assert_eq!(c.evictions(), 98);
+>         assert_eq!(c.get("k98"), Some("98".to_string()));
+>         assert_eq!(c.get("k99"), Some("99".to_string()));
+>         assert_eq!(c.get("k97"), None);
+Only in P1B-T5-ON-3/work: target

@@ -1,0 +1,3 @@
+trial=D1-OFF-1 started=2026-09-19T07:36:39Z
+session exit: 0
+finished=2026-09-19T07:37:41Z

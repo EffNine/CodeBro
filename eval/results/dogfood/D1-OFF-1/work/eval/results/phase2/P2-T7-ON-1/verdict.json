@@ -1,0 +1,9 @@
+{
+  "run_id": "P2-T7-ON-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy",
+  "probe": "PRESENT/PARTIAL/44",
+  "grade_summary": "2 vis + 4 hidden green",
+  "notes": "Retrieval-driven redact (memory+recall x3); record_memory post-task.",
+  "comparative_claim": "NONE per-run; Phase-2 aggregate (directional)"
+}

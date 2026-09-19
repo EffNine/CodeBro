@@ -1,0 +1,9 @@
+{
+  "run_id": "P2-T8-ON-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy",
+  "probe": "PRESENT/entry-OK",
+  "grade_summary": "3 vis + 4 hidden green",
+  "notes": "ON used memory_stats+record_memory ONLY (orientation+note). impact_analyze: ZERO calls. Solved by reading.",
+  "comparative_claim": "NONE per-run; Phase-2 aggregate (directional)"
+}

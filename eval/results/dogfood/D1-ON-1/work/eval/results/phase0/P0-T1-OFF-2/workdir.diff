@@ -1,0 +1,8 @@
+Only in P0-T1-OFF-2/work: Cargo.lock
+diff -r P0-T1-OFF-2/work-fresh/src/lib.rs P0-T1-OFF-2/work/src/lib.rs
+17,18c17
+<         // SEEDED BUG (T1): wrong indices for the even-length case.
+<         Some((v[n / 2] + v[n / 2 + 1]) / 2)
+---
+>         Some((v[n / 2 - 1] + v[n / 2]) / 2)
+Only in P0-T1-OFF-2/work: target

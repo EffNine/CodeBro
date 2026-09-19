@@ -1,0 +1,16 @@
+Only in P1-T5-OFF-2/work: Cargo.lock
+diff -r P1-T5-OFF-2/work-fresh/src/lib.rs P1-T5-OFF-2/work/src/lib.rs
+64a65,76
+> 
+>     #[test]
+>     fn visible_clear_on_overflow() {
+>         let mut c = Cache::new(2);
+>         c.put("a".into(), "1".into());
+>         c.put("b".into(), "2".into());
+>         c.put("c".into(), "3".into());
+>         assert_eq!(c.get("a"), None);
+>         assert_eq!(c.get("c"), Some("3".to_string()));
+>         assert_eq!(c.len(), 1);
+>         assert_eq!(c.evictions(), 2);
+>     }
+Only in P1-T5-OFF-2/work: target

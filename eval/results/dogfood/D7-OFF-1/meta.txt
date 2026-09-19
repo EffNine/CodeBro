@@ -1,0 +1,4 @@
+trial=D7-OFF-1 task=t8 cond=OFF started=2026-09-19T08:25:57Z
+session-a exit: 0
+grade exit: 0
+finished=2026-09-19T08:27:17Z

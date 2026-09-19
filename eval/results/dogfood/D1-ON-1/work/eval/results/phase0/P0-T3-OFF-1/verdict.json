@@ -1,0 +1,9 @@
+{
+  "run_id": "P0-T3-OFF-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (grader decides)",
+  "probe": "A+B ABSENT/UNAVAILABLE",
+  "grade_summary": "13 hidden + 5 visible green",
+  "notes": "Agent corroborated F-01, proceeded via spec.md. Correctly skipped CodeBro steps.",
+  "comparative_claim": "NONE \u2014 Phase-0 is protocol validation only"
+}

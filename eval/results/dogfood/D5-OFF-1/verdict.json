@@ -1,0 +1,9 @@
+{
+  "run_id": "D5-OFF-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (exit 0)",
+  "probe": "ABSENT/0/UNAVAILABLE (confirmed from log)",
+  "grade_summary": "ledger scoped without CodeBro; hidden crash tests green",
+  "notes": "Spec-driven: call-site doc comments (ledger=source of truth) -> Always; PERF.md explicitly identified as trap. 4 reads + edit + bash. Replicates Phase-3 T9-tie mechanism (fixture comments resolve conflict for both arms).",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

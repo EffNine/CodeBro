@@ -1,0 +1,9 @@
+{
+  "run_id": "D6-ON-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (exit 0)",
+  "probe": "PRESENT/reachable (memory_stats completed per tool log)",
+  "grade_summary": "exact restore + no debris + honest errors; hidden green",
+  "notes": "INFRA ANOMALY: session-a exit 124 (570s cap) mid-debris-debugging; workdir already grade-green (3v+5h, exit 0) so green stands per no-rerun rule. CodeBro: memory_stats+memory+recall consulted; codebro_sandbox_test used for verification; 11 edits (iterative debris fixes). No trap-hit (no String-collapse/blanket-Incomplete).",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

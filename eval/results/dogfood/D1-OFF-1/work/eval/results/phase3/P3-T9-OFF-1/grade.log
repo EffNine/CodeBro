@@ -1,0 +1,25 @@
+   Compiling durastore v0.1.0 (/tmp/opencode/phase3/P3-T9-OFF-1/work-grade)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (/tmp/opencode/phase3/P3-T9-OFF-1/work-grade/target/debug/deps/durastore-14de1d8149609e1d)
+
+running 2 tests
+test tests::visible_modes_exist ... ok
+test tests::visible_round_trip ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hidden.rs (/tmp/opencode/phase3/P3-T9-OFF-1/work-grade/target/debug/deps/hidden-9eb50cd72145692f)
+
+running 3 tests
+test hidden_ledger_survives_crash ... ok
+test hidden_ledger_survives_crash_among_others ... ok
+test hidden_pre_crash_reads_work ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests durastore
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

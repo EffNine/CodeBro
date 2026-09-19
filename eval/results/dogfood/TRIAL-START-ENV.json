@@ -1,0 +1,9 @@
+{"program": "dogfood-16", "trial_start": "2026-09-19T14:40:00+08:00",
+ "codebro_source": "9a67ca74e38c3c300fe47866321dc2cf2a07739a",
+ "protocol_freeze": "02f7fbd89dde3a704643c92f24d1505452c5dcbe",
+ "blocker_resolution": "1d8e45184159db46e96fa7f335e235bfe0824834",
+ "tree": "M AGENTS.md only (7df4d0764a..72c9724f40, doc-only)",
+ "opencode": "1.18.31", "model": "agnes/agnes-3.0-flash", "codebro": "1.1.0",
+ "rustc": "1.97.1", "cargo": "1.97.1", "os": "Linux x86_64",
+ "state_snapshot_sha256": "8912a5ff0919d4fbd4d8c6d4d92c5ea2121ea1f18fcc06ee38ff406bbcf8cacd",
+ "protocol_sha256": "d781196daa80ed06d9a9197fed8dfaa24044e9996ece0b89ddf343db3270a5cd"}

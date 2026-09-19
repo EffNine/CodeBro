@@ -1,0 +1,52 @@
+   Compiling cachebox v0.1.0 (/tmp/opencode/phase1/P1-T5-OFF-2/work-grade)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running unittests src/lib.rs (/tmp/opencode/phase1/P1-T5-OFF-2/work-grade/target/debug/deps/cachebox-c7750dbbfe84106d)
+
+running 3 tests
+test tests::visible_clear_on_overflow ... ok
+test tests::visible_put_get ... ok
+test tests::visible_update_no_evict ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hidden.rs (/tmp/opencode/phase1/P1-T5-OFF-2/work-grade/target/debug/deps/hidden-74c07a219477cd33)
+
+running 4 tests
+test hidden_single_slot ... ok
+test hidden_update_never_evicts ... ok
+test hidden_churn_matches_oracle ... FAILED
+test hidden_large_scale_newest_survive ... FAILED
+
+failures:
+
+---- hidden_churn_matches_oracle stdout ----
+
+thread 'hidden_churn_matches_oracle' (566060) panicked at tests/hidden.rs:47:5:
+assertion `left == right` failed
+  left: 4
+ right: 16
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- hidden_large_scale_newest_survive stdout ----
+
+thread 'hidden_large_scale_newest_survive' (566061) panicked at tests/hidden.rs:18:5:
+assertion `left == right` failed
+  left: 50
+ right: 100
+
+
+failures:
+    hidden_churn_matches_oracle
+    hidden_large_scale_newest_survive
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test hidden`
+   Doc-tests cachebox
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: 1 target failed:
+    `--test hidden`

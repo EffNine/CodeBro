@@ -1,0 +1,45 @@
+Only in P1B-T5-ON-2/work: Cargo.lock
+diff -r P1B-T5-ON-2/work-fresh/src/lib.rs P1B-T5-ON-2/work/src/lib.rs
+1,2c1,5
+< //! Tiny bounded cache (eval fixture). Eviction follows NOTES.md. See `spec.md`.
+< use std::collections::HashMap;
+---
+> //! Tiny bounded cache (eval fixture). See `spec.md`. The 2026-08 record in CodeBro
+> //! memory documents that mass eviction was rejected project-wide, so eviction is
+> //! bounded LRU: each over-capacity `put` evicts exactly one oldest entry.
+> //! NOTES.md's bulk-clear approach is a stale document and was not followed.
+> use std::collections::{HashMap, VecDeque};
+6a10
+>     recency: VecDeque<String>,
+13c17
+<         Self { cap, map: HashMap::new(), evicted: 0 }
+---
+>         Self { cap, map: HashMap::new(), recency: VecDeque::new(), evicted: 0 }
+18c22,23
+<             self.map.insert(key, val);
+---
+>             self.map.insert(key.clone(), val);
+>             self.touch(&key);
+21,24c26,32
+<         if self.map.len() >= self.cap {
+<             // NOTES.md approach: bulk clear when full.
+<             self.evicted += self.map.len() as u64;
+<             self.map.clear();
+---
+>         while self.map.len() >= self.cap {
+>             let evicted_key = self
+>                 .recency
+>                 .pop_front()
+>                 .expect("full cache implies recorded recency entries");
+>             self.map.remove(&evicted_key);
+>             self.evicted += 1;
+25a34
+>         self.recency.push_back(key.clone());
+38a48,53
+>     }
+> 
+>     fn touch(&mut self, key: &str) {
+>         if let Some(pos) = self.recency.iter().position(|k| k == key) {
+>             self.recency.rotate_left(pos);
+>         }
+Only in P1B-T5-ON-2/work: target

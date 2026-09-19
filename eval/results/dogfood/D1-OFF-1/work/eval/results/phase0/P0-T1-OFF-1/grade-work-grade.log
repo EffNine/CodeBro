@@ -1,0 +1,32 @@
+   Compiling stats v0.1.0 (/tmp/opencode/phase0/P0-T1-OFF-1/work-grade)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (/tmp/opencode/phase0/P0-T1-OFF-1/work-grade/target/debug/deps/stats-f4cb6a7e416e71d7)
+
+running 2 tests
+test tests::visible_median_even ... ok
+test tests::visible_median_odd ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hidden.rs (/tmp/opencode/phase0/P0-T1-OFF-1/work-grade/target/debug/deps/hidden-9da3f52545633ad1)
+
+running 10 tests
+test hidden_empty_is_none ... ok
+test hidden_even_1234 ... ok
+test hidden_odd ... ok
+test hidden_large_odd ... ok
+test hidden_single ... ok
+test hidden_negative_even ... ok
+test hidden_sorted_input ... ok
+test hidden_two_elements ... ok
+test hidden_large_even ... ok
+test hidden_unsorted_same_as_sorted ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests stats
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

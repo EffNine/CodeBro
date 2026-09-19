@@ -1,0 +1,4 @@
+trial=P2-T7-ON-2 task=t7 cond=ON started=2026-09-16T18:12:53Z
+session-a exit: 0
+grade exit: 0
+finished=2026-09-16T18:15:07Z

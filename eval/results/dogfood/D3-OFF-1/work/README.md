@@ -1,0 +1,160 @@
+# CodeBro
+
+**CodeBro is an MCP-based engineering intelligence runtime that provides AI coding agents with repository understanding, verified facts, engineering memory, impact analysis, guarded changes, and reproducible execution evidence.**
+
+AI coding agents are good at reasoning, but they repeatedly rediscover project
+structure and forget engineering decisions across sessions. CodeBro solves this
+by maintaining verified facts and recorded memory that persist between sessions.
+
+Architecture and module map: [ARCHITECTURE.md](ARCHITECTURE.md).
+
+```
+              AI Coding Agents
+      OpenCode · Claude Code · Codex · Cursor
+                      │
+                     MCP
+                       ▼
+                 ┌───────────┐
+                 │  CodeBro  │
+                 ├───────────┤
+                 │ Facts     │
+                 │ Memory    │
+                 │ Identity  │
+                 │ Impact    │
+                 │ Guarded   │
+                 │ Changes   │
+                 │ Evidence  │
+                 │ Consultant│
+                 └─────┬─────┘
+                       │
+               ConsultantProvider
+                       │
+                       ▼
+                 Conductor
+              (HTTP + Bearer key)
+                       │
+               routing / scoring / health
+                       │
+                       ▼
+                Upstream providers
+```
+
+**Host agent owns:** reasoning, planning, tool selection, execution strategy, UX.
+**CodeBro owns:** project identity, verified project facts, persistent engineering memory, impact analysis, guarded/transactional mutations, sandboxed execution evidence, and consultant queries via Conductor.
+
+CodeBro is **not**:
+- a replacement coding agent
+- a TUI or chat assistant
+- a model provider
+- a generic shell / filesystem / Git MCP
+- an autonomous agent loop
+
+The frozen v1 tool contract is documented in
+[`docs/MCP_API_V1.md`](docs/MCP_API_V1.md); the historical design narrative
+lives in [`docs/design/MCP_SERVER.md`](docs/design/MCP_SERVER.md).
+
+## Quick Start
+
+```bash
+git clone https://github.com/EffNine/CodeBro.git
+cd CodeBro
+cargo install --path crates/mcp-server   # binary name: codebro
+
+# From a target project:
+codebro init        # scan the workspace into .codebro/facts.json
+codebro doctor      # verify the runtime state
+opencode mcp add codebro -- "$(which codebro) serve"
+```
+
+For a complete Conductor setup guide, see [`docs/CONDUCTOR_HOWTO.md`](docs/CONDUCTOR_HOWTO.md).
+
+## What CodeBro Provides (24 tools: v1 contract of 17 + 8 additive − 1 removed)
+
+| Surface | Tools | Purpose |
+|---------|-------|---------|
+| Orientation | `workspace_context`, `repository_health` | Project identity, fact counts, workspace diagnostics |
+| Verified facts | `engineering_facts`, `reindex` | Relevance-ranked retrieval over the validated fact graph (impact evidence arrives via the brief's embedded traversal) |
+| Engineering memory | `engineering_memory`, `memory_stats`, `record_memory`, `delete_memory` | Persistent, trust-aware agent-recorded memory (never promoted into facts) |
+| Identity | `update_identity` | Declared-intent store: constraints, decisions, roadmap |
+| Guarded changes | `apply_change`, `apply_changes` | Single-file guarded mutation; multi-file all-or-nothing transaction with rollback |
+| Execution evidence | `sandbox_status`, `sandbox_exec`, `sandbox_test`, `sandbox_build` | Policy-gated commands with full evidence envelopes (git revision, exit code, reproducibility, environment) |
+| Consultant | `consult` | Ask Conductor-backed providers for architecture/debug/review opinions |
+| Persistent context | `context`, `remember`, `forget`, `recall` | Always-available context packet; confirmed user context with provenance; query-driven history |
+| Learning & skills | `learn`, `skill`, `task` | Cautious hypotheses; human-approved skill registry with reuse/evolution detectors; durable task runtime |
+| Decision support | `engineering_brief` | Bounded deterministic brief for planning |
+
+## Trust Model
+
+Three distinct classes of information — never blurred:
+
+| Class | Source | Trust |
+|-------|--------|-------|
+| **Verified facts** | `codebro init` (tree-sitter scan) | High — deterministic, validated (0-issue store) |
+| **Engineering decisions** | Human-authored identity/constraints | Medium-high — declared intent |
+| **Agent-recorded memory** | Agents calling `record_memory` | Low — unverified, self-declared confidence |
+
+Agent-recorded memory is **never** promoted to the verified fact store.
+
+## Jev Advisory (informational only, off by default)
+
+CodeBro can attach a non-authoritative Jev escalation note to skill approval
+requests. Jev never approves, denies, executes, or changes policy — the
+deterministic `needs_input` verdict is computed first, and the observer runs
+detached with its outcome discarded.
+
+- Baseline: `jev-baseline-1` (`jev-1.13.0`, question set v3, confidence ≥ 0.80,
+  escalation-only). Any baseline drift disables advisory automatically.
+- Flags (both default `false`): `JEV_SHADOW_ENABLED`, `JEV_ADVISORY_ENABLED`.
+  Both off means zero Jev calls and unchanged behavior.
+- Output: `JEV ADVISORY: … Informational only.` tracing line plus structured
+  telemetry in `.codebro/jev-advisory.jsonl`. Rollback is
+  `JEV_ADVISORY_ENABLED=false`.
+
+Details: [`docs/JEV_ADVISORY.md`](docs/JEV_ADVISORY.md).
+
+## Installation
+
+Requires a Rust toolchain (see `rust-toolchain.toml`).
+
+```bash
+cargo build --release
+cargo install --path crates/mcp-server
+```
+
+## CLI
+
+```bash
+codebro init       # Scan workspace → .codebro/facts.json
+codebro doctor     # Diagnostics (exit 0 ok / 1 warn / 2 error)
+codebro serve      # MCP server over stdio
+codebro facts diff # Diff current repo state vs last index + impact projection
+codebro list-models # List models from configured provider
+codebro consult    # Ask Conductor a question directly
+codebro auth status # Check consultant provider auth
+codebro context    # Bounded context packet (host/hook surface, read-only)
+codebro export     # Export portable memory (records, history, skills)
+codebro import     # Import a portable memory export (verified, redacted)
+```
+
+Portable memory is explicit and safe: `codebro export --out <dir>` writes a
+versioned, secret-redacted manifest + JSONL bundle; `codebro import --file
+<dir> --root <workspace>` verifies integrity, validates before writing,
+preserves authority verbatim, never overwrites newer local state, and is
+idempotent. See [docs/design/PORTABILITY.md](docs/design/PORTABILITY.md).
+
+## Links
+
+- [Frozen v1 MCP Contract](docs/MCP_API_V1.md)
+- [v1.1.0 Release Notes](docs/RELEASE_v1.1.0.md)
+- [v1.0.0 Release Notes](docs/RELEASE_v1.0.0.md)
+- [Conductor Setup HOWTO](docs/CONDUCTOR_HOWTO.md)
+- [Architecture Decision Records](docs/ADR/)
+- [Changelog](CHANGELOG.md)
+- [License](LICENSE)
+
+---
+
+*Current public release: [v1.1.0](https://github.com/EffNine/CodeBro/releases/tag/v1.1.0).*
+
+The former chat TUI is preserved on the `tui-legacy` branch; the development
+line is MCP-first only.

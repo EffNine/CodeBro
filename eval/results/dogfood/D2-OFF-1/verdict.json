@@ -1,0 +1,9 @@
+{
+  "run_id": "D2-OFF-1",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy (exit 0)",
+  "probe": "ABSENT/0/UNAVAILABLE (confirmed: zero codebro_ tool_use in log)",
+  "grade_summary": "visible + hidden green without CodeBro",
+  "notes": "OFF green = native escape (ceiling instance for this rep). Read-path analysis pending from session log.",
+  "comparative_claim": "NONE per-run; see dogfood aggregate (preregistered rule)"
+}

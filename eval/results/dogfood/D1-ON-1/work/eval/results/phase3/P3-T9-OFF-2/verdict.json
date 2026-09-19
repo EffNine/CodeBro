@@ -1,0 +1,9 @@
+{
+  "run_id": "P3-T9-OFF-2",
+  "verdict": "SUCCESS",
+  "graded_by": "grade.sh on scratch copy",
+  "probe": "ABSENT/UNAVAILABLE",
+  "grade_summary": "2 vis + 3 hidden green",
+  "notes": "Native: scoped ledger Always from call-site docs.",
+  "comparative_claim": "NONE per-run; Phase-3 aggregate (tie)"
+}

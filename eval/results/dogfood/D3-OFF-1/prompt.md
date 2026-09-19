@@ -1,0 +1,14 @@
+L1: You are working in /tmp/opencode/dogfood/D3-OFF-1/work. Work ONLY in this directory: no docker, no sandbox containers
+    (fixture tasks) / OpenSandbox only for build/test where noted (real-repo tasks) — run `cargo test`
+    directly for fixture tasks. Do not read anything outside /tmp/opencode/dogfood/D3-OFF-1/work except the task files copied there.
+    (D1/D3 real-repo worktree tasks: work ONLY in the worktree; do not read /tmp run dirs of other trials.)
+
+L2: FIRST, before any other action, write exactly three lines to the top of your reply: (1) whether any
+    tool names starting with `codebro_` are available in your toolset (PRESENT/ABSENT), (2) their count
+    followed by COMPLETE if 20 or more else PARTIAL (ON runs) — OFF runs report count only, (3) the
+    `entry_count` from `codebro_memory_stats` if reachable, else the word UNAVAILABLE.
+
+L3-task: State the CURRENT frozen MCP tool-contract size (single integer) and cite the single canonical source file + line range that enforces it. Do not modify anything. Ignore historical counts in older docs unless you can show they are current.
+
+L4: Reply with a short final report: what you changed (files + lines), verification command output,
+    and the three probe values repeated.

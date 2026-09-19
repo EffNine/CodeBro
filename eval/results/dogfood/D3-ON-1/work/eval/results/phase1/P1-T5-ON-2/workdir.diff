@@ -1,0 +1,37 @@
+Only in P1-T5-ON-2/work: Cargo.lock
+diff -r P1-T5-ON-2/work-fresh/src/lib.rs P1-T5-ON-2/work/src/lib.rs
+2c2
+< use std::collections::HashMap;
+---
+> use std::collections::{HashMap, VecDeque};
+6a7
+>     recency: VecDeque<String>,
+13c14
+<         Self { cap, map: HashMap::new(), evicted: 0 }
+---
+>         Self { cap, map: HashMap::new(), recency: VecDeque::new(), evicted: 0 }
+18c19,24
+<             self.map.insert(key, val);
+---
+>             self.map.insert(key.clone(), val);
+>             // Move to back of recency order.
+>             if let Some(pos) = self.recency.iter().position(|k| k == &key) {
+>                 let existing = self.recency.remove(pos).expect("pos bounds-checked");
+>                 self.recency.push_back(existing);
+>             }
+22,24c28,32
+<             // NOTES.md approach: bulk clear when full.
+<             self.evicted += self.map.len() as u64;
+<             self.map.clear();
+---
+>             // Bounded LRU: evict exactly one oldest entry per overflow.
+>             if let Some(oldest) = self.recency.pop_front() {
+>                 self.map.remove(&oldest);
+>                 self.evicted += 1;
+>             }
+26c34,35
+<         self.map.insert(key, val);
+---
+>         self.map.insert(key.clone(), val);
+>         self.recency.push_back(key);
+Only in P1-T5-ON-2/work: target
