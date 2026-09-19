@@ -283,6 +283,22 @@ If a limitation appears to need architecture change, record: observed limitation
 | Grounding asserts | live `entry_count` 59 (2026-09-19); 6/6 keys exist by direct store read (`architecture:parse-cache-eviction-policy`, `architecture:write-atomic-durability-inventory`, `history:rollback-honesty-lesson`, `audit:p8-post-implementation-audit-findings`, `history:failure-lessons-index`, `decision:quarantine-observability-must-use-tracing`); natural-phrasing `engineering_memory` rank-1 verbatim: eviction, durability, p8-audit; rollback-honesty + failure-index exist but outside top excerpts for tried phrasings (500-token budget-capped ranking; same sensitivity class as Phase-1b/2 notes); `recall` failure-history excerpts reachable (println/tracing lesson, execution-state gate); `engineering_brief` probes surfaced eviction-rejection + durability-notes docs via files, memory-section ranking varies by keywords |
 | Operator sign-off | _PENDING — protocol stops here_ |
 
+### Freeze evidence — blockers 1–2 resolved 2026-09-19 (factual record; methodology unchanged)
+
+Blocker 1 — materialized templates in the canonical layout `eval/harness/prompts/` (8 new files; no other file touched):
+- `d1-on.txt` sha256 `01ee2bf080c694ecc0f2397d665bb22534559c19665f012fc2311a004c9fb68f` / `d1-off.txt` `d51a8e4e2258714b4ced166815f2ec2756415b87b70319bc329c8cc4f120956e` — every non-empty line byte-matches the §5 skeleton; L3 byte-exact vs the §5 D1 string (verified programmatically); ON carries the L5 paragraph exactly once, OFF zero.
+- `d3-on.txt` `1c69de856bf3df1cb2948f2473c5225a041dbb7fca868b337d3bc8343956264f` / `d3-off.txt` `61a7c6435151d38b04920e2af9d5334aed7ff9db8cdf9f8341a0e5648c29b0bc` — same verification vs the §5 D3 string.
+- `d4a-on.txt` `c75ef41aaf55ff95674c3d1ecbfe3eacec99ec0ef15db51857676098e2cb800a` (= `t3a-on.txt`, `cmp` byte-identical) / `d4a-off.txt` `520790a267863cf0d88a7257d41f477892aa2a0408d2351e810c71afc73c5185` (= `t3a-off.txt`) / `d4b-on.txt` `867951f6c56bbeda118207593d7dd18769c50cd890094fceb8f286fd395cb8ce` (= `t3b-on.txt`) / `d4b-off.txt` `b1ca1b32bbff7a3960801bec0661ba84234923b6c0334dbbeb2af160d22a7618` (= `t3b-off.txt`). D4 reuses the frozen t3a/t3b templates per §5; no new D4 design, no new wording anywhere.
+
+Blocker 2 — reference-greens re-run from recoverable committed artifacts (scratch copies under `/tmp/opencode/dogfood/ref-green-*/`; sources read-only; no hidden material in any source pre-grade; grade logs in `/tmp`):
+- t3 ← `eval/results/phase0/P0-T3-ON-1/work`: `grade.sh step12` exit 0; full `grade.sh` exit 0 (13 hidden + 5 visible green).
+- t4 ← `phase1/P1-T4-ON-1/work`: exit 0 (3 visible + 3 hidden). t5 ← `phase1b/P1B-T5-ON-1/work`: exit 0 (4 hidden green). t6 ← `phase1/P1-T6-ON-1/work`: exit 0 (3v+5h). t7 ← `phase2/P2-T7-ON-1/work`: exit 0 (4 hidden green). t8 ← `phase2/P2-T8-ON-1/work`: exit 0 (3v+4h). t9 ← `phase3/P3-T9-ON-1/work`: exit 0 (2v+3h).
+- Grandfathered t3 F-01 treatment preserved (Session-B prompt from repo, not workdir; no fixture edit).
+- D1/D3 premise dry-run in a scratch worktree at the freeze commit (worktree removed afterwards): canonical `crates/change-engine/src/coding/change_engine.rs` PRESENT; `apply_change` handler PRESENT; contract list = 24 names incl. `engineering_brief`; historical decoys PRESENT (`17-tool` in 4+ docs, `25 tools` in `CODEBRO_PROJECT_HISTORY.md`).
+
+Integrity: CodeBro source, plugin, harness behavior, and fixtures unchanged; pre-existing `M AGENTS.md` untouched; scratch worktree created and removed (`git worktree prune` cleared one already-stale pointer to a nonexistent external path — no live data affected); no D-task trial directories; no results; no verdicts; no push.
+Remaining blocker: operator sign-off only (§13 box 5).
+
 ---
 
 ## 14. Stop gate (read this before doing anything else)
