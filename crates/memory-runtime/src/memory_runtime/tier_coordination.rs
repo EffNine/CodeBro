@@ -15,6 +15,10 @@ pub struct TierCoordinator {
 }
 
 impl TierCoordinator {
+    fn poison_err(lock: &str) -> super::types::MemoryRuntimeError {
+        super::types::MemoryRuntimeError::Generic(format!("lock poisoned: {}", lock))
+    }
+
     pub fn new(policy: MemoryPolicy) -> Self {
         TierCoordinator {
             lifecycle: Arc::new(MemoryLifecycle::new(1000)),
@@ -32,9 +36,11 @@ impl TierCoordinator {
     /// Create a memory entry in a specific tier.
     pub fn create(&self, entry: MemoryEntry) -> super::types::MemoryRuntimeResult<String> {
         // Check access rules
-        let policy = self.policy.read().unwrap();
+        let policy = self.policy.read().map_err(|_| Self::poison_err("policy"))?;
         if !policy.is_access_allowed(entry.tier, &entry.key, entry.metadata.confidence) {
-            self.diagnostics.write().unwrap().record_policy_violation();
+            if let Ok(mut diagnostics) = self.diagnostics.write() {
+                diagnostics.record_policy_violation();
+            }
             return Err(super::types::MemoryRuntimeError::PolicyViolation(format!(
                 "Access denied for key '{}' in tier {}",
                 entry.key, entry.tier
@@ -47,7 +53,9 @@ impl TierCoordinator {
         }
 
         let id = self.lifecycle.create(entry)?;
-        self.diagnostics.write().unwrap().record_hit();
+        if let Ok(mut diagnostics) = self.diagnostics.write() {
+            diagnostics.record_hit();
+        }
         Ok(id)
     }
 
@@ -94,7 +102,9 @@ impl TierCoordinator {
             .snapshots
             .create(snapshot_id.into(), tier, entry_map, Default::default())?;
 
-        self.diagnostics.write().unwrap().record_snapshot_creation();
+        if let Ok(mut diagnostics) = self.diagnostics.write() {
+            diagnostics.record_snapshot_creation();
+        }
         Ok(id)
     }
 
@@ -106,7 +116,9 @@ impl TierCoordinator {
         new_id: impl Into<String>,
     ) -> super::types::MemoryRuntimeResult<super::snapshot::MemorySnapshot> {
         let result = self.snapshots.merge(source_id, target_id, new_id)?;
-        self.diagnostics.write().unwrap().record_snapshot_merge();
+        if let Ok(mut diagnostics) = self.diagnostics.write() {
+            diagnostics.record_snapshot_merge();
+        }
         Ok(result)
     }
 
@@ -129,7 +141,7 @@ impl TierCoordinator {
 
     /// Apply eviction policy to a tier.
     pub fn evict_by_policy(&self, tier: MemoryTier) -> super::types::MemoryRuntimeResult<usize> {
-        let policy = self.policy.read().unwrap();
+        let policy = self.policy.read().map_err(|_| Self::poison_err("policy"))?;
         let entries = self.lifecycle.list_by_tier(tier);
 
         if entries.is_empty() {
@@ -179,7 +191,9 @@ impl TierCoordinator {
         for entry in to_evict.iter().take(eviction_count) {
             if policy.should_evict(entry) || policy.is_expired(entry) {
                 self.lifecycle.delete(&entry.id)?;
-                self.diagnostics.write().unwrap().record_eviction();
+                if let Ok(mut diagnostics) = self.diagnostics.write() {
+                    diagnostics.record_eviction();
+                }
             }
         }
 
@@ -188,7 +202,7 @@ impl TierCoordinator {
 
     /// Apply retention policy across all tiers.
     pub fn apply_retention(&self) -> super::types::MemoryRuntimeResult<usize> {
-        let policy = self.policy.read().unwrap();
+        let policy = self.policy.read().map_err(|_| Self::poison_err("policy"))?;
         let mut evicted = 0;
 
         for tier in [MemoryTier::Session, MemoryTier::Project, MemoryTier::Global] {
@@ -201,28 +215,44 @@ impl TierCoordinator {
             }
         }
 
-        self.diagnostics
-            .write()
-            .unwrap()
-            .record_event(MemoryEvent::PolicyApplied {
+        if let Ok(mut diagnostics) = self.diagnostics.write() {
+            diagnostics.record_event(MemoryEvent::PolicyApplied {
                 event_id: uuid::Uuid::new_v4().to_string(),
                 policy_name: "retention".to_string(),
                 action: "evicted".to_string(),
                 affected_count: evicted,
                 timestamp: 0,
             });
+        }
 
         Ok(evicted)
     }
 
     /// Get diagnostics.
     pub fn diagnostics(&self) -> super::diagnostics::MemoryDiagnosticsSummary {
-        self.diagnostics.read().unwrap().summary()
+        match self.diagnostics.read() {
+            Ok(guard) => guard.summary(),
+            Err(_) => super::diagnostics::MemoryDiagnosticsSummary {
+                total_hits: 0,
+                total_misses: 0,
+                hit_rate: 0.0,
+                total_evictions: 0,
+                total_snapshot_creations: 0,
+                total_snapshot_merges: 0,
+                total_policy_violations: 0,
+                avg_resolution_latency_ms: 0,
+                p95_resolution_latency_ms: 0,
+                recent_events: 0,
+            },
+        }
     }
 
     /// Get event count.
     pub fn event_count(&self) -> usize {
-        self.diagnostics.read().unwrap().events().len()
+        match self.diagnostics.read() {
+            Ok(guard) => guard.events().len(),
+            Err(_) => 0,
+        }
     }
 
     /// Get entry count.

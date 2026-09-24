@@ -160,6 +160,10 @@ pub struct SnapshotManager {
 }
 
 impl SnapshotManager {
+    fn poison_err(lock: &str) -> super::types::MemoryRuntimeError {
+        super::types::MemoryRuntimeError::Generic(format!("lock poisoned: {}", lock))
+    }
+
     pub fn new(max_events: usize) -> Self {
         SnapshotManager {
             snapshots: Arc::new(RwLock::new(HashMap::new())),
@@ -179,7 +183,10 @@ impl SnapshotManager {
         let id = id.into();
         let snapshot = MemorySnapshot::new(id.clone(), tier, entries).with_metadata(metadata);
 
-        let mut snapshots = self.snapshots.write().unwrap();
+        let mut snapshots = self
+            .snapshots
+            .write()
+            .map_err(|_| Self::poison_err("snapshots"))?;
         snapshots.insert(snapshot.id.clone(), snapshot);
 
         self.record_event(MemoryEvent::SnapshotCreated {
@@ -194,17 +201,26 @@ impl SnapshotManager {
 
     /// Get a snapshot by ID.
     pub fn get(&self, id: &str) -> Option<MemorySnapshot> {
-        self.snapshots.read().unwrap().get(id).cloned()
+        match self.snapshots.read() {
+            Ok(guard) => guard.get(id).cloned(),
+            Err(_) => None,
+        }
     }
 
     /// List all snapshots.
     pub fn list(&self) -> Vec<MemorySnapshot> {
-        self.snapshots.read().unwrap().values().cloned().collect()
+        match self.snapshots.read() {
+            Ok(guard) => guard.values().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Delete a snapshot.
     pub fn delete(&self, id: &str) -> super::types::MemoryRuntimeResult<()> {
-        let mut snapshots = self.snapshots.write().unwrap();
+        let mut snapshots = self
+            .snapshots
+            .write()
+            .map_err(|_| Self::poison_err("snapshots"))?;
         if snapshots.remove(id).is_some() {
             Ok(())
         } else {
@@ -224,7 +240,10 @@ impl SnapshotManager {
     ) -> super::types::MemoryRuntimeResult<MemorySnapshot> {
         // First, read snapshots
         let (source_entries, target_entries, target_tier) = {
-            let snapshots = self.snapshots.read().unwrap();
+            let snapshots = self
+                .snapshots
+                .read()
+                .map_err(|_| Self::poison_err("snapshots"))?;
 
             let source = snapshots.get(source_id).ok_or_else(|| {
                 super::types::MemoryRuntimeError::SnapshotError(format!(
@@ -258,7 +277,10 @@ impl SnapshotManager {
 
         // Now write the merged snapshot
         {
-            let mut snapshots = self.snapshots.write().unwrap();
+            let mut snapshots = self
+                .snapshots
+                .write()
+                .map_err(|_| Self::poison_err("snapshots"))?;
             snapshots.insert(new_id_str, merged.clone());
         }
 
@@ -279,7 +301,10 @@ impl SnapshotManager {
         snapshot_a_id: &str,
         snapshot_b_id: &str,
     ) -> super::types::MemoryRuntimeResult<SnapshotDiff> {
-        let snapshots = self.snapshots.read().unwrap();
+        let snapshots = self
+            .snapshots
+            .read()
+            .map_err(|_| Self::poison_err("snapshots"))?;
 
         let snapshot_a = snapshots.get(snapshot_a_id).ok_or_else(|| {
             super::types::MemoryRuntimeError::SnapshotError(format!(
@@ -316,21 +341,28 @@ impl SnapshotManager {
 
     /// Get snapshot count.
     pub fn snapshot_count(&self) -> usize {
-        self.snapshots.read().unwrap().len()
+        match self.snapshots.read() {
+            Ok(guard) => guard.len(),
+            Err(_) => 0,
+        }
     }
 
     /// Record a snapshot event.
     pub fn record_event(&self, event: MemoryEvent) {
-        let mut events = self.events.write().unwrap();
-        if events.len() >= self.max_events {
-            events.remove(0);
+        if let Ok(mut events) = self.events.write() {
+            if events.len() >= self.max_events {
+                events.remove(0);
+            }
+            events.push(event);
         }
-        events.push(event);
     }
 
     /// Get snapshot events.
     pub fn events(&self) -> Vec<MemoryEvent> {
-        self.events.read().unwrap().clone()
+        match self.events.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => Vec::new(),
+        }
     }
 }
 

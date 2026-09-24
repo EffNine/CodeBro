@@ -187,11 +187,6 @@ mod tests {
 
         let query = MemoryQuery::new("language");
         let resolution = runtime.resolve(&query);
-        // Debug: check what we got
-        eprintln!("Resolution hits: {}", resolution.hits.len());
-        for h in &resolution.hits {
-            eprintln!("  - {} ({})", h.id, h.tier);
-        }
         // First match wins (deterministic)
         assert!(
             !resolution.hits.is_empty(),
