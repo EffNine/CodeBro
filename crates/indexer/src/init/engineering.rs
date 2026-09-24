@@ -246,7 +246,7 @@ pub fn scan_current_digests(root: &Path) -> (BTreeMap<String, String>, usize) {
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| !super::repo_intel::skip_dir(&e.file_name().to_string_lossy()))
+        .filter_entry(|e| !super::repo_intel::skip_walk_entry(e))
     {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_file() {

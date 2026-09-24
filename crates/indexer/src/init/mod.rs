@@ -414,7 +414,7 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         for entry in WalkDir::new(&root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|e| !repo_intel::skip_dir(&e.file_name().to_string_lossy()))
+            .filter_entry(|e| !repo_intel::skip_walk_entry(e))
         {
             let Ok(entry) = entry else { continue };
             if !entry.file_type().is_file() || !graph_edges::is_doc_file(entry.path()) {
@@ -863,7 +863,7 @@ fn manifest_dirs(root: &Path) -> Vec<PathBuf> {
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| !repo_intel::skip_dir(&e.file_name().to_string_lossy()))
+        .filter_entry(|e| !repo_intel::skip_walk_entry(e))
     {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_file() {
@@ -1453,27 +1453,7 @@ fn discover_source_files(root: &Path) -> Vec<PathBuf> {
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            !matches!(
-                name.as_str(),
-                ".git"
-                    | ".codebro"
-                    | "target"
-                    | "node_modules"
-                    | "dist"
-                    | "build"
-                    | "vendor"
-                    | ".venv"
-                    | "venv"
-                    | "__pycache__"
-                    | ".mypy_cache"
-                    | ".pytest_cache"
-                    | "site-packages"
-                    | ".next"
-                    | "coverage"
-            )
-        })
+        .filter_entry(|e| !repo_intel::skip_walk_entry(e))
     {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_file() {
@@ -1748,6 +1728,56 @@ mod tests {
         assert!(names.contains(&"main"));
         // Test detection heuristic picks test_x.
         assert!(!model.tests().is_empty());
+    }
+
+    /// Regression: frozen evaluation artifacts stay preserved on disk but
+    /// their generated source snapshots never enter the engineering fact graph.
+    #[test]
+    fn init_excludes_eval_results_from_engineering_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "pub struct LiveConfig { pub name: String }\n",
+        )
+        .unwrap();
+
+        let trial = dir.path().join("eval/results/dogfood/D1-OFF-1/work");
+        std::fs::create_dir_all(trial.join("src")).unwrap();
+        std::fs::write(
+            trial.join("Cargo.toml"),
+            "[package]\nname = \"trial-copy\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            trial.join("src/main.rs"),
+            "pub struct TrialOnly { pub value: u8 }\n",
+        )
+        .unwrap();
+
+        run(dir.path()).unwrap();
+        let facts = std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap();
+        let model: FactsModel = serde_json::from_str(&facts).unwrap();
+
+        let symbol_names: Vec<&str> = model.symbols().iter().map(|s| s.name.as_str()).collect();
+        assert!(symbol_names.contains(&"LiveConfig"));
+        assert!(
+            !symbol_names.contains(&"TrialOnly"),
+            "generated evaluation snapshots must not enter facts"
+        );
+        assert!(
+            !model
+                .packages()
+                .iter()
+                .any(|package| package.name == "trial-copy"),
+            "generated evaluation manifests must not enter packages"
+        );
+        assert!(dir.path().join("eval/results/dogfood/D1-OFF-1/work/src/main.rs").exists());
     }
 
     #[test]

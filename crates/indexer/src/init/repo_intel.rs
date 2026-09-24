@@ -30,6 +30,13 @@ pub struct PackageDeps {
 /// Per-language aggregate surface: (file_count, line_count).
 pub type LangStats = BTreeMap<String, (u64, u64)>;
 
+/// Shared discovery-walk predicate: conventional generated directories
+/// plus the repository's frozen evaluation result trees.
+pub fn skip_walk_entry(entry: &walkdir::DirEntry) -> bool {
+    skip_dir(&entry.file_name().to_string_lossy())
+        || (entry.file_type().is_dir() && skip_generated_results(entry.path()))
+}
+
 /// Deterministic directory-skip predicate shared by all discovery walks.
 pub fn skip_dir(name: &str) -> bool {
     matches!(
@@ -50,6 +57,23 @@ pub fn skip_dir(name: &str) -> bool {
             | ".next"
             | "coverage"
     )
+}
+
+/// Excludes generated evaluation trial trees from engineering facts.
+///
+/// `eval/results/` stores frozen benchmark output, including complete source
+/// snapshots under `work/`. Indexing those snapshots duplicates packages,
+/// modules, and symbols from the live product tree and distorts repository
+/// intelligence. The artifacts remain preserved on disk and under Git; this
+/// only keeps trial worktrees out of the engineering fact graph.
+pub fn skip_generated_results(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    name == "results"
+        && path
+            .parent()
+            .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "eval"))
 }
 
 /// Aggregate language facts from scanned-file statistics.
