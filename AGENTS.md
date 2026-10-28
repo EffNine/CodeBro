@@ -61,7 +61,7 @@ MCP-first. The old TUI was removed (ADR-012); preserved only on `tui-legacy` bra
 | `update_identity` | write | Update project identity (`.codebro/project_identity.json`). Requires existing identity. All free-text fields (decisions, constraints, summaries, roadmap, milestones) secret-redacted at write |
 | `apply_change` | write | Guarded single-file mutation via ChangeEngine. For new files pass `old=""`. Post-apply read-back verification (`edit_verification`); response is `status=applied_unverified`, `verification_status=unverified` until a build/test passes |
 | `apply_changes` | write | Transactional multi-file mutation: validate → conflict check → apply with rollback; every file read back after apply, any mismatch rolls the whole set back and fails the call. Same `applied_unverified` response semantics |
-| `sandbox_exec` | write | Execute command in isolated sandbox. Read-only build/test/lint only. Raw execution — does NOT produce durable validation evidence |
+| `sandbox_exec` | write | Execute command via the CodeBro sandbox runtime (NOT container-isolated: local backend reports `isolation=none`, `network=host` — treat as host execution; use OpenSandbox for real isolation). Read-only build/test/lint only. Raw execution — does NOT produce durable validation evidence |
 | `sandbox_test` | write | Run tests with structured verification. Auto-detects project type. Passing/failing runs are recorded durably per tree hash and returned as `execution_state` |
 | `sandbox_build` | write | Build/check with structured verification. Passing/failing runs are recorded durably per tree hash and returned as `execution_state` |
 | `sandbox_status` | read | Sandbox runtime status and capabilities |
