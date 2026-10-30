@@ -170,8 +170,9 @@ fn extract_quoted(text: &str) -> Option<String> {
 
 /// Build route symbol facts for one parsed module.
 ///
-/// Route symbols use deterministic ids (`sym::<rel>::route <METHOD path>`)
-/// so re-indexing is stable.
+/// Route symbols use deterministic ids including the declaration line
+/// (`sym::<rel>::<METHOD path>@<line>`) so re-indexing is stable and the same
+/// route declared twice in one file keeps two distinct facts.
 pub fn route_symbols(
     ws_id: &WorkspaceId,
     rel: &str,
@@ -183,7 +184,7 @@ pub fn route_symbols(
         .into_iter()
         .map(|r| {
             let name = format!("{} {}", r.method, r.path);
-            let id = SymbolId::new(format!("sym::{}::{}", rel, name));
+            let id = SymbolId::new(format!("sym::{}::{}@{}", rel, name, r.line));
             let mut sf = SymbolFact::new(id, name.clone(), SymbolKind::Route);
             sf.module = Some(mid.clone());
             sf.visibility = Visibility::Public;
