@@ -203,17 +203,21 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         for sym in parsed.symbols {
             let kind = map_symbol_kind(&sym.kind);
             // Uniqueness: same name can appear multiple times per file
-            // (e.g. method `new` on many structs, or a struct and its impl
-            // block). Disambiguate with kind + line so every symbol gets a
-            // stable, unique id without changing the source-level identity.
+            // (e.g. method `new` on many structs, a struct and its impl
+            // block, or two anonymous functions on the same line). Kind and
+            // line are not enough — anonymous symbols are all named
+            // `unknown` and minified code packs several functions onto one
+            // line — so the column of the declaration start is part of the
+            // identity (#7).
             let sym_id = format!(
-                "sym::{}::{}_{}@{}",
+                "sym::{}::{}_{}@{}:{}",
                 rel,
                 sym.name,
                 kind.as_str(),
-                sym.line_start
+                sym.line_start,
+                sym.column_start
             );
-            let mut sf = SymbolFact::new(SymbolId::new(sym_id), sym.name.clone(), kind);
+            let mut sf = SymbolFact::new(SymbolId::new(sym_id.clone()), sym.name.clone(), kind);
             sf.module = Some(mid.clone());
             sf.visibility = map_visibility(sym.visibility.as_deref());
             sf.signature = sym.signature.clone();
@@ -241,24 +245,20 @@ pub fn run(workspace_root: &Path) -> Result<()> {
             let looks_like_test_fn = (sym.name.starts_with("test_") || sym.name.ends_with("_test"))
                 && matches!(sym.kind, crate::intelligence::parser::SymbolKind::Function);
             if looks_like_test_file || looks_like_test_fn || sym.is_test {
-                let mut tf = TestFact::new(
-                    TestId::new(format!(
-                        "test::{}::{}_{}@{}",
-                        rel,
-                        sym.name,
-                        kind.as_str(),
-                        sym.line_start
-                    )),
-                    sym.name.clone(),
+                // Same identity rule as symbols (#7): include the column so
+                // two tests declared on one line (or two anonymous
+                // functions on one line) remain distinct.
+                let test_id = format!(
+                    "test::{}::{}_{}@{}:{}",
+                    rel,
+                    sym.name,
+                    kind.as_str(),
+                    sym.line_start,
+                    sym.column_start
                 );
+                let mut tf = TestFact::new(TestId::new(test_id), sym.name.clone());
                 tf.target = Some(crate::engineering_facts::FactId::Symbol(SymbolId::new(
-                    format!(
-                        "sym::{}::{}_{}@{}",
-                        rel,
-                        sym.name,
-                        kind.as_str(),
-                        sym.line_start
-                    ),
+                    sym_id.clone(),
                 )));
                 tf.location = Some(
                     SourceLocation::new()
@@ -1728,6 +1728,53 @@ mod tests {
         assert!(names.contains(&"main"));
         // Test detection heuristic picks test_x.
         assert!(!model.tests().is_empty());
+    }
+
+    /// Regression (#7): two distinct functions on the same source line must
+    /// not collapse into one opaque symbol id. Anonymous arrow functions are
+    /// all named `unknown`, so the id must be disambiguated by column, not
+    /// only by kind and line.
+    #[test]
+    fn init_disambiguates_same_line_function_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("web")).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"name\":\"probe-js\",\"version\":\"0.1.0\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("web/app.js"),
+            "const first = () => 1; const second = (path, type) => path + type;\n",
+        )
+        .unwrap();
+
+        run(dir.path()).unwrap();
+        let facts = dir.path().join(".codebro/facts.json");
+        let model: FactsModel =
+            serde_json::from_str(&std::fs::read_to_string(facts).unwrap()).unwrap();
+
+        let same_line: Vec<&crate::engineering_facts::SymbolFact> = model
+            .symbols()
+            .iter()
+            .filter(|s| s.location.line == Some(1) && s.location.file.as_deref() == Some("web/app.js"))
+            .collect();
+        assert!(
+            same_line.len() >= 2,
+            "expected both same-line functions as symbols, got {}",
+            same_line.len()
+        );
+
+        let mut ids: Vec<&str> = same_line.iter().map(|s| s.id.as_str()).collect();
+        ids.sort_unstable();
+        let total = ids.len();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            total,
+            "same-line symbols collapsed to duplicate ids: {:?}",
+            ids
+        );
     }
 
     /// Regression: frozen evaluation artifacts stay preserved on disk but
