@@ -674,7 +674,43 @@ fn secret_pattern_hit(content_lower: &str, pattern: &str) -> bool {
     if pattern == "sk-" {
         return contains_sk_key(content_lower);
     }
+    if pattern == "token" {
+        return contains_token_secret(content_lower);
+    }
     content_lower.contains(&pattern.to_lowercase())
+}
+
+/// Bare `token` is ordinary prose: `tokens`, `tokenize`, `token budget`,
+/// `auth tokens`. A secret needs an assignment (`token: …`, `token = …`).
+/// Matches only when `token` is a standalone word (both sides non-alphanumeric,
+/// so `tokens`/`tokenize` never hit) and is followed by `:` or `=` and a
+/// non-empty value.
+fn contains_token_secret(content_lower: &str) -> bool {
+    let bytes = content_lower.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = content_lower[start..].find("token") {
+        let abs = start + rel;
+        let before_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
+        let after = abs + "token".len();
+        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            let mut i = after;
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b':' || bytes[i] == b'=') {
+                let mut j = i + 1;
+                while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] != b'\n' && bytes[j] != b'\r' {
+                    return true;
+                }
+            }
+        }
+        start = abs + "token".len();
+    }
+    false
 }
 
 /// `sk-` (OpenAI-style key prefix) matches only at a token boundary: a bare
@@ -3924,6 +3960,34 @@ mod tests {
         let result = validate_skill_content(content, "reuse-task-remember-task", None);
         assert!(result.secret_safe, "errors: {:?}", result.errors);
         assert!(result.valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn validate_skill_content_accepts_token_prose() {
+        // P17 follow-up (#3): bare `token` is ordinary prose. `tokens`,
+        // `tokenize`, `token budget`, `auth tokens` are not secrets.
+        let content = "---\nname: token-budget\ndescription: Accounting notes\n---\n\n# Purpose\n\nTrack the token budget, tokenize inputs, and count auth tokens per request.\n\n# Procedure\n\n1. Sum tokens.\n";
+        let result = validate_skill_content(content, "token-budget", None);
+        assert!(result.secret_safe, "errors: {:?}", result.errors);
+        assert!(result.valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn validate_skill_content_rejects_token_assignment() {
+        // A pasted `token: <value>` is still a secret.
+        let content =
+            "---\nname: pasted\ndescription: x\n---\n\n# Purpose\n\ntoken: abc123def456\n";
+        let result = validate_skill_content(content, "pasted", None);
+        assert!(!result.secret_safe, "expected a secret hit");
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn validate_skill_content_rejects_token_assignment_equals() {
+        let content =
+            "---\nname: pasted\ndescription: x\n---\n\n# Purpose\n\ntoken = abc123def456\n";
+        let result = validate_skill_content(content, "pasted", None);
+        assert!(!result.secret_safe, "expected a secret hit");
     }
 
     #[test]
