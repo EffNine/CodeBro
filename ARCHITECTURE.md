@@ -50,6 +50,8 @@ only on the `tui-legacy` branch and tags, with mechanical guards in
 
 ## The 24 MCP tools (17 frozen v1 + 8 additive − 1 removed)
 
+Response bounding (256 KiB envelope, structural truncation, `truncated`/`limit_bytes` metadata) is specified in [docs/response_bounds.md](docs/response_bounds.md).
+
 | # | Tool | Kind |
 |---|---|---|
 | 1 | `workspace_context` | read |

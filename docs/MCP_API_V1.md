@@ -7,6 +7,7 @@ major version bump plus a migration path.
 
 - Transport: stdio (`rmcp`), JSON-RPC 2.0, protocol version `2024-11-05`.
 - Server name: `codebro` (P8: initialize reports `serverInfo: codebro/<crate version>`); binary: `codebro serve --root <workspace>`.
+- Response bounds: every post-P0 tool response is structurally bounded to 256 KiB with deterministic truncation metadata — see [response_bounds.md](response_bounds.md) for the canonical ceilings, truncation semantics, and overflow policy.
 - Tool arguments are passed as JSON strings and deserialized at runtime;
   every schema below is the authoritative shape.
 - stdout hygiene (P8): stdout carries ONLY JSON-RPC when `codebro serve`
