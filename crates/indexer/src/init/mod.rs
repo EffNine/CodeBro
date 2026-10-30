@@ -1757,7 +1757,9 @@ mod tests {
         let same_line: Vec<&crate::engineering_facts::SymbolFact> = model
             .symbols()
             .iter()
-            .filter(|s| s.location.line == Some(1) && s.location.file.as_deref() == Some("web/app.js"))
+            .filter(|s| {
+                s.location.line == Some(1) && s.location.file.as_deref() == Some("web/app.js")
+            })
             .collect();
         assert!(
             same_line.len() >= 2,
