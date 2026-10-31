@@ -6874,11 +6874,11 @@ mod phase8_tests {
 
 #[tool_handler]
 impl rmcp::ServerHandler for CodeBroMcpServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // P8 integration contract: the server identifies itself as the
         // product (`codebro` + crate version), never the SDK default
         // (`"rmcp"`). Clients display and route on `serverInfo`.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(rmcp::model::Implementation::new(
                 crate::integration::SERVER_NAME,
                 env!("CARGO_PKG_VERSION"),
