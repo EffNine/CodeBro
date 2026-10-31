@@ -293,7 +293,11 @@ pub fn run(workspace_root: &Path) -> Result<()> {
         // crate package fact (created below so endpoints resolve).
         for dep in &pkg.dependencies {
             let target_id = PackageId::new(format!("pkg::{crate}::external", crate = dep.name));
-            let dep_id = DependencyId::new(format!("dep::{}->{}", pkg.name, dep.name));
+            let dep_id = DependencyId::new(format!(
+                "dep::{}->{}",
+                pkg.id.as_str().trim_start_matches("pkg::"),
+                dep.name
+            ));
             let mut df = DependencyFact::new(
                 dep_id,
                 FactId::Package(pkg.id.clone()),
@@ -890,6 +894,22 @@ fn manifest_dirs(root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+fn scoped_package_id(rel: &str, name: &str) -> PackageId {
+    if rel.is_empty() {
+        PackageId::new(format!("pkg::{name}"))
+    } else {
+        PackageId::new(format!("pkg::{rel}::{name}"))
+    }
+}
+
+fn scoped_build_target_id(rel: &str, kind: &str, name: &str) -> BuildTargetId {
+    if rel.is_empty() {
+        BuildTargetId::new(format!("build::{kind}::{name}"))
+    } else {
+        BuildTargetId::new(format!("build::{rel}::{kind}::{name}"))
+    }
+}
+
 fn discover_packages(
     root: &Path,
     ws_id: &WorkspaceId,
@@ -901,18 +921,23 @@ fn discover_packages(
     // packages, nested services). Priority per directory: Cargo > Go >
     // Node > Python.
     for dir in manifest_dirs(root) {
+        let rel = dir
+            .strip_prefix(root)
+            .unwrap_or(&dir)
+            .to_string_lossy()
+            .replace('\\', "/");
         let parsed = if dir.join("Cargo.toml").is_file() {
-            parse_cargo_package(&dir, ws_id)
+            parse_cargo_package(&dir, ws_id, &rel)
         } else if dir.join("go.mod").is_file() {
-            parse_go_package(&dir, ws_id)
+            parse_go_package(&dir, ws_id, &rel)
         } else if dir.join("package.json").is_file() {
-            parse_node_package(&dir, ws_id)
+            parse_node_package(&dir, ws_id, &rel)
         } else if dir.join("pyproject.toml").is_file()
             || dir.join("setup.py").is_file()
             || dir.join("setup.cfg").is_file()
             || dir.join("requirements.txt").is_file()
         {
-            parse_python_package(&dir, ws_id)
+            parse_python_package(&dir, ws_id, &rel)
         } else {
             None
         };
@@ -930,10 +955,10 @@ fn discover_packages(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "root".to_string());
-    let id = PackageId::new(format!("pkg::{name}"));
+    let id = scoped_package_id("", &name);
     let fallback_language = primary_language(root).to_string();
     let mut fallback_target = BuildTargetFact::new(
-        BuildTargetId::new(format!("build::bin::{name}")),
+        scoped_build_target_id("", "bin", &name),
         name.clone(),
         BuildTargetKind::Binary,
     );
@@ -957,6 +982,7 @@ fn discover_packages(
 fn parse_cargo_package(
     root: &Path,
     _ws_id: &WorkspaceId,
+    rel: &str,
 ) -> Option<(DiscoveredPackage, Vec<BuildTargetFact>)> {
     let text = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
     let value: toml::Value = text.parse().ok()?;
@@ -967,7 +993,7 @@ fn parse_cargo_package(
         .get("version")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let id = PackageId::new(format!("pkg::{name}"));
+    let id = scoped_package_id(rel, &name);
 
     let mut targets = Vec::new();
 
@@ -980,7 +1006,7 @@ fn parse_cargo_package(
             .unwrap_or(&name)
             .to_string();
         let mut t = BuildTargetFact::new(
-            BuildTargetId::new(format!("build::lib::{lib_name}")),
+            scoped_build_target_id(rel, "lib", &lib_name),
             lib_name,
             BuildTargetKind::Library,
         );
@@ -996,7 +1022,7 @@ fn parse_cargo_package(
     let explicit_bins = value.get("bin").and_then(|b| b.as_array());
     if root.join("src/main.rs").exists() && explicit_bins.is_none() {
         let mut t = BuildTargetFact::new(
-            BuildTargetId::new(format!("build::bin::{name}")),
+            scoped_build_target_id(rel, "bin", &name),
             name.clone(),
             BuildTargetKind::Binary,
         );
@@ -1012,7 +1038,7 @@ fn parse_cargo_package(
                 .unwrap_or(&name)
                 .to_string();
             let mut t = BuildTargetFact::new(
-                BuildTargetId::new(format!("build::bin::{bin_name}")),
+                scoped_build_target_id(rel, "bin", &bin_name),
                 bin_name,
                 BuildTargetKind::Binary,
             );
@@ -1031,7 +1057,7 @@ fn parse_cargo_package(
                 .unwrap_or("test")
                 .to_string();
             let mut bt = BuildTargetFact::new(
-                BuildTargetId::new(format!("build::test::{test_name}")),
+                scoped_build_target_id(rel, "test", &test_name),
                 test_name,
                 BuildTargetKind::Test,
             );
@@ -1044,7 +1070,7 @@ fn parse_cargo_package(
     if targets.is_empty() {
         // Unknown target shape: still register the package with a generic target.
         let mut t = BuildTargetFact::new(
-            BuildTargetId::new(format!("build::bin::{name}")),
+            scoped_build_target_id(rel, "bin", &name),
             name.clone(),
             BuildTargetKind::Unknown,
         );
@@ -1123,6 +1149,7 @@ fn parse_cargo_package(
 fn parse_go_package(
     root: &Path,
     _ws_id: &WorkspaceId,
+    rel: &str,
 ) -> Option<(DiscoveredPackage, Vec<BuildTargetFact>)> {
     let text = std::fs::read_to_string(root.join("go.mod")).ok()?;
     let module = text
@@ -1131,10 +1158,10 @@ fn parse_go_package(
         .and_then(|l| l.split_whitespace().nth(1))
         .map(|s| s.to_string())?;
     let name = module.rsplit('/').next().unwrap_or(&module).to_string();
-    let id = PackageId::new(format!("pkg::{name}"));
+    let id = scoped_package_id(rel, &name);
 
     let mut target = BuildTargetFact::new(
-        BuildTargetId::new(format!("build::bin::{name}")),
+        scoped_build_target_id(rel, "bin", &name),
         name.clone(),
         BuildTargetKind::Binary,
     );
@@ -1189,6 +1216,7 @@ fn parse_go_package(
 fn parse_node_package(
     root: &Path,
     _ws_id: &WorkspaceId,
+    rel: &str,
 ) -> Option<(DiscoveredPackage, Vec<BuildTargetFact>)> {
     let text = std::fs::read_to_string(root.join("package.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -1197,11 +1225,11 @@ fn parse_node_package(
         .get("version")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let id = PackageId::new(format!("pkg::{name}"));
+    let id = scoped_package_id(rel, &name);
     let language = primary_language(root).to_string();
 
     let mut target = BuildTargetFact::new(
-        BuildTargetId::new(format!("build::bin::{name}")),
+        scoped_build_target_id(rel, "bin", &name),
         name.clone(),
         BuildTargetKind::Binary,
     );
@@ -1245,6 +1273,7 @@ fn parse_node_package(
 fn parse_python_package(
     root: &Path,
     _ws_id: &WorkspaceId,
+    rel: &str,
 ) -> Option<(DiscoveredPackage, Vec<BuildTargetFact>)> {
     // 1) pyproject.toml — PEP 621 [project] table.
     if let Ok(text) = std::fs::read_to_string(root.join("pyproject.toml")) {
@@ -1253,6 +1282,7 @@ fn parse_python_package(
                 if let Some(name) = project.get("name").and_then(|n| n.as_str()) {
                     return Some(finish_python_package(
                         root,
+                        rel,
                         name.to_string(),
                         project
                             .get("version")
@@ -1306,7 +1336,14 @@ fn parse_python_package(
                 .collect::<Vec<_>>(),
             DependencyKind::Direct,
         );
-        return Some(finish_python_package(root, name, None, deps, Vec::new()));
+        return Some(finish_python_package(
+            root,
+            rel,
+            name,
+            None,
+            deps,
+            Vec::new(),
+        ));
     }
 
     // 3) requirements.txt — one requirement per line.
@@ -1324,6 +1361,7 @@ fn parse_python_package(
             .collect();
         return Some(finish_python_package(
             root,
+            rel,
             name,
             None,
             python_deps_from_iterable(deps, DependencyKind::Direct),
@@ -1337,14 +1375,15 @@ fn parse_python_package(
 /// Shared tail of Python discovery: build the package + binary target.
 fn finish_python_package(
     root: &Path,
+    rel: &str,
     name: String,
     version: Option<String>,
     direct: Vec<DiscoveredDependency>,
     optional: Vec<DiscoveredDependency>,
 ) -> (DiscoveredPackage, Vec<BuildTargetFact>) {
-    let id = PackageId::new(format!("pkg::{name}"));
+    let id = scoped_package_id(rel, &name);
     let mut target = BuildTargetFact::new(
-        BuildTargetId::new(format!("build::bin::{name}")),
+        scoped_build_target_id(rel, "bin", &name),
         name.clone(),
         BuildTargetKind::Binary,
     );
@@ -1779,6 +1818,61 @@ mod tests {
         );
     }
 
+    /// Regression (#8): package and build-target ids must be scoped by
+    /// workspace-relative path so same-named packages in different
+    /// subprojects (e.g. two Go services sharing a module name) don't
+    /// collide into one fact.
+    #[test]
+    fn init_scopes_package_and_build_target_ids_by_workspace_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("services/alpha")).unwrap();
+        std::fs::create_dir_all(dir.path().join("services/beta")).unwrap();
+        std::fs::write(
+            dir.path().join("services/alpha/go.mod"),
+            "module example.com/shared\n\ngo 1.21\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("services/beta/go.mod"),
+            "module example.com/shared\n\ngo 1.21\n",
+        )
+        .unwrap();
+
+        run(dir.path()).unwrap();
+        let facts = dir.path().join(".codebro/facts.json");
+        let model: FactsModel =
+            serde_json::from_str(&std::fs::read_to_string(facts).unwrap()).unwrap();
+
+        let packages: Vec<&crate::engineering_facts::PackageFact> =
+            model.packages().iter().collect();
+        let pkg_ids: Vec<&str> = packages.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            pkg_ids.len(),
+            2,
+            "expected two packages, got ids {pkg_ids:?}"
+        );
+        let mut sorted = pkg_ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            pkg_ids.len(),
+            "same-named packages in different subprojects collided: {pkg_ids:?}"
+        );
+
+        let targets: Vec<&crate::engineering_facts::BuildTargetFact> =
+            model.build_targets().iter().collect();
+        let target_ids: Vec<&str> = targets.iter().map(|t| t.id.as_str()).collect();
+        let mut sorted_t = target_ids.clone();
+        sorted_t.sort_unstable();
+        sorted_t.dedup();
+        assert_eq!(
+            sorted_t.len(),
+            target_ids.len(),
+            "same-named build targets in different subprojects collided: {target_ids:?}"
+        );
+    }
+
     /// Regression: frozen evaluation artifacts stay preserved on disk but
     /// their generated source snapshots never enter the engineering fact graph.
     #[test]
@@ -1826,7 +1920,10 @@ mod tests {
                 .any(|package| package.name == "trial-copy"),
             "generated evaluation manifests must not enter packages"
         );
-        assert!(dir.path().join("eval/results/dogfood/D1-OFF-1/work/src/main.rs").exists());
+        assert!(dir
+            .path()
+            .join("eval/results/dogfood/D1-OFF-1/work/src/main.rs")
+            .exists());
     }
 
     #[test]
