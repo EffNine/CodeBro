@@ -48,6 +48,32 @@ fn symbol_impl<'a>(scopes: &'a [ImplScope], sym: &SymbolFact) -> Option<&'a str>
     enclosing_impl(scopes, file, line)
 }
 
+/// Deterministic relationship id for a verified `Calls` edge between a
+/// caller and a resolved callee. Both endpoint hashes feed the id so that
+/// distinct callers reaching the same callee never collide.
+fn calls_rel_id(
+    caller_fact_id: &FactId,
+    caller_file: &str,
+    callee_name: &str,
+    line: u32,
+    callee_sym_id: &SymbolId,
+) -> String {
+    let mut h_caller: u64 = 0x811c_9dc5;
+    for b in caller_fact_id.as_str().bytes() {
+        h_caller ^= b as u64;
+        h_caller = h_caller.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut h: u64 = 0x811c_9dc5;
+    for b in callee_sym_id.as_str().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!(
+        "rel::{}::{}@{}#{}#{:016x}",
+        caller_file, callee_name, line, h_caller, h
+    )
+}
+
 /// Build relationship and reference facts from module/symbol data plus
 /// AST-derived calls and imports.
 ///
@@ -108,20 +134,12 @@ pub fn build_relationships(
             let edge = (caller_fact_id.clone(), callee_fact_id);
             if verified_call_set.insert(edge.clone()) {
                 verified_call_edges.push(edge.clone());
-                // Disambiguator from the resolved target: two calls can
-                // share file+line+name (`Ping::new(); Pong::new();`) yet
-                // resolve to different symbols; the id must not collide.
-                let mut h: u64 = 0x811c_9dc5;
-                for b in callee_sym_id.as_str().bytes() {
-                    h ^= b as u64;
-                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
-                }
-                let rel_id = format!(
-                    "rel::{caller_file}::{callee_name}@{line}#{h:016x}",
-                    caller_file = call.caller_file,
-                    callee_name = call.callee_name,
-                    line = call.line_start,
-                    h = h,
+                let rel_id = calls_rel_id(
+                    &caller_fact_id,
+                    &call.caller_file,
+                    &call.callee_name,
+                    call.line_start,
+                    &callee_sym_id,
                 );
                 // Macro-text calls are syntactic recovery, not AST nodes —
                 // they carry heuristic provenance so trust math stays honest.
@@ -587,4 +605,38 @@ fn build_heuristic_imports(
         }
     }
     count as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (duplicate_facts): two distinct callers reaching the same
+    /// callee in one file used to collapse onto a single relationship id
+    /// (`rel::<file>::<callee>@<line>#<callee-hash>`), producing duplicate
+    /// `Calls` facts in the store.
+    #[test]
+    fn calls_rel_ids_distinguish_distinct_callers() {
+        let caller_a = FactId::Symbol(SymbolId::new("sym::mod::a::un_function@1:8035"));
+        let caller_b = FactId::Symbol(SymbolId::new("sym::mod::a::mt_function@1:16555"));
+        let callee = SymbolId::new("sym::mod::a::Cn_function@1:25029");
+
+        let id_a = calls_rel_id(&caller_a, "mod/a.js", "Cn", 7, &callee);
+        let id_b = calls_rel_id(&caller_b, "mod/a.js", "Cn", 7, &callee);
+
+        assert_ne!(
+            id_a, id_b,
+            "distinct callers with the same callee must not share a relationship id"
+        );
+    }
+
+    #[test]
+    fn calls_rel_id_is_stable_for_the_same_call() {
+        let caller = FactId::Symbol(SymbolId::new("sym::mod::a::un_function@1:8035"));
+        let callee = SymbolId::new("sym::mod::a::Cn_function@1:25029");
+        assert_eq!(
+            calls_rel_id(&caller, "mod/a.js", "Cn", 7, &callee),
+            calls_rel_id(&caller, "mod/a.js", "Cn", 7, &callee)
+        );
+    }
 }
