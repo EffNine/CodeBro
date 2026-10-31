@@ -2802,6 +2802,53 @@ mod tests {
         assert!(graph_edges::extract_routes("rust", "let x = 1;\n").is_empty());
     }
 
+    /// Regression: the same route may be declared more than once in one file
+    /// (for example a test table re-registering endpoints). Route ids used to
+    /// be `sym::<file>::<METHOD path>` with no line, so repeated declarations
+    /// collapsed into one id and produced duplicate facts.
+    #[test]
+    fn init_keeps_repeated_route_declarations_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("cmd")).unwrap();
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/routes\n\ngo 1.21\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cmd/main.go"),
+            "package main\n\nimport \"net/http\"\n\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/v1/models\", a)\n\tmux.HandleFunc(\"/v1/models\", b)\n}\n",
+        )
+        .unwrap();
+
+        run(dir.path()).unwrap();
+        let model: FactsModel = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codebro/facts.json")).unwrap(),
+        )
+        .unwrap();
+
+        let routes: Vec<&crate::engineering_facts::SymbolFact> = model
+            .symbols()
+            .iter()
+            .filter(|s| s.kind == crate::engineering_facts::SymbolKind::Route)
+            .filter(|s| s.name.contains("/v1/models"))
+            .collect();
+        assert_eq!(
+            routes.len(),
+            2,
+            "expected both route declarations as facts: {routes:?}"
+        );
+        let mut ids: Vec<&str> = routes.iter().map(|s| s.id.as_str()).collect();
+        ids.sort_unstable();
+        let total = ids.len();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            total,
+            "repeated route declarations collapsed to duplicate ids: {ids:?}"
+        );
+    }
+
     #[test]
     fn init_indexes_route_symbols_and_doc_references() {
         let dir = tempfile::tempdir().unwrap();
